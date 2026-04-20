@@ -12,8 +12,17 @@ describe('setup-workspace script', () => {
     expect(script).toContain('if has_command node; then');
   });
 
-  it('skips optional tool installs instead of crashing when prerequisites are missing', () => {
+  it('records component-level bootstrap status and distinguishes partial completion', () => {
+    expect(script).toContain('BOOTSTRAP_STATUS_PATH="$WORKSPACE/.bootstrap-status"');
+    expect(script).toContain('record_status()');
+    expect(script).toContain('record_status bootstrap "complete"');
+    expect(script).toContain('record_status bootstrap "partial"');
+    expect(script).toContain('rm -f "$BOOTSTRAP_FLAG"');
+  });
+
+  it('retries missing components instead of treating a partial first boot as complete forever', () => {
     expect(script).toContain('skipping nvm install because git is unavailable');
     expect(script).toContain('skipping Homebrew install because curl and git are required at runtime');
+    expect(script).not.toContain('workspace already initialized');
   });
 });

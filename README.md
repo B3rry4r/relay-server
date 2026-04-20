@@ -51,7 +51,7 @@ npm test
 4. Ensure `railway.toml` is present in the repo root.
 5. Deploy and watch the startup logs for workspace bootstrap output.
 
-On first boot, Relay runs `setup-workspace.sh` before the HTTP server starts. That script initializes the mounted workspace with:
+On startup, Relay runs `setup-workspace.sh` before the HTTP server starts. That script initializes the mounted workspace with:
 
 - `/workspace/.bashrc`
 - `/workspace/.bash_profile`
@@ -60,8 +60,10 @@ On first boot, Relay runs `setup-workspace.sh` before the HTTP server starts. Th
 - `/workspace/.npm-global`
 - `/workspace/.local`
 - `/workspace/projects`
+- `/workspace/.bootstrap-status`
 
-The `.bootstrapped` flag prevents repeated initialization on later restarts.
+If every managed component is present, the script writes `/workspace/.bootstrapped`.
+If optional toolchain pieces such as `nvm` or Homebrew are skipped or fail, Relay still starts, but `/workspace/.bootstrapped` is removed and `/workspace/.bootstrap-status` records the partial state so later restarts can retry the missing pieces.
 
 ## Security
 
