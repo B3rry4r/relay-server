@@ -1,3 +1,6 @@
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import request from 'supertest';
 import { io as createClient, type Socket } from 'socket.io-client';
@@ -23,6 +26,14 @@ async function connectClient(port: number, token = 'test-token'): Promise<Socket
 describe('Relay server', () => {
   const servers: RelayServer[] = [];
   const clients: Socket[] = [];
+  const tempDirectories: string[] = [];
+
+  async function createWorkspaceFixture(): Promise<string> {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'relay-workspace-'));
+    tempDirectories.push(workspace);
+    await fs.mkdir(path.join(workspace, 'projects'), { recursive: true });
+    return workspace;
+  }
 
   afterEach(async () => {
     while (clients.length > 0) {
@@ -43,6 +54,11 @@ describe('Relay server', () => {
     delete process.env.TERM_PROGRAM;
     delete process.env.TERM_PROGRAM_VERSION;
     delete process.env.PROMPT_COMMAND;
+
+    while (tempDirectories.length > 0) {
+      const directory = tempDirectories.pop();
+      await fs.rm(directory!, { recursive: true, force: true });
+    }
   });
 
   it('serves backend metadata at the root route', async () => {
@@ -116,6 +132,135 @@ describe('Relay server', () => {
 
     expect(response.status).toBe(200);
     expect(response.body).toEqual({ authenticated: true });
+  });
+
+  it('returns bootstrap status from the workspace', async () => {
+    process.env.PORT = '0';
+    process.env.AUTH_TOKEN = 'test-token';
+    process.env.WORKSPACE = await createWorkspaceFixture();
+
+    await fs.writeFile(path.join(process.env.WORKSPACE, '.bootstrap-status'), 'bootstrap=partial\nnvm=installed\n');
+    await fs.writeFile(path.join(process.env.WORKSPACE, '.bootstrapped'), '');
+
+    const relay = createRelayServer(() => new FakePty());
+    servers.push(relay);
+    const port = await relay.start();
+
+    const response = await request(`http://127.0.0.1:${port}`)
+      .get('/api/bootstrap/status')
+      .set('x-auth-token', 'test-token');
+
+    expect(response.status).toBe(200);
+    expect(response.body.workspace).toBe(process.env.WORKSPACE);
+    expect(response.body.bootstrapped).toBe(true);
+    expect(response.body.status).toEqual({
+      bootstrap: 'partial',
+      nvm: 'installed',
+    });
+  });
+
+  it('supports project and file management APIs', async () => {
+    process.env.PORT = '0';
+    process.env.AUTH_TOKEN = 'test-token';
+    process.env.WORKSPACE = await createWorkspaceFixture();
+
+    const relay = createRelayServer(() => new FakePty());
+    servers.push(relay);
+    const port = await relay.start();
+    const base = request(`http://127.0.0.1:${port}`);
+
+    const createProject = await base
+      .post('/api/projects')
+      .set('x-auth-token', 'test-token')
+      .send({
+        name: 'my-app',
+        template: 'blank',
+        initializeGit: true,
+      });
+
+    expect(createProject.status).toBe(201);
+    expect(createProject.body.project.path).toBe(path.join(process.env.WORKSPACE, 'projects', 'my-app'));
+
+    const listProjects = await base
+      .get('/api/projects')
+      .set('x-auth-token', 'test-token');
+
+    expect(listProjects.status).toBe(200);
+    expect(listProjects.body.projects).toHaveLength(1);
+    expect(listProjects.body.projects[0].id).toBe('my-app');
+
+    const createFolder = await base
+      .post('/api/projects/my-app/folders')
+      .set('x-auth-token', 'test-token')
+      .send({
+        parentPath: 'src',
+        name: 'components',
+      });
+
+    expect(createFolder.status).toBe(201);
+    expect(createFolder.body.created.path).toBe(path.join('src', 'components'));
+
+    const createFile = await base
+      .post('/api/projects/my-app/files')
+      .set('x-auth-token', 'test-token')
+      .send({
+        parentPath: 'src',
+        name: 'index.ts',
+        contents: 'console.log("hello");\n',
+      });
+
+    expect(createFile.status).toBe(201);
+    expect(createFile.body.created.path).toBe(path.join('src', 'index.ts'));
+
+    const tree = await base
+      .get('/api/projects/my-app/tree')
+      .set('x-auth-token', 'test-token');
+
+    expect(tree.status).toBe(200);
+    expect(tree.body.tree).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: 'src', type: 'directory' }),
+      expect.objectContaining({ path: path.join('src', 'components'), type: 'directory' }),
+      expect.objectContaining({ path: path.join('src', 'index.ts'), type: 'file' }),
+    ]));
+
+    const rename = await base
+      .patch('/api/projects/my-app/rename')
+      .set('x-auth-token', 'test-token')
+      .send({
+        path: path.join('src', 'index.ts'),
+        newName: 'main.ts',
+      });
+
+    expect(rename.status).toBe(200);
+    expect(rename.body.updated.newPath).toBe(path.join('src', 'main.ts'));
+
+    const selectProject = await base
+      .post('/api/session/project')
+      .set('x-auth-token', 'test-token')
+      .send({
+        projectId: 'my-app',
+      });
+
+    expect(selectProject.status).toBe(200);
+    expect(selectProject.body.shell.cwd).toBe(path.join(process.env.WORKSPACE, 'projects', 'my-app'));
+
+    const previews = await base
+      .get('/api/previews')
+      .set('x-auth-token', 'test-token');
+
+    expect(previews.status).toBe(200);
+    expect(previews.body).toEqual({ previews: [] });
+
+    const removeItem = await base
+      .delete('/api/projects/my-app/items')
+      .set('x-auth-token', 'test-token')
+      .send({
+        path: path.join('src', 'components'),
+        recursive: true,
+      });
+
+    expect(removeItem.status).toBe(200);
+    expect(removeItem.body.deleted.path).toBe(path.join('src', 'components'));
   });
 
   it('spawns a shell in the workspace and relays PTY output', async () => {
