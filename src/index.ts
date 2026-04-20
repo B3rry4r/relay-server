@@ -1,12 +1,14 @@
-import express from 'express';
-const app = express();
+import { createRelayServer } from './relay-server';
+import { runWorkspaceBootstrap } from './workspace-bootstrap';
 
-app.get('/', (req, res) => {
-  const name = process.env.NAME || 'World';
-  res.send(`Hello ${name}!`);
-});
+async function main(): Promise<void> {
+  await runWorkspaceBootstrap();
+  const relay = createRelayServer();
+  const port = await relay.start();
+  console.log(`Relay listening on port ${port}`);
+}
 
-const port = parseInt(process.env.PORT || '3000');
-app.listen(port, () => {
-  console.log(`listening on port ${port}`);
+main().catch((error) => {
+  console.error('Relay failed to start', error);
+  process.exit(1);
 });
