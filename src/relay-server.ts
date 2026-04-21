@@ -144,8 +144,10 @@ function createTerminalEnv(workspace: string): NodeJS.ProcessEnv {
     JAVA_HOME: path.join(homebrewPrefix, 'opt', 'openjdk'),
     ANDROID_SDK_ROOT: path.join(relayTools, 'android-sdk'),
     HOMEBREW_NO_AUTO_UPDATE: '1',
+    HOMEBREW_NO_ANALYTICS: '1',
     HOMEBREW_NO_ENV_HINTS: '1',
     HOMEBREW_NO_INSTALL_CLEANUP: '1',
+    HOMEBREW_CURL_RETRIES: '3',
     BROWSER: 'relay-browser',
     RELAY_BROWSER: '1',
     PROMPT_COMMAND: '',
@@ -835,11 +837,21 @@ async function runShellCommand(workspace: string, command: string): Promise<{ st
   const shell = resolveShell();
   const args = ['-c', command];
 
-  return execFile(shell, args, {
-    cwd: workspace,
-    env: createTerminalEnv(workspace),
-    maxBuffer: 10 * 1024 * 1024, // 10MB
-  });
+  try {
+    return await execFile(shell, args, {
+      cwd: workspace,
+      env: createTerminalEnv(workspace),
+      maxBuffer: 10 * 1024 * 1024, // 10MB
+    });
+  } catch (error: any) {
+    let message = error.message || 'Command failed';
+    if (error.signal === 'SIGKILL') {
+      message = `${message}\nProcess was killed (likely OOM or timeout).`;
+    } else if (error.code) {
+      message = `${message}\nExit code: ${error.code}`;
+    }
+    throw new Error(message);
+  }
 }
 
 async function ensureToolDirectories(workspace: string): Promise<void> {
