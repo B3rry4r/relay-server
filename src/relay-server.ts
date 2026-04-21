@@ -804,8 +804,16 @@ async function getGitStatus(projectRoot: string): Promise<{
   for (const line of lines) {
     if (line.startsWith('## ')) {
       const branchInfo = line.slice(3);
+      const noCommitsMatch = branchInfo.match(/^No commits yet on (.+)$/);
+      const initialCommitMatch = branchInfo.match(/^Initial commit on (.+)$/);
       const branchMatch = branchInfo.match(/^([^.\s]+)(?:\.\.\.)?/);
-      branch = branchMatch ? branchMatch[1] : branchInfo;
+      branch = noCommitsMatch
+        ? noCommitsMatch[1]
+        : initialCommitMatch
+          ? initialCommitMatch[1]
+          : branchMatch
+            ? branchMatch[1]
+            : branchInfo;
       const aheadMatch = branchInfo.match(/ahead (\d+)/);
       const behindMatch = branchInfo.match(/behind (\d+)/);
       ahead = aheadMatch ? Number(aheadMatch[1]) : 0;

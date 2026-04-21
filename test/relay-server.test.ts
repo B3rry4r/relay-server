@@ -206,6 +206,7 @@ describe('Relay server', () => {
       .set('x-auth-token', 'test-token');
 
     expect(gitStatus.status).toBe(200);
+    expect(gitStatus.body.branch).toBe('main');
     expect(typeof gitStatus.body.clean).toBe('boolean');
 
     const createFolder = await base
