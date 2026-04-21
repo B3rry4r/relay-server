@@ -249,7 +249,7 @@ describe('Relay server', () => {
       .set('x-auth-token', 'test-token');
 
     expect(previews.status).toBe(200);
-    expect(previews.body).toEqual({ previews: [] });
+    expect(Array.isArray(previews.body.previews)).toBe(true);
 
     const removeItem = await base
       .delete('/api/projects/my-app/items')
@@ -261,6 +261,155 @@ describe('Relay server', () => {
 
     expect(removeItem.status).toBe(200);
     expect(removeItem.body.deleted.path).toBe(path.join('src', 'components'));
+  });
+
+  it('supports templates, notes, suggestions, tasks, quick switch, duplicate, upload, download, health, and command parsing', async () => {
+    process.env.PORT = '0';
+    process.env.AUTH_TOKEN = 'test-token';
+    process.env.WORKSPACE = await createWorkspaceFixture();
+
+    await fs.writeFile(path.join(process.env.WORKSPACE, '.bootstrap-status'), 'bootstrap=complete\nhomebrew=installed\n');
+    await fs.writeFile(path.join(process.env.WORKSPACE, '.bootstrapped'), '');
+
+    const relay = createRelayServer(() => new FakePty());
+    servers.push(relay);
+    const port = await relay.start();
+    const base = request(`http://127.0.0.1:${port}`);
+
+    const createTemplateProject = await base
+      .post('/api/projects')
+      .set('x-auth-token', 'test-token')
+      .send({
+        name: 'api-app',
+        template: 'node-api',
+        initializeGit: true,
+      });
+
+    expect(createTemplateProject.status).toBe(201);
+    await expect(fs.stat(path.join(process.env.WORKSPACE, 'projects', 'api-app', 'package.json'))).resolves.toBeTruthy();
+
+    const tasks = await base
+      .get('/api/projects/api-app/tasks')
+      .set('x-auth-token', 'test-token');
+
+    expect(tasks.status).toBe(200);
+    expect(tasks.body.tasks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'dev', command: 'npm run dev' }),
+      expect.objectContaining({ id: 'test', command: 'npm run test' }),
+    ]));
+
+    const suggestions = await base
+      .get('/api/projects/api-app/suggestions')
+      .set('x-auth-token', 'test-token');
+
+    expect(suggestions.status).toBe(200);
+    expect(suggestions.body.suggestions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'npm-install' }),
+      expect.objectContaining({ id: 'npm-dev' }),
+      expect.objectContaining({ id: 'git-status' }),
+    ]));
+
+    const putNotes = await base
+      .put('/api/projects/api-app/notes')
+      .set('x-auth-token', 'test-token')
+      .send({
+        content: 'remember to add auth',
+      });
+
+    expect(putNotes.status).toBe(200);
+    expect(putNotes.body.content).toBe('remember to add auth');
+
+    const getNotes = await base
+      .get('/api/projects/api-app/notes')
+      .set('x-auth-token', 'test-token');
+
+    expect(getNotes.status).toBe(200);
+    expect(getNotes.body.content).toBe('remember to add auth');
+
+    const upload = await base
+      .post('/api/projects/api-app/upload')
+      .set('x-auth-token', 'test-token')
+      .send({
+        parentPath: 'src',
+        name: 'uploaded.txt',
+        contentBase64: Buffer.from('hello upload').toString('base64'),
+      });
+
+    expect(upload.status).toBe(201);
+    expect(upload.body.uploaded.path).toBe(path.join('src', 'uploaded.txt'));
+
+    const duplicate = await base
+      .post('/api/projects/api-app/duplicate')
+      .set('x-auth-token', 'test-token')
+      .send({
+        path: path.join('src', 'uploaded.txt'),
+        newName: 'uploaded-copy.txt',
+      });
+
+    expect(duplicate.status).toBe(201);
+    expect(duplicate.body.duplicated.duplicatedPath).toBe(path.join('src', 'uploaded-copy.txt'));
+
+    const download = await base
+      .get('/api/projects/api-app/download')
+      .set('x-auth-token', 'test-token')
+      .query({
+        path: path.join('src', 'uploaded-copy.txt'),
+      });
+
+    expect(download.status).toBe(200);
+    expect(download.text).toBe('hello upload');
+
+    await base
+      .post('/api/session/project')
+      .set('x-auth-token', 'test-token')
+      .send({ projectId: 'api-app' });
+
+    const quickSwitch = await base
+      .get('/api/projects/quick-switch')
+      .set('x-auth-token', 'test-token');
+
+    expect(quickSwitch.status).toBe(200);
+    expect(quickSwitch.body.projects).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'api-app', recent: true }),
+    ]));
+
+    const pinProject = await base
+      .post('/api/projects/api-app/pin')
+      .set('x-auth-token', 'test-token')
+      .send({ pinned: true });
+
+    expect(pinProject.status).toBe(200);
+    expect(pinProject.body.pinned).toBe(true);
+
+    const workspaceHealth = await base
+      .get('/api/workspace/health')
+      .set('x-auth-token', 'test-token');
+
+    expect(workspaceHealth.status).toBe(200);
+    expect(workspaceHealth.body.bootstrapped).toBe(true);
+    expect(workspaceHealth.body.status.bootstrap).toBe('complete');
+    expect(Array.isArray(workspaceHealth.body.activePorts)).toBe(true);
+
+    const parseGit = await base
+      .post('/api/command-results/parse')
+      .set('x-auth-token', 'test-token')
+      .send({
+        command: 'git status',
+        output: 'On branch main\nnothing to commit, working tree clean\n',
+      });
+
+    expect(parseGit.status).toBe(200);
+    expect(parseGit.body.result).toEqual(expect.objectContaining({
+      type: 'git-status',
+      summary: 'Working tree clean',
+    }));
+
+    const previews = await base
+      .get('/api/previews')
+      .set('x-auth-token', 'test-token');
+
+    expect(previews.status).toBe(200);
+    expect(Array.isArray(previews.body.previews)).toBe(true);
   });
 
   it('spawns a shell in the workspace and relays PTY output', async () => {

@@ -1,7 +1,9 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createServer, type Server as HttpServer } from 'node:http';
+import { execFile as execFileCallback } from 'node:child_process';
 import { EventEmitter } from 'node:events';
+import { promisify } from 'node:util';
 import express, { type Express } from 'express';
 import type { NextFunction, Request, Response } from 'express';
 import cors from 'cors';
@@ -34,12 +36,21 @@ export type RelayServer = {
 const DEFAULT_COLS = 80;
 const DEFAULT_ROWS = 24;
 const PROJECT_NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
+const RECENT_PROJECT_LIMIT = 10;
+const execFile = promisify(execFileCallback);
 
 type TreeNode = {
   name: string;
   path: string;
   type: 'directory' | 'file';
   size?: number;
+};
+
+type PreviewRecord = {
+  label: string;
+  port: number;
+  status: 'active' | 'inactive';
+  url: string;
 };
 
 function resolveAuthToken(): string {
@@ -123,6 +134,10 @@ function getProjectsRoot(): string {
   return path.join(resolveWorkspace(), 'projects');
 }
 
+function getRelayStateRoot(): string {
+  return path.join(resolveWorkspace(), '.relay');
+}
+
 function validateProjectName(name: string): string | null {
   const trimmed = name.trim();
   if (!PROJECT_NAME_PATTERN.test(trimmed)) {
@@ -165,6 +180,10 @@ async function ensureProjectsRoot(): Promise<void> {
   await fs.mkdir(getProjectsRoot(), { recursive: true });
 }
 
+async function ensureRelayStateRoot(): Promise<void> {
+  await fs.mkdir(getRelayStateRoot(), { recursive: true });
+}
+
 async function parseBootstrapStatus(): Promise<Record<string, string>> {
   const statusPath = path.join(resolveWorkspace(), '.bootstrap-status');
 
@@ -181,6 +200,360 @@ async function parseBootstrapStatus(): Promise<Record<string, string>> {
       acc[key] = rest.join('=');
       return acc;
     }, {});
+}
+
+async function readJsonFile<T>(targetPath: string, fallback: T): Promise<T> {
+  if (!await exists(targetPath)) {
+    return fallback;
+  }
+
+  try {
+    const content = await fs.readFile(targetPath, 'utf8');
+    return JSON.parse(content) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+async function writeJsonFile(targetPath: string, value: unknown): Promise<void> {
+  await ensureRelayStateRoot();
+  await fs.writeFile(targetPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+}
+
+async function readPackageJson(projectRoot: string): Promise<Record<string, unknown> | null> {
+  const packageJsonPath = path.join(projectRoot, 'package.json');
+  return readJsonFile<Record<string, unknown> | null>(packageJsonPath, null);
+}
+
+async function getRecentProjects(): Promise<string[]> {
+  return readJsonFile<string[]>(path.join(getRelayStateRoot(), 'recent-projects.json'), []);
+}
+
+async function setRecentProjects(projectIds: string[]): Promise<void> {
+  await writeJsonFile(path.join(getRelayStateRoot(), 'recent-projects.json'), projectIds);
+}
+
+async function markProjectAsRecent(projectId: string): Promise<void> {
+  const recent = await getRecentProjects();
+  const next = [projectId, ...recent.filter((value) => value !== projectId)].slice(0, RECENT_PROJECT_LIMIT);
+  await setRecentProjects(next);
+}
+
+async function getPinnedProjects(): Promise<string[]> {
+  return readJsonFile<string[]>(path.join(getRelayStateRoot(), 'pinned-projects.json'), []);
+}
+
+async function setPinnedProjects(projectIds: string[]): Promise<void> {
+  await writeJsonFile(path.join(getRelayStateRoot(), 'pinned-projects.json'), projectIds);
+}
+
+async function scaffoldTemplate(projectRoot: string, template: string): Promise<void> {
+  switch (template) {
+    case 'blank':
+      return;
+    case 'node-api':
+      await fs.mkdir(path.join(projectRoot, 'src'), { recursive: true });
+      await fs.writeFile(path.join(projectRoot, 'src', 'index.js'), 'console.log("Relay node api");\n');
+      await fs.writeFile(path.join(projectRoot, 'package.json'), `${JSON.stringify({
+        name: path.basename(projectRoot),
+        private: true,
+        scripts: {
+          dev: 'node src/index.js',
+          test: 'echo "No tests yet"',
+        },
+      }, null, 2)}\n`);
+      return;
+    case 'next-app':
+      await fs.mkdir(path.join(projectRoot, 'app'), { recursive: true });
+      await fs.writeFile(path.join(projectRoot, 'app', 'page.tsx'), 'export default function Page() { return <main>Relay Next App</main>; }\n');
+      await fs.writeFile(path.join(projectRoot, 'package.json'), `${JSON.stringify({
+        name: path.basename(projectRoot),
+        private: true,
+        scripts: {
+          dev: 'next dev',
+          build: 'next build',
+          start: 'next start',
+        },
+      }, null, 2)}\n`);
+      return;
+    case 'python-api':
+      await fs.mkdir(path.join(projectRoot, 'app'), { recursive: true });
+      await fs.writeFile(path.join(projectRoot, 'app', 'main.py'), 'print("Relay python api")\n');
+      await fs.writeFile(path.join(projectRoot, 'requirements.txt'), 'fastapi\nuvicorn\n');
+      return;
+    case 'static-site':
+      await fs.writeFile(path.join(projectRoot, 'index.html'), '<!doctype html><html><body><h1>Relay Static Site</h1></body></html>\n');
+      return;
+    case 'cli-tool':
+      await fs.mkdir(path.join(projectRoot, 'bin'), { recursive: true });
+      await fs.writeFile(path.join(projectRoot, 'bin', 'cli.js'), '#!/usr/bin/env node\nconsole.log("Relay CLI");\n');
+      await fs.writeFile(path.join(projectRoot, 'package.json'), `${JSON.stringify({
+        name: path.basename(projectRoot),
+        private: true,
+        bin: {
+          [path.basename(projectRoot)]: './bin/cli.js',
+        },
+      }, null, 2)}\n`);
+      return;
+    default:
+      return;
+  }
+}
+
+async function inferTasks(projectRoot: string): Promise<Array<{ id: string; label: string; command: string }>> {
+  const tasks: Array<{ id: string; label: string; command: string }> = [];
+  const packageJson = await readPackageJson(projectRoot);
+
+  if (packageJson && typeof packageJson.scripts === 'object' && packageJson.scripts !== null) {
+    const scripts = packageJson.scripts as Record<string, unknown>;
+    for (const [key, value] of Object.entries(scripts)) {
+      if (typeof value === 'string' && ['dev', 'test', 'lint', 'build', 'migrate', 'seed', 'start'].includes(key)) {
+        tasks.push({
+          id: key,
+          label: key,
+          command: `npm run ${key}`,
+        });
+      }
+    }
+  }
+
+  if (await exists(path.join(projectRoot, 'requirements.txt'))) {
+    tasks.push({
+      id: 'pip-install',
+      label: 'install',
+      command: 'pip install -r requirements.txt',
+    });
+  }
+
+  return tasks;
+}
+
+async function inferSuggestions(projectRoot: string): Promise<Array<{ id: string; label: string; command: string }>> {
+  const suggestions: Array<{ id: string; label: string; command: string }> = [];
+
+  if (await exists(path.join(projectRoot, 'package.json'))) {
+    suggestions.push(
+      { id: 'npm-install', label: 'Install dependencies', command: 'npm install' },
+      { id: 'npm-dev', label: 'Run dev server', command: 'npm run dev' },
+    );
+  }
+
+  if (await exists(path.join(projectRoot, 'requirements.txt'))) {
+    suggestions.push({
+      id: 'pip-install',
+      label: 'Install Python dependencies',
+      command: 'pip install -r requirements.txt',
+    });
+  }
+
+  if (await exists(path.join(projectRoot, '.git'))) {
+    suggestions.push({
+      id: 'git-status',
+      label: 'Git status',
+      command: 'git status',
+    });
+  }
+
+  return suggestions;
+}
+
+async function readProjectNotes(projectRoot: string): Promise<string> {
+  const notesPath = path.join(projectRoot, '.relay-notes.md');
+  if (!await exists(notesPath)) {
+    return '';
+  }
+
+  return fs.readFile(notesPath, 'utf8');
+}
+
+async function writeProjectNotes(projectRoot: string, content: string): Promise<void> {
+  await fs.writeFile(path.join(projectRoot, '.relay-notes.md'), content, 'utf8');
+}
+
+async function duplicateItem(projectRoot: string, sourcePath: string, newName?: string): Promise<{ sourcePath: string; duplicatedPath: string }> {
+  const sourceAbsolutePath = resolveProjectRelativePath(projectRoot, sourcePath);
+  if (!sourceAbsolutePath) {
+    throw new Error('invalid_path');
+  }
+
+  const stat = await fs.stat(sourceAbsolutePath);
+  const destinationName = newName || `${path.basename(sourceAbsolutePath)}-copy`;
+  const destinationAbsolutePath = path.join(path.dirname(sourceAbsolutePath), destinationName);
+
+  if (stat.isDirectory()) {
+    await fs.cp(sourceAbsolutePath, destinationAbsolutePath, { recursive: true });
+  } else {
+    await fs.copyFile(sourceAbsolutePath, destinationAbsolutePath);
+  }
+
+  return {
+    sourcePath: path.relative(projectRoot, sourceAbsolutePath),
+    duplicatedPath: path.relative(projectRoot, destinationAbsolutePath),
+  };
+}
+
+async function listListeningPorts(): Promise<number[]> {
+  try {
+    const { stdout } = await execFile('sh', ['-lc', 'ss -ltnH 2>/dev/null || netstat -ltn 2>/dev/null'], {
+      cwd: process.cwd(),
+      env: process.env,
+    });
+
+    const ports = stdout
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => {
+        const parts = line.split(/\s+/);
+        const address = parts[parts.length - 2] || parts[parts.length - 1] || '';
+        const port = Number(address.split(':').pop());
+        return Number.isInteger(port) ? port : null;
+      })
+      .filter((value): value is number => value !== null)
+      .filter((port) => port > 0 && port !== 22);
+
+    return Array.from(new Set(ports)).sort((left, right) => left - right);
+  } catch {
+    return [];
+  }
+}
+
+async function getWorkspaceHealth(): Promise<{
+  workspace: string;
+  bootstrapped: boolean;
+  status: Record<string, string>;
+  toolchains: Record<string, string | boolean>;
+  disk: { available: number | null; total: number | null };
+  activePorts: number[];
+}> {
+  const workspace = resolveWorkspace();
+  const status = await parseBootstrapStatus();
+  const bootstrapped = await exists(path.join(workspace, '.bootstrapped'));
+  const activePorts = await listListeningPorts();
+
+  const toolchains: Record<string, string | boolean> = {
+    git: false,
+    node: false,
+  };
+
+  try {
+    const { stdout } = await execFile('git', ['--version'], { cwd: process.cwd(), env: process.env });
+    toolchains.git = stdout.trim();
+  } catch {
+    toolchains.git = false;
+  }
+
+  try {
+    const { stdout } = await execFile('node', ['-v'], { cwd: process.cwd(), env: process.env });
+    toolchains.node = stdout.trim();
+  } catch {
+    toolchains.node = false;
+  }
+
+  let disk = { available: null as number | null, total: null as number | null };
+  try {
+    const { stdout } = await execFile('sh', ['-lc', `df -k "${workspace}" | tail -n 1`], { cwd: process.cwd(), env: process.env });
+    const parts = stdout.trim().split(/\s+/);
+    disk = {
+      total: Number(parts[1]) * 1024 || null,
+      available: Number(parts[3]) * 1024 || null,
+    };
+  } catch {
+    disk = { available: null, total: null };
+  }
+
+  return {
+    workspace,
+    bootstrapped,
+    status,
+    toolchains,
+    disk,
+    activePorts,
+  };
+}
+
+function parseCommandResult(command: string, output: string): {
+  type: string;
+  summary: string;
+  details?: Record<string, unknown>;
+} {
+  if (command.startsWith('git status')) {
+    const lines = output.split('\n');
+    const branchLine = lines.find((line) => line.startsWith('On branch '));
+    const clean = output.includes('working tree clean');
+    return {
+      type: 'git-status',
+      summary: clean ? 'Working tree clean' : 'Working tree has changes',
+      details: {
+        branch: branchLine?.replace('On branch ', '') || null,
+        clean,
+      },
+    };
+  }
+
+  if (command.startsWith('npm install')) {
+    const addedMatch = output.match(/added (\d+) packages?/);
+    return {
+      type: 'npm-install',
+      summary: addedMatch ? `Added ${addedMatch[1]} packages` : 'npm install completed',
+      details: {
+        addedPackages: addedMatch ? Number(addedMatch[1]) : null,
+      },
+    };
+  }
+
+  if (command.includes('test')) {
+    const passed = output.match(/(\d+)\s+passed/);
+    const failed = output.match(/(\d+)\s+failed/);
+    return {
+      type: 'test-results',
+      summary: failed ? 'Tests failed' : 'Tests passed',
+      details: {
+        passed: passed ? Number(passed[1]) : 0,
+        failed: failed ? Number(failed[1]) : 0,
+      },
+    };
+  }
+
+  return {
+    type: 'raw',
+    summary: 'No structured parser available',
+  };
+}
+
+async function buildQuickSwitchProjects(): Promise<Array<{
+  id: string;
+  name: string;
+  path: string;
+  pinned: boolean;
+  recent: boolean;
+}>> {
+  const [projects, recentProjects, pinnedProjects] = await Promise.all([
+    listProjects(),
+    getRecentProjects(),
+    getPinnedProjects(),
+  ]);
+
+  const recentSet = new Set(recentProjects);
+  const pinnedSet = new Set(pinnedProjects);
+
+  return projects.map((project) => ({
+    id: project.id,
+    name: project.name,
+    path: project.path,
+    pinned: pinnedSet.has(project.id),
+    recent: recentSet.has(project.id),
+  })).sort((left, right) => {
+    if (left.pinned !== right.pinned) {
+      return left.pinned ? -1 : 1;
+    }
+
+    if (left.recent !== right.recent) {
+      return left.recent ? -1 : 1;
+    }
+
+    return left.name.localeCompare(right.name);
+  });
 }
 
 async function listProjects(): Promise<Array<{
@@ -319,15 +692,8 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
   });
 
   app.get('/api/bootstrap/status', requireAuth, async (_req, res) => {
-    const workspace = resolveWorkspace();
-    const status = await parseBootstrapStatus();
-    const bootstrapped = await exists(path.join(workspace, '.bootstrapped'));
-
-    res.json({
-      workspace,
-      bootstrapped,
-      status,
-    });
+    const health = await getWorkspaceHealth();
+    res.json(health);
   });
 
   app.get('/api/projects', requireAuth, async (_req, res) => {
@@ -356,6 +722,7 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
     }
 
     await fs.mkdir(projectPath, { recursive: true });
+    await scaffoldTemplate(projectPath, String(req.body?.template || 'blank'));
 
     if (req.body?.initializeGit === true) {
       await fs.mkdir(path.join(projectPath, '.git'), { recursive: true });
@@ -367,6 +734,33 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
         name: projectName,
         path: projectPath,
       },
+    });
+  });
+
+  app.get('/api/projects/quick-switch', requireAuth, async (_req, res) => {
+    res.json({
+      projects: await buildQuickSwitchProjects(),
+    });
+  });
+
+  app.post('/api/projects/:projectId/pin', requireAuth, async (req, res) => {
+    const projectId = readStringParam(req.params.projectId);
+    const projectRoot = resolveProjectRoot(projectId);
+    if (!projectRoot || !await exists(projectRoot)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+
+    const pinned = Boolean(req.body?.pinned);
+    const current = await getPinnedProjects();
+    const next = pinned
+      ? Array.from(new Set([...current, projectId]))
+      : current.filter((value) => value !== projectId);
+    await setPinnedProjects(next);
+
+    res.json({
+      projectId,
+      pinned,
     });
   });
 
@@ -466,6 +860,27 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
     });
   });
 
+  app.post('/api/projects/:projectId/duplicate', requireAuth, async (req, res) => {
+    const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
+    if (!projectRoot || !await exists(projectRoot)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+
+    const sourcePath = String(req.body?.path || '');
+    if (!sourcePath) {
+      res.status(400).json({ error: 'invalid_path', message: 'Path is required.' });
+      return;
+    }
+
+    try {
+      const duplicated = await duplicateItem(projectRoot, sourcePath, typeof req.body?.newName === 'string' ? req.body.newName : undefined);
+      res.status(201).json({ duplicated });
+    } catch {
+      res.status(400).json({ error: 'invalid_path', message: 'Path is invalid.' });
+    }
+  });
+
   app.patch('/api/projects/:projectId/rename', requireAuth, async (req, res) => {
     const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
     if (!projectRoot || !await exists(projectRoot)) {
@@ -512,12 +927,106 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
     });
   });
 
-  app.post('/api/session/project', requireAuth, async (req, res) => {
-    const projectRoot = resolveProjectRoot(String(req.body?.projectId || ''));
+  app.get('/api/projects/:projectId/download', requireAuth, async (req, res) => {
+    const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
     if (!projectRoot || !await exists(projectRoot)) {
       res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
       return;
     }
+
+    const itemPath = resolveProjectRelativePath(projectRoot, String(req.query.path || ''));
+    if (!itemPath || !await exists(itemPath)) {
+      res.status(404).json({ error: 'file_not_found', message: 'File not found.' });
+      return;
+    }
+
+    res.download(itemPath);
+  });
+
+  app.post('/api/projects/:projectId/upload', requireAuth, async (req, res) => {
+    const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
+    if (!projectRoot || !await exists(projectRoot)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+
+    const parentPath = resolveProjectRelativePath(projectRoot, String(req.body?.parentPath || ''));
+    const name = String(req.body?.name || '').trim();
+    const contentBase64 = String(req.body?.contentBase64 || '');
+
+    if (!parentPath || !name) {
+      res.status(400).json({ error: 'invalid_request', message: 'parentPath and name are required.' });
+      return;
+    }
+
+    const targetPath = path.join(parentPath, name);
+    await fs.mkdir(parentPath, { recursive: true });
+    await fs.writeFile(targetPath, Buffer.from(contentBase64, 'base64'));
+
+    res.status(201).json({
+      uploaded: {
+        path: path.relative(projectRoot, targetPath),
+      },
+    });
+  });
+
+  app.get('/api/projects/:projectId/notes', requireAuth, async (req, res) => {
+    const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
+    if (!projectRoot || !await exists(projectRoot)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+
+    res.json({
+      content: await readProjectNotes(projectRoot),
+    });
+  });
+
+  app.put('/api/projects/:projectId/notes', requireAuth, async (req, res) => {
+    const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
+    if (!projectRoot || !await exists(projectRoot)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+
+    const content = String(req.body?.content || '');
+    await writeProjectNotes(projectRoot, content);
+    res.json({ content });
+  });
+
+  app.get('/api/projects/:projectId/tasks', requireAuth, async (req, res) => {
+    const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
+    if (!projectRoot || !await exists(projectRoot)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+
+    res.json({
+      tasks: await inferTasks(projectRoot),
+    });
+  });
+
+  app.get('/api/projects/:projectId/suggestions', requireAuth, async (req, res) => {
+    const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
+    if (!projectRoot || !await exists(projectRoot)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+
+    res.json({
+      suggestions: await inferSuggestions(projectRoot),
+    });
+  });
+
+  app.post('/api/session/project', requireAuth, async (req, res) => {
+    const projectId = String(req.body?.projectId || '');
+    const projectRoot = resolveProjectRoot(projectId);
+    if (!projectRoot || !await exists(projectRoot)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+
+    await markProjectAsRecent(projectId);
 
     res.json({
       project: {
@@ -531,9 +1040,28 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
     });
   });
 
-  app.get('/api/previews', requireAuth, (_req, res) => {
+  app.get('/api/previews', requireAuth, async (_req, res) => {
+    const ports = await listListeningPorts();
     res.json({
-      previews: [],
+      previews: ports.map((port) => ({
+        port,
+        label: `Port ${port}`,
+        url: `/preview/${port}`,
+        status: 'active',
+      })),
+    });
+  });
+
+  app.get('/api/workspace/health', requireAuth, async (_req, res) => {
+    res.json(await getWorkspaceHealth());
+  });
+
+  app.post('/api/command-results/parse', requireAuth, async (req, res) => {
+    const command = String(req.body?.command || '');
+    const output = String(req.body?.output || '');
+
+    res.json({
+      result: parseCommandResult(command, output),
     });
   });
 

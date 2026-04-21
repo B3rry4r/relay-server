@@ -2,7 +2,7 @@
 
 Relay is a backend service for browser-based terminal access. This repository owns the server-side PTY relay, auth validation, and persistent workspace bootstrap for Railway-mounted volumes.
 
-The frontend should live in a separate codebase and connect to this service over HTTP and Socket.IO. See [docs/frontend-contract.md](/home/user/relay/docs/frontend-contract.md:1).
+The frontend should live in a separate codebase and connect to this service over HTTP and Socket.IO. See [docs/frontend-handoff.md](/home/user/relay/docs/frontend-handoff.md:1).
 
 ## Features
 
