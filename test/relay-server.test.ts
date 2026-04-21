@@ -461,16 +461,18 @@ describe('Relay server', () => {
       expect.objectContaining({ id: 'flutter' }),
       expect.objectContaining({ id: 'php' }),
     ]));
+    expect(catalog.body.customToolSupport.installRoot).toBe(path.join(process.env.WORKSPACE, '.relay', 'tools'));
 
     const tools = await base
       .get('/api/tools')
       .set('x-auth-token', 'test-token');
 
     expect(tools.status).toBe(200);
-    expect(tools.body.tools).toEqual(expect.arrayContaining([
+    expect(tools.body.managedTools).toEqual(expect.arrayContaining([
       expect.objectContaining({ id: 'homebrew', installed: true, source: 'relay' }),
       expect.objectContaining({ id: 'flutter', installed: true, source: 'relay' }),
     ]));
+    expect(tools.body.customTools).toEqual([]);
 
     const invalidInstall = await base
       .post('/api/tools/install')
@@ -489,6 +491,43 @@ describe('Relay server', () => {
     expect(uninstallFlutter.body.ok).toBe(true);
     expect(uninstallFlutter.body.tool.id).toBe('flutter');
     expect(uninstallFlutter.body.tool.installed).toBe(false);
+
+    const installCustom = await base
+      .post('/api/tools/custom/install')
+      .set('x-auth-token', 'test-token')
+      .send({
+        id: 'hello-tool',
+        name: 'Hello Tool',
+        installPath: path.join(process.env.WORKSPACE, '.relay', 'tools', 'hello-tool'),
+        binaryPath: path.join(process.env.WORKSPACE, '.relay', 'tools', 'hello-tool', 'bin', 'hello-tool'),
+        installCommand: 'mkdir -p bin && printf \'#!/bin/sh\\necho "hello-tool 1.0.0"\\n\' > bin/hello-tool && chmod +x bin/hello-tool',
+        versionCommand: `${path.join(process.env.WORKSPACE, '.relay', 'tools', 'hello-tool', 'bin', 'hello-tool')} --version`,
+        binLinks: ['hello-tool'],
+      });
+
+    expect(installCustom.status).toBe(200);
+    expect(installCustom.body.ok).toBe(true);
+    expect(installCustom.body.tool.id).toBe('hello-tool');
+    expect(installCustom.body.tool.installed).toBe(true);
+
+    const toolsAfterCustom = await base
+      .get('/api/tools')
+      .set('x-auth-token', 'test-token');
+
+    expect(toolsAfterCustom.status).toBe(200);
+    expect(toolsAfterCustom.body.customTools).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'hello-tool', installed: true, source: 'relay' }),
+    ]));
+
+    const uninstallCustom = await base
+      .post('/api/tools/custom/uninstall')
+      .set('x-auth-token', 'test-token')
+      .send({ tool: 'hello-tool' });
+
+    expect(uninstallCustom.status).toBe(200);
+    expect(uninstallCustom.body.ok).toBe(true);
+    expect(uninstallCustom.body.tool.id).toBe('hello-tool');
+    expect(uninstallCustom.body.tool.installed).toBe(false);
   });
 
   it('supports initializing git later for an existing project', async () => {

@@ -458,6 +458,18 @@ async function writeJsonFile(targetPath: string, value: unknown): Promise<void> 
   await fs.writeFile(targetPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
 }
 
+function getCustomToolsRegistryPath(workspace = resolveWorkspace()): string {
+  return path.join(getRelayStateRoot(workspace), 'custom-tools.json');
+}
+
+async function readCustomTools(workspace = resolveWorkspace()): Promise<CustomToolRecord[]> {
+  return readJsonFile<CustomToolRecord[]>(getCustomToolsRegistryPath(workspace), []);
+}
+
+async function writeCustomTools(workspace: string, tools: CustomToolRecord[]): Promise<void> {
+  await writeJsonFile(getCustomToolsRegistryPath(workspace), tools);
+}
+
 async function readPackageJson(projectRoot: string): Promise<Record<string, unknown> | null> {
   const packageJsonPath = path.join(projectRoot, 'package.json');
   return readJsonFile<Record<string, unknown> | null>(packageJsonPath, null);
@@ -673,12 +685,38 @@ type ManagedToolStatus = {
   category: ManagedToolDefinition['category'];
   description: string;
   id: ManagedToolId;
+  kind: 'managed';
   installMethod: ManagedToolDefinition['installMethod'];
   installPath: string;
   installed: boolean;
   name: string;
   source: 'relay' | 'system' | 'unavailable';
   supported: boolean;
+  version: string | null;
+};
+
+type CustomToolRecord = {
+  binLinks: string[];
+  binaryPath: string;
+  description: string;
+  id: string;
+  installCommand: string;
+  installPath: string;
+  name: string;
+  uninstallCommand?: string;
+  versionCommand?: string;
+};
+
+type CustomToolStatus = {
+  description: string;
+  id: string;
+  kind: 'custom';
+  installMethod: 'custom';
+  installPath: string;
+  installed: boolean;
+  name: string;
+  source: 'relay' | 'unavailable';
+  supported: true;
   version: string | null;
 };
 
@@ -826,6 +864,7 @@ async function getManagedToolStatus(workspace: string, tool: ManagedToolDefiniti
       : await execFile('sh', ['-lc', `command -v ${tool.binary}`], { cwd: workspace, env }).then((result) => result.stdout.trim()).catch(() => '');
     return {
       id: tool.id,
+      kind: 'managed',
       name: tool.name,
       description: tool.description,
       category: tool.category,
@@ -839,6 +878,7 @@ async function getManagedToolStatus(workspace: string, tool: ManagedToolDefiniti
   } catch {
     return {
       id: tool.id,
+      kind: 'managed',
       name: tool.name,
       description: tool.description,
       category: tool.category,
@@ -855,6 +895,43 @@ async function getManagedToolStatus(workspace: string, tool: ManagedToolDefiniti
 async function listManagedToolStatuses(workspace = resolveWorkspace()): Promise<ManagedToolStatus[]> {
   await ensureToolDirectories(workspace);
   return Promise.all(getManagedToolCatalog(workspace).map((tool) => getManagedToolStatus(workspace, tool)));
+}
+
+function sanitizeToolId(value: string): string | null {
+  const trimmed = value.trim().toLowerCase();
+  return /^[a-z0-9._-]+$/.test(trimmed) ? trimmed : null;
+}
+
+async function getCustomToolStatus(workspace: string, tool: CustomToolRecord): Promise<CustomToolStatus> {
+  const binaryExists = await exists(tool.binaryPath);
+  let version: string | null = null;
+  if (binaryExists && tool.versionCommand) {
+    try {
+      const { stdout, stderr } = await runShellCommand(workspace, tool.versionCommand);
+      version = `${stdout}${stderr}`.trim().split('\n')[0] || null;
+    } catch {
+      version = null;
+    }
+  }
+
+  return {
+    id: tool.id,
+    kind: 'custom',
+    name: tool.name,
+    description: tool.description,
+    installMethod: 'custom',
+    installPath: tool.installPath,
+    installed: binaryExists,
+    source: binaryExists ? 'relay' : 'unavailable',
+    supported: true,
+    version,
+  };
+}
+
+async function listCustomToolStatuses(workspace = resolveWorkspace()): Promise<CustomToolStatus[]> {
+  await ensureToolDirectories(workspace);
+  const tools = await readCustomTools(workspace);
+  return Promise.all(tools.map((tool) => getCustomToolStatus(workspace, tool)));
 }
 
 async function installManagedTool(workspace: string, toolId: ManagedToolId): Promise<ManagedToolStatus> {
@@ -915,6 +992,113 @@ async function uninstallManagedTool(workspace: string, toolId: ManagedToolId): P
   return getManagedToolStatus(workspace, tool);
 }
 
+async function installCustomTool(
+  workspace: string,
+  input: {
+    binaryPath: string;
+    description?: string;
+    id: string;
+    installCommand: string;
+    installPath?: string;
+    name: string;
+    uninstallCommand?: string;
+    versionCommand?: string;
+  }
+): Promise<CustomToolStatus> {
+  await ensureToolDirectories(workspace);
+
+  const toolId = sanitizeToolId(input.id);
+  const name = input.name.trim();
+  const installCommand = input.installCommand.trim();
+  if (!toolId || !name || !installCommand) {
+    throw new Error('invalid_custom_tool');
+  }
+
+  const installPath = input.installPath?.trim() || path.join(getRelayToolsRoot(workspace), toolId);
+  const resolvedInstallPath = path.resolve(installPath);
+  const resolvedToolsRoot = path.resolve(getRelayToolsRoot(workspace));
+  if (resolvedInstallPath !== resolvedToolsRoot && !resolvedInstallPath.startsWith(`${resolvedToolsRoot}${path.sep}`)) {
+    throw new Error('invalid_install_path');
+  }
+
+  const resolvedBinaryPath = path.resolve(
+    input.binaryPath.trim() ? input.binaryPath : path.join(resolvedInstallPath, 'bin', toolId)
+  );
+  if (resolvedBinaryPath !== resolvedInstallPath && !resolvedBinaryPath.startsWith(`${resolvedInstallPath}${path.sep}`)) {
+    throw new Error('invalid_binary_path');
+  }
+
+  const binLinks = Array.isArray((input as { binLinks?: unknown }).binLinks)
+    ? ((input as { binLinks?: unknown[] }).binLinks || []).filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+    : [];
+
+  await fs.mkdir(resolvedInstallPath, { recursive: true });
+  const shellCommand = `mkdir -p ${quoteShell(resolvedInstallPath)} && cd ${quoteShell(resolvedInstallPath)} && ${installCommand}`;
+  await runShellCommand(workspace, shellCommand);
+
+  if (binLinks.length > 0) {
+    await Promise.all(binLinks.map(async (linkName) => {
+      const sanitizedLink = sanitizeToolId(linkName);
+      if (!sanitizedLink) {
+        throw new Error('invalid_link_name');
+      }
+      await fs.symlink(resolvedBinaryPath, path.join(getRelayBinRoot(workspace), sanitizedLink)).catch(async () => {
+        await fs.rm(path.join(getRelayBinRoot(workspace), sanitizedLink), { force: true });
+        await fs.symlink(resolvedBinaryPath, path.join(getRelayBinRoot(workspace), sanitizedLink));
+      });
+    }));
+  }
+
+  const tools = await readCustomTools(workspace);
+  const nextRecord: CustomToolRecord = {
+    id: toolId,
+    name,
+    description: input.description?.trim() || 'Custom tool installed into persistent Relay-managed paths.',
+    installCommand,
+    installPath: resolvedInstallPath,
+    binaryPath: resolvedBinaryPath,
+    binLinks: binLinks.map((link) => sanitizeToolId(link)!).filter(Boolean),
+    uninstallCommand: input.uninstallCommand?.trim() || undefined,
+    versionCommand: input.versionCommand?.trim() || undefined,
+  };
+  await writeCustomTools(workspace, [...tools.filter((tool) => tool.id !== toolId), nextRecord]);
+  return getCustomToolStatus(workspace, nextRecord);
+}
+
+async function uninstallCustomTool(workspace: string, toolId: string): Promise<CustomToolStatus> {
+  const sanitizedId = sanitizeToolId(toolId);
+  if (!sanitizedId) {
+    throw new Error('invalid_custom_tool');
+  }
+
+  const tools = await readCustomTools(workspace);
+  const existing = tools.find((tool) => tool.id === sanitizedId);
+  if (!existing) {
+    throw new Error('custom_tool_not_found');
+  }
+
+  if (existing.uninstallCommand) {
+    await runShellCommand(workspace, existing.uninstallCommand);
+  }
+
+  await fs.rm(existing.installPath, { recursive: true, force: true });
+  await Promise.all(existing.binLinks.map((linkName) => fs.rm(path.join(getRelayBinRoot(workspace), linkName), { force: true })));
+  await writeCustomTools(workspace, tools.filter((tool) => tool.id !== sanitizedId));
+
+  return {
+    id: existing.id,
+    kind: 'custom',
+    name: existing.name,
+    description: existing.description,
+    installMethod: 'custom',
+    installPath: existing.installPath,
+    installed: false,
+    source: 'unavailable',
+    supported: true,
+    version: null,
+  };
+}
+
 async function getWorkspaceHealth(): Promise<{
   workspace: string;
   bootstrapped: boolean;
@@ -926,6 +1110,7 @@ async function getWorkspaceHealth(): Promise<{
     tools: string;
   };
   managedTools: ManagedToolStatus[];
+  customTools: CustomToolStatus[];
   status: Record<string, string>;
   toolchains: Record<string, string | boolean>;
   disk: { available: number | null; total: number | null };
@@ -936,6 +1121,7 @@ async function getWorkspaceHealth(): Promise<{
   const bootstrapped = await exists(path.join(workspace, '.bootstrapped'));
   const activePorts = await listListeningPorts();
   const managedTools = await listManagedToolStatuses(workspace);
+  const customTools = await listCustomToolStatuses(workspace);
 
   const toolchains: Record<string, string | boolean> = {
     git: false,
@@ -979,6 +1165,7 @@ async function getWorkspaceHealth(): Promise<{
       state: getRelayStateRoot(workspace),
     },
     managedTools,
+    customTools,
     status,
     toolchains,
     disk,
@@ -1849,12 +2036,19 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
         installPath: tool.installPath,
         supported: tool.supported,
       })),
+      customToolSupport: {
+        installRoot: getRelayToolsRoot(workspace),
+        binRoot: getRelayBinRoot(workspace),
+        statePath: getCustomToolsRegistryPath(workspace),
+      },
     });
   });
 
   app.get('/api/tools', requireAuth, async (_req, res) => {
+    const workspace = resolveWorkspace();
     res.json({
-      tools: await listManagedToolStatuses(resolveWorkspace()),
+      managedTools: await listManagedToolStatuses(workspace),
+      customTools: await listCustomToolStatuses(workspace),
     });
   });
 
@@ -1906,6 +2100,50 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
       res.status(statusCode).json({
         error: statusCode === 400 ? 'unsupported_tool' : 'tool_uninstall_failed',
         message: statusCode === 400 ? 'The requested tool is not supported.' : message,
+      });
+    }
+  });
+
+  app.post('/api/tools/custom/install', requireAuth, async (req, res) => {
+    try {
+      const tool = await installCustomTool(resolveWorkspace(), {
+        id: String(req.body?.id || ''),
+        name: String(req.body?.name || ''),
+        description: typeof req.body?.description === 'string' ? req.body.description : undefined,
+        installCommand: String(req.body?.installCommand || ''),
+        installPath: typeof req.body?.installPath === 'string' ? req.body.installPath : undefined,
+        binaryPath: String(req.body?.binaryPath || ''),
+        uninstallCommand: typeof req.body?.uninstallCommand === 'string' ? req.body.uninstallCommand : undefined,
+        versionCommand: typeof req.body?.versionCommand === 'string' ? req.body.versionCommand : undefined,
+        ...(Array.isArray(req.body?.binLinks) ? { binLinks: req.body.binLinks } : {}),
+      });
+      res.status(200).json({ ok: true, tool });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Custom tool installation failed.';
+      const statusCode = ['invalid_custom_tool', 'invalid_install_path', 'invalid_binary_path', 'invalid_link_name'].includes(message) ? 400 : 500;
+      res.status(statusCode).json({
+        error: statusCode === 400 ? message : 'custom_tool_install_failed',
+        message: statusCode === 400
+          ? 'Custom tool request is invalid.'
+          : message,
+      });
+    }
+  });
+
+  app.post('/api/tools/custom/uninstall', requireAuth, async (req, res) => {
+    try {
+      const tool = await uninstallCustomTool(resolveWorkspace(), String(req.body?.tool || ''));
+      res.status(200).json({ ok: true, tool });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Custom tool removal failed.';
+      const statusCode = ['invalid_custom_tool', 'custom_tool_not_found'].includes(message) ? 400 : 500;
+      res.status(statusCode).json({
+        error: statusCode === 400 ? message : 'custom_tool_uninstall_failed',
+        message: statusCode === 400
+          ? message === 'custom_tool_not_found'
+            ? 'Custom tool not found.'
+            : 'Custom tool request is invalid.'
+          : message,
       });
     }
   });

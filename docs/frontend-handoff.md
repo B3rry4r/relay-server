@@ -860,7 +860,12 @@ Response:
       "installPath": "/workspace/.relay/tools/flutter/bin/flutter",
       "supported": true
     }
-  ]
+  ],
+  "customToolSupport": {
+    "installRoot": "/workspace/.relay/tools",
+    "binRoot": "/workspace/.relay/bin",
+    "statePath": "/workspace/.relay/state/custom-tools.json"
+  }
 }
 ```
 
@@ -870,9 +875,10 @@ Response:
 
 ```json
 {
-  "tools": [
+  "managedTools": [
     {
       "id": "flutter",
+      "kind": "managed",
       "name": "Flutter",
       "description": "Flutter SDK installed into the persistent tool volume for web builds and port-based previews.",
       "category": "sdk",
@@ -882,6 +888,20 @@ Response:
       "source": "relay",
       "supported": true,
       "version": "Flutter 3.22.0"
+    }
+  ],
+  "customTools": [
+    {
+      "id": "hello-tool",
+      "kind": "custom",
+      "name": "Hello Tool",
+      "description": "Custom tool installed into persistent Relay-managed paths.",
+      "installMethod": "custom",
+      "installPath": "/workspace/.relay/tools/hello-tool",
+      "installed": true,
+      "source": "relay",
+      "supported": true,
+      "version": "hello-tool 1.0.0"
     }
   ]
 }
@@ -939,6 +959,73 @@ Response:
     "category": "sdk",
     "installMethod": "git",
     "installPath": "/workspace/.relay/tools/flutter/bin/flutter",
+    "installed": false,
+    "source": "unavailable",
+    "supported": true,
+    "version": null
+  }
+}
+```
+
+## `POST /api/tools/custom/install`
+
+Request:
+
+```json
+{
+  "id": "hello-tool",
+  "name": "Hello Tool",
+  "description": "Example custom tool",
+  "installPath": "/workspace/.relay/tools/hello-tool",
+  "binaryPath": "/workspace/.relay/tools/hello-tool/bin/hello-tool",
+  "installCommand": "mkdir -p bin && printf '#!/bin/sh\\necho \"hello-tool 1.0.0\"\\n' > bin/hello-tool && chmod +x bin/hello-tool",
+  "versionCommand": "/workspace/.relay/tools/hello-tool/bin/hello-tool --version",
+  "binLinks": ["hello-tool"]
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "tool": {
+    "id": "hello-tool",
+    "kind": "custom",
+    "name": "Hello Tool",
+    "description": "Example custom tool",
+    "installMethod": "custom",
+    "installPath": "/workspace/.relay/tools/hello-tool",
+    "installed": true,
+    "source": "relay",
+    "supported": true,
+    "version": "hello-tool 1.0.0"
+  }
+}
+```
+
+## `POST /api/tools/custom/uninstall`
+
+Request:
+
+```json
+{
+  "tool": "hello-tool"
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "tool": {
+    "id": "hello-tool",
+    "kind": "custom",
+    "name": "Hello Tool",
+    "description": "Example custom tool",
+    "installMethod": "custom",
+    "installPath": "/workspace/.relay/tools/hello-tool",
     "installed": false,
     "source": "unavailable",
     "supported": true,

@@ -858,7 +858,12 @@ Body:
       "installPath": "/workspace/.relay/tools/flutter/bin/flutter",
       "supported": true
     }
-  ]
+  ],
+  "customToolSupport": {
+    "installRoot": "/workspace/.relay/tools",
+    "binRoot": "/workspace/.relay/bin",
+    "statePath": "/workspace/.relay/state/custom-tools.json"
+  }
 }
 ```
 
@@ -880,9 +885,10 @@ Body:
 
 ```json
 {
-  "tools": [
+  "managedTools": [
     {
       "id": "flutter",
+      "kind": "managed",
       "name": "Flutter",
       "description": "Flutter SDK installed into the persistent tool volume for web builds and port-based previews.",
       "category": "sdk",
@@ -892,6 +898,20 @@ Body:
       "source": "relay",
       "supported": true,
       "version": "Flutter 3.22.0"
+    }
+  ],
+  "customTools": [
+    {
+      "id": "hello-tool",
+      "kind": "custom",
+      "name": "Hello Tool",
+      "description": "Custom tool installed into persistent Relay-managed paths.",
+      "installMethod": "custom",
+      "installPath": "/workspace/.relay/tools/hello-tool",
+      "installed": true,
+      "source": "relay",
+      "supported": true,
+      "version": "hello-tool 1.0.0"
     }
   ]
 }
@@ -1057,6 +1077,157 @@ Body:
 {
   "error": "tool_uninstall_failed",
   "message": "Tool removal failed."
+}
+```
+
+## New Endpoint
+
+## `POST /api/tools/custom/install`
+
+Installs a custom tool into the persistent Relay volume paths and records it in the custom tool registry.
+
+### Request
+
+```json
+{
+  "id": "hello-tool",
+  "name": "Hello Tool",
+  "description": "Example custom tool",
+  "installPath": "/workspace/.relay/tools/hello-tool",
+  "binaryPath": "/workspace/.relay/tools/hello-tool/bin/hello-tool",
+  "installCommand": "mkdir -p bin && printf '#!/bin/sh\\necho \"hello-tool 1.0.0\"\\n' > bin/hello-tool && chmod +x bin/hello-tool",
+  "versionCommand": "/workspace/.relay/tools/hello-tool/bin/hello-tool --version",
+  "binLinks": ["hello-tool"]
+}
+```
+
+### Request Notes
+
+- `id`, `name`, `installCommand`, and `binaryPath` are required
+- `id` must match `^[a-z0-9._-]+$`
+- `installPath` must stay inside `/workspace/.relay/tools`
+- `binaryPath` must stay inside the chosen install path
+- `binLinks` are optional symlink names created inside `/workspace/.relay/bin`
+- `uninstallCommand` is optional and runs before Relay removes the install path
+
+### Success
+
+Status:
+
+```http
+200 OK
+```
+
+Body:
+
+```json
+{
+  "ok": true,
+  "tool": {
+    "id": "hello-tool",
+    "kind": "custom",
+    "name": "Hello Tool",
+    "description": "Example custom tool",
+    "installMethod": "custom",
+    "installPath": "/workspace/.relay/tools/hello-tool",
+    "installed": true,
+    "source": "relay",
+    "supported": true,
+    "version": "hello-tool 1.0.0"
+  }
+}
+```
+
+### Failure
+
+Status:
+
+```http
+400 Bad Request
+```
+
+Body:
+
+```json
+{
+  "error": "invalid_custom_tool",
+  "message": "Custom tool request is invalid."
+}
+```
+
+### Failure
+
+Status:
+
+```http
+500 Internal Server Error
+```
+
+Body:
+
+```json
+{
+  "error": "custom_tool_install_failed",
+  "message": "Custom tool installation failed."
+}
+```
+
+## New Endpoint
+
+## `POST /api/tools/custom/uninstall`
+
+Uninstalls a custom tool and removes its registry entry.
+
+### Request
+
+```json
+{
+  "tool": "hello-tool"
+}
+```
+
+### Success
+
+Status:
+
+```http
+200 OK
+```
+
+Body:
+
+```json
+{
+  "ok": true,
+  "tool": {
+    "id": "hello-tool",
+    "kind": "custom",
+    "name": "Hello Tool",
+    "description": "Example custom tool",
+    "installMethod": "custom",
+    "installPath": "/workspace/.relay/tools/hello-tool",
+    "installed": false,
+    "source": "unavailable",
+    "supported": true,
+    "version": null
+  }
+}
+```
+
+### Failure
+
+Status:
+
+```http
+400 Bad Request
+```
+
+Body:
+
+```json
+{
+  "error": "custom_tool_not_found",
+  "message": "Custom tool not found."
 }
 ```
 
