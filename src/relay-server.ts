@@ -146,6 +146,8 @@ function createTerminalEnv(workspace: string): NodeJS.ProcessEnv {
     HOMEBREW_NO_AUTO_UPDATE: '1',
     HOMEBREW_NO_ENV_HINTS: '1',
     HOMEBREW_NO_INSTALL_CLEANUP: '1',
+    BROWSER: 'relay-browser',
+    RELAY_BROWSER: '1',
     PROMPT_COMMAND: '',
     TERM: process.env.TERM || 'xterm-256color',
     PATH: [
@@ -848,6 +850,23 @@ async function ensureToolDirectories(workspace: string): Promise<void> {
     fs.mkdir(getRelayBinRoot(workspace), { recursive: true }),
     fs.mkdir(getRelayStateRoot(workspace), { recursive: true }),
   ]);
+  await ensureRelayBinaries(workspace);
+}
+
+async function ensureRelayBinaries(workspace: string): Promise<void> {
+  const binDir = getRelayBinRoot(workspace);
+  const browserScriptPath = path.join(binDir, 'relay-browser');
+  const browserScriptContent = `#!/usr/bin/env sh
+if [ -z "$1" ]; then
+  exit 0
+fi
+
+# Print a formatted message with a clickable link (using OSC 8)
+printf "\\n\\r[relay] A tool wants to open a browser. Please click the link below:\\n\\r"
+printf "\\033]8;;%s\\033\\\\%s\\033]8;;\\033\\\\\\n\\r\\n\\r" "$1" "$1"
+`;
+
+  await fs.writeFile(browserScriptPath, browserScriptContent, { mode: 0o755 });
 }
 
 function quoteShell(value: string): string {
