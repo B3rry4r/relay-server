@@ -139,17 +139,19 @@ fi
 
 if [[ ! -x "$HOMEBREW_PREFIX/bin/brew" ]]; then
   rm -rf "$HOMEBREW_PREFIX"
+  mkdir -p "$HOMEBREW_PREFIX/bin" "$HOMEBREW_PREFIX/sbin"
 
-  if has_command curl && has_command git; then
-    if NONINTERACTIVE=1 CI=1 HOMEBREW_PREFIX="$HOMEBREW_PREFIX" /bin/bash -c \
-      "$(download_to_stdout https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; then
+  if has_command git; then
+    if git clone https://github.com/Homebrew/brew "$HOMEBREW_PREFIX/Homebrew" && \
+      ln -sf ../Homebrew/bin/brew "$HOMEBREW_PREFIX/bin/brew" && \
+      "$HOMEBREW_PREFIX/bin/brew" --version >/dev/null 2>&1; then
       record_status homebrew "installed"
     else
       record_status homebrew "failed"
       BOOTSTRAP_COMPLETE=0
     fi
   else
-    echo "[bootstrap] skipping Homebrew install because curl and git are required at runtime" >&2
+    echo "[bootstrap] skipping Homebrew install because git is unavailable" >&2
     record_status homebrew "skipped"
     BOOTSTRAP_COMPLETE=0
   fi
