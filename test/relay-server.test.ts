@@ -530,6 +530,32 @@ describe('Relay server', () => {
     expect(uninstallCustom.body.tool.installed).toBe(false);
   });
 
+  it('uses the Relay shell environment for managed tool install commands', async () => {
+    process.env.PORT = '0';
+    process.env.AUTH_TOKEN = 'test-token';
+    process.env.WORKSPACE = await createWorkspaceFixture();
+    process.env.SHELL = '/bin/bash';
+
+    const relayRoot = path.join(process.env.WORKSPACE, '.relay');
+    const brewDir = path.join(relayRoot, 'tools', 'homebrew', 'bin');
+    await fs.mkdir(brewDir, { recursive: true });
+    await fs.writeFile(path.join(brewDir, 'brew'), '#!/bin/sh\necho "Homebrew 4.3.0"\n', { mode: 0o755 });
+
+    const relay = createRelayServer(() => new FakePty());
+    servers.push(relay);
+    const port = await relay.start();
+    const base = request(`http://127.0.0.1:${port}`);
+
+    const install = await base
+      .post('/api/tools/install')
+      .set('x-auth-token', 'test-token')
+      .send({ tool: 'php' });
+
+    expect([200, 500]).toContain(install.status);
+    expect(install.body.error).not.toBe('tool_install_failed');
+    expect(String(install.body.message || '')).not.toContain('brew: not found');
+  });
+
   it('supports initializing git later for an existing project', async () => {
     process.env.PORT = '0';
     process.env.AUTH_TOKEN = 'test-token';

@@ -827,7 +827,11 @@ function getManagedToolCatalog(workspace = resolveWorkspace()): Array<ManagedToo
 }
 
 async function runShellCommand(workspace: string, command: string): Promise<{ stdout: string; stderr: string }> {
-  return execFile('sh', ['-lc', command], {
+  const shell = resolveShell();
+  const shellName = path.basename(shell).toLowerCase();
+  const args = shellName.includes('bash') ? ['-lc', command] : ['-c', command];
+
+  return execFile(shell, args, {
     cwd: workspace,
     env: createTerminalEnv(workspace),
   });
