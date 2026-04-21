@@ -799,6 +799,13 @@ Response:
 {
   "workspace": "/workspace",
   "bootstrapped": true,
+  "relay": {
+    "root": "/workspace/.relay",
+    "tools": "/workspace/.relay/tools",
+    "cache": "/workspace/.relay/cache",
+    "bin": "/workspace/.relay/bin",
+    "state": "/workspace/.relay/state"
+  },
   "status": {
     "bootstrap": "complete"
   },
@@ -810,7 +817,133 @@ Response:
     "available": 123456789,
     "total": 987654321
   },
+  "managedTools": [
+    {
+      "id": "homebrew",
+      "name": "Homebrew",
+      "description": "Volume-backed package manager for CLI tools and language runtimes.",
+      "category": "package-manager",
+      "installMethod": "bootstrap",
+      "installPath": "/workspace/.relay/tools/homebrew/bin/brew",
+      "installed": true,
+      "source": "relay",
+      "supported": true,
+      "version": "Homebrew 4.3.0"
+    }
+  ],
   "activePorts": [3000]
+}
+```
+
+## `GET /api/tools/catalog`
+
+Response:
+
+```json
+{
+  "tools": [
+    {
+      "id": "homebrew",
+      "name": "Homebrew",
+      "description": "Volume-backed package manager for CLI tools and language runtimes.",
+      "category": "package-manager",
+      "installMethod": "bootstrap",
+      "installPath": "/workspace/.relay/tools/homebrew/bin/brew",
+      "supported": true
+    },
+    {
+      "id": "flutter",
+      "name": "Flutter",
+      "description": "Flutter SDK installed into the persistent tool volume for web builds and port-based previews.",
+      "category": "sdk",
+      "installMethod": "git",
+      "installPath": "/workspace/.relay/tools/flutter/bin/flutter",
+      "supported": true
+    }
+  ]
+}
+```
+
+## `GET /api/tools`
+
+Response:
+
+```json
+{
+  "tools": [
+    {
+      "id": "flutter",
+      "name": "Flutter",
+      "description": "Flutter SDK installed into the persistent tool volume for web builds and port-based previews.",
+      "category": "sdk",
+      "installMethod": "git",
+      "installPath": "/workspace/.relay/tools/flutter/bin/flutter",
+      "installed": true,
+      "source": "relay",
+      "supported": true,
+      "version": "Flutter 3.22.0"
+    }
+  ]
+}
+```
+
+## `POST /api/tools/install`
+
+Request:
+
+```json
+{
+  "tool": "flutter"
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "tool": {
+    "id": "flutter",
+    "name": "Flutter",
+    "description": "Flutter SDK installed into the persistent tool volume for web builds and port-based previews.",
+    "category": "sdk",
+    "installMethod": "git",
+    "installPath": "/workspace/.relay/tools/flutter/bin/flutter",
+    "installed": true,
+    "source": "relay",
+    "supported": true,
+    "version": "Flutter 3.22.0"
+  }
+}
+```
+
+## `POST /api/tools/uninstall`
+
+Request:
+
+```json
+{
+  "tool": "flutter"
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "tool": {
+    "id": "flutter",
+    "name": "Flutter",
+    "description": "Flutter SDK installed into the persistent tool volume for web builds and port-based previews.",
+    "category": "sdk",
+    "installMethod": "git",
+    "installPath": "/workspace/.relay/tools/flutter/bin/flutter",
+    "installed": false,
+    "source": "unavailable",
+    "supported": true,
+    "version": null
+  }
 }
 ```
 

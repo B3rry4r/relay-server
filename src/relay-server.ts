@@ -38,6 +38,9 @@ const DEFAULT_ROWS = 24;
 const PROJECT_NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
 const RECENT_PROJECT_LIMIT = 10;
 const execFile = promisify(execFileCallback);
+const MANAGED_TOOL_IDS = ['homebrew', 'php', 'composer', 'python', 'go', 'rust', 'java', 'flutter'] as const;
+
+type ManagedToolId = typeof MANAGED_TOOL_IDS[number];
 
 type TreeNode = {
   name: string;
@@ -86,12 +89,73 @@ function resolveShell(): string {
   return process.env.SHELL || 'bash';
 }
 
+function getRelayRoot(workspace = resolveWorkspace()): string {
+  return path.join(workspace, '.relay');
+}
+
+function getRelayToolsRoot(workspace = resolveWorkspace()): string {
+  return path.join(getRelayRoot(workspace), 'tools');
+}
+
+function getRelayCacheRoot(workspace = resolveWorkspace()): string {
+  return path.join(getRelayRoot(workspace), 'cache');
+}
+
+function getRelayBinRoot(workspace = resolveWorkspace()): string {
+  return path.join(getRelayRoot(workspace), 'bin');
+}
+
+function getRelayStateRoot(workspace = resolveWorkspace()): string {
+  return path.join(getRelayRoot(workspace), 'state');
+}
+
+function getHomebrewPrefix(workspace = resolveWorkspace()): string {
+  return path.join(getRelayToolsRoot(workspace), 'homebrew');
+}
+
+function getFlutterRoot(workspace = resolveWorkspace()): string {
+  return path.join(getRelayToolsRoot(workspace), 'flutter');
+}
+
 function createTerminalEnv(workspace: string): NodeJS.ProcessEnv {
+  const relayRoot = getRelayRoot(workspace);
+  const relayTools = getRelayToolsRoot(workspace);
+  const relayCache = getRelayCacheRoot(workspace);
+  const relayBin = getRelayBinRoot(workspace);
+  const homebrewPrefix = getHomebrewPrefix(workspace);
+  const flutterRoot = getFlutterRoot(workspace);
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     HOME: workspace,
+    RELAY_HOME: relayRoot,
+    RELAY_TOOLS: relayTools,
+    RELAY_CACHE: relayCache,
+    RELAY_BIN: relayBin,
+    HOMEBREW_PREFIX: homebrewPrefix,
+    FLUTTER_HOME: flutterRoot,
+    PUB_CACHE: path.join(relayCache, 'dart-pub'),
+    npm_config_cache: path.join(relayCache, 'npm'),
+    PIP_CACHE_DIR: path.join(relayCache, 'pip'),
+    CARGO_HOME: path.join(relayCache, 'cargo'),
+    RUSTUP_HOME: path.join(relayTools, 'rustup'),
+    GOPATH: path.join(relayCache, 'go'),
+    GOMODCACHE: path.join(relayCache, 'go', 'pkg', 'mod'),
+    GRADLE_USER_HOME: path.join(relayCache, 'gradle'),
+    JAVA_HOME: path.join(homebrewPrefix, 'opt', 'openjdk'),
+    ANDROID_SDK_ROOT: path.join(relayTools, 'android-sdk'),
     PROMPT_COMMAND: '',
     TERM: process.env.TERM || 'xterm-256color',
+    PATH: [
+      relayBin,
+      path.join(relayCache, 'go', 'bin'),
+      path.join(relayCache, 'cargo', 'bin'),
+      path.join(homebrewPrefix, 'bin'),
+      path.join(homebrewPrefix, 'sbin'),
+      path.join(flutterRoot, 'bin'),
+      path.join(relayTools, 'python-userbase', 'bin'),
+      path.join(relayTools, 'npm-global', 'bin'),
+      process.env.PATH || '',
+    ].filter(Boolean).join(':'),
   };
 
   for (const key of Object.keys(env)) {
@@ -310,10 +374,6 @@ function requireAuth(req: Request, res: Response, next: NextFunction): void {
 
 function getProjectsRoot(): string {
   return path.join(resolveWorkspace(), 'projects');
-}
-
-function getRelayStateRoot(): string {
-  return path.join(resolveWorkspace(), '.relay');
 }
 
 function validateProjectName(name: string): string | null {
@@ -596,9 +656,276 @@ async function listListeningPorts(): Promise<number[]> {
   }
 }
 
+type ManagedToolDefinition = {
+  binary: string;
+  category: 'package-manager' | 'language' | 'sdk';
+  description: string;
+  formula?: string;
+  id: ManagedToolId;
+  installMethod: 'bootstrap' | 'brew' | 'git' | 'rustup';
+  name: string;
+  pathResolver: (workspace: string) => string;
+  supported: boolean;
+  versionArgs: string[];
+};
+
+type ManagedToolStatus = {
+  category: ManagedToolDefinition['category'];
+  description: string;
+  id: ManagedToolId;
+  installMethod: ManagedToolDefinition['installMethod'];
+  installPath: string;
+  installed: boolean;
+  name: string;
+  source: 'relay' | 'system' | 'unavailable';
+  supported: boolean;
+  version: string | null;
+};
+
+const MANAGED_TOOLS: Record<ManagedToolId, ManagedToolDefinition> = {
+  homebrew: {
+    id: 'homebrew',
+    name: 'Homebrew',
+    description: 'Volume-backed package manager for CLI tools and language runtimes.',
+    category: 'package-manager',
+    installMethod: 'bootstrap',
+    supported: true,
+    binary: 'brew',
+    versionArgs: ['--version'],
+    pathResolver: (workspace) => path.join(getHomebrewPrefix(workspace), 'bin', 'brew'),
+  },
+  php: {
+    id: 'php',
+    name: 'PHP',
+    description: 'PHP runtime installed through Homebrew into the persistent tool volume.',
+    category: 'language',
+    installMethod: 'brew',
+    supported: true,
+    formula: 'php',
+    binary: 'php',
+    versionArgs: ['-v'],
+    pathResolver: (workspace) => path.join(getHomebrewPrefix(workspace), 'bin', 'php'),
+  },
+  composer: {
+    id: 'composer',
+    name: 'Composer',
+    description: 'PHP dependency manager installed through Homebrew.',
+    category: 'package-manager',
+    installMethod: 'brew',
+    supported: true,
+    formula: 'composer',
+    binary: 'composer',
+    versionArgs: ['--version'],
+    pathResolver: (workspace) => path.join(getHomebrewPrefix(workspace), 'bin', 'composer'),
+  },
+  python: {
+    id: 'python',
+    name: 'Python',
+    description: 'Python runtime installed through Homebrew with caches on the persistent volume.',
+    category: 'language',
+    installMethod: 'brew',
+    supported: true,
+    formula: 'python',
+    binary: 'python3',
+    versionArgs: ['--version'],
+    pathResolver: (workspace) => path.join(getHomebrewPrefix(workspace), 'bin', 'python3'),
+  },
+  go: {
+    id: 'go',
+    name: 'Go',
+    description: 'Go toolchain installed through Homebrew with GOPATH and module cache on the volume.',
+    category: 'language',
+    installMethod: 'brew',
+    supported: true,
+    formula: 'go',
+    binary: 'go',
+    versionArgs: ['version'],
+    pathResolver: (workspace) => path.join(getHomebrewPrefix(workspace), 'bin', 'go'),
+  },
+  rust: {
+    id: 'rust',
+    name: 'Rust',
+    description: 'Rust toolchain installed with rustup into persistent Relay-managed paths.',
+    category: 'language',
+    installMethod: 'rustup',
+    supported: true,
+    binary: 'rustc',
+    versionArgs: ['--version'],
+    pathResolver: (workspace) => path.join(getRelayCacheRoot(workspace), 'cargo', 'bin', 'rustc'),
+  },
+  java: {
+    id: 'java',
+    name: 'OpenJDK',
+    description: 'Java toolchain installed through Homebrew for Android CLI and Gradle-based workflows.',
+    category: 'language',
+    installMethod: 'brew',
+    supported: true,
+    formula: 'openjdk',
+    binary: 'java',
+    versionArgs: ['-version'],
+    pathResolver: (workspace) => path.join(getHomebrewPrefix(workspace), 'bin', 'java'),
+  },
+  flutter: {
+    id: 'flutter',
+    name: 'Flutter',
+    description: 'Flutter SDK installed into the persistent tool volume for web builds and port-based previews.',
+    category: 'sdk',
+    installMethod: 'git',
+    supported: true,
+    binary: 'flutter',
+    versionArgs: ['--version'],
+    pathResolver: (workspace) => path.join(getFlutterRoot(workspace), 'bin', 'flutter'),
+  },
+};
+
+function getManagedToolCatalog(workspace = resolveWorkspace()): Array<ManagedToolDefinition & { installPath: string }> {
+  return MANAGED_TOOL_IDS.map((toolId) => {
+    const tool = MANAGED_TOOLS[toolId];
+    return {
+      ...tool,
+      installPath: tool.pathResolver(workspace),
+    };
+  });
+}
+
+async function runShellCommand(workspace: string, command: string): Promise<{ stdout: string; stderr: string }> {
+  return execFile('sh', ['-lc', command], {
+    cwd: workspace,
+    env: createTerminalEnv(workspace),
+  });
+}
+
+async function ensureToolDirectories(workspace: string): Promise<void> {
+  await Promise.all([
+    fs.mkdir(getRelayRoot(workspace), { recursive: true }),
+    fs.mkdir(getRelayToolsRoot(workspace), { recursive: true }),
+    fs.mkdir(getRelayCacheRoot(workspace), { recursive: true }),
+    fs.mkdir(getRelayBinRoot(workspace), { recursive: true }),
+    fs.mkdir(getRelayStateRoot(workspace), { recursive: true }),
+  ]);
+}
+
+function quoteShell(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+async function getManagedToolStatus(workspace: string, tool: ManagedToolDefinition): Promise<ManagedToolStatus> {
+  const installPath = tool.pathResolver(workspace);
+  const relayBinaryExists = await exists(installPath);
+  const env = createTerminalEnv(workspace);
+
+  const commandPath = relayBinaryExists ? installPath : tool.binary;
+  try {
+    const { stdout, stderr } = await execFile(commandPath, tool.versionArgs, {
+      cwd: workspace,
+      env,
+    });
+    const versionOutput = `${stdout}${stderr}`.trim();
+    const resolvedPath = relayBinaryExists
+      ? installPath
+      : await execFile('sh', ['-lc', `command -v ${tool.binary}`], { cwd: workspace, env }).then((result) => result.stdout.trim()).catch(() => '');
+    return {
+      id: tool.id,
+      name: tool.name,
+      description: tool.description,
+      category: tool.category,
+      installMethod: tool.installMethod,
+      installPath,
+      installed: true,
+      supported: tool.supported,
+      version: versionOutput.split('\n')[0] || null,
+      source: resolvedPath.startsWith(getRelayRoot(workspace)) ? 'relay' : 'system',
+    };
+  } catch {
+    return {
+      id: tool.id,
+      name: tool.name,
+      description: tool.description,
+      category: tool.category,
+      installMethod: tool.installMethod,
+      installPath,
+      installed: false,
+      supported: tool.supported,
+      version: null,
+      source: 'unavailable',
+    };
+  }
+}
+
+async function listManagedToolStatuses(workspace = resolveWorkspace()): Promise<ManagedToolStatus[]> {
+  await ensureToolDirectories(workspace);
+  return Promise.all(getManagedToolCatalog(workspace).map((tool) => getManagedToolStatus(workspace, tool)));
+}
+
+async function installManagedTool(workspace: string, toolId: ManagedToolId): Promise<ManagedToolStatus> {
+  await ensureToolDirectories(workspace);
+  const tool = MANAGED_TOOLS[toolId];
+  if (!tool || !tool.supported) {
+    throw new Error('unsupported_tool');
+  }
+
+  if (tool.installMethod === 'bootstrap') {
+    await execFile(path.resolve(process.cwd(), 'setup-workspace.sh'), [], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        WORKSPACE: workspace,
+      },
+    });
+  } else if (tool.installMethod === 'brew') {
+    await installManagedTool(workspace, 'homebrew');
+    await runShellCommand(workspace, `brew install ${quoteShell(tool.formula || tool.id)}`);
+  } else if (tool.installMethod === 'git') {
+    const flutterRoot = getFlutterRoot(workspace);
+    if (await exists(flutterRoot)) {
+      await runShellCommand(workspace, `git -C ${quoteShell(flutterRoot)} pull --ff-only`);
+    } else {
+      await runShellCommand(workspace, `git clone https://github.com/flutter/flutter.git -b stable ${quoteShell(flutterRoot)}`);
+    }
+    await runShellCommand(workspace, `${quoteShell(path.join(flutterRoot, 'bin', 'flutter'))} config --enable-web`);
+  } else if (tool.installMethod === 'rustup') {
+    await runShellCommand(
+      workspace,
+      'curl https://sh.rustup.rs -sSf | sh -s -- -y --no-modify-path --default-toolchain stable'
+    );
+  }
+
+  return getManagedToolStatus(workspace, tool);
+}
+
+async function uninstallManagedTool(workspace: string, toolId: ManagedToolId): Promise<ManagedToolStatus> {
+  const tool = MANAGED_TOOLS[toolId];
+  if (!tool || !tool.supported) {
+    throw new Error('unsupported_tool');
+  }
+
+  if (tool.installMethod === 'bootstrap') {
+    await fs.rm(getHomebrewPrefix(workspace), { recursive: true, force: true });
+  } else if (tool.installMethod === 'brew') {
+    if (await exists(path.join(getHomebrewPrefix(workspace), 'bin', 'brew'))) {
+      await runShellCommand(workspace, `brew uninstall ${quoteShell(tool.formula || tool.id)}`);
+    }
+  } else if (tool.installMethod === 'git') {
+    await fs.rm(getFlutterRoot(workspace), { recursive: true, force: true });
+  } else if (tool.installMethod === 'rustup') {
+    await fs.rm(path.join(getRelayCacheRoot(workspace), 'cargo'), { recursive: true, force: true });
+    await fs.rm(path.join(getRelayToolsRoot(workspace), 'rustup'), { recursive: true, force: true });
+  }
+
+  return getManagedToolStatus(workspace, tool);
+}
+
 async function getWorkspaceHealth(): Promise<{
   workspace: string;
   bootstrapped: boolean;
+  relay: {
+    bin: string;
+    cache: string;
+    root: string;
+    state: string;
+    tools: string;
+  };
+  managedTools: ManagedToolStatus[];
   status: Record<string, string>;
   toolchains: Record<string, string | boolean>;
   disk: { available: number | null; total: number | null };
@@ -608,6 +935,7 @@ async function getWorkspaceHealth(): Promise<{
   const status = await parseBootstrapStatus();
   const bootstrapped = await exists(path.join(workspace, '.bootstrapped'));
   const activePorts = await listListeningPorts();
+  const managedTools = await listManagedToolStatuses(workspace);
 
   const toolchains: Record<string, string | boolean> = {
     git: false,
@@ -643,6 +971,14 @@ async function getWorkspaceHealth(): Promise<{
   return {
     workspace,
     bootstrapped,
+    relay: {
+      root: getRelayRoot(workspace),
+      tools: getRelayToolsRoot(workspace),
+      cache: getRelayCacheRoot(workspace),
+      bin: getRelayBinRoot(workspace),
+      state: getRelayStateRoot(workspace),
+    },
+    managedTools,
     status,
     toolchains,
     disk,
@@ -1499,6 +1835,79 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
 
   app.get('/api/workspace/health', requireAuth, async (_req, res) => {
     res.json(await getWorkspaceHealth());
+  });
+
+  app.get('/api/tools/catalog', requireAuth, async (_req, res) => {
+    const workspace = resolveWorkspace();
+    res.json({
+      tools: getManagedToolCatalog(workspace).map((tool) => ({
+        id: tool.id,
+        name: tool.name,
+        description: tool.description,
+        category: tool.category,
+        installMethod: tool.installMethod,
+        installPath: tool.installPath,
+        supported: tool.supported,
+      })),
+    });
+  });
+
+  app.get('/api/tools', requireAuth, async (_req, res) => {
+    res.json({
+      tools: await listManagedToolStatuses(resolveWorkspace()),
+    });
+  });
+
+  app.post('/api/tools/install', requireAuth, async (req, res) => {
+    const toolId = String(req.body?.tool || '') as ManagedToolId;
+    if (!MANAGED_TOOL_IDS.includes(toolId)) {
+      res.status(400).json({
+        error: 'unsupported_tool',
+        message: 'The requested tool is not supported.',
+      });
+      return;
+    }
+
+    try {
+      const tool = await installManagedTool(resolveWorkspace(), toolId);
+      res.status(200).json({
+        ok: true,
+        tool,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Tool installation failed.';
+      const statusCode = message === 'unsupported_tool' ? 400 : 500;
+      res.status(statusCode).json({
+        error: statusCode === 400 ? 'unsupported_tool' : 'tool_install_failed',
+        message: statusCode === 400 ? 'The requested tool is not supported.' : message,
+      });
+    }
+  });
+
+  app.post('/api/tools/uninstall', requireAuth, async (req, res) => {
+    const toolId = String(req.body?.tool || '') as ManagedToolId;
+    if (!MANAGED_TOOL_IDS.includes(toolId)) {
+      res.status(400).json({
+        error: 'unsupported_tool',
+        message: 'The requested tool is not supported.',
+      });
+      return;
+    }
+
+    try {
+      const tool = await uninstallManagedTool(resolveWorkspace(), toolId);
+      res.status(200).json({
+        ok: true,
+        tool,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Tool removal failed.';
+      const statusCode = message === 'unsupported_tool' ? 400 : 500;
+      res.status(statusCode).json({
+        error: statusCode === 400 ? 'unsupported_tool' : 'tool_uninstall_failed',
+        message: statusCode === 400 ? 'The requested tool is not supported.' : message,
+      });
+    }
   });
 
   app.post('/api/command-results/parse', requireAuth, async (req, res) => {

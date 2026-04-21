@@ -14,6 +14,8 @@ describe('setup-workspace script', () => {
 
   it('records component-level bootstrap status and distinguishes partial completion', () => {
     expect(script).toContain('BOOTSTRAP_STATUS_PATH="$WORKSPACE/.bootstrap-status"');
+    expect(script).toContain('RELAY_ROOT="$WORKSPACE/.relay"');
+    expect(script).toContain('RELAY_ENV_PATH="$RELAY_STATE_DIR/tool-env.sh"');
     expect(script).toContain('record_status()');
     expect(script).toContain('record_status bootstrap "complete"');
     expect(script).toContain('record_status bootstrap "partial"');
@@ -23,6 +25,8 @@ describe('setup-workspace script', () => {
   it('retries missing components instead of treating a partial first boot as complete forever', () => {
     expect(script).toContain('skipping nvm install because git is unavailable');
     expect(script).toContain('skipping Homebrew install because curl and git are required at runtime');
+    expect(script).toContain('export RELAY_HOME="$RELAY_ROOT"');
+    expect(script).toContain('export FLUTTER_HOME="$FLUTTER_HOME_DIR"');
     expect(script).not.toContain('workspace already initialized');
   });
 });

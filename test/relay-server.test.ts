@@ -407,7 +407,9 @@ describe('Relay server', () => {
 
     expect(workspaceHealth.status).toBe(200);
     expect(workspaceHealth.body.bootstrapped).toBe(true);
+    expect(workspaceHealth.body.relay.root).toBe(path.join(process.env.WORKSPACE, '.relay'));
     expect(workspaceHealth.body.status.bootstrap).toBe('complete');
+    expect(Array.isArray(workspaceHealth.body.managedTools)).toBe(true);
     expect(Array.isArray(workspaceHealth.body.activePorts)).toBe(true);
 
     const parseGit = await base
@@ -430,6 +432,63 @@ describe('Relay server', () => {
 
     expect(previews.status).toBe(200);
     expect(Array.isArray(previews.body.previews)).toBe(true);
+  });
+
+  it('supports managed tool catalog, status, validation, and uninstall flows', async () => {
+    process.env.PORT = '0';
+    process.env.AUTH_TOKEN = 'test-token';
+    process.env.WORKSPACE = await createWorkspaceFixture();
+
+    const brewDir = path.join(process.env.WORKSPACE, '.relay', 'tools', 'homebrew', 'bin');
+    const flutterDir = path.join(process.env.WORKSPACE, '.relay', 'tools', 'flutter', 'bin');
+    await fs.mkdir(brewDir, { recursive: true });
+    await fs.mkdir(flutterDir, { recursive: true });
+    await fs.writeFile(path.join(brewDir, 'brew'), '#!/bin/sh\necho "Homebrew 4.3.0"\n', { mode: 0o755 });
+    await fs.writeFile(path.join(flutterDir, 'flutter'), '#!/bin/sh\necho "Flutter 3.22.0"\n', { mode: 0o755 });
+
+    const relay = createRelayServer(() => new FakePty());
+    servers.push(relay);
+    const port = await relay.start();
+    const base = request(`http://127.0.0.1:${port}`);
+
+    const catalog = await base
+      .get('/api/tools/catalog')
+      .set('x-auth-token', 'test-token');
+
+    expect(catalog.status).toBe(200);
+    expect(catalog.body.tools).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'homebrew' }),
+      expect.objectContaining({ id: 'flutter' }),
+      expect.objectContaining({ id: 'php' }),
+    ]));
+
+    const tools = await base
+      .get('/api/tools')
+      .set('x-auth-token', 'test-token');
+
+    expect(tools.status).toBe(200);
+    expect(tools.body.tools).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'homebrew', installed: true, source: 'relay' }),
+      expect.objectContaining({ id: 'flutter', installed: true, source: 'relay' }),
+    ]));
+
+    const invalidInstall = await base
+      .post('/api/tools/install')
+      .set('x-auth-token', 'test-token')
+      .send({ tool: 'not-real' });
+
+    expect(invalidInstall.status).toBe(400);
+    expect(invalidInstall.body.error).toBe('unsupported_tool');
+
+    const uninstallFlutter = await base
+      .post('/api/tools/uninstall')
+      .set('x-auth-token', 'test-token')
+      .send({ tool: 'flutter' });
+
+    expect(uninstallFlutter.status).toBe(200);
+    expect(uninstallFlutter.body.ok).toBe(true);
+    expect(uninstallFlutter.body.tool.id).toBe('flutter');
+    expect(uninstallFlutter.body.tool.installed).toBe(false);
   });
 
   it('supports initializing git later for an existing project', async () => {
@@ -628,10 +687,15 @@ describe('Relay server', () => {
       expect(options.command).toBe('/bin/sh');
       expect(options.cwd).toBe('/tmp/relay-workspace');
       expect(options.env.HOME).toBe('/tmp/relay-workspace');
+      expect(options.env.RELAY_HOME).toBe('/tmp/relay-workspace/.relay');
+      expect(options.env.RELAY_TOOLS).toBe('/tmp/relay-workspace/.relay/tools');
+      expect(options.env.RELAY_CACHE).toBe('/tmp/relay-workspace/.relay/cache');
+      expect(options.env.RELAY_BIN).toBe('/tmp/relay-workspace/.relay/bin');
       expect(options.env.PROMPT_COMMAND).toBe('');
       expect(options.env.VSCODE_GIT_IPC_HANDLE).toBeUndefined();
       expect(options.env.TERM_PROGRAM).toBeUndefined();
       expect(options.env.TERM_PROGRAM_VERSION).toBeUndefined();
+      expect(String(options.env.PATH)).toContain('/tmp/relay-workspace/.relay/bin');
       expect(options.cols).toBe(80);
       expect(options.rows).toBe(24);
 

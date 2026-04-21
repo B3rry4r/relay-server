@@ -775,6 +775,13 @@ Body:
 {
   "workspace": "/workspace",
   "bootstrapped": true,
+  "relay": {
+    "root": "/workspace/.relay",
+    "tools": "/workspace/.relay/tools",
+    "cache": "/workspace/.relay/cache",
+    "bin": "/workspace/.relay/bin",
+    "state": "/workspace/.relay/state"
+  },
   "status": {
     "bootstrap": "complete",
     "nvm": "installed",
@@ -788,15 +795,270 @@ Body:
     "available": 123456789,
     "total": 987654321
   },
+  "managedTools": [
+    {
+      "id": "homebrew",
+      "name": "Homebrew",
+      "description": "Volume-backed package manager for CLI tools and language runtimes.",
+      "category": "package-manager",
+      "installMethod": "bootstrap",
+      "installPath": "/workspace/.relay/tools/homebrew/bin/brew",
+      "installed": true,
+      "source": "relay",
+      "supported": true,
+      "version": "Homebrew 4.3.0"
+    }
+  ],
   "activePorts": [3000]
 }
 ```
 
 ### Notes
 
+- `relay` exposes the persistent volume-backed tool roots used by shell sessions and managed installs
+- `managedTools` reports curated Relay-managed toolchains and whether they are currently available
 - `activePorts` uses runtime listening-port detection
 - `toolchains` values may be `false` if unavailable
 - `disk.available` and `disk.total` may be `null` if filesystem stats cannot be read
+
+## New Endpoint
+
+## `GET /api/tools/catalog`
+
+Returns the curated managed-tool catalog for the frontend install surfaces.
+
+### Success
+
+Status:
+
+```http
+200 OK
+```
+
+Body:
+
+```json
+{
+  "tools": [
+    {
+      "id": "homebrew",
+      "name": "Homebrew",
+      "description": "Volume-backed package manager for CLI tools and language runtimes.",
+      "category": "package-manager",
+      "installMethod": "bootstrap",
+      "installPath": "/workspace/.relay/tools/homebrew/bin/brew",
+      "supported": true
+    },
+    {
+      "id": "flutter",
+      "name": "Flutter",
+      "description": "Flutter SDK installed into the persistent tool volume for web builds and port-based previews.",
+      "category": "sdk",
+      "installMethod": "git",
+      "installPath": "/workspace/.relay/tools/flutter/bin/flutter",
+      "supported": true
+    }
+  ]
+}
+```
+
+## New Endpoint
+
+## `GET /api/tools`
+
+Returns current installation state for the managed-tool catalog.
+
+### Success
+
+Status:
+
+```http
+200 OK
+```
+
+Body:
+
+```json
+{
+  "tools": [
+    {
+      "id": "flutter",
+      "name": "Flutter",
+      "description": "Flutter SDK installed into the persistent tool volume for web builds and port-based previews.",
+      "category": "sdk",
+      "installMethod": "git",
+      "installPath": "/workspace/.relay/tools/flutter/bin/flutter",
+      "installed": true,
+      "source": "relay",
+      "supported": true,
+      "version": "Flutter 3.22.0"
+    }
+  ]
+}
+```
+
+## New Endpoint
+
+## `POST /api/tools/install`
+
+Installs a managed tool into the persistent Relay volume paths.
+
+### Request
+
+```json
+{
+  "tool": "flutter"
+}
+```
+
+### Supported Tool Values
+
+- `homebrew`
+- `php`
+- `composer`
+- `python`
+- `go`
+- `rust`
+- `java`
+- `flutter`
+
+### Success
+
+Status:
+
+```http
+200 OK
+```
+
+Body:
+
+```json
+{
+  "ok": true,
+  "tool": {
+    "id": "flutter",
+    "name": "Flutter",
+    "description": "Flutter SDK installed into the persistent tool volume for web builds and port-based previews.",
+    "category": "sdk",
+    "installMethod": "git",
+    "installPath": "/workspace/.relay/tools/flutter/bin/flutter",
+    "installed": true,
+    "source": "relay",
+    "supported": true,
+    "version": "Flutter 3.22.0"
+  }
+}
+```
+
+### Failure
+
+Status:
+
+```http
+400 Bad Request
+```
+
+Body:
+
+```json
+{
+  "error": "unsupported_tool",
+  "message": "The requested tool is not supported."
+}
+```
+
+### Failure
+
+Status:
+
+```http
+500 Internal Server Error
+```
+
+Body:
+
+```json
+{
+  "error": "tool_install_failed",
+  "message": "Tool installation failed."
+}
+```
+
+## New Endpoint
+
+## `POST /api/tools/uninstall`
+
+Removes a managed tool from the persistent Relay volume paths.
+
+### Request
+
+```json
+{
+  "tool": "flutter"
+}
+```
+
+### Success
+
+Status:
+
+```http
+200 OK
+```
+
+Body:
+
+```json
+{
+  "ok": true,
+  "tool": {
+    "id": "flutter",
+    "name": "Flutter",
+    "description": "Flutter SDK installed into the persistent tool volume for web builds and port-based previews.",
+    "category": "sdk",
+    "installMethod": "git",
+    "installPath": "/workspace/.relay/tools/flutter/bin/flutter",
+    "installed": false,
+    "source": "unavailable",
+    "supported": true,
+    "version": null
+  }
+}
+```
+
+### Failure
+
+Status:
+
+```http
+400 Bad Request
+```
+
+Body:
+
+```json
+{
+  "error": "unsupported_tool",
+  "message": "The requested tool is not supported."
+}
+```
+
+### Failure
+
+Status:
+
+```http
+500 Internal Server Error
+```
+
+Body:
+
+```json
+{
+  "error": "tool_uninstall_failed",
+  "message": "Tool removal failed."
+}
+```
 
 ## New Endpoint
 

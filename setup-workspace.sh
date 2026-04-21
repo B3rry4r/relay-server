@@ -5,13 +5,26 @@ set -euo pipefail
 WORKSPACE="${WORKSPACE:-/workspace}"
 BOOTSTRAP_FLAG="$WORKSPACE/.bootstrapped"
 BOOTSTRAP_STATUS_PATH="$WORKSPACE/.bootstrap-status"
-NVM_DIR="$WORKSPACE/.nvm"
-HOMEBREW_PREFIX="$WORKSPACE/homebrew"
+RELAY_ROOT="$WORKSPACE/.relay"
+RELAY_TOOLS_DIR="$RELAY_ROOT/tools"
+RELAY_CACHE_DIR="$RELAY_ROOT/cache"
+RELAY_BIN_DIR="$RELAY_ROOT/bin"
+RELAY_STATE_DIR="$RELAY_ROOT/state"
+RELAY_ENV_PATH="$RELAY_STATE_DIR/tool-env.sh"
+NVM_DIR="$RELAY_TOOLS_DIR/nvm"
+HOMEBREW_PREFIX="$RELAY_TOOLS_DIR/homebrew"
 BASHRC_PATH="$WORKSPACE/.bashrc"
 BASH_PROFILE_PATH="$WORKSPACE/.bash_profile"
 PROJECTS_DIR="$WORKSPACE/projects"
-NPM_GLOBAL_DIR="$WORKSPACE/.npm-global"
-PYTHON_USERBASE="$WORKSPACE/.local"
+NPM_GLOBAL_DIR="$RELAY_TOOLS_DIR/npm-global"
+PYTHON_USERBASE="$RELAY_TOOLS_DIR/python-userbase"
+PUB_CACHE_DIR="$RELAY_CACHE_DIR/dart-pub"
+PIP_CACHE_DIR="$RELAY_CACHE_DIR/pip"
+CARGO_HOME_DIR="$RELAY_CACHE_DIR/cargo"
+RUSTUP_HOME_DIR="$RELAY_TOOLS_DIR/rustup"
+GO_HOME_DIR="$RELAY_CACHE_DIR/go"
+GRADLE_HOME_DIR="$RELAY_CACHE_DIR/gradle"
+FLUTTER_HOME_DIR="$RELAY_TOOLS_DIR/flutter"
 BOOTSTRAP_COMPLETE=1
 
 has_command() {
@@ -56,19 +69,45 @@ record_status() {
 }
 
 mkdir -p "$WORKSPACE" "$PROJECTS_DIR" "$NPM_GLOBAL_DIR/bin" "$PYTHON_USERBASE/bin"
+mkdir -p "$RELAY_ROOT" "$RELAY_TOOLS_DIR" "$RELAY_CACHE_DIR" "$RELAY_BIN_DIR" "$RELAY_STATE_DIR" \
+  "$PUB_CACHE_DIR" "$PIP_CACHE_DIR" "$CARGO_HOME_DIR/bin" "$GO_HOME_DIR/bin" "$GRADLE_HOME_DIR"
 printf '' > "$BOOTSTRAP_STATUS_PATH"
 record_status workspace "$WORKSPACE"
+record_status relay_root "ready"
+record_status relay_tools "ready"
+record_status relay_cache "ready"
+record_status relay_bin "ready"
+record_status relay_state "ready"
 record_status projects_dir "ready"
 record_status npm_global "ready"
 record_status python_userbase "ready"
 
-cat > "$BASHRC_PATH" <<EOF
-export HOME="$WORKSPACE"
+cat > "$RELAY_ENV_PATH" <<EOF
+export RELAY_HOME="$RELAY_ROOT"
+export RELAY_TOOLS="$RELAY_TOOLS_DIR"
+export RELAY_CACHE="$RELAY_CACHE_DIR"
+export RELAY_BIN="$RELAY_BIN_DIR"
 export NVM_DIR="$NVM_DIR"
+export HOMEBREW_PREFIX="$HOMEBREW_PREFIX"
 export npm_config_prefix="$NPM_GLOBAL_DIR"
 export PYTHONUSERBASE="$PYTHON_USERBASE"
-export PATH="$NPM_GLOBAL_DIR/bin:$PYTHON_USERBASE/bin:$HOMEBREW_PREFIX/bin:\$PATH"
+export PUB_CACHE="$PUB_CACHE_DIR"
+export PIP_CACHE_DIR="$PIP_CACHE_DIR"
+export CARGO_HOME="$CARGO_HOME_DIR"
+export RUSTUP_HOME="$RUSTUP_HOME_DIR"
+export GOPATH="$GO_HOME_DIR"
+export GOMODCACHE="$GO_HOME_DIR/pkg/mod"
+export GRADLE_USER_HOME="$GRADLE_HOME_DIR"
+export FLUTTER_HOME="$FLUTTER_HOME_DIR"
+export ANDROID_SDK_ROOT="$RELAY_TOOLS_DIR/android-sdk"
+export JAVA_HOME="$HOMEBREW_PREFIX/opt/openjdk"
+export PATH="$RELAY_BIN_DIR:$GO_HOME_DIR/bin:$CARGO_HOME_DIR/bin:$NPM_GLOBAL_DIR/bin:$PYTHON_USERBASE/bin:$HOMEBREW_PREFIX/bin:$HOMEBREW_PREFIX/sbin:$FLUTTER_HOME_DIR/bin:\$PATH"
 [ -s "\$NVM_DIR/nvm.sh" ] && source "\$NVM_DIR/nvm.sh"
+EOF
+
+cat > "$BASHRC_PATH" <<EOF
+export HOME="$WORKSPACE"
+[ -f "$RELAY_ENV_PATH" ] && source "$RELAY_ENV_PATH"
 EOF
 
 cat > "$BASH_PROFILE_PATH" <<EOF
