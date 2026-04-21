@@ -53,6 +53,27 @@ type PreviewRecord = {
   url: string;
 };
 
+type GitFileEntry = {
+  path: string;
+  status: string;
+};
+
+type ActiveCommand = {
+  command: string;
+  commandId: string;
+  startedAt: number;
+};
+
+type ShellTranscriptState = {
+  activeCommand: ActiveCommand | null;
+  currentCwd: string;
+  inputBuffer: string;
+  markerBuffer: string;
+  nextCommandNumber: number;
+};
+
+const RELAY_PROMPT_MARKER_PREFIX = '\u001b]9;9;relay-prompt|';
+
 function resolveAuthToken(): string {
   return process.env.AUTH_TOKEN || '';
 }
@@ -82,6 +103,11 @@ function createTerminalEnv(workspace: string): NodeJS.ProcessEnv {
   delete env.TERM_PROGRAM;
   delete env.TERM_PROGRAM_VERSION;
 
+  const shellName = path.basename(resolveShell()).toLowerCase();
+  if (shellName.includes('bash')) {
+    env.PS1 = '\\[\\e]9;9;relay-prompt|$PWD|$?\\a\\]\\u@\\h:\\w\\$ ';
+  }
+
   return env;
 }
 
@@ -92,6 +118,158 @@ function escapeHtml(value: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+function createShellTranscriptState(workspace: string): ShellTranscriptState {
+  return {
+    activeCommand: null,
+    currentCwd: workspace,
+    inputBuffer: '',
+    markerBuffer: '',
+    nextCommandNumber: 1,
+  };
+}
+
+function emitCommandOutput(
+  socket: { emit(eventName: string, payload: Record<string, unknown>): void },
+  state: ShellTranscriptState,
+  chunk: string
+): void {
+  if (!state.activeCommand || chunk.length === 0) {
+    return;
+  }
+
+  socket.emit('shell_event', {
+    type: 'command_output',
+    commandId: state.activeCommand.commandId,
+    stream: 'stdout',
+    chunk,
+  });
+}
+
+function finishActiveCommand(
+  socket: { emit(eventName: string, payload: Record<string, unknown>): void },
+  state: ShellTranscriptState,
+  exitCode: number
+): void {
+  if (!state.activeCommand) {
+    return;
+  }
+
+  const finishedAt = Date.now();
+  socket.emit('shell_event', {
+    type: 'command_finished',
+    commandId: state.activeCommand.commandId,
+    exitCode,
+    finishedAt: new Date(finishedAt).toISOString(),
+    durationMs: finishedAt - state.activeCommand.startedAt,
+  });
+  state.activeCommand = null;
+}
+
+function handleTerminalInput(
+  socket: { emit(eventName: string, payload: Record<string, unknown>): void },
+  state: ShellTranscriptState,
+  data: string
+): void {
+  for (const char of data) {
+    if (char === '\r' || char === '\n') {
+      const command = state.inputBuffer.trim();
+      state.inputBuffer = '';
+
+      if (command.length > 0) {
+        const commandId = `cmd-${state.nextCommandNumber++}`;
+        state.activeCommand = {
+          command,
+          commandId,
+          startedAt: Date.now(),
+        };
+        socket.emit('shell_event', {
+          type: 'command_started',
+          commandId,
+          command,
+          cwd: state.currentCwd,
+          source: 'terminal',
+          startedAt: new Date(state.activeCommand.startedAt).toISOString(),
+        });
+      }
+      continue;
+    }
+
+    if (char === '\u0003') {
+      state.inputBuffer = '';
+      continue;
+    }
+
+    if (char === '\u007f' || char === '\b') {
+      state.inputBuffer = state.inputBuffer.slice(0, -1);
+      continue;
+    }
+
+    if (char >= ' ' && char !== '\u007f') {
+      state.inputBuffer += char;
+    }
+  }
+}
+
+function handleShellOutput(
+  socket: { emit(eventName: string, payload: Record<string, unknown>): void },
+  state: ShellTranscriptState,
+  data: string
+): void {
+  state.markerBuffer += data;
+
+  while (state.markerBuffer.length > 0) {
+    const markerIndex = state.markerBuffer.indexOf(RELAY_PROMPT_MARKER_PREFIX);
+    if (markerIndex === -1) {
+      const keepLength = Math.max(0, RELAY_PROMPT_MARKER_PREFIX.length - 1);
+      const flushLength = Math.max(0, state.markerBuffer.length - keepLength);
+      if (flushLength > 0) {
+        emitCommandOutput(socket, state, state.markerBuffer.slice(0, flushLength));
+        state.markerBuffer = state.markerBuffer.slice(flushLength);
+      }
+      break;
+    }
+
+    if (markerIndex > 0) {
+      emitCommandOutput(socket, state, state.markerBuffer.slice(0, markerIndex));
+      state.markerBuffer = state.markerBuffer.slice(markerIndex);
+    }
+
+    const markerEndIndex = state.markerBuffer.indexOf('\u0007');
+    if (markerEndIndex === -1) {
+      break;
+    }
+
+    const markerPayload = state.markerBuffer
+      .slice(RELAY_PROMPT_MARKER_PREFIX.length, markerEndIndex);
+    state.markerBuffer = state.markerBuffer.slice(markerEndIndex + 1);
+
+    const separatorIndex = markerPayload.lastIndexOf('|');
+    const cwd = separatorIndex >= 0
+      ? markerPayload.slice(0, separatorIndex)
+      : state.currentCwd;
+    const exitCodeRaw = separatorIndex >= 0
+      ? markerPayload.slice(separatorIndex + 1)
+      : '0';
+    const exitCode = Number.parseInt(exitCodeRaw, 10);
+
+    finishActiveCommand(socket, state, Number.isNaN(exitCode) ? 0 : exitCode);
+
+    if (cwd && cwd !== state.currentCwd) {
+      state.currentCwd = cwd;
+      socket.emit('shell_event', {
+        type: 'cwd_changed',
+        cwd,
+      });
+    }
+
+    socket.emit('shell_event', {
+      type: 'prompt',
+      cwd: state.currentCwd,
+      prompt: '',
+    });
+  }
 }
 
 function extractRequestToken(req: Request): string {
@@ -556,6 +734,149 @@ async function buildQuickSwitchProjects(): Promise<Array<{
   });
 }
 
+async function runGit(projectRoot: string, args: string[], extraEnv: NodeJS.ProcessEnv = {}): Promise<{ stdout: string; stderr: string }> {
+  return execFile('git', args, {
+    cwd: projectRoot,
+    env: {
+      ...process.env,
+      ...extraEnv,
+    },
+  });
+}
+
+async function ensureGitRepo(projectRoot: string): Promise<boolean> {
+  try {
+    const { stdout } = await runGit(projectRoot, ['rev-parse', '--is-inside-work-tree']);
+    return stdout.trim() === 'true';
+  } catch {
+    return false;
+  }
+}
+
+function normalizeGitStatus(code: string): string {
+  switch (code) {
+    case 'M':
+      return 'modified';
+    case 'A':
+      return 'added';
+    case 'D':
+      return 'deleted';
+    case 'R':
+      return 'renamed';
+    case 'C':
+      return 'copied';
+    case 'U':
+      return 'updated';
+    default:
+      return 'unknown';
+  }
+}
+
+async function getGitStatus(projectRoot: string): Promise<{
+  branch: string | null;
+  ahead: number;
+  behind: number;
+  clean: boolean;
+  staged: GitFileEntry[];
+  unstaged: GitFileEntry[];
+  untracked: Array<{ path: string }>;
+  conflicts: GitFileEntry[];
+}> {
+  const { stdout } = await runGit(projectRoot, ['status', '--porcelain=v1', '--branch']);
+  const lines = stdout.split('\n').filter(Boolean);
+  let branch: string | null = null;
+  let ahead = 0;
+  let behind = 0;
+  const staged: GitFileEntry[] = [];
+  const unstaged: GitFileEntry[] = [];
+  const untracked: Array<{ path: string }> = [];
+  const conflicts: GitFileEntry[] = [];
+
+  for (const line of lines) {
+    if (line.startsWith('## ')) {
+      const branchInfo = line.slice(3);
+      const branchMatch = branchInfo.match(/^([^.\s]+)(?:\.\.\.)?/);
+      branch = branchMatch ? branchMatch[1] : branchInfo;
+      const aheadMatch = branchInfo.match(/ahead (\d+)/);
+      const behindMatch = branchInfo.match(/behind (\d+)/);
+      ahead = aheadMatch ? Number(aheadMatch[1]) : 0;
+      behind = behindMatch ? Number(behindMatch[1]) : 0;
+      continue;
+    }
+
+    const x = line[0];
+    const y = line[1];
+    const filePath = line.slice(3).split(' -> ').pop() || line.slice(3);
+
+    if (x === '?' && y === '?') {
+      untracked.push({ path: filePath });
+      continue;
+    }
+
+    if ('UAD'.includes(x) && 'UAD'.includes(y) && x === y || x === 'U' || y === 'U') {
+      conflicts.push({
+        path: filePath,
+        status: 'conflict',
+      });
+      continue;
+    }
+
+    if (x !== ' ' && x !== '?') {
+      staged.push({
+        path: filePath,
+        status: normalizeGitStatus(x),
+      });
+    }
+
+    if (y !== ' ' && y !== '?') {
+      unstaged.push({
+        path: filePath,
+        status: normalizeGitStatus(y),
+      });
+    }
+  }
+
+  return {
+    branch,
+    ahead,
+    behind,
+    clean: staged.length === 0 && unstaged.length === 0 && untracked.length === 0 && conflicts.length === 0,
+    staged,
+    unstaged,
+    untracked,
+    conflicts,
+  };
+}
+
+async function getGitBranches(projectRoot: string): Promise<{ current: string | null; branches: string[] }> {
+  const [currentBranch, branchList] = await Promise.all([
+    runGit(projectRoot, ['branch', '--show-current']),
+    runGit(projectRoot, ['branch', '--format=%(refname:short)']),
+  ]);
+
+  return {
+    current: currentBranch.stdout.trim() || null,
+    branches: branchList.stdout.split('\n').map((line) => line.trim()).filter(Boolean),
+  };
+}
+
+function createGitHttpEnv(auth?: { username?: string; token?: string; password?: string }): NodeJS.ProcessEnv {
+  if (!auth?.token && !auth?.password) {
+    return {};
+  }
+
+  const username = auth.username || 'git';
+  const secret = auth.token || auth.password || '';
+  const authHeader = Buffer.from(`${username}:${secret}`).toString('base64');
+
+  return {
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'http.extraHeader',
+    GIT_CONFIG_VALUE_0: `AUTHORIZATION: Basic ${authHeader}`,
+  };
+}
+
 async function listProjects(): Promise<Array<{
   id: string;
   name: string;
@@ -1018,6 +1339,73 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
     });
   });
 
+  app.post('/api/projects/clone', requireAuth, async (req, res) => {
+    const url = String(req.body?.url || '').trim();
+    const requestedName = String(req.body?.name || '').trim();
+    const branch = String(req.body?.branch || '').trim();
+    const provider = String(req.body?.provider || 'url');
+
+    if (!url) {
+      res.status(400).json({
+        error: 'invalid_request',
+        message: 'url is required.',
+      });
+      return;
+    }
+
+    if (provider !== 'url') {
+      res.status(400).json({
+        error: 'unsupported_provider',
+        message: 'Only provider=url is currently supported.',
+      });
+      return;
+    }
+
+    const inferredName = requestedName || path.basename(url, '.git');
+    const projectName = validateProjectName(inferredName);
+    if (!projectName) {
+      res.status(400).json({
+        error: 'invalid_project_name',
+        message: 'Project names may only contain letters, numbers, hyphens, underscores, and periods.',
+      });
+      return;
+    }
+
+    await ensureProjectsRoot();
+    const projectPath = path.join(getProjectsRoot(), projectName);
+    if (await exists(projectPath)) {
+      res.status(409).json({
+        error: 'project_exists',
+        message: 'A project with this name already exists.',
+      });
+      return;
+    }
+
+    const authEnv = createGitHttpEnv(req.body?.auth);
+    const args = ['clone'];
+    if (branch) {
+      args.push('--branch', branch);
+    }
+    args.push(url, projectPath);
+
+    try {
+      await runGit(process.cwd(), args, authEnv);
+      res.status(201).json({
+        project: {
+          id: projectName,
+          name: projectName,
+          path: projectPath,
+        },
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Clone failed.';
+      res.status(400).json({
+        error: 'git_clone_failed',
+        message,
+      });
+    }
+  });
+
   app.post('/api/session/project', requireAuth, async (req, res) => {
     const projectId = String(req.body?.projectId || '');
     const projectRoot = resolveProjectRoot(projectId);
@@ -1065,6 +1453,234 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
     });
   });
 
+  app.get('/api/projects/:projectId/git/status', requireAuth, async (req, res) => {
+    const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
+    if (!projectRoot || !await exists(projectRoot)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+
+    if (!await ensureGitRepo(projectRoot)) {
+      res.status(400).json({ error: 'not_a_git_repo', message: 'This project is not a git repository.' });
+      return;
+    }
+
+    res.json(await getGitStatus(projectRoot));
+  });
+
+  app.get('/api/projects/:projectId/git/diff', requireAuth, async (req, res) => {
+    const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
+    if (!projectRoot || !await exists(projectRoot)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+
+    if (!await ensureGitRepo(projectRoot)) {
+      res.status(400).json({ error: 'not_a_git_repo', message: 'This project is not a git repository.' });
+      return;
+    }
+
+    const staged = String(req.query.staged || 'false') === 'true';
+    const filePath = typeof req.query.path === 'string' ? req.query.path : '';
+    const args = ['diff'];
+    if (staged) {
+      args.push('--cached');
+    }
+    if (filePath) {
+      args.push('--', filePath);
+    }
+
+    const { stdout } = await runGit(projectRoot, args);
+    res.json({ diff: stdout });
+  });
+
+  app.get('/api/projects/:projectId/git/branches', requireAuth, async (req, res) => {
+    const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
+    if (!projectRoot || !await exists(projectRoot)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+
+    if (!await ensureGitRepo(projectRoot)) {
+      res.status(400).json({ error: 'not_a_git_repo', message: 'This project is not a git repository.' });
+      return;
+    }
+
+    res.json(await getGitBranches(projectRoot));
+  });
+
+  app.post('/api/projects/:projectId/git/stage', requireAuth, async (req, res) => {
+    const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
+    const paths = Array.isArray(req.body?.paths) ? req.body.paths.filter((value: unknown): value is string => typeof value === 'string') : [];
+
+    if (!projectRoot || !await exists(projectRoot)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+
+    if (!await ensureGitRepo(projectRoot)) {
+      res.status(400).json({ error: 'not_a_git_repo', message: 'This project is not a git repository.' });
+      return;
+    }
+
+    await runGit(projectRoot, ['add', '--', ...paths]);
+    res.json({ ok: true });
+  });
+
+  app.post('/api/projects/:projectId/git/unstage', requireAuth, async (req, res) => {
+    const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
+    const paths = Array.isArray(req.body?.paths) ? req.body.paths.filter((value: unknown): value is string => typeof value === 'string') : [];
+
+    if (!projectRoot || !await exists(projectRoot)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+
+    if (!await ensureGitRepo(projectRoot)) {
+      res.status(400).json({ error: 'not_a_git_repo', message: 'This project is not a git repository.' });
+      return;
+    }
+
+    await runGit(projectRoot, ['restore', '--staged', '--', ...paths]);
+    res.json({ ok: true });
+  });
+
+  app.post('/api/projects/:projectId/git/discard', requireAuth, async (req, res) => {
+    const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
+    const paths = Array.isArray(req.body?.paths) ? req.body.paths.filter((value: unknown): value is string => typeof value === 'string') : [];
+
+    if (!projectRoot || !await exists(projectRoot)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+
+    if (!await ensureGitRepo(projectRoot)) {
+      res.status(400).json({ error: 'not_a_git_repo', message: 'This project is not a git repository.' });
+      return;
+    }
+
+    await runGit(projectRoot, ['restore', '--', ...paths]);
+    res.json({ ok: true });
+  });
+
+  app.post('/api/projects/:projectId/git/commit', requireAuth, async (req, res) => {
+    const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
+    const message = String(req.body?.message || '').trim();
+
+    if (!projectRoot || !await exists(projectRoot)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+
+    if (!await ensureGitRepo(projectRoot)) {
+      res.status(400).json({ error: 'not_a_git_repo', message: 'This project is not a git repository.' });
+      return;
+    }
+
+    if (!message) {
+      res.status(400).json({ error: 'invalid_commit_message', message: 'Commit message is required.' });
+      return;
+    }
+
+    try {
+      await runGit(projectRoot, ['commit', '-m', message]);
+      const { stdout } = await runGit(projectRoot, ['rev-parse', '--short', 'HEAD']);
+      res.json({
+        ok: true,
+        commit: {
+          message,
+          hash: stdout.trim(),
+        },
+      });
+    } catch (error) {
+      res.status(400).json({
+        error: 'git_commit_failed',
+        message: error instanceof Error ? error.message : 'Commit failed.',
+      });
+    }
+  });
+
+  app.post('/api/projects/:projectId/git/branch/checkout', requireAuth, async (req, res) => {
+    const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
+    const branch = String(req.body?.branch || '').trim();
+    const create = Boolean(req.body?.create);
+
+    if (!projectRoot || !await exists(projectRoot)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+
+    if (!await ensureGitRepo(projectRoot)) {
+      res.status(400).json({ error: 'not_a_git_repo', message: 'This project is not a git repository.' });
+      return;
+    }
+
+    if (!branch) {
+      res.status(400).json({ error: 'invalid_branch', message: 'Branch is required.' });
+      return;
+    }
+
+    try {
+      await runGit(projectRoot, create ? ['checkout', '-b', branch] : ['checkout', branch]);
+      res.json({ ok: true, branch });
+    } catch (error) {
+      res.status(400).json({
+        error: 'git_checkout_failed',
+        message: error instanceof Error ? error.message : 'Checkout failed.',
+      });
+    }
+  });
+
+  app.post('/api/projects/:projectId/git/pull', requireAuth, async (req, res) => {
+    const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
+
+    if (!projectRoot || !await exists(projectRoot)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+
+    if (!await ensureGitRepo(projectRoot)) {
+      res.status(400).json({ error: 'not_a_git_repo', message: 'This project is not a git repository.' });
+      return;
+    }
+
+    try {
+      const authEnv = createGitHttpEnv(req.body?.auth);
+      const { stdout, stderr } = await runGit(projectRoot, ['pull', '--ff-only'], authEnv);
+      res.json({ ok: true, output: `${stdout}${stderr}`.trim() });
+    } catch (error) {
+      res.status(400).json({
+        error: 'git_pull_failed',
+        message: error instanceof Error ? error.message : 'Pull failed.',
+      });
+    }
+  });
+
+  app.post('/api/projects/:projectId/git/push', requireAuth, async (req, res) => {
+    const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
+
+    if (!projectRoot || !await exists(projectRoot)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+
+    if (!await ensureGitRepo(projectRoot)) {
+      res.status(400).json({ error: 'not_a_git_repo', message: 'This project is not a git repository.' });
+      return;
+    }
+
+    try {
+      const authEnv = createGitHttpEnv(req.body?.auth);
+      const { stdout, stderr } = await runGit(projectRoot, ['push'], authEnv);
+      res.json({ ok: true, output: `${stdout}${stderr}`.trim() });
+    } catch (error) {
+      res.status(400).json({
+        error: 'git_push_failed',
+        message: error instanceof Error ? error.message : 'Push failed.',
+      });
+    }
+  });
+
   io.use((socket, next) => {
     const authToken = typeof socket.handshake.auth.token === 'string'
       ? socket.handshake.auth.token
@@ -1080,6 +1696,7 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
 
   io.on('connection', (socket) => {
     const workspace = resolveWorkspace();
+    const transcriptState = createShellTranscriptState(workspace);
     let shell: PtyLike;
 
     try {
@@ -1101,6 +1718,7 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
 
     shell.onData((data) => {
       socket.emit('output', data);
+      handleShellOutput(socket, transcriptState, data);
     });
 
     if (typeof shell.onExit === 'function') {
@@ -1117,6 +1735,7 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
         return;
       }
 
+      handleTerminalInput(socket, transcriptState, data);
       shell.write(data);
     });
 

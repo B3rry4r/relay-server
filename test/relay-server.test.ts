@@ -1,10 +1,14 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { execFile as execFileCallback } from 'node:child_process';
+import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 import request from 'supertest';
 import { io as createClient, type Socket } from 'socket.io-client';
 import { createRelayServer, FakePty, type PtyFactory, type RelayServer } from '../src/relay-server';
+
+const execFile = promisify(execFileCallback);
 
 async function connectClient(port: number, token = 'test-token'): Promise<Socket> {
   const client = createClient(`http://127.0.0.1:${port}`, {
@@ -33,6 +37,12 @@ describe('Relay server', () => {
     tempDirectories.push(workspace);
     await fs.mkdir(path.join(workspace, 'projects'), { recursive: true });
     return workspace;
+  }
+
+  async function initGitRepo(projectRoot: string): Promise<void> {
+    await execFile('git', ['init'], { cwd: projectRoot });
+    await execFile('git', ['config', 'user.email', 'relay@example.com'], { cwd: projectRoot });
+    await execFile('git', ['config', 'user.name', 'Relay Test'], { cwd: projectRoot });
   }
 
   afterEach(async () => {
@@ -412,6 +422,126 @@ describe('Relay server', () => {
     expect(Array.isArray(previews.body.previews)).toBe(true);
   });
 
+  it('supports git APIs and clone by URL', async () => {
+    process.env.PORT = '0';
+    process.env.AUTH_TOKEN = 'test-token';
+    process.env.WORKSPACE = await createWorkspaceFixture();
+
+    const relay = createRelayServer(() => new FakePty());
+    servers.push(relay);
+    const port = await relay.start();
+    const base = request(`http://127.0.0.1:${port}`);
+
+    const sourceRepo = path.join(process.env.WORKSPACE, 'projects', 'source-repo');
+    await fs.mkdir(sourceRepo, { recursive: true });
+    await initGitRepo(sourceRepo);
+    await fs.writeFile(path.join(sourceRepo, 'README.md'), '# Relay\n');
+    await execFile('git', ['add', '--', 'README.md'], { cwd: sourceRepo });
+    await execFile('git', ['commit', '-m', 'init'], { cwd: sourceRepo });
+
+    const cloneResponse = await base
+      .post('/api/projects/clone')
+      .set('x-auth-token', 'test-token')
+      .send({
+        url: sourceRepo,
+        name: 'cloned-repo',
+        provider: 'url',
+      });
+
+    expect(cloneResponse.status).toBe(201);
+    expect(cloneResponse.body.project.id).toBe('cloned-repo');
+
+    const clonedRepo = path.join(process.env.WORKSPACE, 'projects', 'cloned-repo');
+    await initGitRepo(clonedRepo);
+
+    await fs.writeFile(path.join(clonedRepo, 'notes.txt'), 'one\n');
+
+    const statusBeforeStage = await base
+      .get('/api/projects/cloned-repo/git/status')
+      .set('x-auth-token', 'test-token');
+
+    expect(statusBeforeStage.status).toBe(200);
+    expect(statusBeforeStage.body.clean).toBe(false);
+    expect(statusBeforeStage.body.untracked).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: 'notes.txt' }),
+    ]));
+
+    const stage = await base
+      .post('/api/projects/cloned-repo/git/stage')
+      .set('x-auth-token', 'test-token')
+      .send({
+        paths: ['notes.txt'],
+      });
+
+    expect(stage.status).toBe(200);
+    expect(stage.body.ok).toBe(true);
+
+    const statusAfterStage = await base
+      .get('/api/projects/cloned-repo/git/status')
+      .set('x-auth-token', 'test-token');
+
+    expect(statusAfterStage.status).toBe(200);
+    expect(statusAfterStage.body.staged).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: 'notes.txt' }),
+    ]));
+
+    const diff = await base
+      .get('/api/projects/cloned-repo/git/diff')
+      .set('x-auth-token', 'test-token')
+      .query({ staged: 'true' });
+
+    expect(diff.status).toBe(200);
+    expect(typeof diff.body.diff).toBe('string');
+
+    const commit = await base
+      .post('/api/projects/cloned-repo/git/commit')
+      .set('x-auth-token', 'test-token')
+      .send({
+        message: 'add notes',
+      });
+
+    expect(commit.status).toBe(200);
+    expect(commit.body.ok).toBe(true);
+    expect(commit.body.commit.message).toBe('add notes');
+
+    const branches = await base
+      .get('/api/projects/cloned-repo/git/branches')
+      .set('x-auth-token', 'test-token');
+
+    expect(branches.status).toBe(200);
+    expect(Array.isArray(branches.body.branches)).toBe(true);
+
+    const checkout = await base
+      .post('/api/projects/cloned-repo/git/branch/checkout')
+      .set('x-auth-token', 'test-token')
+      .send({
+        branch: 'feature/test',
+        create: true,
+      });
+
+    expect(checkout.status).toBe(200);
+    expect(checkout.body.branch).toBe('feature/test');
+
+    await fs.writeFile(path.join(clonedRepo, 'notes.txt'), 'two\n');
+
+    const discard = await base
+      .post('/api/projects/cloned-repo/git/discard')
+      .set('x-auth-token', 'test-token')
+      .send({
+        paths: ['notes.txt'],
+      });
+
+    expect(discard.status).toBe(200);
+    expect(discard.body.ok).toBe(true);
+
+    const statusAfterDiscard = await base
+      .get('/api/projects/cloned-repo/git/status')
+      .set('x-auth-token', 'test-token');
+
+    expect(statusAfterDiscard.status).toBe(200);
+    expect(statusAfterDiscard.body.conflicts).toEqual([]);
+  });
+
   it('spawns a shell in the workspace and relays PTY output', async () => {
     process.env.PORT = '0';
     process.env.WORKSPACE = '/tmp/relay-workspace';
@@ -476,6 +606,55 @@ describe('Relay server', () => {
 
     expect(pty?.writes).toEqual(['ls\n']);
     expect(pty?.resizeCalls).toEqual([{ cols: 120, rows: 40 }]);
+  });
+
+  it('emits structured shell transcript events alongside raw output', async () => {
+    process.env.PORT = '0';
+    process.env.AUTH_TOKEN = 'test-token';
+
+    let pty: FakePty | undefined;
+    const relay = createRelayServer(() => {
+      pty = new FakePty();
+      return pty;
+    });
+    servers.push(relay);
+    const port = await relay.start();
+    const client = await connectClient(port, 'test-token');
+    clients.push(client);
+    const events: Array<Record<string, unknown>> = [];
+    client.on('shell_event', (event) => {
+      events.push(event);
+    });
+
+    client.emit('input', 'pwd\n');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    pty?.pushOutput('/workspace/projects/demo\n');
+    pty?.pushOutput('\u001b]9;9;relay-prompt|/workspace/projects/demo|0\u0007');
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'command_started',
+      command: 'pwd',
+      source: 'terminal',
+    }));
+    const outputText = events
+      .filter((event) => event.type === 'command_output')
+      .map((event) => String(event.chunk || ''))
+      .join('');
+    expect(outputText).toBe('/workspace/projects/demo\n');
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'command_finished',
+      exitCode: 0,
+    }));
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'cwd_changed',
+      cwd: '/workspace/projects/demo',
+    }));
+    expect(events).toContainEqual(expect.objectContaining({
+      type: 'prompt',
+      cwd: '/workspace/projects/demo',
+    }));
   });
 
   it('kills the PTY on socket disconnect', async () => {
