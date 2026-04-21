@@ -867,6 +867,15 @@ printf "\\033]8;;%s\\033\\\\%s\\033]8;;\\033\\\\\\n\\r\\n\\r" "$1" "$1"
 `;
 
   await fs.writeFile(browserScriptPath, browserScriptContent, { mode: 0o755 });
+
+  // Link xdg-open to our redirection script for tools that don't respect $BROWSER
+  const xdgOpenPath = path.join(binDir, 'xdg-open');
+  try {
+    await fs.unlink(xdgOpenPath).catch(() => {});
+    await fs.symlink('relay-browser', xdgOpenPath);
+  } catch (error) {
+    // Ignore errors if symlink fails
+  }
 }
 
 function quoteShell(value: string): string {
