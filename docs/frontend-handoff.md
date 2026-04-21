@@ -302,7 +302,8 @@ Response:
       "id": "my-app",
       "name": "my-app",
       "path": "/workspace/projects/my-app",
-      "lastModifiedAt": "2026-04-20T22:00:00.000Z"
+      "lastModifiedAt": "2026-04-20T22:00:00.000Z",
+      "gitInitialized": true
     }
   ]
 }
@@ -331,7 +332,8 @@ Success:
   "project": {
     "id": "my-app",
     "name": "my-app",
-    "path": "/workspace/projects/my-app"
+    "path": "/workspace/projects/my-app",
+    "gitInitialized": true
   }
 }
 ```

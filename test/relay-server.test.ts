@@ -190,6 +190,7 @@ describe('Relay server', () => {
 
     expect(createProject.status).toBe(201);
     expect(createProject.body.project.path).toBe(path.join(process.env.WORKSPACE, 'projects', 'my-app'));
+    expect(createProject.body.project.gitInitialized).toBe(true);
 
     const listProjects = await base
       .get('/api/projects')
@@ -198,6 +199,14 @@ describe('Relay server', () => {
     expect(listProjects.status).toBe(200);
     expect(listProjects.body.projects).toHaveLength(1);
     expect(listProjects.body.projects[0].id).toBe('my-app');
+    expect(listProjects.body.projects[0].gitInitialized).toBe(true);
+
+    const gitStatus = await base
+      .get('/api/projects/my-app/git/status')
+      .set('x-auth-token', 'test-token');
+
+    expect(gitStatus.status).toBe(200);
+    expect(typeof gitStatus.body.clean).toBe('boolean');
 
     const createFolder = await base
       .post('/api/projects/my-app/folders')

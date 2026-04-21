@@ -299,7 +299,8 @@ Body:
   "project": {
     "id": "my-app",
     "name": "my-app",
-    "path": "/workspace/projects/my-app"
+    "path": "/workspace/projects/my-app",
+    "gitInitialized": true
   }
 }
 ```
@@ -335,6 +336,23 @@ Body:
 {
   "error": "project_exists",
   "message": "A project with this name already exists."
+}
+```
+
+### Git Initialization Failure
+
+Status:
+
+```http
+500 Internal Server Error
+```
+
+Body:
+
+```json
+{
+  "error": "git_init_failed",
+  "message": "Git initialization failed."
 }
 ```
 
@@ -925,7 +943,7 @@ Body:
 ```json
 {
   "error": "not_a_git_repo",
-  "message": "This project is not a git repository."
+  "message": "Git repository not detected for this project. Project setup may not have initialized Git successfully."
 }
 ```
 

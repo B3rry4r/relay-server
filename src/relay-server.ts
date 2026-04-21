@@ -753,6 +753,15 @@ async function ensureGitRepo(projectRoot: string): Promise<boolean> {
   }
 }
 
+async function initializeGitRepository(projectRoot: string): Promise<void> {
+  try {
+    await runGit(projectRoot, ['init', '-b', 'main']);
+    return;
+  } catch {
+    await runGit(projectRoot, ['init']);
+  }
+}
+
 function normalizeGitStatus(code: string): string {
   switch (code) {
     case 'M':
@@ -882,6 +891,7 @@ async function listProjects(): Promise<Array<{
   name: string;
   path: string;
   lastModifiedAt: string;
+  gitInitialized: boolean;
 }>> {
   await ensureProjectsRoot();
   const entries = await fs.readdir(getProjectsRoot(), { withFileTypes: true });
@@ -896,6 +906,7 @@ async function listProjects(): Promise<Array<{
         name: entry.name,
         path: projectPath,
         lastModifiedAt: stat.mtime.toISOString(),
+        gitInitialized: await ensureGitRepo(projectPath),
       };
     }));
 
@@ -1046,7 +1057,16 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
     await scaffoldTemplate(projectPath, String(req.body?.template || 'blank'));
 
     if (req.body?.initializeGit === true) {
-      await fs.mkdir(path.join(projectPath, '.git'), { recursive: true });
+      try {
+        await initializeGitRepository(projectPath);
+      } catch (error) {
+        await fs.rm(projectPath, { recursive: true, force: true });
+        res.status(500).json({
+          error: 'git_init_failed',
+          message: error instanceof Error ? error.message : 'Git initialization failed.',
+        });
+        return;
+      }
     }
 
     res.status(201).json({
@@ -1054,6 +1074,7 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
         id: projectName,
         name: projectName,
         path: projectPath,
+        gitInitialized: req.body?.initializeGit === true,
       },
     });
   });
@@ -1461,7 +1482,10 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
     }
 
     if (!await ensureGitRepo(projectRoot)) {
-      res.status(400).json({ error: 'not_a_git_repo', message: 'This project is not a git repository.' });
+      res.status(400).json({
+        error: 'not_a_git_repo',
+        message: 'Git repository not detected for this project. Project setup may not have initialized Git successfully.',
+      });
       return;
     }
 
@@ -1476,7 +1500,10 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
     }
 
     if (!await ensureGitRepo(projectRoot)) {
-      res.status(400).json({ error: 'not_a_git_repo', message: 'This project is not a git repository.' });
+      res.status(400).json({
+        error: 'not_a_git_repo',
+        message: 'Git repository not detected for this project. Project setup may not have initialized Git successfully.',
+      });
       return;
     }
 
@@ -1502,7 +1529,10 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
     }
 
     if (!await ensureGitRepo(projectRoot)) {
-      res.status(400).json({ error: 'not_a_git_repo', message: 'This project is not a git repository.' });
+      res.status(400).json({
+        error: 'not_a_git_repo',
+        message: 'Git repository not detected for this project. Project setup may not have initialized Git successfully.',
+      });
       return;
     }
 
@@ -1519,7 +1549,10 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
     }
 
     if (!await ensureGitRepo(projectRoot)) {
-      res.status(400).json({ error: 'not_a_git_repo', message: 'This project is not a git repository.' });
+      res.status(400).json({
+        error: 'not_a_git_repo',
+        message: 'Git repository not detected for this project. Project setup may not have initialized Git successfully.',
+      });
       return;
     }
 
@@ -1537,7 +1570,10 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
     }
 
     if (!await ensureGitRepo(projectRoot)) {
-      res.status(400).json({ error: 'not_a_git_repo', message: 'This project is not a git repository.' });
+      res.status(400).json({
+        error: 'not_a_git_repo',
+        message: 'Git repository not detected for this project. Project setup may not have initialized Git successfully.',
+      });
       return;
     }
 
@@ -1555,7 +1591,10 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
     }
 
     if (!await ensureGitRepo(projectRoot)) {
-      res.status(400).json({ error: 'not_a_git_repo', message: 'This project is not a git repository.' });
+      res.status(400).json({
+        error: 'not_a_git_repo',
+        message: 'Git repository not detected for this project. Project setup may not have initialized Git successfully.',
+      });
       return;
     }
 
@@ -1573,7 +1612,10 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
     }
 
     if (!await ensureGitRepo(projectRoot)) {
-      res.status(400).json({ error: 'not_a_git_repo', message: 'This project is not a git repository.' });
+      res.status(400).json({
+        error: 'not_a_git_repo',
+        message: 'Git repository not detected for this project. Project setup may not have initialized Git successfully.',
+      });
       return;
     }
 
@@ -1611,7 +1653,10 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
     }
 
     if (!await ensureGitRepo(projectRoot)) {
-      res.status(400).json({ error: 'not_a_git_repo', message: 'This project is not a git repository.' });
+      res.status(400).json({
+        error: 'not_a_git_repo',
+        message: 'Git repository not detected for this project. Project setup may not have initialized Git successfully.',
+      });
       return;
     }
 
@@ -1640,7 +1685,10 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
     }
 
     if (!await ensureGitRepo(projectRoot)) {
-      res.status(400).json({ error: 'not_a_git_repo', message: 'This project is not a git repository.' });
+      res.status(400).json({
+        error: 'not_a_git_repo',
+        message: 'Git repository not detected for this project. Project setup may not have initialized Git successfully.',
+      });
       return;
     }
 
