@@ -889,6 +889,64 @@ Current parser supports:
 
 All endpoints below operate inside the selected project root.
 
+## `POST /api/projects/:projectId/git/init`
+
+Initializes a Git repository inside an existing project root.
+
+### Request
+
+```json
+{}
+```
+
+### Success
+
+Status:
+
+```http
+200 OK
+```
+
+Body:
+
+```json
+{
+  "ok": true,
+  "project": {
+    "id": "my-app",
+    "path": "/workspace/projects/my-app",
+    "gitInitialized": true
+  },
+  "git": {
+    "branch": "main",
+    "ahead": 0,
+    "behind": 0,
+    "clean": true,
+    "staged": [],
+    "unstaged": [],
+    "untracked": [],
+    "conflicts": []
+  }
+}
+```
+
+### Failure
+
+Status:
+
+```http
+500 Internal Server Error
+```
+
+Body:
+
+```json
+{
+  "error": "git_init_failed",
+  "message": "Git initialization failed."
+}
+```
+
 ## `GET /api/projects/:projectId/git/status`
 
 Returns structured Git status.

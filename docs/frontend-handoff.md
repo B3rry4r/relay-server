@@ -356,6 +356,59 @@ Validation failure:
 }
 ```
 
+Git initialization failure:
+
+```json
+{
+  "error": "git_init_failed",
+  "message": "Git initialization failed."
+}
+```
+
+## `POST /api/projects/:projectId/git/init`
+
+Auth:
+
+- required
+
+Request:
+
+```json
+{}
+```
+
+Success:
+
+```json
+{
+  "ok": true,
+  "project": {
+    "id": "my-app",
+    "path": "/workspace/projects/my-app",
+    "gitInitialized": true
+  },
+  "git": {
+    "branch": "main",
+    "ahead": 0,
+    "behind": 0,
+    "clean": true,
+    "staged": [],
+    "unstaged": [],
+    "untracked": [],
+    "conflicts": []
+  }
+}
+```
+
+Failure:
+
+```json
+{
+  "error": "git_init_failed",
+  "message": "Git initialization failed."
+}
+```
+
 ## `GET /api/projects/:projectId/tree`
 
 Auth:

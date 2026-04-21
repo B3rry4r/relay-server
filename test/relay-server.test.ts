@@ -432,6 +432,67 @@ describe('Relay server', () => {
     expect(Array.isArray(previews.body.previews)).toBe(true);
   });
 
+  it('supports initializing git later for an existing project', async () => {
+    process.env.PORT = '0';
+    process.env.AUTH_TOKEN = 'test-token';
+    process.env.WORKSPACE = await createWorkspaceFixture();
+
+    const relay = createRelayServer(() => new FakePty());
+    servers.push(relay);
+    const port = await relay.start();
+    const base = request(`http://127.0.0.1:${port}`);
+
+    const createProject = await base
+      .post('/api/projects')
+      .set('x-auth-token', 'test-token')
+      .send({
+        name: 'plain-app',
+        template: 'blank',
+        initializeGit: false,
+      });
+
+    expect(createProject.status).toBe(201);
+    expect(createProject.body.project.gitInitialized).toBe(false);
+
+    const statusBeforeInit = await base
+      .get('/api/projects/plain-app/git/status')
+      .set('x-auth-token', 'test-token');
+
+    expect(statusBeforeInit.status).toBe(400);
+    expect(statusBeforeInit.body.error).toBe('not_a_git_repo');
+
+    const initGit = await base
+      .post('/api/projects/plain-app/git/init')
+      .set('x-auth-token', 'test-token')
+      .send({});
+
+    expect(initGit.status).toBe(200);
+    expect(initGit.body.ok).toBe(true);
+    expect(initGit.body.project.gitInitialized).toBe(true);
+    expect(initGit.body.git.branch).toBe('main');
+    expect(initGit.body.git.clean).toBe(true);
+
+    const listProjects = await base
+      .get('/api/projects')
+      .set('x-auth-token', 'test-token');
+
+    expect(listProjects.status).toBe(200);
+    expect(listProjects.body.projects).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'plain-app',
+        gitInitialized: true,
+      }),
+    ]));
+
+    const statusAfterInit = await base
+      .get('/api/projects/plain-app/git/status')
+      .set('x-auth-token', 'test-token');
+
+    expect(statusAfterInit.status).toBe(200);
+    expect(statusAfterInit.body.branch).toBe('main');
+    expect(statusAfterInit.body.clean).toBe(true);
+  });
+
   it('supports git APIs and clone by URL', async () => {
     process.env.PORT = '0';
     process.env.AUTH_TOKEN = 'test-token';

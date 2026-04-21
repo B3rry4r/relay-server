@@ -1435,6 +1435,34 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
     }
   });
 
+  app.post('/api/projects/:projectId/git/init', requireAuth, async (req, res) => {
+    const projectId = readStringParam(req.params.projectId);
+    const projectRoot = resolveProjectRoot(projectId);
+    if (!projectRoot || !await exists(projectRoot)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+
+    try {
+      await initializeGitRepository(projectRoot);
+      const status = await getGitStatus(projectRoot);
+      res.status(200).json({
+        ok: true,
+        project: {
+          id: projectId,
+          path: projectRoot,
+          gitInitialized: true,
+        },
+        git: status,
+      });
+    } catch (error) {
+      res.status(500).json({
+        error: 'git_init_failed',
+        message: error instanceof Error ? error.message : 'Git initialization failed.',
+      });
+    }
+  });
+
   app.post('/api/session/project', requireAuth, async (req, res) => {
     const projectId = String(req.body?.projectId || '');
     const projectRoot = resolveProjectRoot(projectId);
