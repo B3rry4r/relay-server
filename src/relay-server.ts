@@ -143,6 +143,9 @@ function createTerminalEnv(workspace: string): NodeJS.ProcessEnv {
     GRADLE_USER_HOME: path.join(relayCache, 'gradle'),
     JAVA_HOME: path.join(homebrewPrefix, 'opt', 'openjdk'),
     ANDROID_SDK_ROOT: path.join(relayTools, 'android-sdk'),
+    HOMEBREW_NO_AUTO_UPDATE: '1',
+    HOMEBREW_NO_ENV_HINTS: '1',
+    HOMEBREW_NO_INSTALL_CLEANUP: '1',
     PROMPT_COMMAND: '',
     TERM: process.env.TERM || 'xterm-256color',
     PATH: [
@@ -644,7 +647,7 @@ async function duplicateItem(projectRoot: string, sourcePath: string, newName?: 
 
 async function listListeningPorts(): Promise<number[]> {
   try {
-    const { stdout } = await execFile('sh', ['-lc', 'ss -ltnH 2>/dev/null || netstat -ltn 2>/dev/null'], {
+    const { stdout } = await execFile('sh', ['-c', 'ss -ltnH 2>/dev/null || netstat -ltn 2>/dev/null'], {
       cwd: process.cwd(),
       env: process.env,
     });
@@ -828,12 +831,12 @@ function getManagedToolCatalog(workspace = resolveWorkspace()): Array<ManagedToo
 
 async function runShellCommand(workspace: string, command: string): Promise<{ stdout: string; stderr: string }> {
   const shell = resolveShell();
-  const shellName = path.basename(shell).toLowerCase();
-  const args = shellName.includes('bash') ? ['-lc', command] : ['-c', command];
+  const args = ['-c', command];
 
   return execFile(shell, args, {
     cwd: workspace,
     env: createTerminalEnv(workspace),
+    maxBuffer: 10 * 1024 * 1024, // 10MB
   });
 }
 
@@ -865,7 +868,7 @@ async function getManagedToolStatus(workspace: string, tool: ManagedToolDefiniti
     const versionOutput = `${stdout}${stderr}`.trim();
     const resolvedPath = relayBinaryExists
       ? installPath
-      : await execFile('sh', ['-lc', `command -v ${tool.binary}`], { cwd: workspace, env }).then((result) => result.stdout.trim()).catch(() => '');
+      : await execFile('sh', ['-c', `command -v ${tool.binary}`], { cwd: workspace, env }).then((result) => result.stdout.trim()).catch(() => '');
     return {
       id: tool.id,
       kind: 'managed',
@@ -1148,7 +1151,7 @@ async function getWorkspaceHealth(): Promise<{
 
   let disk = { available: null as number | null, total: null as number | null };
   try {
-    const { stdout } = await execFile('sh', ['-lc', `df -k "${workspace}" | tail -n 1`], { cwd: process.cwd(), env: process.env });
+    const { stdout } = await execFile('sh', ['-c', `df -k "${workspace}" | tail -n 1`], { cwd: process.cwd(), env: process.env });
     const parts = stdout.trim().split(/\s+/);
     disk = {
       total: Number(parts[1]) * 1024 || null,
