@@ -457,9 +457,8 @@ describe('Relay server', () => {
 
     expect(catalog.status).toBe(200);
     expect(catalog.body.tools).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: 'homebrew' }),
+      expect.objectContaining({ id: 'rust' }),
       expect.objectContaining({ id: 'flutter' }),
-      expect.objectContaining({ id: 'php' }),
     ]));
     expect(catalog.body.customToolSupport.installRoot).toBe(path.join(process.env.WORKSPACE, '.relay', 'tools'));
 
@@ -469,7 +468,7 @@ describe('Relay server', () => {
 
     expect(tools.status).toBe(200);
     expect(tools.body.managedTools).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: 'homebrew', installed: true, source: 'relay' }),
+      expect.objectContaining({ id: 'rust', installed: false, source: 'unavailable' }),
       expect.objectContaining({ id: 'flutter', installed: true, source: 'relay' }),
     ]));
     expect(tools.body.customTools).toEqual([]);
@@ -549,11 +548,11 @@ describe('Relay server', () => {
     const install = await base
       .post('/api/tools/install')
       .set('x-auth-token', 'test-token')
-      .send({ tool: 'php' });
+      .send({ tool: 'rust' });
 
-    expect([200, 500]).toContain(install.status);
-    expect(install.body.error).not.toBe('tool_install_failed');
-    expect(String(install.body.message || '')).not.toContain('brew: not found');
+    expect(install.status).toBe(200);
+    expect(install.body.ok).toBe(true);
+    expect(install.body.tool.id).toBe('rust');
   });
 
   it('supports initializing git later for an existing project', async () => {

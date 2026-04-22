@@ -38,7 +38,7 @@ const DEFAULT_ROWS = 24;
 const PROJECT_NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
 const RECENT_PROJECT_LIMIT = 10;
 const execFile = promisify(execFileCallback);
-const MANAGED_TOOL_IDS = ['homebrew', 'php', 'composer', 'python', 'go', 'rust', 'java', 'flutter'] as const;
+const MANAGED_TOOL_IDS = ['rust', 'flutter'] as const;
 
 type ManagedToolId = typeof MANAGED_TOOL_IDS[number];
 
@@ -109,10 +109,6 @@ function getRelayStateRoot(workspace = resolveWorkspace()): string {
   return path.join(getRelayRoot(workspace), 'state');
 }
 
-function getHomebrewPrefix(workspace = resolveWorkspace()): string {
-  return path.join(getRelayToolsRoot(workspace), 'homebrew');
-}
-
 function getFlutterRoot(workspace = resolveWorkspace()): string {
   return path.join(getRelayToolsRoot(workspace), 'flutter');
 }
@@ -122,7 +118,6 @@ function createTerminalEnv(workspace: string): NodeJS.ProcessEnv {
   const relayTools = getRelayToolsRoot(workspace);
   const relayCache = getRelayCacheRoot(workspace);
   const relayBin = getRelayBinRoot(workspace);
-  const homebrewPrefix = getHomebrewPrefix(workspace);
   const flutterRoot = getFlutterRoot(workspace);
   const env: NodeJS.ProcessEnv = {
     ...process.env,
@@ -131,7 +126,6 @@ function createTerminalEnv(workspace: string): NodeJS.ProcessEnv {
     RELAY_TOOLS: relayTools,
     RELAY_CACHE: relayCache,
     RELAY_BIN: relayBin,
-    HOMEBREW_PREFIX: homebrewPrefix,
     FLUTTER_HOME: flutterRoot,
     PUB_CACHE: path.join(relayCache, 'dart-pub'),
     npm_config_cache: path.join(relayCache, 'npm'),
@@ -141,13 +135,7 @@ function createTerminalEnv(workspace: string): NodeJS.ProcessEnv {
     GOPATH: path.join(relayCache, 'go'),
     GOMODCACHE: path.join(relayCache, 'go', 'pkg', 'mod'),
     GRADLE_USER_HOME: path.join(relayCache, 'gradle'),
-    JAVA_HOME: path.join(homebrewPrefix, 'opt', 'openjdk'),
     ANDROID_SDK_ROOT: path.join(relayTools, 'android-sdk'),
-    HOMEBREW_NO_AUTO_UPDATE: '1',
-    HOMEBREW_NO_ANALYTICS: '1',
-    HOMEBREW_NO_ENV_HINTS: '1',
-    HOMEBREW_NO_INSTALL_CLEANUP: '1',
-    HOMEBREW_CURL_RETRIES: '3',
     BROWSER: 'relay-browser',
     RELAY_BROWSER: '1',
     PROMPT_COMMAND: '',
@@ -156,8 +144,6 @@ function createTerminalEnv(workspace: string): NodeJS.ProcessEnv {
       relayBin,
       path.join(relayCache, 'go', 'bin'),
       path.join(relayCache, 'cargo', 'bin'),
-      path.join(homebrewPrefix, 'bin'),
-      path.join(homebrewPrefix, 'sbin'),
       path.join(flutterRoot, 'bin'),
       path.join(relayTools, 'python-userbase', 'bin'),
       path.join(relayTools, 'npm-global', 'bin'),
@@ -728,65 +714,6 @@ type CustomToolStatus = {
 };
 
 const MANAGED_TOOLS: Record<ManagedToolId, ManagedToolDefinition> = {
-  homebrew: {
-    id: 'homebrew',
-    name: 'Homebrew',
-    description: 'Volume-backed package manager for CLI tools and language runtimes.',
-    category: 'package-manager',
-    installMethod: 'bootstrap',
-    supported: true,
-    binary: 'brew',
-    versionArgs: ['--version'],
-    pathResolver: (workspace) => path.join(getHomebrewPrefix(workspace), 'bin', 'brew'),
-  },
-  php: {
-    id: 'php',
-    name: 'PHP',
-    description: 'PHP runtime installed through Homebrew into the persistent tool volume.',
-    category: 'language',
-    installMethod: 'brew',
-    supported: true,
-    formula: 'php',
-    binary: 'php',
-    versionArgs: ['-v'],
-    pathResolver: (workspace) => path.join(getHomebrewPrefix(workspace), 'bin', 'php'),
-  },
-  composer: {
-    id: 'composer',
-    name: 'Composer',
-    description: 'PHP dependency manager installed through Homebrew.',
-    category: 'package-manager',
-    installMethod: 'brew',
-    supported: true,
-    formula: 'composer',
-    binary: 'composer',
-    versionArgs: ['--version'],
-    pathResolver: (workspace) => path.join(getHomebrewPrefix(workspace), 'bin', 'composer'),
-  },
-  python: {
-    id: 'python',
-    name: 'Python',
-    description: 'Python runtime installed through Homebrew with caches on the persistent volume.',
-    category: 'language',
-    installMethod: 'brew',
-    supported: true,
-    formula: 'python',
-    binary: 'python3',
-    versionArgs: ['--version'],
-    pathResolver: (workspace) => path.join(getHomebrewPrefix(workspace), 'bin', 'python3'),
-  },
-  go: {
-    id: 'go',
-    name: 'Go',
-    description: 'Go toolchain installed through Homebrew with GOPATH and module cache on the volume.',
-    category: 'language',
-    installMethod: 'brew',
-    supported: true,
-    formula: 'go',
-    binary: 'go',
-    versionArgs: ['version'],
-    pathResolver: (workspace) => path.join(getHomebrewPrefix(workspace), 'bin', 'go'),
-  },
   rust: {
     id: 'rust',
     name: 'Rust',
@@ -797,18 +724,6 @@ const MANAGED_TOOLS: Record<ManagedToolId, ManagedToolDefinition> = {
     binary: 'rustc',
     versionArgs: ['--version'],
     pathResolver: (workspace) => path.join(getRelayCacheRoot(workspace), 'cargo', 'bin', 'rustc'),
-  },
-  java: {
-    id: 'java',
-    name: 'OpenJDK',
-    description: 'Java toolchain installed through Homebrew for Android CLI and Gradle-based workflows.',
-    category: 'language',
-    installMethod: 'brew',
-    supported: true,
-    formula: 'openjdk',
-    binary: 'java',
-    versionArgs: ['-version'],
-    pathResolver: (workspace) => path.join(getHomebrewPrefix(workspace), 'bin', 'java'),
   },
   flutter: {
     id: 'flutter',
@@ -862,32 +777,6 @@ async function ensureToolDirectories(workspace: string): Promise<void> {
     fs.mkdir(getRelayBinRoot(workspace), { recursive: true }),
     fs.mkdir(getRelayStateRoot(workspace), { recursive: true }),
   ]);
-  await ensureRelayBinaries(workspace);
-}
-
-async function ensureRelayBinaries(workspace: string): Promise<void> {
-  const binDir = getRelayBinRoot(workspace);
-  const browserScriptPath = path.join(binDir, 'relay-browser');
-  const browserScriptContent = `#!/usr/bin/env sh
-if [ -z "$1" ]; then
-  exit 0
-fi
-
-# Print a formatted message with a clickable link (using OSC 8)
-printf "\\n\\r[relay] A tool wants to open a browser. Please click the link below:\\n\\r"
-printf "\\033]8;;%s\\033\\\\%s\\033]8;;\\033\\\\\\n\\r\\n\\r" "$1" "$1"
-`;
-
-  await fs.writeFile(browserScriptPath, browserScriptContent, { mode: 0o755 });
-
-  // Link xdg-open to our redirection script for tools that don't respect $BROWSER
-  const xdgOpenPath = path.join(binDir, 'xdg-open');
-  try {
-    await fs.unlink(xdgOpenPath).catch(() => {});
-    await fs.symlink('relay-browser', xdgOpenPath);
-  } catch (error) {
-    // Ignore errors if symlink fails
-  }
 }
 
 function quoteShell(value: string): string {
@@ -996,9 +885,6 @@ async function installManagedTool(workspace: string, toolId: ManagedToolId): Pro
         WORKSPACE: workspace,
       },
     });
-  } else if (tool.installMethod === 'brew') {
-    await installManagedTool(workspace, 'homebrew');
-    await runShellCommand(workspace, `brew install ${quoteShell(tool.formula || tool.id)}`);
   } else if (tool.installMethod === 'git') {
     const flutterRoot = getFlutterRoot(workspace);
     if (await exists(flutterRoot)) {
@@ -1024,11 +910,7 @@ async function uninstallManagedTool(workspace: string, toolId: ManagedToolId): P
   }
 
   if (tool.installMethod === 'bootstrap') {
-    await fs.rm(getHomebrewPrefix(workspace), { recursive: true, force: true });
-  } else if (tool.installMethod === 'brew') {
-    if (await exists(path.join(getHomebrewPrefix(workspace), 'bin', 'brew'))) {
-      await runShellCommand(workspace, `brew uninstall ${quoteShell(tool.formula || tool.id)}`);
-    }
+    // No-op for removed bootstrap tools
   } else if (tool.installMethod === 'git') {
     await fs.rm(getFlutterRoot(workspace), { recursive: true, force: true });
   } else if (tool.installMethod === 'rustup') {

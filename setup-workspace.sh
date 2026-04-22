@@ -12,7 +12,6 @@ RELAY_BIN_DIR="$RELAY_ROOT/bin"
 RELAY_STATE_DIR="$RELAY_ROOT/state"
 RELAY_ENV_PATH="$RELAY_STATE_DIR/tool-env.sh"
 NVM_DIR="$RELAY_TOOLS_DIR/nvm"
-HOMEBREW_PREFIX="$RELAY_TOOLS_DIR/homebrew"
 BASHRC_PATH="$WORKSPACE/.bashrc"
 BASH_PROFILE_PATH="$WORKSPACE/.bash_profile"
 PROJECTS_DIR="$WORKSPACE/projects"
@@ -88,12 +87,6 @@ export RELAY_TOOLS="$RELAY_TOOLS_DIR"
 export RELAY_CACHE="$RELAY_CACHE_DIR"
 export RELAY_BIN="$RELAY_BIN_DIR"
 export NVM_DIR="$NVM_DIR"
-export HOMEBREW_PREFIX="$HOMEBREW_PREFIX"
-export HOMEBREW_NO_AUTO_UPDATE=1
-export HOMEBREW_NO_ANALYTICS=1
-export HOMEBREW_NO_ENV_HINTS=1
-export HOMEBREW_NO_INSTALL_CLEANUP=1
-export HOMEBREW_CURL_RETRIES=3
 export npm_config_prefix="$NPM_GLOBAL_DIR"
 export PYTHONUSERBASE="$PYTHON_USERBASE"
 export PUB_CACHE="$PUB_CACHE_DIR"
@@ -105,8 +98,7 @@ export GOMODCACHE="$GO_HOME_DIR/pkg/mod"
 export GRADLE_USER_HOME="$GRADLE_HOME_DIR"
 export FLUTTER_HOME="$FLUTTER_HOME_DIR"
 export ANDROID_SDK_ROOT="$RELAY_TOOLS_DIR/android-sdk"
-export JAVA_HOME="$HOMEBREW_PREFIX/opt/openjdk"
-export PATH="$RELAY_BIN_DIR:$GO_HOME_DIR/bin:$CARGO_HOME_DIR/bin:$NPM_GLOBAL_DIR/bin:$PYTHON_USERBASE/bin:$HOMEBREW_PREFIX/bin:$HOMEBREW_PREFIX/sbin:$FLUTTER_HOME_DIR/bin:\$PATH"
+export PATH="$RELAY_BIN_DIR:$GO_HOME_DIR/bin:$CARGO_HOME_DIR/bin:$NPM_GLOBAL_DIR/bin:$PYTHON_USERBASE/bin:$FLUTTER_HOME_DIR/bin:\$PATH"
 [ -s "\$NVM_DIR/nvm.sh" ] && source "\$NVM_DIR/nvm.sh"
 EOF
 
@@ -140,28 +132,6 @@ if [[ ! -s "$NVM_DIR/nvm.sh" ]]; then
   fi
 else
   record_status nvm "ready"
-fi
-
-if [[ ! -x "$HOMEBREW_PREFIX/bin/brew" ]]; then
-  rm -rf "$HOMEBREW_PREFIX"
-  mkdir -p "$HOMEBREW_PREFIX/bin" "$HOMEBREW_PREFIX/sbin"
-
-  if has_command git; then
-    if git clone https://github.com/Homebrew/brew "$HOMEBREW_PREFIX/Homebrew" && \
-      ln -sf ../Homebrew/bin/brew "$HOMEBREW_PREFIX/bin/brew" && \
-      "$HOMEBREW_PREFIX/bin/brew" --version >/dev/null 2>&1; then
-      record_status homebrew "installed"
-    else
-      record_status homebrew "failed"
-      BOOTSTRAP_COMPLETE=0
-    fi
-  else
-    echo "[bootstrap] skipping Homebrew install because git is unavailable" >&2
-    record_status homebrew "skipped"
-    BOOTSTRAP_COMPLETE=0
-  fi
-else
-  record_status homebrew "ready"
 fi
 
 if [[ "$BOOTSTRAP_COMPLETE" -eq 1 ]]; then

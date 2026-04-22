@@ -24,8 +24,6 @@ describe('setup-workspace script', () => {
 
   it('retries missing components instead of treating a partial first boot as complete forever', () => {
     expect(script).toContain('skipping nvm install because git is unavailable');
-    expect(script).toContain('skipping Homebrew install because git is unavailable');
-    expect(script).toContain('git clone https://github.com/Homebrew/brew');
     expect(script).toContain('export RELAY_HOME="$RELAY_ROOT"');
     expect(script).toContain('export FLUTTER_HOME="$FLUTTER_HOME_DIR"');
     expect(script).not.toContain('workspace already initialized');
