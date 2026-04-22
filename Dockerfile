@@ -12,11 +12,11 @@ RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
     python3-venv \
-    php8.1-cli \
-    php8.1-xml \
-    php8.1-mbstring \
-    php8.1-curl \
-    php8.1-zip \
+    php-cli \
+    php-xml \
+    php-mbstring \
+    php-curl \
+    php-zip \
     composer \
     golang-go \
     default-jdk \
