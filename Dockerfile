@@ -60,7 +60,15 @@ RUN apt-get update && apt-get install -y \
     cargo \
     unzip \
     ca-certificates \
+    chromium \
+    libgtk-3-0 \
+    libnotify4 \
+    libnss3 \
+    libxss1 \
+    libasound2 \
     && rm -rf /var/lib/apt/lists/*
+
+ENV CHROME_EXECUTABLE_PATH=/usr/bin/chromium
 
 RUN curl -fsSL https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-x64.tar.gz | tar -xz -C /usr/local --strip-components=1
 
