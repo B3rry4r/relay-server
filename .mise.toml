@@ -1,0 +1,7 @@
+[tools]
+php = "latest"
+composer = "latest"
+go = "latest"
+java = "latest"
+rust = "latest"
+flutter = "latest"
