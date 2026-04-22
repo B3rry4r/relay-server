@@ -66,7 +66,7 @@ RUN curl -fsSL https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-x64.tar.gz |
 
 WORKDIR /app
 COPY --from=builder /app/dist ./dist
-COPY package.json .
+COPY package.json package-lock.json .
 RUN npm ci --omit=dev --ignore-scripts
 COPY setup-workspace.sh .
 
