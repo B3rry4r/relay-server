@@ -895,6 +895,32 @@ async function runShellCommand(workspace: string, command: string): Promise<{ st
   }
 }
 
+async function findCommandPath(workspace: string, command: string): Promise<string | null> {
+  try {
+    const { stdout } = await execFile(
+      resolveShell(),
+      ['-c', `command -v ${command}`],
+      {
+        cwd: workspace,
+        env: createTerminalEnv(workspace),
+      }
+    );
+    const resolved = stdout.trim();
+    return resolved.length > 0 ? resolved : null;
+  } catch {
+    return null;
+  }
+}
+
+async function ensureNixAvailable(workspace: string): Promise<string> {
+  const nixPath = await findCommandPath(workspace, 'nix');
+  if (!nixPath) {
+    throw new Error('nix_unavailable');
+  }
+
+  return nixPath;
+}
+
 async function ensureToolDirectories(workspace: string): Promise<void> {
   await Promise.all([
     fs.mkdir(getRelayRoot(workspace), { recursive: true }),
@@ -1063,6 +1089,7 @@ async function installManagedTool(workspace: string, toolId: ManagedToolId): Pro
     }
     await runShellCommand(workspace, `'${path.join(flutterRoot, 'bin', 'flutter')}' config --enable-web`);
   } else if (tool.installMethod === 'nix') {
+    await ensureNixAvailable(workspace);
     const profilePath = getManagedToolProfilePath(workspace, tool.id);
     await fs.mkdir(path.dirname(profilePath), { recursive: true });
     await runShellCommand(workspace, `nix profile install --accept-flake-config --profile '${profilePath}' '${tool.nixPackage}'`);
@@ -1197,7 +1224,8 @@ async function searchNixPackages(workspace: string, query: string): Promise<Arra
     throw new Error('invalid_search_query');
   }
 
-  const { stdout } = await execFile('nix', ['search', 'nixpkgs', trimmed, '--json'], {
+  const nixPath = await ensureNixAvailable(workspace);
+  const { stdout } = await execFile(nixPath, ['search', 'nixpkgs', trimmed, '--json'], {
     cwd: workspace,
     env: createTerminalEnv(workspace),
     maxBuffer: 20 * 1024 * 1024,
@@ -1233,6 +1261,7 @@ async function installNixPackage(
     throw new Error('invalid_nix_package');
   }
 
+  await ensureNixAvailable(workspace);
   const profilePath = getNixPackageProfilePath(workspace, packageId);
   const binPath = path.join(getRelayBinRoot(workspace), binary);
 
@@ -2378,10 +2407,22 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Nix search failed.';
-      const statusCode = message === 'invalid_search_query' ? 400 : 500;
+      const statusCode = message === 'invalid_search_query'
+        ? 400
+        : message === 'nix_unavailable'
+          ? 503
+          : 500;
       res.status(statusCode).json({
-        error: statusCode === 400 ? 'invalid_search_query' : 'nix_search_failed',
-        message: statusCode === 400 ? 'Search query must be at least 2 characters.' : message,
+        error: statusCode === 400
+          ? 'invalid_search_query'
+          : statusCode === 503
+            ? 'nix_unavailable'
+            : 'nix_search_failed',
+        message: statusCode === 400
+          ? 'Search query must be at least 2 characters.'
+          : statusCode === 503
+            ? 'Nix is not installed in the Relay runtime.'
+            : message,
       });
     }
   });
@@ -2400,13 +2441,23 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
       res.status(200).json({ ok: true, tool });
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Nix install failed.';
-      const statusCode = ['invalid_nix_package', 'nix_binary_not_found'].includes(message) ? 400 : 500;
+      const statusCode = ['invalid_nix_package', 'nix_binary_not_found'].includes(message)
+        ? 400
+        : message === 'nix_unavailable'
+          ? 503
+          : 500;
       res.status(statusCode).json({
-        error: statusCode === 400 ? message : 'nix_install_failed',
+        error: statusCode === 400
+          ? message
+          : statusCode === 503
+            ? 'nix_unavailable'
+            : 'nix_install_failed',
         message: statusCode === 400
           ? message === 'nix_binary_not_found'
             ? 'Installed package does not provide the requested binary.'
             : 'Nix package request is invalid.'
+          : statusCode === 503
+            ? 'Nix is not installed in the Relay runtime.'
           : message,
       });
     }
