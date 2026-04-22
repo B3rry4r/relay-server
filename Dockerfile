@@ -5,12 +5,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
     AUTH_TOKEN=change_this_to_a_strong_random_string \
     PORT=3000
 
-RUN apt-get update && apt-get install -y ca-certificates curl gnupg
-
-RUN mkdir -p /etc/apt/keyrings && \
-    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
-    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodus main" > /etc/apt/sources.list.d/nodesource.list
-
 RUN apt-get update && apt-get install -y \
     git \
     curl \
@@ -29,8 +23,10 @@ RUN apt-get update && apt-get install -y \
     rustc \
     cargo \
     unzip \
-    nodejs \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-x64.tar.gz | tar -xz -C /usr/local --strip-components=1
 
 WORKDIR /app
 COPY package*.json ./
