@@ -1,5 +1,5 @@
 [build]
-aptPackages = ["git", "curl", "build-essential", "python3", "python3-pip", "python3-venv", "php-cli", "composer", "golang-go", "default-jdk", "rustc", "cargo"]
+aptPackages = ["git", "curl", "build-essential", "python3", "python3-pip", "python3-venv", "php8.1-cli", "composer", "golang-go", "default-jdk", "rust-all", "unzip"]
 
 [deploy]
 startCommand = "npm start"
