@@ -126,6 +126,8 @@ function createTerminalEnv(workspace: string): NodeJS.ProcessEnv {
     RELAY_TOOLS: relayTools,
     RELAY_CACHE: relayCache,
     RELAY_BIN: relayBin,
+    MISE_DATA_DIR: path.join(relayTools, 'mise-data'),
+    MISE_CONFIG_DIR: path.join(getRelayStateRoot(workspace), 'mise'),
     FLUTTER_HOME: flutterRoot,
     PUB_CACHE: path.join(relayCache, 'dart-pub'),
     npm_config_cache: path.join(relayCache, 'npm'),
@@ -141,6 +143,7 @@ function createTerminalEnv(workspace: string): NodeJS.ProcessEnv {
     PROMPT_COMMAND: '',
     TERM: process.env.TERM || 'xterm-256color',
     PATH: [
+      path.join(relayTools, 'mise', 'bin'),
       relayBin,
       path.join(relayCache, 'go', 'bin'),
       path.join(relayCache, 'cargo', 'bin'),

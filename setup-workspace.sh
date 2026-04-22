@@ -12,6 +12,10 @@ RELAY_BIN_DIR="$RELAY_ROOT/bin"
 RELAY_STATE_DIR="$RELAY_ROOT/state"
 RELAY_ENV_PATH="$RELAY_STATE_DIR/tool-env.sh"
 NVM_DIR="$RELAY_TOOLS_DIR/nvm"
+MISE_DIR="$RELAY_TOOLS_DIR/mise"
+MISE_BIN_DIR="$MISE_DIR/bin"
+MISE_DATA_DIR="$RELAY_TOOLS_DIR/mise-data"
+MISE_CONFIG_DIR="$RELAY_STATE_DIR/mise"
 BASHRC_PATH="$WORKSPACE/.bashrc"
 BASH_PROFILE_PATH="$WORKSPACE/.bash_profile"
 PROJECTS_DIR="$WORKSPACE/projects"
@@ -69,7 +73,8 @@ record_status() {
 
 mkdir -p "$WORKSPACE" "$PROJECTS_DIR" "$NPM_GLOBAL_DIR/bin" "$PYTHON_USERBASE/bin"
 mkdir -p "$RELAY_ROOT" "$RELAY_TOOLS_DIR" "$RELAY_CACHE_DIR" "$RELAY_BIN_DIR" "$RELAY_STATE_DIR" \
-  "$PUB_CACHE_DIR" "$PIP_CACHE_DIR" "$CARGO_HOME_DIR/bin" "$GO_HOME_DIR/bin" "$GRADLE_HOME_DIR"
+  "$PUB_CACHE_DIR" "$PIP_CACHE_DIR" "$CARGO_HOME_DIR/bin" "$GO_HOME_DIR/bin" "$GRADLE_HOME_DIR" \
+  "$MISE_DIR" "$MISE_DATA_DIR" "$MISE_CONFIG_DIR"
 printf '' > "$BOOTSTRAP_STATUS_PATH"
 record_status workspace "$WORKSPACE"
 record_status relay_root "ready"
@@ -81,12 +86,19 @@ record_status projects_dir "ready"
 record_status npm_global "ready"
 record_status python_userbase "ready"
 
+if ! has_command mise; then
+  curl https://mise.run | MISE_INSTALL_PATH="$MISE_BIN_DIR/mise" sh
+fi
+record_status mise "installed"
+
 cat > "$RELAY_ENV_PATH" <<EOF
 export RELAY_HOME="$RELAY_ROOT"
 export RELAY_TOOLS="$RELAY_TOOLS_DIR"
 export RELAY_CACHE="$RELAY_CACHE_DIR"
 export RELAY_BIN="$RELAY_BIN_DIR"
 export NVM_DIR="$NVM_DIR"
+export MISE_DATA_DIR="$MISE_DATA_DIR"
+export MISE_CONFIG_DIR="$MISE_CONFIG_DIR"
 export npm_config_prefix="$NPM_GLOBAL_DIR"
 export PYTHONUSERBASE="$PYTHON_USERBASE"
 export PUB_CACHE="$PUB_CACHE_DIR"
@@ -98,7 +110,7 @@ export GOMODCACHE="$GO_HOME_DIR/pkg/mod"
 export GRADLE_USER_HOME="$GRADLE_HOME_DIR"
 export FLUTTER_HOME="$FLUTTER_HOME_DIR"
 export ANDROID_SDK_ROOT="$RELAY_TOOLS_DIR/android-sdk"
-export PATH="$RELAY_BIN_DIR:$GO_HOME_DIR/bin:$CARGO_HOME_DIR/bin:$NPM_GLOBAL_DIR/bin:$PYTHON_USERBASE/bin:$FLUTTER_HOME_DIR/bin:\$PATH"
+export PATH="$MISE_BIN_DIR:$RELAY_BIN_DIR:$GO_HOME_DIR/bin:$CARGO_HOME_DIR/bin:$NPM_GLOBAL_DIR/bin:$PYTHON_USERBASE/bin:$FLUTTER_HOME_DIR/bin:\$PATH"
 [ -s "\$NVM_DIR/nvm.sh" ] && source "\$NVM_DIR/nvm.sh"
 EOF
 
