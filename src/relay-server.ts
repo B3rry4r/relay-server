@@ -38,7 +38,7 @@ const DEFAULT_ROWS = 24;
 const PROJECT_NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
 const RECENT_PROJECT_LIMIT = 10;
 const execFile = promisify(execFileCallback);
-const MANAGED_TOOL_IDS = ['rust', 'flutter'] as const;
+const MANAGED_TOOL_IDS = ['php', 'python', 'go', 'rust', 'java', 'flutter'] as const;
 
 type ManagedToolId = typeof MANAGED_TOOL_IDS[number];
 
@@ -113,6 +113,44 @@ function getFlutterRoot(workspace = resolveWorkspace()): string {
   return path.join(getRelayToolsRoot(workspace), 'flutter');
 }
 
+function getRelayBrowserPath(workspace = resolveWorkspace()): string {
+  return path.join(getRelayBinRoot(workspace), 'relay-browser');
+}
+
+function getGeminiSettingsPath(workspace = resolveWorkspace()): string {
+  return path.join(workspace, '.gemini', 'settings.json');
+}
+
+function getNixPackagesRegistryPath(workspace = resolveWorkspace()): string {
+  return path.join(getRelayStateRoot(workspace), 'nix-packages.json');
+}
+
+function getNixPackageProfilesRoot(workspace = resolveWorkspace()): string {
+  return path.join(getRelayToolsRoot(workspace), 'nix-profiles');
+}
+
+function getNixPackageProfilePath(workspace: string, packageId: string): string {
+  return path.join(getNixPackageProfilesRoot(workspace), packageId);
+}
+
+function getSystemNixPlatform(): string {
+  const arch = process.arch === 'x64'
+    ? 'x86_64'
+    : process.arch === 'arm64'
+      ? 'aarch64'
+      : process.arch;
+  const platform = process.platform === 'linux'
+    ? 'linux'
+    : process.platform === 'darwin'
+      ? 'darwin'
+      : process.platform;
+  return `${arch}-${platform}`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 function createTerminalEnv(workspace: string): NodeJS.ProcessEnv {
   const relayRoot = getRelayRoot(workspace);
   const relayTools = getRelayToolsRoot(workspace);
@@ -138,8 +176,10 @@ function createTerminalEnv(workspace: string): NodeJS.ProcessEnv {
     GOMODCACHE: path.join(relayCache, 'go', 'pkg', 'mod'),
     GRADLE_USER_HOME: path.join(relayCache, 'gradle'),
     ANDROID_SDK_ROOT: path.join(relayTools, 'android-sdk'),
-    BROWSER: 'relay-browser',
+    NIX_CONFIG: `${process.env.NIX_CONFIG ? `${process.env.NIX_CONFIG}\n` : ''}experimental-features = nix-command flakes`,
+    BROWSER: getRelayBrowserPath(workspace),
     RELAY_BROWSER: '1',
+    RELAY_BROWSER_STATE_PATH: path.join(getRelayStateRoot(workspace), 'browser-url.txt'),
     PROMPT_COMMAND: '',
     TERM: process.env.TERM || 'xterm-256color',
     PATH: [
@@ -668,10 +708,10 @@ type ManagedToolDefinition = {
   binary: string;
   category: 'package-manager' | 'language' | 'sdk';
   description: string;
-  formula?: string;
   id: ManagedToolId;
-  installMethod: 'bootstrap' | 'brew' | 'git' | 'rustup';
+  installMethod: 'git' | 'nix';
   name: string;
+  nixPackage?: string;
   pathResolver: (workspace: string) => string;
   supported: boolean;
   versionArgs: string[];
@@ -716,27 +756,110 @@ type CustomToolStatus = {
   version: string | null;
 };
 
+type NixPackageRecord = {
+  binary: string;
+  id: string;
+  name: string;
+  packageRef: string;
+  profilePath: string;
+  versionArgs?: string[];
+};
+
+type NixPackageStatus = {
+  binary: string;
+  id: string;
+  kind: 'nix-package';
+  installMethod: 'nix';
+  installPath: string;
+  installed: boolean;
+  name: string;
+  packageRef: string;
+  source: 'relay' | 'unavailable';
+  version: string | null;
+};
+
+function getManagedToolProfilesRoot(workspace = resolveWorkspace()): string {
+  return path.join(getRelayToolsRoot(workspace), 'profiles');
+}
+
+function getManagedToolProfilePath(workspace: string, toolId: ManagedToolId): string {
+  return path.join(getManagedToolProfilesRoot(workspace), toolId);
+}
+
+function getManagedToolLinkedBinaryPath(workspace: string, binary: string): string {
+  return path.join(getRelayBinRoot(workspace), binary);
+}
+
 const MANAGED_TOOLS: Record<ManagedToolId, ManagedToolDefinition> = {
+  php: {
+    id: 'php',
+    name: 'PHP',
+    description: 'PHP runtime installed from nixpkgs into persistent Relay-managed profiles.',
+    category: 'language',
+    installMethod: 'nix',
+    nixPackage: 'nixpkgs#php',
+    binary: 'php',
+    versionArgs: ['-v'],
+    supported: true,
+    pathResolver: (workspace) => getManagedToolLinkedBinaryPath(workspace, 'php'),
+  },
+  python: {
+    id: 'python',
+    name: 'Python',
+    description: 'Python runtime installed from nixpkgs into persistent Relay-managed profiles.',
+    category: 'language',
+    installMethod: 'nix',
+    nixPackage: 'nixpkgs#python3',
+    binary: 'python3',
+    versionArgs: ['--version'],
+    supported: true,
+    pathResolver: (workspace) => getManagedToolLinkedBinaryPath(workspace, 'python3'),
+  },
+  go: {
+    id: 'go',
+    name: 'Go',
+    description: 'Go toolchain installed from nixpkgs into persistent Relay-managed profiles.',
+    category: 'language',
+    installMethod: 'nix',
+    nixPackage: 'nixpkgs#go',
+    binary: 'go',
+    versionArgs: ['version'],
+    supported: true,
+    pathResolver: (workspace) => getManagedToolLinkedBinaryPath(workspace, 'go'),
+  },
   rust: {
     id: 'rust',
     name: 'Rust',
-    description: 'Rust toolchain installed with rustup into persistent Relay-managed paths.',
+    description: 'Rust toolchain installed from nixpkgs into persistent Relay-managed profiles.',
     category: 'language',
-    installMethod: 'rustup',
-    supported: true,
+    installMethod: 'nix',
+    nixPackage: 'nixpkgs#rustc',
     binary: 'rustc',
     versionArgs: ['--version'],
-    pathResolver: (workspace) => path.join(getRelayCacheRoot(workspace), 'cargo', 'bin', 'rustc'),
+    supported: true,
+    pathResolver: (workspace) => getManagedToolLinkedBinaryPath(workspace, 'rustc'),
+  },
+  java: {
+    id: 'java',
+    name: 'OpenJDK',
+    description: 'Java runtime installed from nixpkgs into persistent Relay-managed profiles.',
+    category: 'language',
+    installMethod: 'nix',
+    nixPackage: 'nixpkgs#jdk',
+    binary: 'java',
+    versionArgs: ['-version'],
+    supported: true,
+    pathResolver: (workspace) => getManagedToolLinkedBinaryPath(workspace, 'java'),
   },
   flutter: {
     id: 'flutter',
     name: 'Flutter',
-    description: 'Flutter SDK installed into the persistent tool volume for web builds and port-based previews.',
+    description: 'Flutter SDK installed into the persistent Relay tool volume for web and CLI workflows.',
     category: 'sdk',
     installMethod: 'git',
-    supported: true,
     binary: 'flutter',
     versionArgs: ['--version'],
+    supported: true,
     pathResolver: (workspace) => path.join(getFlutterRoot(workspace), 'bin', 'flutter'),
   },
 };
@@ -776,64 +899,12 @@ async function ensureToolDirectories(workspace: string): Promise<void> {
   await Promise.all([
     fs.mkdir(getRelayRoot(workspace), { recursive: true }),
     fs.mkdir(getRelayToolsRoot(workspace), { recursive: true }),
+    fs.mkdir(getManagedToolProfilesRoot(workspace), { recursive: true }),
+    fs.mkdir(getNixPackageProfilesRoot(workspace), { recursive: true }),
     fs.mkdir(getRelayCacheRoot(workspace), { recursive: true }),
     fs.mkdir(getRelayBinRoot(workspace), { recursive: true }),
     fs.mkdir(getRelayStateRoot(workspace), { recursive: true }),
   ]);
-}
-
-function quoteShell(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-
-async function getManagedToolStatus(workspace: string, tool: ManagedToolDefinition): Promise<ManagedToolStatus> {
-  const installPath = tool.pathResolver(workspace);
-  const relayBinaryExists = await exists(installPath);
-  const env = createTerminalEnv(workspace);
-
-  const commandPath = relayBinaryExists ? installPath : tool.binary;
-  try {
-    const { stdout, stderr } = await execFile(commandPath, tool.versionArgs, {
-      cwd: workspace,
-      env,
-    });
-    const versionOutput = `${stdout}${stderr}`.trim();
-    const resolvedPath = relayBinaryExists
-      ? installPath
-      : await execFile('sh', ['-c', `command -v ${tool.binary}`], { cwd: workspace, env }).then((result) => result.stdout.trim()).catch(() => '');
-    return {
-      id: tool.id,
-      kind: 'managed',
-      name: tool.name,
-      description: tool.description,
-      category: tool.category,
-      installMethod: tool.installMethod,
-      installPath,
-      installed: true,
-      supported: tool.supported,
-      version: versionOutput.split('\n')[0] || null,
-      source: resolvedPath.startsWith(getRelayRoot(workspace)) ? 'relay' : 'system',
-    };
-  } catch {
-    return {
-      id: tool.id,
-      kind: 'managed',
-      name: tool.name,
-      description: tool.description,
-      category: tool.category,
-      installMethod: tool.installMethod,
-      installPath,
-      installed: false,
-      supported: tool.supported,
-      version: null,
-      source: 'unavailable',
-    };
-  }
-}
-
-async function listManagedToolStatuses(workspace = resolveWorkspace()): Promise<ManagedToolStatus[]> {
-  await ensureToolDirectories(workspace);
-  return Promise.all(getManagedToolCatalog(workspace).map((tool) => getManagedToolStatus(workspace, tool)));
 }
 
 function sanitizeToolId(value: string): string | null {
@@ -873,55 +944,357 @@ async function listCustomToolStatuses(workspace = resolveWorkspace()): Promise<C
   return Promise.all(tools.map((tool) => getCustomToolStatus(workspace, tool)));
 }
 
-async function installManagedTool(workspace: string, toolId: ManagedToolId): Promise<ManagedToolStatus> {
+async function ensureRelayBrowserScript(workspace: string): Promise<void> {
+  const browserPath = getRelayBrowserPath(workspace);
+  const script = `#!/usr/bin/env bash
+set -euo pipefail
+
+URL="\${1:-}"
+STATE_PATH="\${RELAY_BROWSER_STATE_PATH:-${path.join(getRelayStateRoot(workspace), 'browser-url.txt')}}"
+mkdir -p "$(dirname "$STATE_PATH")"
+printf '%s\n' "$URL" > "$STATE_PATH"
+printf '[relay] Browser auth URL: %s\n' "$URL" >&2
+
+if command -v xdg-open >/dev/null 2>&1; then
+  xdg-open "$URL" >/dev/null 2>&1 || true
+elif command -v open >/dev/null 2>&1; then
+  open "$URL" >/dev/null 2>&1 || true
+fi
+`;
+
+  await fs.writeFile(browserPath, script, { mode: 0o755 });
+}
+
+async function ensureGeminiAuthSettings(workspace: string): Promise<void> {
+  const settingsPath = getGeminiSettingsPath(workspace);
+  await fs.mkdir(path.dirname(settingsPath), { recursive: true });
+  const current = await readJsonFile<Record<string, unknown>>(settingsPath, {});
+  const security = isRecord(current.security) ? current.security : {};
+  const auth = isRecord(security.auth) ? security.auth : {};
+
+  if (typeof auth.selectedType === 'string' && auth.selectedType.length > 0) {
+    return;
+  }
+
+  await writeJsonFile(settingsPath, {
+    ...current,
+    security: {
+      ...security,
+      auth: {
+        ...auth,
+        selectedType: 'oauth-personal',
+      },
+    },
+  });
+}
+
+async function ensureRelayRuntimeAssets(workspace: string): Promise<void> {
   await ensureToolDirectories(workspace);
+  await Promise.all([
+    ensureRelayBrowserScript(workspace),
+    ensureGeminiAuthSettings(workspace),
+  ]);
+}
+
+async function listManagedToolStatuses(workspace = resolveWorkspace()): Promise<ManagedToolStatus[]> {
+  await ensureRelayRuntimeAssets(workspace);
+  return Promise.all(getManagedToolCatalog(workspace).map(async (tool) => {
+    const installPath = tool.pathResolver(workspace);
+    const env = createTerminalEnv(workspace);
+    const relayBinaryExists = await exists(installPath);
+    const commandPath = relayBinaryExists ? installPath : tool.binary;
+
+    try {
+      const { stdout, stderr } = await execFile(commandPath, tool.versionArgs, {
+        cwd: workspace,
+        env,
+      });
+      const version = `${stdout}${stderr}`.trim().split('\n')[0] || null;
+      const resolvedPath = relayBinaryExists
+        ? installPath
+        : await execFile('sh', ['-c', `command -v ${tool.binary}`], { cwd: workspace, env })
+          .then((result) => result.stdout.trim())
+          .catch(() => '');
+
+      return {
+        id: tool.id,
+        kind: 'managed' as const,
+        name: tool.name,
+        description: tool.description,
+        category: tool.category,
+        installMethod: tool.installMethod,
+        installPath,
+        installed: true,
+        source: resolvedPath.startsWith(getRelayRoot(workspace)) ? 'relay' as const : 'system' as const,
+        supported: tool.supported,
+        version,
+      };
+    } catch {
+      return {
+        id: tool.id,
+        kind: 'managed' as const,
+        name: tool.name,
+        description: tool.description,
+        category: tool.category,
+        installMethod: tool.installMethod,
+        installPath,
+        installed: false,
+        source: 'unavailable' as const,
+        supported: tool.supported,
+        version: null,
+      };
+    }
+  }));
+}
+
+async function installManagedTool(workspace: string, toolId: ManagedToolId): Promise<ManagedToolStatus> {
+  await ensureRelayRuntimeAssets(workspace);
   const tool = MANAGED_TOOLS[toolId];
   if (!tool || !tool.supported) {
     throw new Error('unsupported_tool');
   }
 
-  if (tool.installMethod === 'bootstrap') {
-    await execFile(path.resolve(process.cwd(), 'setup-workspace.sh'), [], {
-      cwd: process.cwd(),
-      env: {
-        ...process.env,
-        WORKSPACE: workspace,
-      },
-    });
-  } else if (tool.installMethod === 'git') {
+  if (tool.installMethod === 'git') {
     const flutterRoot = getFlutterRoot(workspace);
     if (await exists(flutterRoot)) {
-      await runShellCommand(workspace, `git -C ${quoteShell(flutterRoot)} pull --ff-only`);
+      await runShellCommand(workspace, `git -C '${flutterRoot}' pull --ff-only`);
     } else {
-      await runShellCommand(workspace, `git clone https://github.com/flutter/flutter.git -b stable ${quoteShell(flutterRoot)}`);
+      await runShellCommand(workspace, `git clone https://github.com/flutter/flutter.git -b stable '${flutterRoot}'`);
     }
-    await runShellCommand(workspace, `${quoteShell(path.join(flutterRoot, 'bin', 'flutter'))} config --enable-web`);
-  } else if (tool.installMethod === 'rustup') {
-    await runShellCommand(
-      workspace,
-      'curl https://sh.rustup.rs -sSf | sh -s -- -y --no-modify-path --default-toolchain stable'
-    );
+    await runShellCommand(workspace, `'${path.join(flutterRoot, 'bin', 'flutter')}' config --enable-web`);
+  } else if (tool.installMethod === 'nix') {
+    const profilePath = getManagedToolProfilePath(workspace, tool.id);
+    await fs.mkdir(path.dirname(profilePath), { recursive: true });
+    await runShellCommand(workspace, `nix profile install --accept-flake-config --profile '${profilePath}' '${tool.nixPackage}'`);
+    const sourceBinary = path.join(profilePath, 'bin', tool.binary);
+    const targetBinary = getManagedToolLinkedBinaryPath(workspace, tool.binary);
+    await fs.rm(targetBinary, { force: true });
+    await fs.symlink(sourceBinary, targetBinary);
   }
 
-  return getManagedToolStatus(workspace, tool);
+  const statuses = await listManagedToolStatuses(workspace);
+  return statuses.find((status) => status.id === toolId) ?? {
+    id: tool.id,
+    kind: 'managed',
+    name: tool.name,
+    description: tool.description,
+    category: tool.category,
+    installMethod: tool.installMethod,
+    installPath: tool.pathResolver(workspace),
+    installed: false,
+    source: 'unavailable',
+    supported: tool.supported,
+    version: null,
+  };
 }
 
 async function uninstallManagedTool(workspace: string, toolId: ManagedToolId): Promise<ManagedToolStatus> {
+  await ensureRelayRuntimeAssets(workspace);
   const tool = MANAGED_TOOLS[toolId];
   if (!tool || !tool.supported) {
     throw new Error('unsupported_tool');
   }
 
-  if (tool.installMethod === 'bootstrap') {
-    // No-op for removed bootstrap tools
-  } else if (tool.installMethod === 'git') {
+  if (tool.installMethod === 'git') {
     await fs.rm(getFlutterRoot(workspace), { recursive: true, force: true });
-  } else if (tool.installMethod === 'rustup') {
-    await fs.rm(path.join(getRelayCacheRoot(workspace), 'cargo'), { recursive: true, force: true });
-    await fs.rm(path.join(getRelayToolsRoot(workspace), 'rustup'), { recursive: true, force: true });
+  } else if (tool.installMethod === 'nix') {
+    await fs.rm(getManagedToolProfilePath(workspace, tool.id), { recursive: true, force: true });
+    await fs.rm(getManagedToolLinkedBinaryPath(workspace, tool.binary), { force: true });
   }
 
-  return getManagedToolStatus(workspace, tool);
+  const statuses = await listManagedToolStatuses(workspace);
+  return statuses.find((status) => status.id === toolId) ?? {
+    id: tool.id,
+    kind: 'managed',
+    name: tool.name,
+    description: tool.description,
+    category: tool.category,
+    installMethod: tool.installMethod,
+    installPath: tool.pathResolver(workspace),
+    installed: false,
+    source: 'unavailable',
+    supported: tool.supported,
+    version: null,
+  };
+}
+
+async function readNixPackages(workspace = resolveWorkspace()): Promise<NixPackageRecord[]> {
+  return readJsonFile<NixPackageRecord[]>(getNixPackagesRegistryPath(workspace), []);
+}
+
+async function writeNixPackages(workspace: string, packages: NixPackageRecord[]): Promise<void> {
+  await writeJsonFile(getNixPackagesRegistryPath(workspace), packages);
+}
+
+async function getNixPackageStatus(workspace: string, pkg: NixPackageRecord): Promise<NixPackageStatus> {
+  const installPath = path.join(getRelayBinRoot(workspace), pkg.binary);
+  const installed = await exists(installPath);
+  let version: string | null = null;
+
+  if (installed) {
+    try {
+      const { stdout, stderr } = await execFile(installPath, pkg.versionArgs || ['--version'], {
+        cwd: workspace,
+        env: createTerminalEnv(workspace),
+      });
+      version = `${stdout}${stderr}`.trim().split('\n')[0] || null;
+    } catch {
+      version = null;
+    }
+  }
+
+  return {
+    id: pkg.id,
+    kind: 'nix-package',
+    name: pkg.name,
+    binary: pkg.binary,
+    packageRef: pkg.packageRef,
+    installMethod: 'nix',
+    installPath,
+    installed,
+    source: installed ? 'relay' : 'unavailable',
+    version,
+  };
+}
+
+async function listNixPackageStatuses(workspace = resolveWorkspace()): Promise<NixPackageStatus[]> {
+  await ensureRelayRuntimeAssets(workspace);
+  const packages = await readNixPackages(workspace);
+  return Promise.all(packages.map((pkg) => getNixPackageStatus(workspace, pkg)));
+}
+
+function sanitizePackageRef(value: string): string | null {
+  const trimmed = value.trim();
+  return /^[A-Za-z0-9._+/#:-]+$/.test(trimmed) ? trimmed : null;
+}
+
+function nixAttrToPackageRef(attr: string): string {
+  const system = getSystemNixPlatform();
+  const prefixes = [
+    `legacyPackages.${system}.`,
+    `packages.${system}.`,
+  ];
+
+  for (const prefix of prefixes) {
+    if (attr.startsWith(prefix)) {
+      return `nixpkgs#${attr.slice(prefix.length)}`;
+    }
+  }
+
+  return `nixpkgs#${attr}`;
+}
+
+async function searchNixPackages(workspace: string, query: string): Promise<Array<{
+  attr: string;
+  description: string | null;
+  name: string;
+  packageRef: string;
+  version: string | null;
+}>> {
+  await ensureRelayRuntimeAssets(workspace);
+  const trimmed = query.trim();
+  if (trimmed.length < 2) {
+    throw new Error('invalid_search_query');
+  }
+
+  const { stdout } = await execFile('nix', ['search', 'nixpkgs', trimmed, '--json'], {
+    cwd: workspace,
+    env: createTerminalEnv(workspace),
+    maxBuffer: 20 * 1024 * 1024,
+  });
+
+  const parsed = JSON.parse(stdout) as Record<string, Record<string, unknown>>;
+  return Object.entries(parsed)
+    .map(([attr, meta]) => ({
+      attr,
+      name: typeof meta?.pname === 'string'
+        ? meta.pname
+        : typeof meta?.name === 'string'
+          ? meta.name
+          : attr.split('.').pop() || attr,
+      description: typeof meta?.description === 'string' ? meta.description : null,
+      version: typeof meta?.version === 'string' ? meta.version : null,
+      packageRef: nixAttrToPackageRef(attr),
+    }))
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .slice(0, 25);
+}
+
+async function installNixPackage(
+  workspace: string,
+  input: { binary: string; id?: string; name?: string; packageRef: string; versionArgs?: string[] }
+): Promise<NixPackageStatus> {
+  await ensureRelayRuntimeAssets(workspace);
+  const packageRef = sanitizePackageRef(input.packageRef);
+  const binary = sanitizeToolId(input.binary);
+  const packageId = sanitizeToolId(input.id || binary || input.packageRef.split('#').pop() || '');
+
+  if (!packageRef || !binary || !packageId) {
+    throw new Error('invalid_nix_package');
+  }
+
+  const profilePath = getNixPackageProfilePath(workspace, packageId);
+  const binPath = path.join(getRelayBinRoot(workspace), binary);
+
+  await runShellCommand(
+    workspace,
+    `nix profile install --accept-flake-config --profile '${profilePath}' '${packageRef}'`
+  );
+
+  const sourceBinary = path.join(profilePath, 'bin', binary);
+  if (!await exists(sourceBinary)) {
+    throw new Error('nix_binary_not_found');
+  }
+
+  await fs.rm(binPath, { force: true });
+  await fs.symlink(sourceBinary, binPath);
+
+  const packages = await readNixPackages(workspace);
+  const nextRecord: NixPackageRecord = {
+    id: packageId,
+    name: input.name?.trim() || binary,
+    packageRef,
+    binary,
+    profilePath,
+    ...(input.versionArgs?.length ? { versionArgs: input.versionArgs } : {}),
+  };
+  await writeNixPackages(workspace, [
+    ...packages.filter((pkg) => pkg.id !== packageId),
+    nextRecord,
+  ]);
+
+  return getNixPackageStatus(workspace, nextRecord);
+}
+
+async function uninstallNixPackage(workspace: string, toolId: string): Promise<NixPackageStatus> {
+  await ensureRelayRuntimeAssets(workspace);
+  const sanitizedId = sanitizeToolId(toolId);
+  if (!sanitizedId) {
+    throw new Error('invalid_nix_package');
+  }
+
+  const packages = await readNixPackages(workspace);
+  const existing = packages.find((pkg) => pkg.id === sanitizedId);
+  if (!existing) {
+    throw new Error('nix_package_not_found');
+  }
+
+  await fs.rm(existing.profilePath, { recursive: true, force: true });
+  await fs.rm(path.join(getRelayBinRoot(workspace), existing.binary), { force: true });
+  await writeNixPackages(workspace, packages.filter((pkg) => pkg.id !== sanitizedId));
+
+  return {
+    id: existing.id,
+    kind: 'nix-package',
+    name: existing.name,
+    binary: existing.binary,
+    packageRef: existing.packageRef,
+    installMethod: 'nix',
+    installPath: path.join(getRelayBinRoot(workspace), existing.binary),
+    installed: false,
+    source: 'unavailable',
+    version: null,
+  };
 }
 
 async function installCustomTool(
@@ -965,20 +1338,16 @@ async function installCustomTool(
     : [];
 
   await fs.mkdir(resolvedInstallPath, { recursive: true });
-  const shellCommand = `mkdir -p ${quoteShell(resolvedInstallPath)} && cd ${quoteShell(resolvedInstallPath)} && ${installCommand}`;
-  await runShellCommand(workspace, shellCommand);
+  await runShellCommand(workspace, `mkdir -p '${resolvedInstallPath}' && cd '${resolvedInstallPath}' && ${installCommand}`);
 
-  if (binLinks.length > 0) {
-    await Promise.all(binLinks.map(async (linkName) => {
-      const sanitizedLink = sanitizeToolId(linkName);
-      if (!sanitizedLink) {
-        throw new Error('invalid_link_name');
-      }
-      await fs.symlink(resolvedBinaryPath, path.join(getRelayBinRoot(workspace), sanitizedLink)).catch(async () => {
-        await fs.rm(path.join(getRelayBinRoot(workspace), sanitizedLink), { force: true });
-        await fs.symlink(resolvedBinaryPath, path.join(getRelayBinRoot(workspace), sanitizedLink));
-      });
-    }));
+  for (const linkName of binLinks) {
+    const sanitizedLink = sanitizeToolId(linkName);
+    if (!sanitizedLink) {
+      throw new Error('invalid_link_name');
+    }
+    const linkPath = path.join(getRelayBinRoot(workspace), sanitizedLink);
+    await fs.rm(linkPath, { force: true });
+    await fs.symlink(resolvedBinaryPath, linkPath);
   }
 
   const tools = await readCustomTools(workspace);
@@ -1043,17 +1412,22 @@ async function getWorkspaceHealth(): Promise<{
   };
   managedTools: ManagedToolStatus[];
   customTools: CustomToolStatus[];
+  nixPackages: NixPackageStatus[];
   status: Record<string, string>;
   toolchains: Record<string, string | boolean>;
   disk: { available: number | null; total: number | null };
   activePorts: number[];
 }> {
   const workspace = resolveWorkspace();
+  await ensureRelayRuntimeAssets(workspace);
   const status = await parseBootstrapStatus();
   const bootstrapped = await exists(path.join(workspace, '.bootstrapped'));
   const activePorts = await listListeningPorts();
-  const managedTools = await listManagedToolStatuses(workspace);
-  const customTools = await listCustomToolStatuses(workspace);
+  const [managedTools, customTools, nixPackages] = await Promise.all([
+    listManagedToolStatuses(workspace),
+    listCustomToolStatuses(workspace),
+    listNixPackageStatuses(workspace),
+  ]);
 
   const toolchains: Record<string, string | boolean> = {
     git: false,
@@ -1098,6 +1472,7 @@ async function getWorkspaceHealth(): Promise<{
     },
     managedTools,
     customTools,
+    nixPackages,
     status,
     toolchains,
     disk,
@@ -1958,6 +2333,7 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
 
   app.get('/api/tools/catalog', requireAuth, async (_req, res) => {
     const workspace = resolveWorkspace();
+    await ensureRelayRuntimeAssets(workspace);
     res.json({
       tools: getManagedToolCatalog(workspace).map((tool) => ({
         id: tool.id,
@@ -1973,6 +2349,12 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
         binRoot: getRelayBinRoot(workspace),
         statePath: getCustomToolsRegistryPath(workspace),
       },
+      nixSupport: {
+        installRoot: getNixPackageProfilesRoot(workspace),
+        statePath: getNixPackagesRegistryPath(workspace),
+        searchEndpoint: '/api/tools/nix/search',
+        installEndpoint: '/api/tools/nix/install',
+      },
     });
   });
 
@@ -1981,7 +2363,71 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
     res.json({
       managedTools: await listManagedToolStatuses(workspace),
       customTools: await listCustomToolStatuses(workspace),
+      nixPackages: await listNixPackageStatuses(workspace),
     });
+  });
+
+  app.get('/api/tools/nix/search', requireAuth, async (req, res) => {
+    const query = typeof req.query.q === 'string' ? req.query.q : '';
+
+    try {
+      const results = await searchNixPackages(resolveWorkspace(), query);
+      res.json({
+        query,
+        results,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Nix search failed.';
+      const statusCode = message === 'invalid_search_query' ? 400 : 500;
+      res.status(statusCode).json({
+        error: statusCode === 400 ? 'invalid_search_query' : 'nix_search_failed',
+        message: statusCode === 400 ? 'Search query must be at least 2 characters.' : message,
+      });
+    }
+  });
+
+  app.post('/api/tools/nix/install', requireAuth, async (req, res) => {
+    try {
+      const tool = await installNixPackage(resolveWorkspace(), {
+        id: typeof req.body?.id === 'string' ? req.body.id : undefined,
+        name: typeof req.body?.name === 'string' ? req.body.name : undefined,
+        packageRef: String(req.body?.packageRef || ''),
+        binary: String(req.body?.binary || ''),
+        versionArgs: Array.isArray(req.body?.versionArgs)
+          ? req.body.versionArgs.filter((value: unknown): value is string => typeof value === 'string' && value.length > 0)
+          : undefined,
+      });
+      res.status(200).json({ ok: true, tool });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Nix install failed.';
+      const statusCode = ['invalid_nix_package', 'nix_binary_not_found'].includes(message) ? 400 : 500;
+      res.status(statusCode).json({
+        error: statusCode === 400 ? message : 'nix_install_failed',
+        message: statusCode === 400
+          ? message === 'nix_binary_not_found'
+            ? 'Installed package does not provide the requested binary.'
+            : 'Nix package request is invalid.'
+          : message,
+      });
+    }
+  });
+
+  app.post('/api/tools/nix/uninstall', requireAuth, async (req, res) => {
+    try {
+      const tool = await uninstallNixPackage(resolveWorkspace(), String(req.body?.tool || ''));
+      res.status(200).json({ ok: true, tool });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Nix uninstall failed.';
+      const statusCode = ['invalid_nix_package', 'nix_package_not_found'].includes(message) ? 400 : 500;
+      res.status(statusCode).json({
+        error: statusCode === 400 ? message : 'nix_uninstall_failed',
+        message: statusCode === 400
+          ? message === 'nix_package_not_found'
+            ? 'Installed nix package not found.'
+            : 'Nix package request is invalid.'
+          : message,
+      });
+    }
   });
 
   app.post('/api/tools/install', requireAuth, async (req, res) => {
@@ -2378,6 +2824,17 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
     }
 
     activeShells.set(socket.id, shell);
+    let shellClosed = false;
+
+    const closeShell = () => {
+      if (shellClosed) {
+        return;
+      }
+
+      shellClosed = true;
+      activeShells.delete(socket.id);
+      shell.kill();
+    };
 
     shell.onData((data) => {
       socket.emit('output', data);
@@ -2386,6 +2843,7 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
 
     if (typeof shell.onExit === 'function') {
       shell.onExit(() => {
+        shellClosed = true;
         activeShells.delete(socket.id);
         if (socket.connected) {
           socket.disconnect(true);
@@ -2413,10 +2871,9 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
       shell.resize(cols, rows);
     });
 
-    socket.on('disconnect', () => {
-      activeShells.delete(socket.id);
-      shell.kill();
-    });
+    socket.on('disconnect', closeShell);
+    socket.on('disconnecting', closeShell);
+    socket.conn.on('close', closeShell);
   });
 
   return {
@@ -2425,6 +2882,7 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
     io,
     async start() {
       const port = Number.parseInt(process.env.PORT || '3000', 10);
+      await ensureRelayRuntimeAssets(resolveWorkspace());
 
       await new Promise<void>((resolve, reject) => {
         const onError = (error: Error) => {

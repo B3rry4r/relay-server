@@ -439,12 +439,24 @@ describe('Relay server', () => {
     process.env.AUTH_TOKEN = 'test-token';
     process.env.WORKSPACE = await createWorkspaceFixture();
 
-    const brewDir = path.join(process.env.WORKSPACE, '.relay', 'tools', 'homebrew', 'bin');
+    const relayRoot = path.join(process.env.WORKSPACE, '.relay');
+    const relayBin = path.join(relayRoot, 'bin');
     const flutterDir = path.join(process.env.WORKSPACE, '.relay', 'tools', 'flutter', 'bin');
-    await fs.mkdir(brewDir, { recursive: true });
+    const nixProfilePath = path.join(relayRoot, 'tools', 'nix-profiles', 'zig');
+    await fs.mkdir(relayBin, { recursive: true });
     await fs.mkdir(flutterDir, { recursive: true });
-    await fs.writeFile(path.join(brewDir, 'brew'), '#!/bin/sh\necho "Homebrew 4.3.0"\n', { mode: 0o755 });
+    await fs.mkdir(path.join(nixProfilePath, 'bin'), { recursive: true });
     await fs.writeFile(path.join(flutterDir, 'flutter'), '#!/bin/sh\necho "Flutter 3.22.0"\n', { mode: 0o755 });
+    await fs.writeFile(path.join(nixProfilePath, 'bin', 'zig'), '#!/bin/sh\necho "0.13.0"\n', { mode: 0o755 });
+    await fs.symlink(path.join(nixProfilePath, 'bin', 'zig'), path.join(relayBin, 'zig'));
+    await fs.mkdir(path.join(relayRoot, 'state'), { recursive: true });
+    await fs.writeFile(path.join(relayRoot, 'state', 'nix-packages.json'), `${JSON.stringify([{
+      id: 'zig',
+      name: 'Zig',
+      binary: 'zig',
+      packageRef: 'nixpkgs#zig',
+      profilePath: nixProfilePath,
+    }], null, 2)}\n`);
 
     const relay = createRelayServer(() => new FakePty());
     servers.push(relay);
@@ -461,6 +473,7 @@ describe('Relay server', () => {
       expect.objectContaining({ id: 'flutter' }),
     ]));
     expect(catalog.body.customToolSupport.installRoot).toBe(path.join(process.env.WORKSPACE, '.relay', 'tools'));
+    expect(catalog.body.nixSupport.installRoot).toBe(path.join(process.env.WORKSPACE, '.relay', 'tools', 'nix-profiles'));
 
     const tools = await base
       .get('/api/tools')
@@ -472,6 +485,12 @@ describe('Relay server', () => {
       expect.objectContaining({ id: 'flutter', installed: true, source: 'relay' }),
     ]));
     expect(tools.body.customTools).toEqual([]);
+    expect(tools.body.nixPackages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'zig', installed: true, source: 'relay' }),
+    ]));
+
+    await expect(fs.readFile(path.join(process.env.WORKSPACE, '.gemini', 'settings.json'), 'utf8')).resolves.toContain('"selectedType": "oauth-personal"');
+    await expect(fs.readFile(path.join(process.env.WORKSPACE, '.relay', 'bin', 'relay-browser'), 'utf8')).resolves.toContain('Browser auth URL');
 
     const invalidInstall = await base
       .post('/api/tools/install')
@@ -536,9 +555,26 @@ describe('Relay server', () => {
     process.env.SHELL = '/bin/bash';
 
     const relayRoot = path.join(process.env.WORKSPACE, '.relay');
-    const brewDir = path.join(relayRoot, 'tools', 'homebrew', 'bin');
-    await fs.mkdir(brewDir, { recursive: true });
-    await fs.writeFile(path.join(brewDir, 'brew'), '#!/bin/sh\necho "Homebrew 4.3.0"\n', { mode: 0o755 });
+    const relayBin = path.join(relayRoot, 'bin');
+    await fs.mkdir(relayBin, { recursive: true });
+    await fs.writeFile(path.join(relayBin, 'nix'), `#!/bin/sh
+set -eu
+PROFILE=""
+PACKAGE=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--profile" ]; then
+    PROFILE="$2"
+    shift 2
+    continue
+  fi
+  PACKAGE="$1"
+  shift
+done
+NAME="$(printf '%s' "$PACKAGE" | awk -F'#' '{print $NF}')"
+mkdir -p "$PROFILE/bin"
+printf '#!/bin/sh\\necho "%s 1.0.0"\\n' "$NAME" > "$PROFILE/bin/$NAME"
+chmod +x "$PROFILE/bin/$NAME"
+`, { mode: 0o755 });
 
     const relay = createRelayServer(() => new FakePty());
     servers.push(relay);
@@ -553,6 +589,95 @@ describe('Relay server', () => {
     expect(install.status).toBe(200);
     expect(install.body.ok).toBe(true);
     expect(install.body.tool.id).toBe('rust');
+  });
+
+  it('supports nix package search validation and install flows', async () => {
+    process.env.PORT = '0';
+    process.env.AUTH_TOKEN = 'test-token';
+    process.env.WORKSPACE = await createWorkspaceFixture();
+
+    const relayRoot = path.join(process.env.WORKSPACE, '.relay');
+    const relayBin = path.join(relayRoot, 'bin');
+    await fs.mkdir(relayBin, { recursive: true });
+    await fs.writeFile(path.join(relayBin, 'nix'), `#!/bin/sh
+set -eu
+COMMAND="$1"
+shift
+if [ "$COMMAND" = "search" ]; then
+  printf '{"legacyPackages.x86_64-linux.zig":{"pname":"zig","version":"0.13.0","description":"Zig compiler"}}'
+  exit 0
+fi
+PROFILE=""
+PACKAGE=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--profile" ]; then
+    PROFILE="$2"
+    shift 2
+    continue
+  fi
+  PACKAGE="$1"
+  shift
+done
+NAME="$(printf '%s' "$PACKAGE" | awk -F'#' '{print $NF}')"
+mkdir -p "$PROFILE/bin"
+printf '#!/bin/sh\\necho "%s 0.13.0"\\n' "$NAME" > "$PROFILE/bin/$NAME"
+chmod +x "$PROFILE/bin/$NAME"
+`, { mode: 0o755 });
+
+    const relay = createRelayServer(() => new FakePty());
+    servers.push(relay);
+    const port = await relay.start();
+    const base = request(`http://127.0.0.1:${port}`);
+
+    const invalidSearch = await base
+      .get('/api/tools/nix/search')
+      .set('x-auth-token', 'test-token')
+      .query({ q: 'a' });
+
+    expect(invalidSearch.status).toBe(400);
+    expect(invalidSearch.body.error).toBe('invalid_search_query');
+
+    const search = await base
+      .get('/api/tools/nix/search')
+      .set('x-auth-token', 'test-token')
+      .query({ q: 'zig' });
+
+    expect(search.status).toBe(200);
+    expect(search.body.results).toEqual(expect.arrayContaining([
+      expect.objectContaining({ packageRef: 'nixpkgs#zig' }),
+    ]));
+
+    const install = await base
+      .post('/api/tools/nix/install')
+      .set('x-auth-token', 'test-token')
+      .send({
+        id: 'zig',
+        name: 'Zig',
+        packageRef: 'nixpkgs#zig',
+        binary: 'zig',
+      });
+
+    expect(install.status).toBe(200);
+    expect(install.body.tool.id).toBe('zig');
+    expect(install.body.tool.installed).toBe(true);
+
+    const tools = await base
+      .get('/api/tools')
+      .set('x-auth-token', 'test-token');
+
+    expect(tools.status).toBe(200);
+    expect(tools.body.nixPackages).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'zig', installed: true }),
+    ]));
+
+    const uninstall = await base
+      .post('/api/tools/nix/uninstall')
+      .set('x-auth-token', 'test-token')
+      .send({ tool: 'zig' });
+
+    expect(uninstall.status).toBe(200);
+    expect(uninstall.body.tool.id).toBe('zig');
+    expect(uninstall.body.tool.installed).toBe(false);
   });
 
   it('supports initializing git later for an existing project', async () => {

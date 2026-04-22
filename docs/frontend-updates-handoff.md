@@ -785,7 +785,8 @@ Body:
   "status": {
     "bootstrap": "complete",
     "nvm": "installed",
-    "homebrew": "installed"
+    "nix": "available",
+    "gemini_auth": "ready"
   },
   "toolchains": {
     "git": "git version 2.39.5",
@@ -797,18 +798,19 @@ Body:
   },
   "managedTools": [
     {
-      "id": "homebrew",
-      "name": "Homebrew",
-      "description": "Volume-backed package manager for CLI tools and language runtimes.",
-      "category": "package-manager",
-      "installMethod": "bootstrap",
-      "installPath": "/workspace/.relay/tools/homebrew/bin/brew",
-      "installed": true,
-      "source": "relay",
+      "id": "python",
+      "name": "Python",
+      "description": "Python runtime installed from nixpkgs into persistent Relay-managed profiles.",
+      "category": "language",
+      "installMethod": "nix",
+      "installPath": "/workspace/.relay/bin/python3",
+      "installed": false,
+      "source": "unavailable",
       "supported": true,
-      "version": "Homebrew 4.3.0"
+      "version": null
     }
   ],
+  "nixPackages": [],
   "activePorts": [3000]
 }
 ```
@@ -841,12 +843,12 @@ Body:
 {
   "tools": [
     {
-      "id": "homebrew",
-      "name": "Homebrew",
-      "description": "Volume-backed package manager for CLI tools and language runtimes.",
-      "category": "package-manager",
-      "installMethod": "bootstrap",
-      "installPath": "/workspace/.relay/tools/homebrew/bin/brew",
+      "id": "rust",
+      "name": "Rust",
+      "description": "Rust toolchain installed from nixpkgs into persistent Relay-managed profiles.",
+      "category": "language",
+      "installMethod": "nix",
+      "installPath": "/workspace/.relay/bin/rustc",
       "supported": true
     },
     {
@@ -863,6 +865,12 @@ Body:
     "installRoot": "/workspace/.relay/tools",
     "binRoot": "/workspace/.relay/bin",
     "statePath": "/workspace/.relay/state/custom-tools.json"
+  },
+  "nixSupport": {
+    "installRoot": "/workspace/.relay/tools/nix-profiles",
+    "statePath": "/workspace/.relay/state/nix-packages.json",
+    "searchEndpoint": "/api/tools/nix/search",
+    "installEndpoint": "/api/tools/nix/install"
   }
 }
 ```
@@ -900,6 +908,20 @@ Body:
       "version": "Flutter 3.22.0"
     }
   ],
+  "nixPackages": [
+    {
+      "id": "zig",
+      "kind": "nix-package",
+      "name": "Zig",
+      "binary": "zig",
+      "packageRef": "nixpkgs#zig",
+      "installMethod": "nix",
+      "installPath": "/workspace/.relay/bin/zig",
+      "installed": true,
+      "source": "relay",
+      "version": "zig 0.13.0"
+    }
+  ],
   "customTools": [
     {
       "id": "hello-tool",
@@ -933,9 +955,7 @@ Installs a managed tool into the persistent Relay volume paths.
 
 ### Supported Tool Values
 
-- `homebrew`
 - `php`
-- `composer`
 - `python`
 - `go`
 - `rust`
@@ -1001,6 +1021,124 @@ Body:
 {
   "error": "tool_install_failed",
   "message": "Tool installation failed."
+}
+```
+
+## New Endpoint
+
+## `GET /api/tools/nix/search`
+
+Searches nix packages for command-palette install flows.
+
+### Success
+
+Status:
+
+```http
+200 OK
+```
+
+Body:
+
+```json
+{
+  "query": "zig",
+  "results": [
+    {
+      "attr": "legacyPackages.x86_64-linux.zig",
+      "name": "zig",
+      "description": "Zig compiler",
+      "version": "0.13.0",
+      "packageRef": "nixpkgs#zig"
+    }
+  ]
+}
+```
+
+## New Endpoint
+
+## `POST /api/tools/nix/install`
+
+Installs a nix package into a persistent Relay-managed profile and links the requested binary into `/workspace/.relay/bin`.
+
+### Request
+
+```json
+{
+  "id": "zig",
+  "name": "Zig",
+  "packageRef": "nixpkgs#zig",
+  "binary": "zig"
+}
+```
+
+### Success
+
+Status:
+
+```http
+200 OK
+```
+
+Body:
+
+```json
+{
+  "ok": true,
+  "tool": {
+    "id": "zig",
+    "kind": "nix-package",
+    "name": "Zig",
+    "binary": "zig",
+    "packageRef": "nixpkgs#zig",
+    "installMethod": "nix",
+    "installPath": "/workspace/.relay/bin/zig",
+    "installed": true,
+    "source": "relay",
+    "version": "zig 0.13.0"
+  }
+}
+```
+
+## New Endpoint
+
+## `POST /api/tools/nix/uninstall`
+
+Uninstalls a previously installed nix package and removes its linked binary.
+
+### Request
+
+```json
+{
+  "tool": "zig"
+}
+```
+
+### Success
+
+Status:
+
+```http
+200 OK
+```
+
+Body:
+
+```json
+{
+  "ok": true,
+  "tool": {
+    "id": "zig",
+    "kind": "nix-package",
+    "name": "Zig",
+    "binary": "zig",
+    "packageRef": "nixpkgs#zig",
+    "installMethod": "nix",
+    "installPath": "/workspace/.relay/bin/zig",
+    "installed": false,
+    "source": "unavailable",
+    "version": null
+  }
 }
 ```
 

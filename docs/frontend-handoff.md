@@ -819,18 +819,19 @@ Response:
   },
   "managedTools": [
     {
-      "id": "homebrew",
-      "name": "Homebrew",
-      "description": "Volume-backed package manager for CLI tools and language runtimes.",
-      "category": "package-manager",
-      "installMethod": "bootstrap",
-      "installPath": "/workspace/.relay/tools/homebrew/bin/brew",
-      "installed": true,
-      "source": "relay",
+      "id": "python",
+      "name": "Python",
+      "description": "Python runtime installed from nixpkgs into persistent Relay-managed profiles.",
+      "category": "language",
+      "installMethod": "nix",
+      "installPath": "/workspace/.relay/bin/python3",
+      "installed": false,
+      "source": "unavailable",
       "supported": true,
-      "version": "Homebrew 4.3.0"
+      "version": null
     }
   ],
+  "nixPackages": [],
   "activePorts": [3000]
 }
 ```
@@ -843,12 +844,12 @@ Response:
 {
   "tools": [
     {
-      "id": "homebrew",
-      "name": "Homebrew",
-      "description": "Volume-backed package manager for CLI tools and language runtimes.",
-      "category": "package-manager",
-      "installMethod": "bootstrap",
-      "installPath": "/workspace/.relay/tools/homebrew/bin/brew",
+      "id": "rust",
+      "name": "Rust",
+      "description": "Rust toolchain installed from nixpkgs into persistent Relay-managed profiles.",
+      "category": "language",
+      "installMethod": "nix",
+      "installPath": "/workspace/.relay/bin/rustc",
       "supported": true
     },
     {
@@ -865,6 +866,12 @@ Response:
     "installRoot": "/workspace/.relay/tools",
     "binRoot": "/workspace/.relay/bin",
     "statePath": "/workspace/.relay/state/custom-tools.json"
+  },
+  "nixSupport": {
+    "installRoot": "/workspace/.relay/tools/nix-profiles",
+    "statePath": "/workspace/.relay/state/nix-packages.json",
+    "searchEndpoint": "/api/tools/nix/search",
+    "installEndpoint": "/api/tools/nix/install"
   }
 }
 ```
@@ -888,6 +895,20 @@ Response:
       "source": "relay",
       "supported": true,
       "version": "Flutter 3.22.0"
+    }
+  ],
+  "nixPackages": [
+    {
+      "id": "zig",
+      "kind": "nix-package",
+      "name": "Zig",
+      "binary": "zig",
+      "packageRef": "nixpkgs#zig",
+      "installMethod": "nix",
+      "installPath": "/workspace/.relay/bin/zig",
+      "installed": true,
+      "source": "relay",
+      "version": "zig 0.13.0"
     }
   ],
   "customTools": [
@@ -933,6 +954,101 @@ Response:
     "source": "relay",
     "supported": true,
     "version": "Flutter 3.22.0"
+  }
+}
+```
+
+Supported managed tool values:
+
+- `php`
+- `python`
+- `go`
+- `rust`
+- `java`
+- `flutter`
+
+## `GET /api/tools/nix/search`
+
+Query params:
+
+- `q`: string, minimum 2 characters
+
+Response:
+
+```json
+{
+  "query": "zig",
+  "results": [
+    {
+      "attr": "legacyPackages.x86_64-linux.zig",
+      "name": "zig",
+      "description": "Zig compiler",
+      "version": "0.13.0",
+      "packageRef": "nixpkgs#zig"
+    }
+  ]
+}
+```
+
+## `POST /api/tools/nix/install`
+
+Request:
+
+```json
+{
+  "id": "zig",
+  "name": "Zig",
+  "packageRef": "nixpkgs#zig",
+  "binary": "zig"
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "tool": {
+    "id": "zig",
+    "kind": "nix-package",
+    "name": "Zig",
+    "binary": "zig",
+    "packageRef": "nixpkgs#zig",
+    "installMethod": "nix",
+    "installPath": "/workspace/.relay/bin/zig",
+    "installed": true,
+    "source": "relay",
+    "version": "zig 0.13.0"
+  }
+}
+```
+
+## `POST /api/tools/nix/uninstall`
+
+Request:
+
+```json
+{
+  "tool": "zig"
+}
+```
+
+Response:
+
+```json
+{
+  "ok": true,
+  "tool": {
+    "id": "zig",
+    "kind": "nix-package",
+    "name": "Zig",
+    "binary": "zig",
+    "packageRef": "nixpkgs#zig",
+    "installMethod": "nix",
+    "installPath": "/workspace/.relay/bin/zig",
+    "installed": false,
+    "source": "unavailable",
+    "version": null
   }
 }
 ```
