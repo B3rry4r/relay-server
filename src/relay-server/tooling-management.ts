@@ -52,6 +52,58 @@ export async function listManagedToolStatuses(
     const installPath = tool.pathResolver(workspace);
     const env = createTerminalEnv(workspace);
     const relayBinaryExists = await exists(installPath);
+
+    if (tool.installMethod === 'system') {
+      try {
+        const { stdout, stderr } = await execFile('sh', ['-c', `command -v ${tool.binary}`], { cwd: workspace, env });
+        const resolvedPath = stdout.trim();
+        if (!resolvedPath) {
+          return {
+            id: tool.id,
+            kind: 'managed' as const,
+            name: tool.name,
+            description: tool.description,
+            category: tool.category,
+            installMethod: tool.installMethod,
+            installPath,
+            installed: false,
+            source: 'unavailable' as const,
+            supported: tool.supported,
+            version: null,
+          };
+        }
+        const { stdout: versionOut, stderr: versionErr } = await execFile(resolvedPath, tool.versionArgs, { cwd: workspace, env });
+        const version = `${versionOut}${versionErr}`.trim().split('\n')[0] || null;
+        return {
+          id: tool.id,
+          kind: 'managed' as const,
+          name: tool.name,
+          description: tool.description,
+          category: tool.category,
+          installMethod: tool.installMethod,
+          installPath,
+          installed: true,
+          source: resolvedPath.startsWith(getRelayRoot(workspace)) ? 'relay' : 'system',
+          supported: tool.supported,
+          version,
+        };
+      } catch {
+        return {
+          id: tool.id,
+          kind: 'managed' as const,
+          name: tool.name,
+          description: tool.description,
+          category: tool.category,
+          installMethod: tool.installMethod,
+          installPath,
+          installed: false,
+          source: 'unavailable' as const,
+          supported: tool.supported,
+          version: null,
+        };
+      }
+    }
+
     const commandPath = relayBinaryExists ? installPath : tool.binary;
 
     try {
@@ -112,6 +164,8 @@ export async function installManagedTool(
       await runShellCommand(workspace, `git clone https://github.com/flutter/flutter.git -b stable '${flutterRoot}'`);
     }
     await runShellCommand(workspace, `'${path.join(flutterRoot, 'bin', 'flutter')}' config --enable-web`);
+  } else if (tool.installMethod === 'system') {
+    throw new Error('system_tools_must_be_preinstalled');
   } else {
     await ensureNixAvailable(workspace);
     const profilePath = path.join(getRelayToolsRoot(workspace), 'profiles', tool.id);

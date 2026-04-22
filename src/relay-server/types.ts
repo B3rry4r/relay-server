@@ -74,7 +74,7 @@ export type ManagedToolDefinition = {
   category: 'package-manager' | 'language' | 'sdk';
   description: string;
   id: ManagedToolId;
-  installMethod: 'git' | 'nix';
+  installMethod: 'git' | 'nix' | 'system';
   name: string;
   nixPackage?: string;
   pathResolver: (workspace: string) => string;

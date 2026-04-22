@@ -76,7 +76,7 @@ export function registerToolRoutes(app: Express): void {
       const statusCode = message === 'invalid_search_query' ? 400 : message === 'nix_unavailable' ? 503 : 500;
       res.status(statusCode).json({
         error: statusCode === 400 ? 'invalid_search_query' : statusCode === 503 ? 'nix_unavailable' : 'nix_search_failed',
-        message: statusCode === 400 ? 'Search query must be at least 2 characters.' : statusCode === 503 ? 'Nix is not installed in the Relay runtime.' : message,
+        message: statusCode === 400 ? 'Search query must be at least 2 characters.' : statusCode === 503 ? 'Nix package manager is not available in Railway. Use system tools instead.' : message,
       });
     }
   });
