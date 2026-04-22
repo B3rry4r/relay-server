@@ -2,5 +2,5 @@
 dockerfile = "Dockerfile"
 
 [deploy]
-startCommand = "npm start"
+startCommand = "node dist/src/index.js"
 restartPolicyType = "ON_FAILURE"
