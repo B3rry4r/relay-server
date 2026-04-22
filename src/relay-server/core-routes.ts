@@ -78,7 +78,11 @@ export function registerCoreRoutes(app: Express): void {
     await markProjectAsRecent(projectId);
     res.json({
       project: { id: path.basename(projectRoot), path: projectRoot },
-      shell: { cwd: projectRoot, suggestedCommand: `cd ${projectRoot}` },
+      shell: {
+        cwd: projectRoot,
+        cdCommand: `cd '${projectRoot}'`,
+        cdEvent: { projectId },
+      },
     });
   });
 
@@ -92,6 +96,59 @@ export function registerCoreRoutes(app: Express): void {
         status: 'active',
       })),
     });
+  });
+
+  app.get('/api/previews/:port', requireAuth, async (req, res) => {
+    const port = Number(req.params.port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      res.status(400).json({ error: 'invalid_port', message: 'Port must be between 1 and 65535.' });
+      return;
+    }
+
+    const ports = await listListeningPorts();
+    const isActive = ports.includes(port);
+
+    res.json({
+      port,
+      active: isActive,
+      url: `/preview/${port}`,
+      label: `Port ${port}`,
+    });
+  });
+
+  app.post('/api/previews/:port/serve', requireAuth, async (req, res) => {
+    const port = Number(req.params.port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      res.status(400).json({ error: 'invalid_port', message: 'Port must be between 1 and 65535.' });
+      return;
+    }
+
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execFileAsync = promisify(execFile);
+
+    const ports = await listListeningPorts();
+    if (ports.includes(port)) {
+      res.json({ ok: true, port, message: 'Port already in use.' });
+      return;
+    }
+
+    const workspace = resolveWorkspace();
+    const { spawn } = await import('node:child_process');
+    spawn('python3', ['-m', 'http.server', String(port)], {
+      cwd: workspace,
+      detached: true,
+      stdio: 'ignore',
+    });
+
+    setTimeout(async () => {
+      const updatedPorts = await listListeningPorts();
+      if (updatedPorts.includes(port)) {
+        console.log(`Preview server started on port ${port}`);
+      }
+    }, 1000);
+
+    res.json({ ok: true, port, message: `Preview server starting on port ${port}` });
   });
 
   app.get('/api/workspace/health', requireAuth, async (_req, res) => {

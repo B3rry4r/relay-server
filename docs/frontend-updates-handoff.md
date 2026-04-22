@@ -1841,6 +1841,7 @@ Frontend should therefore support two clone/push/pull modes:
 Behavior update:
 
 - marks the project as recent for `GET /api/projects/quick-switch`
+- **Now includes `cdEvent` for socket-based directory change**
 
 ### Request
 
@@ -1860,9 +1861,38 @@ Behavior update:
   },
   "shell": {
     "cwd": "/workspace/projects/my-app",
-    "suggestedCommand": "cd /workspace/projects/my-app"
+    "cdCommand": "cd '/workspace/projects/my-app'",
+    "cdEvent": {
+      "projectId": "my-app"
+    }
   }
 }
+```
+
+### Frontend Implementation
+
+```typescript
+async function selectProject(projectId: string) {
+  const response = await fetch('/api/session/project', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${token}` },
+    body: JSON.stringify({ projectId })
+  });
+  const { project, shell } = await response.json();
+
+  // Emit cd event to change terminal directory
+  socket.emit('cd', shell.cdEvent);
+
+  // Update UI state
+  setCurrentProject(project);
+}
+```
+
+### Terminal State After Selection
+
+The terminal will automatically `cd` into the project directory. The shell prompt should show:
+```
+user@workspace:~/projects/my-app$
 ```
 
 ## Current Limitations
@@ -2162,6 +2192,111 @@ When user clicks "Preview", show a panel:
 1. User opens project with `hasBuild: true`
 2. Show "Preview" as primary action
 3. Click → serve → show iframe
+
+---
+
+## Socket Events Update
+
+### New Event: `cd`
+
+Send this event when user selects a project to change terminal directory.
+
+```typescript
+socket.emit('cd', { projectId: 'my-project' });
+```
+
+Or with explicit path:
+
+```typescript
+socket.emit('cd', { path: '/workspace/projects/my-project' });
+```
+
+### Response on Socket
+
+The terminal will output the cd command result. The backend emits:
+- Success: terminal shows the cd result
+- Failure: terminal shows error message like `[relay] cd: /path: No such directory`
+
+### Best Practice
+
+After calling `POST /api/session/project`, emit the `cd` event:
+
+```typescript
+const response = await fetch('/api/session/project', { ... });
+const { shell } = await response.json();
+
+// Emit cd event to change terminal directory
+socket.emit('cd', { projectId: projectId });
+
+// Or use the path directly
+socket.emit('cd', { path: shell.cwd });
+```
+
+---
+
+## Preview Endpoints Update
+
+## `GET /api/previews`
+
+Returns all listening ports.
+
+### Success
+
+```json
+{
+  "previews": [
+    { "port": 3000, "label": "Port 3000", "url": "/preview/3000", "status": "active" },
+    { "port": 8080, "label": "Port 8080", "url": "/preview/8080", "status": "active" }
+  ]
+}
+```
+
+## `GET /api/previews/:port`
+
+Check status of a specific port.
+
+### Success
+
+```json
+{
+  "port": 3000,
+  "active": true,
+  "url": "/preview/3000",
+  "label": "Port 3000"
+}
+```
+
+## `POST /api/previews/:port/serve`
+
+Start a preview server on a specific port.
+
+### Request
+
+```json
+{}
+```
+
+### Success
+
+```json
+{
+  "ok": true,
+  "port": 3000,
+  "message": "Preview server starting on port 3000"
+}
+```
+
+### Port Already in Use
+
+```json
+{
+  "ok": true,
+  "port": 3000,
+  "message": "Port already in use."
+}
+```
+
+---
 
 ## State Management
 

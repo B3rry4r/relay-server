@@ -5,7 +5,9 @@ import { createShellTranscriptState, handleShellOutput, handleTerminalInput } fr
 import {
   createTerminalEnv,
   escapeHtml,
+  exists,
   isValidToken,
+  resolveProjectRoot,
   resolveShell,
   resolveWorkspace,
 } from './runtime';
@@ -31,6 +33,7 @@ export function registerSocketHandlers(
     const workspace = resolveWorkspace();
     const transcriptState = createShellTranscriptState(workspace);
     let shell: PtyLike;
+    let currentCwd = workspace;
 
     try {
       shell = ptyFactory({
@@ -88,6 +91,30 @@ export function registerSocketHandlers(
         return;
       }
       shell.resize(cols, rows);
+    });
+
+    socket.on('cd', async (payload: { path: string; projectId?: string }) => {
+      let targetPath = payload.path;
+
+      if (payload.projectId) {
+        const projectRoot = resolveProjectRoot(payload.projectId);
+        if (projectRoot && await exists(projectRoot)) {
+          targetPath = projectRoot;
+        }
+      }
+
+      if (!targetPath) {
+        socket.emit('output', '\r\n[relay] cd: path required\r\n');
+        return;
+      }
+
+      if (!await exists(targetPath)) {
+        socket.emit('output', `\r\n[relay] cd: ${targetPath}: No such directory\r\n`);
+        return;
+      }
+
+      currentCwd = targetPath;
+      shell.write(`cd '${targetPath}'\n`);
     });
 
     socket.on('disconnect', closeShell);
