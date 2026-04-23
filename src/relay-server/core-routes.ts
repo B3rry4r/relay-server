@@ -11,6 +11,7 @@ import {
   setPinnedProjects,
 } from './projects';
 import { exists, resolveProjectRoot } from './runtime';
+import { getActiveTerminals } from './socket';
 
 export function registerCoreRoutes(app: Express): void {
   app.get('/', (_req, res) => {
@@ -151,7 +152,53 @@ export function registerCoreRoutes(app: Express): void {
     res.json({ ok: true, port, message: `Preview server starting on port ${port}` });
   });
 
+  app.all('/preview/:port(*)', requireAuth, async (req, res) => {
+    const port = Number(req.params.port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      res.status(400).json({ error: 'invalid_port', message: 'Port must be between 1 and 65535.' });
+      return;
+    }
+
+    const ports = await listListeningPorts();
+    if (!ports.includes(port)) {
+      res.status(502).json({ error: 'preview_not_available', message: `No server running on port ${port}` });
+      return;
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const httpProxy = require('http-proxy') as {
+      createProxyServer(options: { target: string; changeOrigin: boolean }): {
+        on(event: 'error', callback: (err: Error) => void): void;
+        web(req: Express.Request, res: Express.Response): void;
+      };
+    };
+
+    const proxy = httpProxy.createProxyServer({
+      target: `http://127.0.0.1:${port}`,
+      changeOrigin: true,
+    });
+
+    proxy.on('error', (err: Error) => {
+      console.error('Preview proxy error:', err.message);
+      res.status(502).json({ error: 'proxy_error', message: 'Failed to proxy request' });
+    });
+
+    proxy.web(req, res);
+  });
+
   app.get('/api/workspace/health', requireAuth, async (_req, res) => {
     res.json(await getWorkspaceHealth());
+  });
+
+  app.get('/api/terminals', requireAuth, (_req, res) => {
+    const terminals = getActiveTerminals();
+    res.json({
+      terminals: terminals.map((t) => ({
+        id: t.id,
+        cwd: t.cwd,
+        pid: t.pid,
+        createdAt: t.createdAt,
+      })),
+    });
   });
 }

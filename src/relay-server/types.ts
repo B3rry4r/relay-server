@@ -8,6 +8,7 @@ export type PtyLike = {
   onExit?(callback: (event: { exitCode: number; signal?: number }) => void): void;
   resize(cols: number, rows: number): void;
   write(data: string): void;
+  pid?: number;
 };
 
 export type PtyFactory = (options: {
@@ -57,6 +58,13 @@ export const DEFAULT_ROWS = 24;
 export const PROJECT_NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
 export const RECENT_PROJECT_LIMIT = 10;
 export const RELAY_PROMPT_MARKER_PREFIX = '\u001b]9;9;relay-prompt|';
+
+export type TerminalSession = {
+  id: string;
+  createdAt: number;
+  cwd: string;
+  pid: number;
+};
 
 export const MANAGED_TOOL_IDS = [
   'php',

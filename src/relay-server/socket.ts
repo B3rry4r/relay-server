@@ -1,5 +1,5 @@
 import type { Server as SocketIOServer } from 'socket.io';
-import type { PtyFactory, PtyLike } from './types';
+import type { PtyFactory, PtyLike, TerminalSession } from './types';
 import { DEFAULT_COLS, DEFAULT_ROWS } from './types';
 import { createShellTranscriptState, handleShellOutput, handleTerminalInput } from './transcript';
 import {
@@ -12,11 +12,57 @@ import {
   resolveWorkspace,
 } from './runtime';
 
+const activeShells = new Map<string, PtyLike>();
+const terminalSessions = new Map<string, TerminalSession>();
+
+export function getActiveTerminals(): TerminalSession[] {
+  return Array.from(terminalSessions.values());
+}
+
+export function createTerminalSession(
+  socketId: string,
+  ptyFactory: PtyFactory,
+  workspace: string
+): TerminalSession | null {
+  let shell: PtyLike;
+  try {
+    shell = ptyFactory({
+      command: resolveShell(),
+      cols: DEFAULT_COLS,
+      cwd: workspace,
+      env: createTerminalEnv(workspace),
+      rows: DEFAULT_ROWS,
+    });
+  } catch {
+    return null;
+  }
+
+  const session: TerminalSession = {
+    id: socketId,
+    createdAt: Date.now(),
+    cwd: workspace,
+    pid: shell.pid || 0,
+  };
+
+  activeShells.set(socketId, shell);
+  terminalSessions.set(socketId, session);
+
+  return session;
+}
+
+export function closeTerminalSession(socketId: string): void {
+  const shell = activeShells.get(socketId);
+  if (shell) {
+    shell.kill();
+  }
+  activeShells.delete(socketId);
+  terminalSessions.delete(socketId);
+}
+
 export function registerSocketHandlers(
   io: SocketIOServer,
   ptyFactory: PtyFactory
 ): void {
-  const activeShells = new Map<string, PtyLike>();
 
   io.use((socket, next) => {
     const authToken = typeof socket.handshake.auth.token === 'string'
@@ -32,33 +78,23 @@ export function registerSocketHandlers(
   io.on('connection', (socket) => {
     const workspace = resolveWorkspace();
     const transcriptState = createShellTranscriptState(workspace);
-    let shell: PtyLike;
+    const session = createTerminalSession(socket.id, ptyFactory, workspace);
+    const shell = session ? activeShells.get(socket.id) : null;
     let currentCwd = workspace;
 
-    try {
-      shell = ptyFactory({
-        command: resolveShell(),
-        cols: DEFAULT_COLS,
-        cwd: workspace,
-        env: createTerminalEnv(workspace),
-        rows: DEFAULT_ROWS,
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown PTY error';
-      socket.emit('output', `\r\n[relay] Failed to start shell: ${escapeHtml(message)}\r\n`);
+    if (!session || !shell) {
+      socket.emit('output', `\r\n[relay] Failed to start shell\r\n`);
       socket.disconnect(true);
       return;
     }
 
-    activeShells.set(socket.id, shell);
     let shellClosed = false;
     const closeShell = () => {
       if (shellClosed) {
         return;
       }
       shellClosed = true;
-      activeShells.delete(socket.id);
-      shell.kill();
+      closeTerminalSession(socket.id);
     };
 
     shell.onData((data) => {
@@ -69,7 +105,7 @@ export function registerSocketHandlers(
     if (typeof shell.onExit === 'function') {
       shell.onExit(() => {
         shellClosed = true;
-        activeShells.delete(socket.id);
+        closeTerminalSession(socket.id);
         if (socket.connected) {
           socket.disconnect(true);
         }
@@ -115,6 +151,12 @@ export function registerSocketHandlers(
 
       currentCwd = targetPath;
       shell.write(`cd '${targetPath}'\n`);
+    });
+
+    socket.on('terminal:create', (_payload: { cwd?: string }) => {
+      const targetCwd = _payload?.cwd || workspace;
+      const newSession = createTerminalSession(socket.id + '-' + Date.now(), ptyFactory, targetCwd);
+      socket.emit('terminal:created', newSession);
     });
 
     socket.on('disconnect', closeShell);
