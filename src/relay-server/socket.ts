@@ -106,9 +106,8 @@ export function registerSocketHandlers(
       shell.onExit(() => {
         shellClosed = true;
         closeTerminalSession(socket.id);
-        if (socket.connected) {
-          socket.disconnect(true);
-        }
+        // Don't disconnect socket - other terminals may still be active
+        socket.emit('terminal:closed', { id: session.id });
       });
     }
 
