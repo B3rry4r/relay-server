@@ -159,6 +159,13 @@ export function registerSocketHandlers(
       socket.emit('terminal:created', newSession);
     });
 
+    socket.on('terminal:close', (_payload: { id: string }) => {
+      const terminalId = _payload?.id;
+      if (terminalId) {
+        closeTerminalSession(terminalId);
+      }
+    });
+
     socket.on('disconnect', closeShell);
     socket.on('disconnecting', closeShell);
     socket.conn.on('close', closeShell);
