@@ -123,6 +123,51 @@ export function registerGitRoutes(app: Express): void {
     res.json({ diff: (await runGit(projectRoot, args)).stdout });
   });
 
+  app.get('/api/projects/:projectId/git/log', requireAuth, async (req, res) => {
+    const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
+    if (!projectRoot || !await exists(projectRoot)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+    if (!await ensureGitRepo(projectRoot)) {
+      notGitRepo(res);
+      return;
+    }
+    const limit = Math.min(Number(req.query.limit) || 20, 100);
+    const filePath = typeof req.query.path === 'string' ? req.query.path : undefined;
+    const args = ['log', `--max-count=${limit}`, '--format=%H|%h|%s|%an|%ae|%ad|%ar'];
+    if (filePath) {
+      args.push('--', filePath);
+    }
+    const output = (await runGit(projectRoot, args)).stdout;
+    const commits = output.trim().split('\n').filter(Boolean).map((line) => {
+      const [hash, shortHash, subject, authorName, authorEmail, date, relativeDate] = line.split('|');
+      return { hash, shortHash, subject, authorName, authorEmail, date, relativeDate };
+    });
+    res.json({ commits });
+  });
+
+  app.get('/api/projects/:projectId/git/show', requireAuth, async (req, res) => {
+    const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
+    if (!projectRoot || !await exists(projectRoot)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+    if (!await ensureGitRepo(projectRoot)) {
+      notGitRepo(res);
+      return;
+    }
+    const hash = String(req.query.hash || 'HEAD');
+    const filePath = typeof req.query.path === 'string' ? req.query.path : undefined;
+    const args = ['show', `${hash}${filePath ? ` -- ${filePath}` : ''}`];
+    try {
+      const output = (await runGit(projectRoot, args)).stdout;
+      res.json({ hash, content: output });
+    } catch {
+      res.json({ hash, content: '' });
+    }
+  });
+
   app.get('/api/projects/:projectId/git/branches', requireAuth, async (req, res) => {
     const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
     if (!projectRoot || !await exists(projectRoot)) {

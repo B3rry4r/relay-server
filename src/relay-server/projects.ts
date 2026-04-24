@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { execFile as execFileCallback } from 'node:child_process';
 import { promisify } from 'node:util';
-import { ensureGitRepo } from './git';
+import { ensureGitRepo, runGit, getGitStatus } from './git';
 import {
   RECENT_PROJECT_LIMIT,
   type TreeNode,
@@ -18,6 +18,29 @@ import {
 } from './runtime';
 
 const execFile = promisify(execFileCallback);
+
+async function getGitStatusMap(projectRoot: string): Promise<Map<string, string>> {
+  const statusMap = new Map<string, string>();
+  if (!await ensureGitRepo(projectRoot)) {
+    return statusMap;
+  }
+  try {
+    const status = await getGitStatus(projectRoot);
+    for (const file of status.staged ?? []) {
+      statusMap.set(file.path, file.status ?? 'staged');
+    }
+    for (const file of status.unstaged ?? []) {
+      statusMap.set(file.path, file.status ?? 'modified');
+    }
+    for (const file of status.untracked ?? []) {
+      statusMap.set(file.path, 'untracked');
+    }
+    for (const file of status.conflicts ?? []) {
+      statusMap.set(file.path, 'conflicted');
+    }
+  } catch { /* ignore */ }
+  return statusMap;
+}
 
 export async function readPackageJson(
   projectRoot: string
@@ -262,6 +285,7 @@ export async function buildTree(
     return [];
   }
 
+  const statusMap = await getGitStatusMap(projectRoot);
   const entries = await fs.readdir(targetPath, { withFileTypes: true });
   const nodes = await Promise.all(entries.map(async (entry) => {
     const entryAbsolutePath = path.join(targetPath, entry.name);
@@ -276,11 +300,13 @@ export async function buildTree(
     }
 
     const stat = await fs.stat(entryAbsolutePath);
+    const gitStatus = statusMap.get(entryRelativePath);
     return [{
       name: entry.name,
       path: entryRelativePath,
       type: 'file' as const,
       size: stat.size,
+      status: gitStatus as TreeNode['status'],
     }];
   }));
 

@@ -197,6 +197,21 @@ export function registerProjectRoutes(app: Express): void {
     res.download(itemPath);
   });
 
+  app.get('/api/projects/:projectId/file', requireAuth, async (req, res) => {
+    const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
+    const itemPath = projectRoot ? resolveProjectRelativePath(projectRoot, String(req.query.path || '')) : null;
+    if (!projectRoot || !await exists(projectRoot)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+    if (!itemPath || !await exists(itemPath)) {
+      res.status(404).json({ error: 'file_not_found', message: 'File not found.' });
+      return;
+    }
+    const content = await fs.readFile(itemPath, 'utf-8');
+    res.json({ content });
+  });
+
   app.post('/api/projects/:projectId/upload', requireAuth, async (req, res) => {
     const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
     if (!projectRoot || !await exists(projectRoot)) {
