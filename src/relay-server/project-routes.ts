@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { Express } from 'express';
+import { marked } from 'marked';
 import { initializeGitRepository } from './git';
 import {
   buildTree,
@@ -209,7 +210,9 @@ export function registerProjectRoutes(app: Express): void {
       return;
     }
     const content = await fs.readFile(itemPath, 'utf-8');
-    res.json({ content });
+    const ext = itemPath.split('.').pop()?.toLowerCase();
+    const parsed = (ext === 'md' || ext === 'markdown') ? await marked(content) : '';
+    res.json({ content, parsed });
   });
 
   app.post('/api/projects/:projectId/upload', requireAuth, async (req, res) => {
