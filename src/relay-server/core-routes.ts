@@ -1,4 +1,5 @@
 import type { Express } from 'express';
+import fs from 'node:fs';
 import path from 'node:path';
 import { requireAuth, extractRequestToken, isValidToken, readStringParam, resolveWorkspace } from './runtime';
 import { getWorkspaceHealth } from './monitoring';
@@ -29,6 +30,18 @@ export function registerCoreRoutes(app: Express): void {
 
   app.get('/health', (_req, res) => {
     res.json({ ok: true });
+  });
+
+  app.get('/api/version', (_req, res) => {
+    const packagePath = path.join(process.cwd(), 'package.json');
+    let version = 'unknown';
+    try {
+      const packageJson = JSON.parse(fs.readFileSync(packagePath, 'utf-8'));
+      version = packageJson.version || 'unknown';
+    } catch {
+      // keep default
+    }
+    res.json({ version });
   });
 
   app.get('/api/auth/validate', (req, res) => {
