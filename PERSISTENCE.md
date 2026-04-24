@@ -2,9 +2,19 @@
 
 This document outlines where Relay stores its persistent configuration, internal state, and tool definitions on the filesystem.
 
-## Storage Locations
+## opencode Persistence
 
-All core Relay persistence is located within the workspace volume:
+The `opencode` agent persists its data and configuration in the following locations within the `/workspace` volume. 
+
+**Warning**: Deleting these folders can result in loss of configuration, session history, or agent functionality.
+
+| Directory | Purpose | Consequence of Deletion |
+| :--- | :--- | :--- |
+| `/workspace/.config/opencode` | User configuration (settings, preferences). | Resets application settings to default. |
+| `/workspace/.local/share/opencode` | Persistent user data (session history, custom agents). | Loss of session history and persisted user data. |
+| `/workspace/.local/state/opencode` | Runtime state (logs, current task status). | May cause errors or reset the agent's current task status. |
+| `/workspace/.cache/opencode` | Temporary caches. | Slows down performance while caches are rebuilt. Safe to delete. |
+| `/workspace/.relay/tools/.../opencode-ai` | Installed agent binaries. | Breaks `opencode` functionality until re-installed. |
 
 -   **`/workspace/.relay/`**: The primary directory for Relay's persistent state.
     -   **Tool Configurations**: Stores persistent custom tool definitions.
