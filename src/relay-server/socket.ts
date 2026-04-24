@@ -2,6 +2,11 @@ import type { Server as SocketIOServer } from 'socket.io';
 import type { PtyFactory, PtyLike, TerminalSession } from './types';
 import { DEFAULT_COLS, DEFAULT_ROWS } from './types';
 import {
+  createShellTranscriptState,
+  handleShellOutput,
+  handleTerminalInput,
+} from './transcript';
+import {
   createTerminalEnv,
   exists,
   isValidToken,
@@ -50,18 +55,17 @@ export function createTerminalSession(
 
 export function closeTerminalSession(terminalId: string): void {
   const shell = activeShells.get(terminalId);
+  activeShells.delete(terminalId);
+  terminalSessions.delete(terminalId);
   if (shell) {
     shell.kill();
   }
-  activeShells.delete(terminalId);
-  terminalSessions.delete(terminalId);
 }
 
 export function registerSocketHandlers(
   io: SocketIOServer,
   ptyFactory: PtyFactory
 ): void {
-
   io.use((socket, next) => {
     const authToken = typeof socket.handshake.auth.token === 'string'
       ? socket.handshake.auth.token
@@ -75,6 +79,7 @@ export function registerSocketHandlers(
 
   io.on('connection', (socket) => {
     const workspace = resolveWorkspace();
+    const transcript = createShellTranscriptState(workspace);
     let selectedTerminalId: string | null = null;
 
     // Helper to get active shell for selected terminal
@@ -95,6 +100,17 @@ export function registerSocketHandlers(
       });
     };
 
+    const bindShellToSocket = (terminalId: string, shell: PtyLike): void => {
+      shell.onData((data: string) => {
+        socket.emit('output', data);
+        handleShellOutput(socket, transcript, data);
+      });
+
+      if (typeof shell.onExit === 'function') {
+        shell.onExit(() => onTerminalExit(terminalId));
+      }
+    };
+
     // Create first terminal automatically if none exist
     const existing = getActiveTerminals();
     if (existing.length > 0) {
@@ -102,10 +118,7 @@ export function registerSocketHandlers(
       selectedTerminalId = existing[0].id;
       const shell = activeShells.get(selectedTerminalId);
       if (shell) {
-        const boundExit = () => onTerminalExit(selectedTerminalId!);
-        if (typeof shell.onExit === 'function') {
-          shell.onExit(boundExit);
-        }
+        bindShellToSocket(selectedTerminalId, shell);
       }
       socket.emit('terminals:ready', { terminals: existing });
       socket.emit('terminal:selected', { id: selectedTerminalId, cwd: existing[0].cwd });
@@ -118,16 +131,14 @@ export function registerSocketHandlers(
         selectedTerminalId = terminalId;
         const shell = activeShells.get(terminalId);
         if (shell) {
-          shell.onData((data: string) => {
-            socket.emit('output', data);
-          });
-          if (typeof shell.onExit === 'function') {
-            shell.onExit(() => onTerminalExit(terminalId));
-          }
+          bindShellToSocket(terminalId, shell);
         }
         socket.emit('terminals:ready', { terminals: getActiveTerminals() });
         socket.emit('terminal:created', session);
         socket.emit('terminal:selected', { id: terminalId, cwd: session.cwd });
+      } else {
+        socket.emit('output', '\r\n[relay] Failed to start shell\r\n');
+        socket.disconnect(true);
       }
     }
 
@@ -139,13 +150,7 @@ export function registerSocketHandlers(
       if (session) {
         const shell = activeShells.get(terminalId);
         if (shell) {
-          // Only this terminal outputs to socket
-          shell.onData((data: string) => {
-            socket.emit('output', data);
-          });
-          if (typeof shell.onExit === 'function') {
-            shell.onExit(() => onTerminalExit(terminalId));
-          }
+          bindShellToSocket(terminalId, shell);
         }
         
         selectedTerminalId = terminalId;
@@ -179,10 +184,7 @@ export function registerSocketHandlers(
             selectedTerminalId = newId;
             const shell = activeShells.get(newId);
             if (shell) {
-              shell.onData((data: string) => socket.emit('output', data));
-              if (typeof shell.onExit === 'function') {
-                shell.onExit(() => onTerminalExit(newId));
-              }
+              bindShellToSocket(newId, shell);
             }
             socket.emit('terminal:created', session);
             socket.emit('terminal:selected', { id: newId, cwd: session.cwd });
@@ -196,6 +198,7 @@ export function registerSocketHandlers(
       if (typeof data !== 'string' || data.length === 0) return;
       const shell = getShell();
       if (shell) {
+        handleTerminalInput(socket, transcript, data);
         shell.write(data);
       } else {
         socket.emit('output', '\r\n[relay] No terminal selected\r\n');
@@ -243,9 +246,9 @@ export function registerSocketHandlers(
     });
 
     socket.on('disconnect', () => {
-      // Clean up selected terminal only
       if (selectedTerminalId) {
-        onTerminalExit(selectedTerminalId);
+        closeTerminalSession(selectedTerminalId);
+        selectedTerminalId = null;
       }
     });
   });

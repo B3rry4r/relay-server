@@ -28,6 +28,7 @@ import {
 import {
   ensureNixAvailable,
   ensureRelayRuntimeAssets,
+  findCommandPath,
   getManagedToolCatalog,
   readCustomTools,
   runShellCommand,
@@ -165,7 +166,22 @@ export async function installManagedTool(
     }
     await runShellCommand(workspace, `'${path.join(flutterRoot, 'bin', 'flutter')}' config --enable-web`);
   } else if (tool.installMethod === 'system') {
-    throw new Error('system_tools_must_be_preinstalled');
+    const systemBinaryPath = await findCommandPath(workspace, tool.binary);
+    if (systemBinaryPath) {
+      await fs.rm(path.join(getRelayBinRoot(workspace), tool.binary), { force: true });
+      await fs.symlink(systemBinaryPath, path.join(getRelayBinRoot(workspace), tool.binary));
+    } else {
+      if (!tool.nixPackage) {
+        throw new Error('system_tools_must_be_preinstalled');
+      }
+      await ensureNixAvailable(workspace);
+      const profilePath = path.join(getRelayToolsRoot(workspace), 'profiles', tool.id);
+      await fs.mkdir(path.dirname(profilePath), { recursive: true });
+      await runShellCommand(workspace, `nix profile install --accept-flake-config --profile '${profilePath}' '${tool.nixPackage}'`);
+      const sourceBinary = path.join(profilePath, 'bin', tool.binary);
+      await fs.rm(path.join(getRelayBinRoot(workspace), tool.binary), { force: true });
+      await fs.symlink(sourceBinary, path.join(getRelayBinRoot(workspace), tool.binary));
+    }
   } else {
     await ensureNixAvailable(workspace);
     const profilePath = path.join(getRelayToolsRoot(workspace), 'profiles', tool.id);

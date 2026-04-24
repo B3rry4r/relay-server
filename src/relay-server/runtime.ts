@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
 import path from 'node:path';
 import type { NextFunction, Request, Response } from 'express';
 import { PROJECT_NAME_PATTERN } from './types';
@@ -33,6 +34,14 @@ export function getRelayBinRoot(workspace = resolveWorkspace()): string {
 
 export function getRelayStateRoot(workspace = resolveWorkspace()): string {
   return path.join(getRelayRoot(workspace), 'state');
+}
+
+export function getRelayMachineIdPath(workspace = resolveWorkspace()): string {
+  return path.join(getRelayStateRoot(workspace), 'machine-id');
+}
+
+export function getRelayHostnamePath(workspace = resolveWorkspace()): string {
+  return path.join(getRelayStateRoot(workspace), 'hostname');
 }
 
 export function getProjectsRoot(): string {
@@ -88,6 +97,13 @@ export function createTerminalEnv(workspace: string): NodeJS.ProcessEnv {
   const relayBin = getRelayBinRoot(workspace);
   const flutterRoot = getFlutterRoot(workspace);
 
+  const relayMachineId = fsSync.existsSync(getRelayMachineIdPath(workspace))
+    ? fsSync.readFileSync(getRelayMachineIdPath(workspace), 'utf8').trim()
+    : '';
+  const relayHostname = fsSync.existsSync(getRelayHostnamePath(workspace))
+    ? fsSync.readFileSync(getRelayHostnamePath(workspace), 'utf8').trim()
+    : '';
+
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     HOME: workspace,
@@ -95,6 +111,9 @@ export function createTerminalEnv(workspace: string): NodeJS.ProcessEnv {
     RELAY_TOOLS: relayTools,
     RELAY_CACHE: relayCache,
     RELAY_BIN: relayBin,
+    RELAY_MACHINE_ID: relayMachineId,
+    RELAY_HOSTNAME: relayHostname,
+    HOSTNAME: relayHostname || process.env.HOSTNAME || '',
     MISE_DATA_DIR: path.join(relayTools, 'mise-data'),
     MISE_CONFIG_DIR: path.join(getRelayStateRoot(workspace), 'mise'),
     FLUTTER_HOME: flutterRoot,

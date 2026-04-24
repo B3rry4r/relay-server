@@ -11,6 +11,8 @@ RELAY_CACHE_DIR="$RELAY_ROOT/cache"
 RELAY_BIN_DIR="$RELAY_ROOT/bin"
 RELAY_STATE_DIR="$RELAY_ROOT/state"
 RELAY_ENV_PATH="$RELAY_STATE_DIR/tool-env.sh"
+RELAY_MACHINE_ID_PATH="$RELAY_STATE_DIR/machine-id"
+RELAY_HOSTNAME_PATH="$RELAY_STATE_DIR/hostname"
 NVM_DIR="$RELAY_TOOLS_DIR/nvm"
 MISE_DIR="$RELAY_TOOLS_DIR/mise"
 MISE_BIN_DIR="$MISE_DIR/bin"
@@ -88,6 +90,41 @@ record_status npm_global "ready"
 record_status python_userbase "ready"
 record_status nix_profiles "ready"
 
+ensure_relay_identity() {
+  mkdir -p "$RELAY_STATE_DIR"
+
+  if [[ ! -s "$RELAY_MACHINE_ID_PATH" ]]; then
+    if has_command uuidgen; then
+      uuidgen | tr -d '-' | tr '[:upper:]' '[:lower:]' > "$RELAY_MACHINE_ID_PATH"
+    elif [[ -r /proc/sys/kernel/random/uuid ]]; then
+      tr -d '-' < /proc/sys/kernel/random/uuid | tr '[:upper:]' '[:lower:]' > "$RELAY_MACHINE_ID_PATH"
+    else
+      node -e "console.log(require('node:crypto').randomUUID().replace(/-/g, '').toLowerCase())" > "$RELAY_MACHINE_ID_PATH"
+    fi
+  fi
+
+  if [[ ! -s "$RELAY_HOSTNAME_PATH" ]]; then
+    printf 'relay-%s\n' "$(head -c 6 "$RELAY_MACHINE_ID_PATH")" > "$RELAY_HOSTNAME_PATH"
+  fi
+
+  RELAY_MACHINE_ID="$(tr -d '\n\r' < "$RELAY_MACHINE_ID_PATH")"
+  RELAY_HOSTNAME="$(tr -d '\n\r' < "$RELAY_HOSTNAME_PATH")"
+
+  printf '%s\n' "$RELAY_MACHINE_ID" > /etc/machine-id
+  mkdir -p /var/lib/dbus
+  printf '%s\n' "$RELAY_MACHINE_ID" > /var/lib/dbus/machine-id
+  hostname "$RELAY_HOSTNAME" >/dev/null 2>&1 || true
+
+  export RELAY_MACHINE_ID
+  export RELAY_HOSTNAME
+  export HOSTNAME="$RELAY_HOSTNAME"
+
+  record_status relay_machine_id "ready"
+  record_status relay_hostname "ready"
+}
+
+ensure_relay_identity
+
 if ! has_command mise; then
   curl https://mise.run | MISE_INSTALL_PATH="$MISE_BIN_DIR/mise" sh
 fi
@@ -147,6 +184,9 @@ export RELAY_HOME="$RELAY_ROOT"
 export RELAY_TOOLS="$RELAY_TOOLS_DIR"
 export RELAY_CACHE="$RELAY_CACHE_DIR"
 export RELAY_BIN="$RELAY_BIN_DIR"
+export RELAY_MACHINE_ID="$RELAY_MACHINE_ID"
+export RELAY_HOSTNAME="$RELAY_HOSTNAME"
+export HOSTNAME="$RELAY_HOSTNAME"
 export NVM_DIR="$NVM_DIR"
 export MISE_DATA_DIR="$MISE_DATA_DIR"
 export MISE_CONFIG_DIR="$MISE_CONFIG_DIR"
