@@ -1,10 +1,8 @@
 import type { Server as SocketIOServer } from 'socket.io';
 import type { PtyFactory, PtyLike, TerminalSession } from './types';
 import { DEFAULT_COLS, DEFAULT_ROWS } from './types';
-import { createShellTranscriptState, handleShellOutput, handleTerminalInput } from './transcript';
 import {
   createTerminalEnv,
-  escapeHtml,
   exists,
   isValidToken,
   resolveProjectRoot,
@@ -20,7 +18,7 @@ export function getActiveTerminals(): TerminalSession[] {
 }
 
 export function createTerminalSession(
-  socketId: string,
+  terminalId: string,
   ptyFactory: PtyFactory,
   workspace: string
 ): TerminalSession | null {
@@ -38,25 +36,25 @@ export function createTerminalSession(
   }
 
   const session: TerminalSession = {
-    id: socketId,
+    id: terminalId,
     createdAt: Date.now(),
     cwd: workspace,
     pid: shell.pid || 0,
   };
 
-  activeShells.set(socketId, shell);
-  terminalSessions.set(socketId, session);
+  activeShells.set(terminalId, shell);
+  terminalSessions.set(terminalId, session);
 
   return session;
 }
 
-export function closeTerminalSession(socketId: string): void {
-  const shell = activeShells.get(socketId);
+export function closeTerminalSession(terminalId: string): void {
+  const shell = activeShells.get(terminalId);
   if (shell) {
     shell.kill();
   }
-  activeShells.delete(socketId);
-  terminalSessions.delete(socketId);
+  activeShells.delete(terminalId);
+  terminalSessions.delete(terminalId);
 }
 
 export function registerSocketHandlers(
@@ -77,46 +75,105 @@ export function registerSocketHandlers(
 
   io.on('connection', (socket) => {
     const workspace = resolveWorkspace();
-    const transcriptState = createShellTranscriptState(workspace);
-    const session = createTerminalSession(socket.id, ptyFactory, workspace);
-    const shell = session ? activeShells.get(socket.id) : null;
-    let currentCwd = workspace;
-
-    if (!session || !shell) {
-      socket.emit('output', `\r\n[relay] Failed to start shell\r\n`);
-      socket.disconnect(true);
-      return;
-    }
-
+    let selectedTerminalId: string | null = null;
     let shellClosed = false;
+
+    // Emit existing terminals and wait for user to create one
+    socket.emit('terminals:ready', { 
+      terminals: getActiveTerminals() 
+    });
+
+    const attachToTerminal = (terminalId: string): PtyLike | null => {
+      const term = activeShells.get(terminalId);
+      if (term) {
+        selectedTerminalId = terminalId;
+        return term;
+      }
+      return null;
+    };
+
     const closeShell = () => {
       if (shellClosed) {
         return;
       }
       shellClosed = true;
-      closeTerminalSession(socket.id);
+      if (selectedTerminalId) {
+        closeTerminalSession(selectedTerminalId);
+      }
     };
 
-    shell.onData((data) => {
+    // Output from selected terminal
+    const handleOutput = (data: string) => {
       socket.emit('output', data);
-      handleShellOutput(socket, transcriptState, data);
+    };
+
+    socket.on('terminal:create', (_payload: { cwd?: string }) => {
+      const terminalId = socket.id + '-' + Date.now();
+      const targetCwd = _payload?.cwd || workspace;
+      const newSession = createTerminalSession(terminalId, ptyFactory, targetCwd);
+      
+      if (newSession) {
+        const shell = activeShells.get(terminalId);
+        if (shell) {
+          shell.onData(handleOutput);
+          if (typeof shell.onExit === 'function') {
+            shell.onExit(() => {
+              // This terminal closed - remove it and notify client
+              closeTerminalSession(terminalId);
+              if (selectedTerminalId === terminalId) {
+                selectedTerminalId = null;
+              }
+              socket.emit('terminal:closed', { id: terminalId });
+              socket.emit('terminals:updated', { 
+                terminals: getActiveTerminals() 
+              });
+            });
+          }
+        }
+        
+        selectedTerminalId = terminalId;
+        socket.emit('terminal:created', newSession);
+        socket.emit('terminal:selected', { id: terminalId });
+        socket.emit('terminals:updated', { 
+          terminals: getActiveTerminals() 
+        });
+      }
     });
 
-    if (typeof shell.onExit === 'function') {
-      shell.onExit(() => {
-        shellClosed = true;
-        closeTerminalSession(socket.id);
-        // Don't disconnect socket - other terminals may still be active
-        socket.emit('terminal:closed', { id: session.id });
-      });
-    }
+    socket.on('terminal:select', (_payload: { id: string }) => {
+      const terminalId = _payload?.id;
+      if (terminalId && terminalSessions.has(terminalId)) {
+        selectedTerminalId = terminalId;
+        socket.emit('terminal:selected', { id: terminalId });
+      }
+    });
+
+    socket.on('terminal:close', (_payload: { id: string }) => {
+      const terminalId = _payload?.id;
+      if (terminalId && terminalSessions.has(terminalId)) {
+        closeTerminalSession(terminalId);
+        if (selectedTerminalId === terminalId) {
+          selectedTerminalId = null;
+        }
+        socket.emit('terminal:closed', { id: terminalId });
+        socket.emit('terminals:updated', { 
+          terminals: getActiveTerminals() 
+        });
+      }
+    });
 
     socket.on('input', (data: string) => {
       if (typeof data !== 'string' || data.length === 0) {
         return;
       }
-      handleTerminalInput(socket, transcriptState, data);
-      shell.write(data);
+      if (!selectedTerminalId) {
+        socket.emit('output', '\r\n[relay] No terminal selected. Create or select a terminal first.\r\n');
+        return;
+      }
+      const shell = activeShells.get(selectedTerminalId);
+      if (shell) {
+        shell.write(data);
+      }
     });
 
     socket.on('resize', (payload: { cols?: number; rows?: number } = {}) => {
@@ -125,7 +182,12 @@ export function registerSocketHandlers(
       if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 1 || rows < 1) {
         return;
       }
-      shell.resize(cols, rows);
+      if (selectedTerminalId) {
+        const shell = activeShells.get(selectedTerminalId);
+        if (shell) {
+          shell.resize(cols, rows);
+        }
+      }
     });
 
     socket.on('cd', async (payload: { path: string; projectId?: string }) => {
@@ -148,20 +210,16 @@ export function registerSocketHandlers(
         return;
       }
 
-      currentCwd = targetPath;
-      shell.write(`cd '${targetPath}'\n`);
-    });
-
-    socket.on('terminal:create', (_payload: { cwd?: string }) => {
-      const targetCwd = _payload?.cwd || workspace;
-      const newSession = createTerminalSession(socket.id + '-' + Date.now(), ptyFactory, targetCwd);
-      socket.emit('terminal:created', newSession);
-    });
-
-    socket.on('terminal:close', (_payload: { id: string }) => {
-      const terminalId = _payload?.id;
-      if (terminalId) {
-        closeTerminalSession(terminalId);
+      if (selectedTerminalId) {
+        const shell = activeShells.get(selectedTerminalId);
+        if (shell) {
+          shell.write(`cd '${targetPath}'\n`);
+        }
+        // Update session cwd
+        const session = terminalSessions.get(selectedTerminalId);
+        if (session) {
+          session.cwd = targetPath;
+        }
       }
     });
 
