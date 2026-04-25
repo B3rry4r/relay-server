@@ -209,7 +209,26 @@ export function registerProjectRoutes(app: Express): void {
       res.status(404).json({ error: 'file_not_found', message: 'File not found.' });
       return;
     }
-    const content = await fs.readFile(itemPath, 'utf-8');
+    const stats = await fs.stat(itemPath);
+    if (!stats.isFile()) {
+      res.status(400).json({ error: 'not_a_file', message: 'Selected item is not a file.' });
+      return;
+    }
+    if (stats.size > 2 * 1024 * 1024) {
+      res.status(413).json({ error: 'file_too_large', message: 'File is too large to preview.' });
+      return;
+    }
+
+    const buffer = await fs.readFile(itemPath);
+    if (buffer.includes(0)) {
+      res.json({
+        content: `[binary file]\n${path.relative(projectRoot, itemPath)} cannot be displayed as text.`,
+        parsed: '',
+      });
+      return;
+    }
+
+    const content = buffer.toString('utf-8');
     const ext = itemPath.split('.').pop()?.toLowerCase();
     const parsed = (ext === 'md' || ext === 'markdown') ? await marked(content) : '';
     res.json({ content, parsed });
