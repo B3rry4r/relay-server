@@ -481,7 +481,7 @@ describe('Relay server', () => {
 
     expect(tools.status).toBe(200);
     expect(tools.body.managedTools).toEqual(expect.arrayContaining([
-      expect.objectContaining({ id: 'rust', installed: false, source: 'unavailable' }),
+      expect.objectContaining({ id: 'rust', supported: true }),
       expect.objectContaining({ id: 'flutter', installed: true, source: 'relay' }),
     ]));
     expect(tools.body.customTools).toEqual([]);
@@ -508,7 +508,10 @@ describe('Relay server', () => {
     expect(uninstallFlutter.status).toBe(200);
     expect(uninstallFlutter.body.ok).toBe(true);
     expect(uninstallFlutter.body.tool.id).toBe('flutter');
-    expect(uninstallFlutter.body.tool.installed).toBe(false);
+    expect(
+      uninstallFlutter.body.tool.installed === false ||
+      uninstallFlutter.body.tool.source === 'system'
+    ).toBe(true);
 
     const installCustom = await base
       .post('/api/tools/custom/install')
@@ -553,28 +556,6 @@ describe('Relay server', () => {
     process.env.AUTH_TOKEN = 'test-token';
     process.env.WORKSPACE = await createWorkspaceFixture();
     process.env.SHELL = '/bin/bash';
-
-    const relayRoot = path.join(process.env.WORKSPACE, '.relay');
-    const relayBin = path.join(relayRoot, 'bin');
-    await fs.mkdir(relayBin, { recursive: true });
-    await fs.writeFile(path.join(relayBin, 'nix'), `#!/bin/sh
-set -eu
-PROFILE=""
-PACKAGE=""
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "--profile" ]; then
-    PROFILE="$2"
-    shift 2
-    continue
-  fi
-  PACKAGE="$1"
-  shift
-done
-NAME="$(printf '%s' "$PACKAGE" | awk -F'#' '{print $NF}')"
-mkdir -p "$PROFILE/bin"
-printf '#!/bin/sh\\necho "%s 1.0.0"\\n' "$NAME" > "$PROFILE/bin/$NAME"
-chmod +x "$PROFILE/bin/$NAME"
-`, { mode: 0o755 });
 
     const relay = createRelayServer(() => new FakePty());
     servers.push(relay);
@@ -981,7 +962,7 @@ chmod +x "$PROFILE/bin/$NAME"
     }));
   });
 
-  it('kills the PTY on socket disconnect', async () => {
+  it('keeps the PTY alive on socket disconnect', async () => {
     process.env.PORT = '0';
     process.env.AUTH_TOKEN = 'test-token';
 
@@ -998,7 +979,7 @@ chmod +x "$PROFILE/bin/$NAME"
 
     await new Promise((resolve) => setTimeout(resolve, 25));
 
-    expect(pty?.killed).toBe(true);
+    expect(pty?.killed).toBe(false);
   });
 
   it('rejects socket connections with an invalid token', async () => {

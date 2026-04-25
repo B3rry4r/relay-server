@@ -4,8 +4,8 @@ import type { Server as SocketIOServer } from 'socket.io';
 
 export type PtyLike = {
   kill(): void;
-  onData(callback: (data: string) => void): void;
-  onExit?(callback: (event: { exitCode: number; signal?: number }) => void): void;
+  onData(callback: (data: string) => void): { dispose(): void } | void;
+  onExit?(callback: (event: { exitCode: number; signal?: number }) => void): { dispose(): void } | void;
   resize(cols: number, rows: number): void;
   write(data: string): void;
   pid?: number;
@@ -65,6 +65,7 @@ export type TerminalSession = {
   createdAt: number;
   cwd: string;
   pid: number;
+  scrollback: string;
 };
 
 export const MANAGED_TOOL_IDS = [

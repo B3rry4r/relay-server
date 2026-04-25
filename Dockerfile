@@ -60,10 +60,20 @@ RUN apt-get update && apt-get install -y \
     cargo \
     unzip \
     ca-certificates \
-    chromium-browser \
+    wget \
+    gnupg \
     && rm -rf /var/lib/apt/lists/*
 
-ENV CHROME_EXECUTABLE_PATH=/usr/bin/chromium
+RUN wget -q -O - https://dl.google.com/linux/linux_signing_key.pub \
+    | gpg --dearmor -o /usr/share/keyrings/google-linux-signing-keyring.gpg \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-linux-signing-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
+    > /etc/apt/sources.list.d/google-chrome.list \
+    && apt-get update \
+    && apt-get install -y google-chrome-stable \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV CHROME_EXECUTABLE=/usr/bin/google-chrome \
+    CHROME_EXECUTABLE_PATH=/usr/bin/google-chrome
 
 RUN curl -fsSL https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-x64.tar.gz | tar -xz -C /usr/local --strip-components=1
 

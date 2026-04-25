@@ -2,11 +2,6 @@ import type { Server as SocketIOServer } from 'socket.io';
 import type { PtyFactory, PtyLike, TerminalSession } from './types';
 import { DEFAULT_COLS, DEFAULT_ROWS } from './types';
 import {
-  createShellTranscriptState,
-  handleShellOutput,
-  handleTerminalInput,
-} from './transcript';
-import {
   createTerminalEnv,
   exists,
   isValidToken,
@@ -14,12 +9,22 @@ import {
   resolveShell,
   resolveWorkspace,
 } from './runtime';
+import {
+  createShellTranscriptState,
+  handleShellOutput,
+  handleTerminalInput,
+} from './transcript';
 
 const activeShells = new Map<string, PtyLike>();
 const terminalSessions = new Map<string, TerminalSession>();
+const MAX_SCROLLBACK_BYTES = 1024 * 1024;
 
 export function getActiveTerminals(): TerminalSession[] {
   return Array.from(terminalSessions.values());
+}
+
+function getTerminalSummaries(): Array<Omit<TerminalSession, 'scrollback'>> {
+  return getActiveTerminals().map(({ scrollback: _scrollback, ...session }) => session);
 }
 
 export function createTerminalSession(
@@ -45,6 +50,7 @@ export function createTerminalSession(
     createdAt: Date.now(),
     cwd: workspace,
     pid: shell.pid || 0,
+    scrollback: '',
   };
 
   activeShells.set(terminalId, shell);
@@ -59,6 +65,12 @@ export function closeTerminalSession(terminalId: string): void {
   terminalSessions.delete(terminalId);
   if (shell) {
     shell.kill();
+  }
+}
+
+export function closeAllTerminalSessions(): void {
+  for (const terminalId of Array.from(terminalSessions.keys())) {
+    closeTerminalSession(terminalId);
   }
 }
 
@@ -81,59 +93,71 @@ export function registerSocketHandlers(
     const workspace = resolveWorkspace();
     const transcript = createShellTranscriptState(workspace);
     let selectedTerminalId: string | null = null;
+    const disposables: Array<{ dispose(): void }> = [];
 
-    // Helper to get active shell for selected terminal
     const getShell = (): PtyLike | null => {
       if (!selectedTerminalId) return null;
       return activeShells.get(selectedTerminalId) || null;
     };
 
-    // Callback when terminal exits - notify client
+    const replayTerminal = (terminalId: string): void => {
+      const session = terminalSessions.get(terminalId);
+      if (session?.scrollback) {
+        socket.emit('terminal:replay', { id: terminalId, data: session.scrollback });
+      }
+    };
+
+    const bindShellToSocket = (terminalId: string, shell: PtyLike): void => {
+      const dataDisposable = shell.onData((data: string) => {
+        const session = terminalSessions.get(terminalId);
+        if (session) {
+          session.scrollback = `${session.scrollback}${data}`.slice(-MAX_SCROLLBACK_BYTES);
+        }
+        if (selectedTerminalId === terminalId) {
+          socket.emit('output', data);
+          handleShellOutput(socket, transcript, data);
+        }
+      });
+      if (dataDisposable) disposables.push(dataDisposable);
+
+      if (typeof shell.onExit === 'function') {
+        const exitDisposable = shell.onExit(() => onTerminalExit(terminalId));
+        if (exitDisposable) disposables.push(exitDisposable);
+      }
+    };
+
     const onTerminalExit = (terminalId: string) => {
       closeTerminalSession(terminalId);
       if (selectedTerminalId === terminalId) {
         selectedTerminalId = null;
       }
       socket.emit('terminal:closed', { id: terminalId });
-      socket.emit('terminals:updated', { 
-        terminals: getActiveTerminals() 
+      socket.emit('terminals:updated', {
+        terminals: getTerminalSummaries(),
       });
     };
 
-    const bindShellToSocket = (terminalId: string, shell: PtyLike): void => {
-      shell.onData((data: string) => {
-        socket.emit('output', data);
-        handleShellOutput(socket, transcript, data);
-      });
-
-      if (typeof shell.onExit === 'function') {
-        shell.onExit(() => onTerminalExit(terminalId));
-      }
-    };
-
-    // Create first terminal automatically if none exist
     const existing = getActiveTerminals();
     if (existing.length > 0) {
-      // Reuse first existing terminal
       selectedTerminalId = existing[0].id;
       const shell = activeShells.get(selectedTerminalId);
       if (shell) {
         bindShellToSocket(selectedTerminalId, shell);
       }
-      socket.emit('terminals:ready', { terminals: existing });
+      socket.emit('terminals:ready', { terminals: getTerminalSummaries() });
       socket.emit('terminal:selected', { id: selectedTerminalId, cwd: existing[0].cwd });
+      replayTerminal(selectedTerminalId);
     } else {
-      // Create new terminal
       const terminalId = socket.id + '-' + Date.now();
       const session = createTerminalSession(terminalId, ptyFactory, workspace);
-      
+
       if (session) {
         selectedTerminalId = terminalId;
         const shell = activeShells.get(terminalId);
         if (shell) {
           bindShellToSocket(terminalId, shell);
         }
-        socket.emit('terminals:ready', { terminals: getActiveTerminals() });
+        socket.emit('terminals:ready', { terminals: getTerminalSummaries() });
         socket.emit('terminal:created', session);
         socket.emit('terminal:selected', { id: terminalId, cwd: session.cwd });
       } else {
@@ -146,17 +170,19 @@ export function registerSocketHandlers(
       const terminalId = socket.id + '-' + Date.now();
       const targetCwd = _payload?.cwd || workspace;
       const session = createTerminalSession(terminalId, ptyFactory, targetCwd);
-      
+
       if (session) {
         const shell = activeShells.get(terminalId);
         if (shell) {
           bindShellToSocket(terminalId, shell);
         }
-        
+
         selectedTerminalId = terminalId;
         socket.emit('terminal:created', session);
         socket.emit('terminal:selected', { id: terminalId, cwd: session.cwd });
-        socket.emit('terminals:updated', { terminals: getActiveTerminals() });
+        socket.emit('terminals:updated', { terminals: getTerminalSummaries() });
+      } else {
+        socket.emit('output', '\r\n[relay] Failed to start shell\r\n');
       }
     });
 
@@ -165,10 +191,11 @@ export function registerSocketHandlers(
       if (terminalId && terminalSessions.has(terminalId)) {
         selectedTerminalId = terminalId;
         const session = terminalSessions.get(terminalId);
-        socket.emit('terminal:selected', { 
-          id: terminalId, 
-          cwd: session?.cwd 
+        socket.emit('terminal:selected', {
+          id: terminalId,
+          cwd: session?.cwd,
         });
+        replayTerminal(terminalId);
       }
     });
 
@@ -176,7 +203,6 @@ export function registerSocketHandlers(
       const terminalId = _payload?.id;
       if (terminalId && terminalSessions.has(terminalId)) {
         onTerminalExit(terminalId);
-        // Create new terminal if all closed
         if (terminalSessions.size === 0) {
           const newId = socket.id + '-' + Date.now();
           const session = createTerminalSession(newId, ptyFactory, workspace);
@@ -188,7 +214,7 @@ export function registerSocketHandlers(
             }
             socket.emit('terminal:created', session);
             socket.emit('terminal:selected', { id: newId, cwd: session.cwd });
-            socket.emit('terminals:updated', { terminals: getActiveTerminals() });
+            socket.emit('terminals:updated', { terminals: getTerminalSummaries() });
           }
         }
       }
@@ -246,10 +272,10 @@ export function registerSocketHandlers(
     });
 
     socket.on('disconnect', () => {
-      if (selectedTerminalId) {
-        closeTerminalSession(selectedTerminalId);
-        selectedTerminalId = null;
+      while (disposables.length > 0) {
+        disposables.pop()?.dispose();
       }
+      selectedTerminalId = null;
     });
   });
 }

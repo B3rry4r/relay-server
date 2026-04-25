@@ -7,7 +7,7 @@ import { registerCoreRoutes } from './relay-server/core-routes';
 import { registerFlutterRoutes } from './relay-server/flutter-routes';
 import { registerGitRoutes } from './relay-server/git-routes';
 import { registerProjectRoutes } from './relay-server/project-routes';
-import { registerSocketHandlers } from './relay-server/socket';
+import { closeAllTerminalSessions, registerSocketHandlers } from './relay-server/socket';
 import { registerToolRoutes } from './relay-server/tool-routes';
 import { ensureRelayRuntimeAssets } from './relay-server/tooling';
 import { resolveWorkspace } from './relay-server/runtime';
@@ -42,7 +42,7 @@ export function defaultPtyFactory(options: {
     cols: options.cols,
     cwd: options.cwd,
     env: options.env,
-    name: 'xterm-color',
+    name: 'xterm-256color',
     rows: options.rows,
   });
 }
@@ -94,6 +94,8 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
       return address && typeof address === 'object' ? address.port : port;
     },
     async stop() {
+      closeAllTerminalSessions();
+
       if (!httpServer.listening) {
         io.close();
         return;
@@ -118,12 +120,14 @@ export class FakePty extends EventEmitter implements PtyLike {
   public resizeCalls: Array<{ cols: number; rows: number }> = [];
   public writes: string[] = [];
 
-  onData(callback: (data: string) => void): void {
+  onData(callback: (data: string) => void): { dispose(): void } {
     this.on('data', callback);
+    return { dispose: () => this.off('data', callback) };
   }
 
-  onExit(callback: (event: { exitCode: number; signal?: number }) => void): void {
+  onExit(callback: (event: { exitCode: number; signal?: number }) => void): { dispose(): void } {
     this.on('exit', callback);
+    return { dispose: () => this.off('exit', callback) };
   }
 
   write(data: string): void {
