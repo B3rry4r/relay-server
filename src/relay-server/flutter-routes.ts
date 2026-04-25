@@ -61,9 +61,37 @@ async function waitForPort(port: number, timeoutMs = 25000): Promise<boolean> {
   return false;
 }
 
-function readPreviewPort(value: unknown): number {
+function readPreviewPort(value: unknown): number | null {
+  if (value === undefined || value === null || value === '') {
+    return null;
+  }
   const port = typeof value === 'number' ? value : Number(value);
-  return Number.isInteger(port) && port > 0 && port <= 65535 ? port : 8080;
+  return Number.isInteger(port) && port > 0 && port <= 65535 ? port : null;
+}
+
+async function findAvailablePreviewPort(preferredPort = 8080): Promise<number> {
+  const activePorts = new Set(await listListeningPorts());
+  for (let candidate = Math.max(1024, preferredPort); candidate <= 65535; candidate += 1) {
+    if (!activePorts.has(candidate)) {
+      return candidate;
+    }
+  }
+  throw new Error('No preview ports are available.');
+}
+
+function sanitizeFlutterOutput(output: string): string {
+  const lines = output
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter((line) => line.length > 0)
+    .filter((line) => !line.startsWith('Woah! You appear to be trying to run flutter as root.'));
+
+  const bindError = lines.find((line) => line.includes('Failed to bind web development server: SocketException: Failed to create server socket'));
+  if (bindError) {
+    return 'Flutter could not start the web preview because the selected port is already in use. Choose another preview port and try again.';
+  }
+
+  return lines.slice(-12).join('\n');
 }
 
 async function ensureFlutterInstalled(workspace: string): Promise<boolean> {
@@ -200,7 +228,7 @@ export function registerFlutterRoutes(app: Express): void {
   app.post('/api/projects/:projectId/flutter/serve', requireAuth, async (req, res) => {
     const projectId = readStringParam(req.params.projectId);
     const projectRoot = resolveProjectRoot(projectId);
-    const port = readPreviewPort(req.body?.port);
+    const requestedPort = readPreviewPort(req.body?.port);
 
     if (!projectRoot || !await exists(projectRoot)) {
       res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
@@ -221,6 +249,7 @@ export function registerFlutterRoutes(app: Express): void {
     const flutterBin = path.join(getFlutterRoot(workspace), 'bin', 'flutter');
     const env = createTerminalEnv(workspace);
     const existing = getRunningFlutterDevSession(projectId);
+    const port = requestedPort ?? await findAvailablePreviewPort(existing?.port ?? 8080);
 
     if (existing?.port === port) {
       res.json({
@@ -240,7 +269,7 @@ export function registerFlutterRoutes(app: Express): void {
 
     try {
       const activePorts = await listListeningPorts();
-      if (activePorts.includes(port)) {
+      if (requestedPort && activePorts.includes(port)) {
         res.status(409).json({
           error: 'port_in_use',
           message: `Port ${port} is already in use. Choose another preview port.`,
@@ -283,10 +312,10 @@ export function registerFlutterRoutes(app: Express): void {
 
       const ready = await waitForPort(port);
       if (!ready) {
-        const output = session.output.trim();
+        const output = sanitizeFlutterOutput(session.output.trim());
         stopFlutterDevSession(projectId);
         res.status(500).json({
-          error: 'serve_failed',
+          error: output.includes('selected port is already in use') ? 'port_in_use' : 'serve_failed',
           message: output || 'Flutter dev server did not become ready in time.',
         });
         return;
