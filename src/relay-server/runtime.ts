@@ -118,6 +118,7 @@ export function createTerminalEnv(workspace: string): NodeJS.ProcessEnv {
     MISE_CONFIG_DIR: path.join(getRelayStateRoot(workspace), 'mise'),
     FLUTTER_HOME: flutterRoot,
     PUB_CACHE: path.join(relayCache, 'dart-pub'),
+    npm_config_prefix: path.join(relayTools, 'npm-global'),
     npm_config_cache: path.join(relayCache, 'npm'),
     PIP_CACHE_DIR: path.join(relayCache, 'pip'),
     CARGO_HOME: path.join(relayCache, 'cargo'),

@@ -861,6 +861,7 @@ chmod +x "$PROFILE/bin/$NAME"
       expect(options.env.RELAY_TOOLS).toBe('/tmp/relay-workspace/.relay/tools');
       expect(options.env.RELAY_CACHE).toBe('/tmp/relay-workspace/.relay/cache');
       expect(options.env.RELAY_BIN).toBe('/tmp/relay-workspace/.relay/bin');
+      expect(options.env.npm_config_prefix).toBe('/tmp/relay-workspace/.relay/tools/npm-global');
       expect(options.env.PROMPT_COMMAND).toBe('');
       expect(options.env.VSCODE_GIT_IPC_HANDLE).toBeUndefined();
       expect(options.env.TERM_PROGRAM).toBeUndefined();
