@@ -1,2 +1,9 @@
 35;35;25Mclear35;30;26M0;30;26M0;30;26m
 35;32;25Mclear
+cd '/workspace/projects/my-app'
+cd '/workspace/projects/relay-server'
+ls
+clear
+opencode
+cd '/workspace/projects/my-app'
+flutter doctor
