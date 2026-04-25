@@ -4,3 +4,9 @@ dist/
 .DS_Store
 npm-debug.log*
 acli
+.bash_history
+.cache/
+.codex/
+.config/
+.local/
+.relay/

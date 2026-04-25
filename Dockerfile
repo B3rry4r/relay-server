@@ -72,8 +72,7 @@ RUN wget -q -O - https://dl.google.com/linux/linux_signing_key.pub \
     && apt-get install -y google-chrome-stable \
     && rm -rf /var/lib/apt/lists/*
 
-ENV CHROME_EXECUTABLE=/usr/bin/google-chrome \
-    CHROME_EXECUTABLE_PATH=/usr/bin/google-chrome
+ENV RELAY_CHROME_BIN=/usr/bin/google-chrome
 
 RUN curl -fsSL https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-x64.tar.gz | tar -xz -C /usr/local --strip-components=1
 

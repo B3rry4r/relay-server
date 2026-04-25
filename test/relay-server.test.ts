@@ -491,6 +491,7 @@ describe('Relay server', () => {
 
     await expect(fs.readFile(path.join(process.env.WORKSPACE, '.gemini', 'settings.json'), 'utf8')).resolves.toContain('"selectedType": "oauth-personal"');
     await expect(fs.readFile(path.join(process.env.WORKSPACE, '.relay', 'bin', 'relay-browser'), 'utf8')).resolves.toContain('Browser auth URL');
+    await expect(fs.readFile(path.join(process.env.WORKSPACE, '.relay', 'bin', 'relay-chrome'), 'utf8')).resolves.toContain('--no-sandbox');
 
     const invalidInstall = await base
       .post('/api/tools/install')

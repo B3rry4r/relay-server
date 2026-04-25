@@ -8,7 +8,7 @@
     "dev": "nodemon --watch 'src/**' --watch 'docs/**' --ext 'ts,md,json' --exec 'npm run build && node dist/src/index.js'",
     "build": "rm -rf dist && tsc",
     "start": "npm run build && node dist/src/index.js",
-    "test": "vitest run"
+    "test": "vitest run --dir test"
   },
   "license": "Apache-2.0",
   "dependencies": {

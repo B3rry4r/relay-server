@@ -154,6 +154,15 @@ EOF
 chmod +x "$RELAY_BIN_DIR/relay-browser"
 record_status relay_browser "ready"
 
+cat > "$RELAY_BIN_DIR/relay-chrome" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+CHROME_BIN="\${RELAY_CHROME_BIN:-/usr/bin/google-chrome}"
+exec "\$CHROME_BIN" --headless=new --no-sandbox --disable-dev-shm-usage --disable-gpu "\$@"
+EOF
+chmod +x "$RELAY_BIN_DIR/relay-chrome"
+record_status relay_chrome "ready"
+
 if [[ ! -f "$WORKSPACE/.gemini/settings.json" ]]; then
   cat > "$WORKSPACE/.gemini/settings.json" <<EOF
 {
@@ -201,7 +210,7 @@ export GOMODCACHE="$GO_HOME_DIR/pkg/mod"
 export GRADLE_USER_HOME="$GRADLE_HOME_DIR"
 export FLUTTER_HOME="$FLUTTER_HOME_DIR"
 export ANDROID_SDK_ROOT="$RELAY_TOOLS_DIR/android-sdk"
-export CHROME_EXECUTABLE="\${CHROME_EXECUTABLE:-/usr/bin/google-chrome}"
+export CHROME_EXECUTABLE="$RELAY_BIN_DIR/relay-chrome"
 export CHROME_EXECUTABLE_PATH="\${CHROME_EXECUTABLE_PATH:-\$CHROME_EXECUTABLE}"
 export NIX_CONFIG="experimental-features = nix-command flakes"
 export BROWSER="$RELAY_BIN_DIR/relay-browser"

@@ -22,6 +22,7 @@ import {
   getNixPackagesRegistryPath,
   getRelayBinRoot,
   getRelayBrowserPath,
+  getRelayChromePath,
   getRelayCacheRoot,
   getRelayRoot,
   getRelayStateRoot,
@@ -260,6 +261,14 @@ fi
 `, { mode: 0o755 });
 }
 
+async function ensureRelayChromeScript(workspace: string): Promise<void> {
+  await fs.writeFile(getRelayChromePath(workspace), `#!/usr/bin/env bash
+set -euo pipefail
+CHROME_BIN="\${RELAY_CHROME_BIN:-/usr/bin/google-chrome}"
+exec "$CHROME_BIN" --headless=new --no-sandbox --disable-dev-shm-usage --disable-gpu "$@"
+`, { mode: 0o755 });
+}
+
 async function ensureGeminiAuthSettings(workspace: string): Promise<void> {
   const settingsPath = getGeminiSettingsPath(workspace);
   await fs.mkdir(path.dirname(settingsPath), { recursive: true });
@@ -284,6 +293,7 @@ export async function ensureRelayRuntimeAssets(workspace: string): Promise<void>
   await ensureToolDirectories(workspace);
   await Promise.all([
     ensureRelayBrowserScript(workspace),
+    ensureRelayChromeScript(workspace),
     ensureGeminiAuthSettings(workspace),
   ]);
 }

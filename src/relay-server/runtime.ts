@@ -56,6 +56,10 @@ export function getRelayBrowserPath(workspace = resolveWorkspace()): string {
   return path.join(getRelayBinRoot(workspace), 'relay-browser');
 }
 
+export function getRelayChromePath(workspace = resolveWorkspace()): string {
+  return path.join(getRelayBinRoot(workspace), 'relay-chrome');
+}
+
 export function getGeminiSettingsPath(workspace = resolveWorkspace()): string {
   return path.join(workspace, '.gemini', 'settings.json');
 }
@@ -127,8 +131,8 @@ export function createTerminalEnv(workspace: string): NodeJS.ProcessEnv {
     GOMODCACHE: path.join(relayCache, 'go', 'pkg', 'mod'),
     GRADLE_USER_HOME: path.join(relayCache, 'gradle'),
     ANDROID_SDK_ROOT: path.join(relayTools, 'android-sdk'),
-    CHROME_EXECUTABLE: process.env.CHROME_EXECUTABLE || process.env.CHROME_EXECUTABLE_PATH || '/usr/bin/google-chrome',
-    CHROME_EXECUTABLE_PATH: process.env.CHROME_EXECUTABLE_PATH || process.env.CHROME_EXECUTABLE || '/usr/bin/google-chrome',
+    CHROME_EXECUTABLE: getRelayChromePath(workspace),
+    CHROME_EXECUTABLE_PATH: getRelayChromePath(workspace),
     NIX_CONFIG: `${process.env.NIX_CONFIG ? `${process.env.NIX_CONFIG}\n` : ''}experimental-features = nix-command flakes`,
     BROWSER: getRelayBrowserPath(workspace),
     RELAY_BROWSER: '1',
