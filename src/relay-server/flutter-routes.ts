@@ -428,6 +428,16 @@ export function registerFlutterRoutes(app: Express): void {
     }
 
     const ext = path.extname(requestedFile);
+    if (ext === '.html') {
+      const html = await fs.readFile(requestedFile, 'utf8');
+      res.set('Content-Type', 'text/html');
+      res.send(html.replace(
+        /<base\s+href=(["'])\/\1\s*\/?>/i,
+        `<base href="/api/projects/${projectId}/flutter/preview/">`,
+      ));
+      return;
+    }
+
     const mimeTypes: Record<string, string> = {
       '.html': 'text/html',
       '.js': 'application/javascript',
