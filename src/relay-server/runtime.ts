@@ -179,8 +179,13 @@ export function extractRequestToken(req: Request): string {
   const bearerToken = authorization?.startsWith('Bearer ')
     ? authorization.slice('Bearer '.length)
     : '';
+  const cookieToken = (req.header('cookie') || '')
+    .split(';')
+    .map((part) => part.trim())
+    .find((part) => part.startsWith('relay_auth_token='))
+    ?.slice('relay_auth_token='.length) || '';
 
-  return tokenFromQuery || headerValue || bearerToken || '';
+  return tokenFromQuery || headerValue || bearerToken || decodeURIComponent(cookieToken);
 }
 
 export function isValidToken(token: string): boolean {
@@ -193,12 +198,21 @@ export function readStringParam(value: string | string[] | undefined): string {
 }
 
 export function requireAuth(req: Request, res: Response, next: NextFunction): void {
-  if (!isValidToken(extractRequestToken(req))) {
+  const token = extractRequestToken(req);
+  if (!isValidToken(token)) {
     res.status(401).json({
       error: 'unauthorized',
       message: 'A valid auth token is required.',
     });
     return;
+  }
+
+  if (typeof req.query.token === 'string') {
+    res.cookie('relay_auth_token', token, {
+      httpOnly: true,
+      sameSite: 'lax',
+      path: '/',
+    });
   }
 
   next();

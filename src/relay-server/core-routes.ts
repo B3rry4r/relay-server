@@ -165,8 +165,9 @@ export function registerCoreRoutes(app: Express): void {
     res.json({ ok: true, port, message: `Preview server starting on port ${port}` });
   });
 
-  app.all('/preview/:port(*)', requireAuth, async (req, res) => {
-    const port = Number(req.params.port);
+  app.all(/^\/preview\/(\d+)(\/.*)?$/, requireAuth, async (req, res) => {
+    const port = Number(req.params[0]);
+    const targetPath = req.params[1] || '/';
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       res.status(400).json({ error: 'invalid_port', message: 'Port must be between 1 and 65535.' });
       return;
@@ -180,8 +181,17 @@ export function registerCoreRoutes(app: Express): void {
 
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const httpProxy = require('http-proxy') as {
-      createProxyServer(options: { target: string; changeOrigin: boolean }): {
+      createProxyServer(options: { target: string; changeOrigin: boolean; selfHandleResponse?: boolean }): {
         on(event: 'error', callback: (err: Error) => void): void;
+        on(
+          event: 'proxyRes',
+          callback: (
+            proxyRes: NodeJS.ReadableStream & {
+              headers?: Record<string, string | string[] | undefined>;
+              statusCode?: number;
+            },
+          ) => void
+        ): void;
         web(req: Express.Request, res: Express.Response): void;
       };
     };
@@ -189,6 +199,7 @@ export function registerCoreRoutes(app: Express): void {
     const proxy = httpProxy.createProxyServer({
       target: `http://127.0.0.1:${port}`,
       changeOrigin: true,
+      selfHandleResponse: true,
     });
 
     proxy.on('error', (err: Error) => {
@@ -196,6 +207,34 @@ export function registerCoreRoutes(app: Express): void {
       res.status(502).json({ error: 'proxy_error', message: 'Failed to proxy request' });
     });
 
+    proxy.on('proxyRes', (proxyRes: NodeJS.ReadableStream & { headers?: Record<string, string | string[] | undefined>; statusCode?: number }) => {
+      const headers = { ...(proxyRes.headers || {}) };
+      const contentType = String(headers['content-type'] || '');
+      const statusCode = proxyRes.statusCode || 200;
+
+      if (!contentType.includes('text/html')) {
+        res.writeHead(statusCode, headers);
+        proxyRes.pipe(res);
+        return;
+      }
+
+      const chunks: Buffer[] = [];
+      proxyRes.on('data', (chunk: Buffer) => chunks.push(chunk));
+      proxyRes.on('end', () => {
+        const html = Buffer.concat(chunks)
+          .toString('utf8')
+          .replace(/<base\s+href=(["'])\/\1\s*\/?>/i, `<base href="/preview/${port}/">`);
+        delete headers['content-length'];
+        delete headers['content-encoding'];
+        res.writeHead(statusCode, headers);
+        res.end(html);
+      });
+    });
+
+    const originalUrl = new URL(req.originalUrl, 'http://relay.local');
+    originalUrl.searchParams.delete('token');
+    const query = originalUrl.searchParams.toString();
+    req.url = `${targetPath}${query ? `?${query}` : ''}`;
     proxy.web(req, res);
   });
 

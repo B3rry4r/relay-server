@@ -1,7 +1,7 @@
 import express, { type Express } from 'express';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { execFile as execFileCallback, spawn as spawnCallback } from 'node:child_process';
+import { execFile as execFileCallback, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
   createTerminalEnv,
@@ -13,9 +13,46 @@ import {
   resolveWorkspace,
 } from './runtime';
 import { installManagedTool, listManagedToolStatuses } from './tooling-management';
+import { listListeningPorts } from './projects';
 
 const execFile = promisify(execFileCallback);
-const spawn = promisify(spawnCallback);
+
+type FlutterDevSession = {
+  port: number;
+  process: ChildProcessWithoutNullStreams;
+  projectId: string;
+  projectRoot: string;
+  startedAt: number;
+  output: string;
+};
+
+const flutterDevSessions = new Map<string, FlutterDevSession>();
+
+function appendSessionOutput(session: FlutterDevSession, chunk: Buffer): void {
+  session.output = `${session.output}${chunk.toString('utf8')}`.slice(-20000);
+}
+
+function stopFlutterDevSession(projectId: string): void {
+  const session = flutterDevSessions.get(projectId);
+  if (!session) return;
+  session.process.kill('SIGTERM');
+  flutterDevSessions.delete(projectId);
+}
+
+async function waitForPort(port: number, timeoutMs = 25000): Promise<boolean> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const ports = await listListeningPorts();
+    if (ports.includes(port)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return false;
+}
+
+function readPreviewPort(value: unknown): number {
+  const port = typeof value === 'number' ? value : Number(value);
+  return Number.isInteger(port) && port > 0 && port <= 65535 ? port : 8080;
+}
 
 async function ensureFlutterInstalled(workspace: string): Promise<boolean> {
   const flutterPath = getFlutterRoot(workspace);
@@ -151,7 +188,7 @@ export function registerFlutterRoutes(app: Express): void {
   app.post('/api/projects/:projectId/flutter/serve', requireAuth, async (req, res) => {
     const projectId = readStringParam(req.params.projectId);
     const projectRoot = resolveProjectRoot(projectId);
-    const port = typeof req.body?.port === 'number' ? req.body.port : 8080;
+    const port = readPreviewPort(req.body?.port);
 
     if (!projectRoot || !await exists(projectRoot)) {
       res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
@@ -171,31 +208,85 @@ export function registerFlutterRoutes(app: Express): void {
 
     const flutterBin = path.join(getFlutterRoot(workspace), 'bin', 'flutter');
     const env = createTerminalEnv(workspace);
+    const existing = flutterDevSessions.get(projectId);
+
+    if (existing?.port === port && existing.process.exitCode === null) {
+      res.json({
+        ok: true,
+        url: `/preview/${port}/`,
+        port,
+        mode: 'dev-server',
+        ready: true,
+        message: `Flutter dev preview is already running on port ${port}.`,
+      });
+      return;
+    }
+
+    if (existing) {
+      stopFlutterDevSession(projectId);
+    }
 
     try {
-      await execFile(flutterBin, ['pub', 'get'], { cwd: projectRoot, env });
-
-      const buildDir = path.join(projectRoot, 'build', 'web');
-      if (!await exists(buildDir)) {
-        await execFile(flutterBin, ['build', 'web', '--release'], {
-          cwd: projectRoot,
-          env,
-          maxBuffer: 100 * 1024 * 1024,
+      const activePorts = await listListeningPorts();
+      if (activePorts.includes(port)) {
+        res.status(409).json({
+          error: 'port_in_use',
+          message: `Port ${port} is already in use. Choose another preview port.`,
         });
+        return;
       }
 
-      spawn('python3', ['-m', 'http.server', String(port)], {
-        cwd: buildDir,
+      await execFile(flutterBin, ['pub', 'get'], { cwd: projectRoot, env });
+
+      const child = spawn(flutterBin, [
+        'run',
+        '-d',
+        'web-server',
+        '--web-hostname',
+        '0.0.0.0',
+        '--web-port',
+        String(port),
+      ], {
+        cwd: projectRoot,
         env,
-        detached: true,
-        stdio: 'ignore',
+        stdio: 'pipe',
       });
+
+      const session: FlutterDevSession = {
+        port,
+        process: child,
+        projectId,
+        projectRoot,
+        startedAt: Date.now(),
+        output: '',
+      };
+      flutterDevSessions.set(projectId, session);
+      child.stdout.on('data', (chunk: Buffer) => appendSessionOutput(session, chunk));
+      child.stderr.on('data', (chunk: Buffer) => appendSessionOutput(session, chunk));
+      child.on('exit', () => {
+        if (flutterDevSessions.get(projectId)?.process === child) {
+          flutterDevSessions.delete(projectId);
+        }
+      });
+
+      const ready = await waitForPort(port);
+      if (!ready) {
+        const output = session.output.trim();
+        stopFlutterDevSession(projectId);
+        res.status(500).json({
+          error: 'serve_failed',
+          message: output || 'Flutter dev server did not become ready in time.',
+        });
+        return;
+      }
 
       res.json({
         ok: true,
-        url: `http://localhost:${port}`,
+        url: `/preview/${port}/`,
         port,
-        message: `Flutter web preview running on port ${port}`,
+        mode: 'dev-server',
+        ready,
+        message: `Flutter dev preview running on port ${port}.`,
       });
     } catch (error) {
       res.status(500).json({
@@ -211,6 +302,18 @@ export function registerFlutterRoutes(app: Express): void {
 
     if (!projectRoot || !await exists(projectRoot)) {
       res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+
+    const session = flutterDevSessions.get(projectId);
+    if (session?.process.exitCode === null) {
+      res.json({
+        ready: true,
+        mode: 'dev-server',
+        port: session.port,
+        url: `/preview/${session.port}/`,
+        output: session.output,
+      });
       return;
     }
 
