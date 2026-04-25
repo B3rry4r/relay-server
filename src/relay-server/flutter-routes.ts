@@ -39,6 +39,18 @@ function stopFlutterDevSession(projectId: string): void {
   flutterDevSessions.delete(projectId);
 }
 
+function getRunningFlutterDevSession(projectId: string): FlutterDevSession | null {
+  const session = flutterDevSessions.get(projectId);
+  return session?.process.exitCode === null ? session : null;
+}
+
+function writeFlutterDevCommand(projectId: string, command: 'reload' | 'restart'): FlutterDevSession | null {
+  const session = getRunningFlutterDevSession(projectId);
+  if (!session) return null;
+  session.process.stdin.write(command === 'restart' ? 'R' : 'r');
+  return session;
+}
+
 async function waitForPort(port: number, timeoutMs = 25000): Promise<boolean> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
@@ -208,9 +220,9 @@ export function registerFlutterRoutes(app: Express): void {
 
     const flutterBin = path.join(getFlutterRoot(workspace), 'bin', 'flutter');
     const env = createTerminalEnv(workspace);
-    const existing = flutterDevSessions.get(projectId);
+    const existing = getRunningFlutterDevSession(projectId);
 
-    if (existing?.port === port && existing.process.exitCode === null) {
+    if (existing?.port === port) {
       res.json({
         ok: true,
         url: `/preview/${port}/`,
@@ -296,6 +308,68 @@ export function registerFlutterRoutes(app: Express): void {
     }
   });
 
+  app.post('/api/projects/:projectId/flutter/reload', requireAuth, async (req, res) => {
+    const projectId = readStringParam(req.params.projectId);
+    const session = writeFlutterDevCommand(projectId, 'reload');
+
+    if (!session) {
+      res.status(404).json({
+        error: 'flutter_preview_not_running',
+        message: 'Start the Flutter dev preview before using hot reload.',
+      });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      port: session.port,
+      mode: 'dev-server',
+      message: 'Flutter hot reload requested.',
+    });
+  });
+
+  app.post('/api/projects/:projectId/flutter/restart', requireAuth, async (req, res) => {
+    const projectId = readStringParam(req.params.projectId);
+    const session = writeFlutterDevCommand(projectId, 'restart');
+
+    if (!session) {
+      res.status(404).json({
+        error: 'flutter_preview_not_running',
+        message: 'Start the Flutter dev preview before using hot restart.',
+      });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      port: session.port,
+      mode: 'dev-server',
+      message: 'Flutter hot restart requested.',
+    });
+  });
+
+  app.post('/api/projects/:projectId/flutter/stop', requireAuth, async (req, res) => {
+    const projectId = readStringParam(req.params.projectId);
+    const session = getRunningFlutterDevSession(projectId);
+
+    if (!session) {
+      res.json({
+        ok: true,
+        running: false,
+        message: 'Flutter dev preview is not running.',
+      });
+      return;
+    }
+
+    stopFlutterDevSession(projectId);
+    res.json({
+      ok: true,
+      running: false,
+      port: session.port,
+      message: `Flutter dev preview on port ${session.port} stopped.`,
+    });
+  });
+
   app.get('/api/projects/:projectId/flutter/preview', requireAuth, async (req, res) => {
     const projectId = readStringParam(req.params.projectId);
     const projectRoot = resolveProjectRoot(projectId);
@@ -305,8 +379,8 @@ export function registerFlutterRoutes(app: Express): void {
       return;
     }
 
-    const session = flutterDevSessions.get(projectId);
-    if (session?.process.exitCode === null) {
+    const session = getRunningFlutterDevSession(projectId);
+    if (session) {
       res.json({
         ready: true,
         mode: 'dev-server',

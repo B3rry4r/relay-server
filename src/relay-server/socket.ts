@@ -18,6 +18,7 @@ import {
 const activeShells = new Map<string, PtyLike>();
 const terminalSessions = new Map<string, TerminalSession>();
 const MAX_SCROLLBACK_BYTES = 1024 * 1024;
+let lastSelectedTerminalId: string | null = null;
 
 export function getActiveTerminals(): TerminalSession[] {
   return Array.from(terminalSessions.values());
@@ -94,6 +95,7 @@ export function registerSocketHandlers(
     const transcript = createShellTranscriptState(workspace);
     let selectedTerminalId: string | null = null;
     const disposables: Array<{ dispose(): void }> = [];
+    const boundTerminalIds = new Set<string>();
 
     const getShell = (): PtyLike | null => {
       if (!selectedTerminalId) return null;
@@ -108,6 +110,9 @@ export function registerSocketHandlers(
     };
 
     const bindShellToSocket = (terminalId: string, shell: PtyLike): void => {
+      if (boundTerminalIds.has(terminalId)) return;
+      boundTerminalIds.add(terminalId);
+
       const dataDisposable = shell.onData((data: string) => {
         const session = terminalSessions.get(terminalId);
         if (session) {
@@ -131,6 +136,10 @@ export function registerSocketHandlers(
       if (selectedTerminalId === terminalId) {
         selectedTerminalId = null;
       }
+      if (lastSelectedTerminalId === terminalId) {
+        lastSelectedTerminalId = getActiveTerminals()
+          .sort((left, right) => right.createdAt - left.createdAt)[0]?.id ?? null;
+      }
       socket.emit('terminal:closed', { id: terminalId });
       socket.emit('terminals:updated', {
         terminals: getTerminalSummaries(),
@@ -139,13 +148,23 @@ export function registerSocketHandlers(
 
     const existing = getActiveTerminals();
     if (existing.length > 0) {
-      selectedTerminalId = existing[0].id;
-      const shell = activeShells.get(selectedTerminalId);
-      if (shell) {
-        bindShellToSocket(selectedTerminalId, shell);
+      for (const session of existing) {
+        const shell = activeShells.get(session.id);
+        if (shell) {
+          bindShellToSocket(session.id, shell);
+        }
       }
+      const requestedTerminalId = typeof socket.handshake.auth.activeTerminalId === 'string'
+        ? socket.handshake.auth.activeTerminalId
+        : '';
+      const selectedSession =
+        existing.find((session) => session.id === requestedTerminalId) ??
+        existing.find((session) => session.id === lastSelectedTerminalId) ??
+        existing.sort((left, right) => right.createdAt - left.createdAt)[0];
+      selectedTerminalId = selectedSession.id;
+      lastSelectedTerminalId = selectedTerminalId;
       socket.emit('terminals:ready', { terminals: getTerminalSummaries() });
-      socket.emit('terminal:selected', { id: selectedTerminalId, cwd: existing[0].cwd });
+      socket.emit('terminal:selected', { id: selectedTerminalId, cwd: selectedSession.cwd });
       replayTerminal(selectedTerminalId);
     } else {
       const terminalId = socket.id + '-' + Date.now();
@@ -153,6 +172,7 @@ export function registerSocketHandlers(
 
       if (session) {
         selectedTerminalId = terminalId;
+        lastSelectedTerminalId = terminalId;
         const shell = activeShells.get(terminalId);
         if (shell) {
           bindShellToSocket(terminalId, shell);
@@ -178,6 +198,7 @@ export function registerSocketHandlers(
         }
 
         selectedTerminalId = terminalId;
+        lastSelectedTerminalId = terminalId;
         socket.emit('terminal:created', session);
         socket.emit('terminal:selected', { id: terminalId, cwd: session.cwd });
         socket.emit('terminals:updated', { terminals: getTerminalSummaries() });
@@ -190,6 +211,7 @@ export function registerSocketHandlers(
       const terminalId = _payload?.id;
       if (terminalId && terminalSessions.has(terminalId)) {
         selectedTerminalId = terminalId;
+        lastSelectedTerminalId = terminalId;
         const session = terminalSessions.get(terminalId);
         socket.emit('terminal:selected', {
           id: terminalId,
@@ -208,6 +230,7 @@ export function registerSocketHandlers(
           const session = createTerminalSession(newId, ptyFactory, workspace);
           if (session) {
             selectedTerminalId = newId;
+            lastSelectedTerminalId = newId;
             const shell = activeShells.get(newId);
             if (shell) {
               bindShellToSocket(newId, shell);
@@ -275,6 +298,7 @@ export function registerSocketHandlers(
       while (disposables.length > 0) {
         disposables.pop()?.dispose();
       }
+      boundTerminalIds.clear();
       selectedTerminalId = null;
     });
   });
