@@ -249,7 +249,8 @@ export function registerFlutterRoutes(app: Express): void {
     const flutterBin = path.join(getFlutterRoot(workspace), 'bin', 'flutter');
     const env = createTerminalEnv(workspace);
     const existing = getRunningFlutterDevSession(projectId);
-    const port = requestedPort ?? await findAvailablePreviewPort(existing?.port ?? 8080);
+    const preferredPort = requestedPort ?? existing?.port ?? 8080;
+    const port = await findAvailablePreviewPort(preferredPort);
 
     if (existing?.port === port) {
       res.json({
@@ -263,18 +264,9 @@ export function registerFlutterRoutes(app: Express): void {
       return;
     }
 
-    if (existing) {
-      stopFlutterDevSession(projectId);
-    }
-
     try {
-      const activePorts = await listListeningPorts();
-      if (requestedPort && activePorts.includes(port)) {
-        res.status(409).json({
-          error: 'port_in_use',
-          message: `Port ${port} is already in use. Choose another preview port.`,
-        });
-        return;
+      if (existing) {
+        stopFlutterDevSession(projectId);
       }
 
       await execFile(flutterBin, ['pub', 'get'], { cwd: projectRoot, env });
