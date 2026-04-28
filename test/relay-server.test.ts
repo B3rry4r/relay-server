@@ -915,6 +915,41 @@ chmod +x "$PROFILE/bin/$NAME"
     expect(pty?.resizeCalls).toEqual([{ cols: 120, rows: 40 }]);
   });
 
+  it('keeps relay-managed global tool paths rooted at the workspace for project terminals', async () => {
+    process.env.PORT = '0';
+    process.env.AUTH_TOKEN = 'test-token';
+    process.env.WORKSPACE = '/tmp/relay-workspace';
+
+    const calls: Array<{ cwd: string; env: NodeJS.ProcessEnv }> = [];
+    const factory: PtyFactory = (options) => {
+      calls.push({ cwd: options.cwd, env: options.env });
+      return new FakePty();
+    };
+
+    const relay = createRelayServer(factory);
+    servers.push(relay);
+    const port = await relay.start();
+    const client = await connectClient(port, 'test-token');
+    clients.push(client);
+
+    const created = new Promise<{ id: string; cwd: string }>((resolve) => {
+      client.once('terminal:created', resolve);
+    });
+
+    client.emit('terminal:create', { cwd: '/tmp/relay-workspace/projects/cloned-app' });
+
+    await expect(created).resolves.toMatchObject({
+      cwd: '/tmp/relay-workspace/projects/cloned-app',
+    });
+
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.cwd).toBe('/tmp/relay-workspace/projects/cloned-app');
+    expect(calls[1]?.env.HOME).toBe('/tmp/relay-workspace');
+    expect(calls[1]?.env.RELAY_HOME).toBe('/tmp/relay-workspace/.relay');
+    expect(calls[1]?.env.npm_config_prefix).toBe('/tmp/relay-workspace/.relay/tools/npm-global');
+    expect(String(calls[1]?.env.PATH)).toContain('/tmp/relay-workspace/.relay/tools/npm-global/bin');
+  });
+
   it('emits structured shell transcript events alongside raw output', async () => {
     process.env.PORT = '0';
     process.env.AUTH_TOKEN = 'test-token';

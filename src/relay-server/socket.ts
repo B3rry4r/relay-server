@@ -31,15 +31,16 @@ function getTerminalSummaries(): Array<Omit<TerminalSession, 'scrollback'>> {
 export function createTerminalSession(
   terminalId: string,
   ptyFactory: PtyFactory,
-  workspace: string
+  cwd: string,
+  workspaceRoot: string
 ): TerminalSession | null {
   let shell: PtyLike;
   try {
     shell = ptyFactory({
       command: resolveShell(),
       cols: DEFAULT_COLS,
-      cwd: workspace,
-      env: createTerminalEnv(workspace),
+      cwd,
+      env: createTerminalEnv(workspaceRoot),
       rows: DEFAULT_ROWS,
     });
   } catch {
@@ -49,7 +50,7 @@ export function createTerminalSession(
   const session: TerminalSession = {
     id: terminalId,
     createdAt: Date.now(),
-    cwd: workspace,
+    cwd,
     pid: shell.pid || 0,
     scrollback: '',
   };
@@ -91,8 +92,8 @@ export function registerSocketHandlers(
   });
 
   io.on('connection', (socket) => {
-    const workspace = resolveWorkspace();
-    const transcript = createShellTranscriptState(workspace);
+    const workspaceRoot = resolveWorkspace();
+    const transcript = createShellTranscriptState(workspaceRoot);
     let selectedTerminalId: string | null = null;
     const disposables: Array<{ dispose(): void }> = [];
     const boundTerminalIds = new Set<string>();
@@ -168,7 +169,7 @@ export function registerSocketHandlers(
       replayTerminal(selectedTerminalId);
     } else {
       const terminalId = socket.id + '-' + Date.now();
-      const session = createTerminalSession(terminalId, ptyFactory, workspace);
+      const session = createTerminalSession(terminalId, ptyFactory, workspaceRoot, workspaceRoot);
 
       if (session) {
         selectedTerminalId = terminalId;
@@ -188,8 +189,8 @@ export function registerSocketHandlers(
 
     socket.on('terminal:create', (_payload: { cwd?: string }) => {
       const terminalId = socket.id + '-' + Date.now();
-      const targetCwd = _payload?.cwd || workspace;
-      const session = createTerminalSession(terminalId, ptyFactory, targetCwd);
+      const targetCwd = _payload?.cwd || workspaceRoot;
+      const session = createTerminalSession(terminalId, ptyFactory, targetCwd, workspaceRoot);
 
       if (session) {
         const shell = activeShells.get(terminalId);
@@ -227,7 +228,7 @@ export function registerSocketHandlers(
         onTerminalExit(terminalId);
         if (terminalSessions.size === 0) {
           const newId = socket.id + '-' + Date.now();
-          const session = createTerminalSession(newId, ptyFactory, workspace);
+          const session = createTerminalSession(newId, ptyFactory, workspaceRoot, workspaceRoot);
           if (session) {
             selectedTerminalId = newId;
             lastSelectedTerminalId = newId;
