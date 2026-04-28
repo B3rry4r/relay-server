@@ -8,16 +8,21 @@
     "dev": "nodemon --watch 'src/**' --watch 'docs/**' --ext 'ts,md,json' --exec 'npm run build && node dist/src/index.js'",
     "build": "rm -rf dist && tsc",
     "start": "npm run build && node dist/src/index.js",
+    "mcp": "node mcp-server.mjs",
     "test": "vitest run --dir test"
   },
   "license": "Apache-2.0",
   "dependencies": {
+    "@cfworker/json-schema": "^4.1.1",
+    "@modelcontextprotocol/node": "^2.0.0-alpha.2",
+    "@modelcontextprotocol/server": "^2.0.0-alpha.2",
     "cors": "^2.8.5",
     "express": "^4.21.2",
     "http-proxy": "^1.18.1",
     "marked": "^18.0.2",
     "node-pty": "npm:@homebridge/node-pty-prebuilt-multiarch@^0.13.1",
-    "socket.io": "^4.8.1"
+    "socket.io": "^4.8.1",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",

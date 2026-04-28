@@ -38,6 +38,27 @@ curl -H 'x-auth-token: change-this-token' http://localhost:3012/api/auth/validat
 
 The live context bridge is available at `POST /api/context/snapshot` with the Relay auth token. The web client uses it to render the current workspace, terminal, Git, preview, and Flutter state as one JSON snapshot.
 
+## MCP bridge
+
+Relay also ships a standalone MCP server for local clients and agents.
+
+Run it with:
+
+```sh
+RELAY_BACKEND_URL=http://127.0.0.1:8080 AUTH_TOKEN=change-this-token npm run mcp
+```
+
+It exposes tools for:
+
+- workspace snapshots and health
+- project listing and selection
+- project trees and file reads
+- terminal creation, selection, close, and command dispatch
+- preview port serving
+- Flutter status, build, serve, reload, restart, and stop
+
+The MCP server talks to the live Relay backend over HTTP and Socket.IO, so it can inspect logs and drive the same workspace state the UI sees.
+
 Run tests:
 
 ```sh
