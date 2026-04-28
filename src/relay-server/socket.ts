@@ -4,10 +4,13 @@ import { DEFAULT_COLS, DEFAULT_ROWS } from './types';
 import {
   createTerminalEnv,
   exists,
+  getRelayTerminalSessionsPath,
   isValidToken,
+  readJsonFile,
   resolveProjectRoot,
   resolveShell,
   resolveWorkspace,
+  writeJsonFile,
 } from './runtime';
 import {
   createShellTranscriptState,
@@ -19,6 +22,83 @@ const activeShells = new Map<string, PtyLike>();
 const terminalSessions = new Map<string, TerminalSession>();
 const MAX_SCROLLBACK_BYTES = 1024 * 1024;
 let lastSelectedTerminalId: string | null = null;
+let persistTimer: NodeJS.Timeout | null = null;
+let restorePromise: Promise<void> | null = null;
+let suppressTerminalPersistence = false;
+
+type PersistedTerminalSession = Pick<TerminalSession, 'id' | 'createdAt' | 'cwd' | 'scrollback'>;
+type PersistedTerminalState = {
+  lastSelectedTerminalId: string | null;
+  sessions: PersistedTerminalSession[];
+};
+
+function snapshotTerminalState(): PersistedTerminalState {
+  return {
+    lastSelectedTerminalId,
+    sessions: getActiveTerminals().map((session) => ({
+      id: session.id,
+      createdAt: session.createdAt,
+      cwd: session.cwd,
+      scrollback: session.scrollback.slice(-MAX_SCROLLBACK_BYTES),
+    })),
+  };
+}
+
+export async function persistTerminalState(): Promise<void> {
+  if (suppressTerminalPersistence) {
+    return;
+  }
+  await writeJsonFile(getRelayTerminalSessionsPath(resolveWorkspace()), snapshotTerminalState());
+}
+
+export function setTerminalPersistenceSuppressed(value: boolean): void {
+  suppressTerminalPersistence = value;
+}
+
+function schedulePersistTerminalState(): void {
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+  }
+
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    void persistTerminalState().catch(() => undefined);
+  }, 250);
+}
+
+async function restorePersistedTerminalSessions(ptyFactory: PtyFactory): Promise<void> {
+  if (restorePromise) {
+    await restorePromise;
+    return;
+  }
+
+  restorePromise = (async () => {
+    const workspaceRoot = resolveWorkspace();
+    const state = await readJsonFile<PersistedTerminalState | null>(
+      getRelayTerminalSessionsPath(workspaceRoot),
+      null,
+    );
+
+    if (!state?.sessions?.length) {
+      lastSelectedTerminalId = state?.lastSelectedTerminalId ?? null;
+      return;
+    }
+
+    for (const persisted of state.sessions) {
+      const session = createTerminalSession(persisted.id, ptyFactory, persisted.cwd || workspaceRoot, workspaceRoot);
+      if (session) {
+        session.createdAt = persisted.createdAt || session.createdAt;
+        session.scrollback = (persisted.scrollback || '').slice(-MAX_SCROLLBACK_BYTES);
+      }
+    }
+
+    lastSelectedTerminalId = state.lastSelectedTerminalId && terminalSessions.has(state.lastSelectedTerminalId)
+      ? state.lastSelectedTerminalId
+      : getActiveTerminals().sort((left, right) => right.createdAt - left.createdAt)[0]?.id ?? null;
+  })();
+
+  await restorePromise;
+}
 
 export function getActiveTerminals(): TerminalSession[] {
   return Array.from(terminalSessions.values());
@@ -57,23 +137,41 @@ export function createTerminalSession(
 
   activeShells.set(terminalId, shell);
   terminalSessions.set(terminalId, session);
+  schedulePersistTerminalState();
 
   return session;
 }
 
-export function closeTerminalSession(terminalId: string): void {
+export function closeTerminalSession(terminalId: string, skipPersist = false): void {
   const shell = activeShells.get(terminalId);
   activeShells.delete(terminalId);
   terminalSessions.delete(terminalId);
   if (shell) {
     shell.kill();
   }
+  if (!skipPersist) {
+    schedulePersistTerminalState();
+  }
 }
 
-export function closeAllTerminalSessions(): void {
+export function closeAllTerminalSessions(skipPersist = false): void {
   for (const terminalId of Array.from(terminalSessions.keys())) {
-    closeTerminalSession(terminalId);
+    closeTerminalSession(terminalId, skipPersist);
   }
+}
+
+export async function restoreTerminalSessions(ptyFactory: PtyFactory): Promise<void> {
+  await restorePersistedTerminalSessions(ptyFactory);
+}
+
+export function resetTerminalPersistenceRuntime(): void {
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  restorePromise = null;
+  lastSelectedTerminalId = null;
+  suppressTerminalPersistence = false;
 }
 
 export function registerSocketHandlers(
@@ -99,8 +197,15 @@ export function registerSocketHandlers(
     const boundTerminalIds = new Set<string>();
 
     const getShell = (): PtyLike | null => {
-      if (!selectedTerminalId) return null;
-      return activeShells.get(selectedTerminalId) || null;
+      const fallbackId =
+        selectedTerminalId
+        ?? lastSelectedTerminalId
+        ?? getActiveTerminals().sort((left, right) => right.createdAt - left.createdAt)[0]?.id
+        ?? null;
+      if (!fallbackId) return null;
+      selectedTerminalId = fallbackId;
+      lastSelectedTerminalId = fallbackId;
+      return activeShells.get(fallbackId) || null;
     };
 
     const replayTerminal = (terminalId: string): void => {
@@ -118,6 +223,7 @@ export function registerSocketHandlers(
         const session = terminalSessions.get(terminalId);
         if (session) {
           session.scrollback = `${session.scrollback}${data}`.slice(-MAX_SCROLLBACK_BYTES);
+          schedulePersistTerminalState();
         }
         if (selectedTerminalId === terminalId) {
           socket.emit('output', data);
@@ -133,7 +239,7 @@ export function registerSocketHandlers(
     };
 
     const onTerminalExit = (terminalId: string) => {
-      closeTerminalSession(terminalId);
+      closeTerminalSession(terminalId, suppressTerminalPersistence);
       if (selectedTerminalId === terminalId) {
         selectedTerminalId = null;
       }
@@ -145,6 +251,7 @@ export function registerSocketHandlers(
       socket.emit('terminals:updated', {
         terminals: getTerminalSummaries(),
       });
+      schedulePersistTerminalState();
     };
 
     const existing = getActiveTerminals();
@@ -219,6 +326,7 @@ export function registerSocketHandlers(
           cwd: session?.cwd,
         });
         replayTerminal(terminalId);
+        schedulePersistTerminalState();
       }
     });
 
@@ -239,6 +347,7 @@ export function registerSocketHandlers(
             socket.emit('terminal:created', session);
             socket.emit('terminal:selected', { id: newId, cwd: session.cwd });
             socket.emit('terminals:updated', { terminals: getTerminalSummaries() });
+            schedulePersistTerminalState();
           }
         }
       }
@@ -291,6 +400,7 @@ export function registerSocketHandlers(
         const session = selectedTerminalId ? terminalSessions.get(selectedTerminalId) : null;
         if (session) {
           session.cwd = targetPath;
+          schedulePersistTerminalState();
         }
       }
     });

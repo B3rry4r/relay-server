@@ -8,7 +8,14 @@ import { registerContextRoutes } from './relay-server/context-routes';
 import { registerFlutterRoutes } from './relay-server/flutter-routes';
 import { registerGitRoutes } from './relay-server/git-routes';
 import { registerProjectRoutes } from './relay-server/project-routes';
-import { closeAllTerminalSessions, registerSocketHandlers } from './relay-server/socket';
+import {
+  closeAllTerminalSessions,
+  persistTerminalState,
+  registerSocketHandlers,
+  restoreTerminalSessions,
+  resetTerminalPersistenceRuntime,
+  setTerminalPersistenceSuppressed,
+} from './relay-server/socket';
 import { registerToolRoutes } from './relay-server/tool-routes';
 import { ensureRelayRuntimeAssets } from './relay-server/tooling';
 import { resolveWorkspace } from './relay-server/runtime';
@@ -76,6 +83,7 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
     async start() {
       const port = Number.parseInt(process.env.PORT || '3000', 10);
       await ensureRelayRuntimeAssets(resolveWorkspace());
+      await restoreTerminalSessions(ptyFactory);
 
       await new Promise<void>((resolve, reject) => {
         const onError = (error: Error) => {
@@ -96,7 +104,11 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
       return address && typeof address === 'object' ? address.port : port;
     },
     async stop() {
-      closeAllTerminalSessions();
+      await persistTerminalState();
+      setTerminalPersistenceSuppressed(true);
+      closeAllTerminalSessions(true);
+      setTerminalPersistenceSuppressed(false);
+      resetTerminalPersistenceRuntime();
 
       if (!httpServer.listening) {
         io.close();

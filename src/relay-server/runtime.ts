@@ -44,6 +44,10 @@ export function getRelayHostnamePath(workspace = resolveWorkspace()): string {
   return path.join(getRelayStateRoot(workspace), 'hostname');
 }
 
+export function getRelayTerminalSessionsPath(workspace = resolveWorkspace()): string {
+  return path.join(getRelayStateRoot(workspace), 'terminal-sessions.json');
+}
+
 export function getProjectsRoot(): string {
   return path.join(resolveWorkspace(), 'projects');
 }

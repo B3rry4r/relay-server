@@ -1083,6 +1083,44 @@ chmod +x "$PROFILE/bin/$NAME"
     expect(pty?.killed).toBe(false);
   });
 
+  it('restores terminal sessions after a relay restart', async () => {
+    process.env.PORT = '0';
+    process.env.AUTH_TOKEN = 'test-token';
+    process.env.WORKSPACE = await createWorkspaceFixture();
+
+    const factory = () => new FakePty();
+    const relay1 = createRelayServer(factory);
+    const port1 = await relay1.start();
+    const client = await connectClient(port1, 'test-token');
+    clients.push(client);
+
+    const firstResponse = await request(`http://127.0.0.1:${port1}`)
+      .get('/api/terminals')
+      .set('x-auth-token', 'test-token');
+
+    expect(firstResponse.status).toBe(200);
+    expect(firstResponse.body.terminals.length).toBeGreaterThan(0);
+    const restoredTerminalId = firstResponse.body.terminals[0].id as string;
+
+    client.disconnect();
+    await relay1.stop();
+
+    const relay2 = createRelayServer(factory);
+    servers.push(relay2);
+    const port2 = await relay2.start();
+
+    const secondResponse = await request(`http://127.0.0.1:${port2}`)
+      .get('/api/terminals')
+      .set('x-auth-token', 'test-token');
+
+    expect(secondResponse.status).toBe(200);
+    expect(secondResponse.body.terminals).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: restoredTerminalId }),
+      ]),
+    );
+  });
+
   it('rejects socket connections with an invalid token', async () => {
     process.env.PORT = '0';
     process.env.AUTH_TOKEN = 'test-token';
