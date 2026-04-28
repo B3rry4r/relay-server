@@ -16,7 +16,6 @@ describe('setup-workspace script', () => {
     expect(script).toContain('BOOTSTRAP_STATUS_PATH="$WORKSPACE/.bootstrap-status"');
     expect(script).toContain('RELAY_ROOT="$WORKSPACE/.relay"');
     expect(script).toContain('RELAY_ENV_PATH="$RELAY_STATE_DIR/tool-env.sh"');
-    expect(script).toContain('record_status nix "available"');
     expect(script).toContain('record_status relay_browser "ready"');
     expect(script).toContain('record_status relay_chrome "ready"');
     expect(script).toContain('record_status gemini_auth "ready"');
@@ -34,7 +33,6 @@ describe('setup-workspace script', () => {
     expect(script).toContain('export RELAY_MACHINE_ID="$RELAY_MACHINE_ID"');
     expect(script).toContain('export RELAY_HOSTNAME="$RELAY_HOSTNAME"');
     expect(script).toContain('export FLUTTER_HOME="$FLUTTER_HOME_DIR"');
-    expect(script).toContain('export NIX_CONFIG="experimental-features = nix-command flakes"');
     expect(script).toContain('export BROWSER="$RELAY_BIN_DIR/relay-browser"');
     expect(script).toContain('export CHROME_EXECUTABLE="$RELAY_BIN_DIR/relay-chrome"');
     expect(script).not.toContain('workspace already initialized');

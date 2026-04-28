@@ -133,7 +133,6 @@ export function createTerminalEnv(workspace: string): NodeJS.ProcessEnv {
     ANDROID_SDK_ROOT: path.join(relayTools, 'android-sdk'),
     CHROME_EXECUTABLE: getRelayChromePath(workspace),
     CHROME_EXECUTABLE_PATH: getRelayChromePath(workspace),
-    NIX_CONFIG: `${process.env.NIX_CONFIG ? `${process.env.NIX_CONFIG}\n` : ''}experimental-features = nix-command flakes`,
     BROWSER: getRelayBrowserPath(workspace),
     RELAY_BROWSER: '1',
     RELAY_BROWSER_STATE_PATH: path.join(getRelayStateRoot(workspace), 'browser-url.txt'),

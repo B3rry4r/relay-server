@@ -61,14 +61,13 @@ On startup, Relay runs `setup-workspace.sh` before the HTTP server starts. That 
 - `/workspace/.gemini/settings.json`
 - `/workspace/.relay/bin/relay-browser`
 - `/workspace/.relay/tools`
-- `/workspace/.relay/tools/nix-profiles`
 - `/workspace/.relay/cache`
 - `/workspace/.relay/state`
 - `/workspace/projects`
 - `/workspace/.bootstrap-status`
 
 If every managed component is present, the script writes `/workspace/.bootstrapped`.
-If optional toolchain pieces such as `nvm`, `mise`, or `nix` are skipped or fail, Relay still starts, but `/workspace/.bootstrapped` is removed and `/workspace/.bootstrap-status` records the partial state so later restarts can retry the missing pieces.
+If optional toolchain pieces such as `nvm` or `mise` are skipped or fail, Relay still starts, but `/workspace/.bootstrapped` is removed and `/workspace/.bootstrap-status` records the partial state so later restarts can retry the missing pieces.
 
 ## Security
 

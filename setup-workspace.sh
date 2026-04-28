@@ -18,7 +18,6 @@ MISE_DIR="$RELAY_TOOLS_DIR/mise"
 MISE_BIN_DIR="$MISE_DIR/bin"
 MISE_DATA_DIR="$RELAY_TOOLS_DIR/mise-data"
 MISE_CONFIG_DIR="$RELAY_STATE_DIR/mise"
-NIX_PROFILES_DIR="$RELAY_TOOLS_DIR/nix-profiles"
 BASHRC_PATH="$WORKSPACE/.bashrc"
 BASH_PROFILE_PATH="$WORKSPACE/.bash_profile"
 PROJECTS_DIR="$WORKSPACE/projects"
@@ -77,7 +76,7 @@ record_status() {
 mkdir -p "$WORKSPACE" "$PROJECTS_DIR" "$NPM_GLOBAL_DIR/bin" "$PYTHON_USERBASE/bin"
 mkdir -p "$RELAY_ROOT" "$RELAY_TOOLS_DIR" "$RELAY_CACHE_DIR" "$RELAY_BIN_DIR" "$RELAY_STATE_DIR" \
   "$PUB_CACHE_DIR" "$PIP_CACHE_DIR" "$CARGO_HOME_DIR/bin" "$GO_HOME_DIR/bin" "$GRADLE_HOME_DIR" \
-  "$MISE_DIR" "$MISE_DATA_DIR" "$MISE_CONFIG_DIR" "$NIX_PROFILES_DIR" "$WORKSPACE/.gemini"
+  "$MISE_DIR" "$MISE_DATA_DIR" "$MISE_CONFIG_DIR" "$WORKSPACE/.gemini"
 printf '' > "$BOOTSTRAP_STATUS_PATH"
 record_status workspace "$WORKSPACE"
 record_status relay_root "ready"
@@ -88,7 +87,6 @@ record_status relay_state "ready"
 record_status projects_dir "ready"
 record_status npm_global "ready"
 record_status python_userbase "ready"
-record_status nix_profiles "ready"
 
 ensure_relay_identity() {
   mkdir -p "$RELAY_STATE_DIR"
@@ -129,13 +127,6 @@ if ! has_command mise; then
   curl https://mise.run | MISE_INSTALL_PATH="$MISE_BIN_DIR/mise" sh
 fi
 record_status mise "installed"
-
-if has_command nix; then
-  record_status nix "available"
-else
-  record_status nix "missing"
-  BOOTSTRAP_COMPLETE=0
-fi
 
 cat > "$RELAY_BIN_DIR/relay-browser" <<EOF
 #!/usr/bin/env bash
@@ -212,7 +203,6 @@ export FLUTTER_HOME="$FLUTTER_HOME_DIR"
 export ANDROID_SDK_ROOT="$RELAY_TOOLS_DIR/android-sdk"
 export CHROME_EXECUTABLE="$RELAY_BIN_DIR/relay-chrome"
 export CHROME_EXECUTABLE_PATH="\${CHROME_EXECUTABLE_PATH:-\$CHROME_EXECUTABLE}"
-export NIX_CONFIG="experimental-features = nix-command flakes"
 export BROWSER="$RELAY_BIN_DIR/relay-browser"
 export RELAY_BROWSER_STATE_PATH="$RELAY_STATE_DIR/browser-url.txt"
 export TERM="xterm-256color"
