@@ -359,8 +359,6 @@ export function registerSocketHandlers(
       if (shell) {
         handleTerminalInput(socket, transcript, data);
         shell.write(data);
-      } else {
-        socket.emit('output', '\r\n[relay] No terminal selected\r\n');
       }
     });
 
