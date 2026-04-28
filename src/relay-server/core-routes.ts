@@ -175,24 +175,17 @@ export function registerCoreRoutes(app: Express): void {
     }
 
     const ports = await listListeningPorts();
-    if (!ports.includes(port) && !hasRunningFlutterDevSessionOnPort(port)) {
+    const hasDevServer = ports.includes(port) || hasRunningFlutterDevSessionOnPort(port);
+
+    if (!hasDevServer) {
       res.status(502).json({ error: 'preview_not_available', message: `No server running on port ${port}` });
       return;
     }
 
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
     const httpProxy = require('http-proxy') as {
       createProxyServer(options: { target: string; changeOrigin: boolean; selfHandleResponse?: boolean }): {
         on(event: 'error', callback: (err: Error) => void): void;
-        on(
-          event: 'proxyRes',
-          callback: (
-            proxyRes: NodeJS.ReadableStream & {
-              headers?: Record<string, string | string[] | undefined>;
-              statusCode?: number;
-            },
-          ) => void
-        ): void;
+        on(event: 'proxyRes', callback: (proxyRes: NodeJS.ReadableStream & { headers?: Record<string, string | string[] | undefined>; statusCode?: number }) => void): void;
         web(req: Express.Request, res: Express.Response): void;
       };
     };
