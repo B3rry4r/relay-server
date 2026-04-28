@@ -4,6 +4,7 @@ import express, { type Express } from 'express';
 import cors from 'cors';
 import { Server as SocketIOServer } from 'socket.io';
 import { registerCoreRoutes } from './relay-server/core-routes';
+import { registerContextRoutes } from './relay-server/context-routes';
 import { registerFlutterRoutes } from './relay-server/flutter-routes';
 import { registerGitRoutes } from './relay-server/git-routes';
 import { registerProjectRoutes } from './relay-server/project-routes';
@@ -61,6 +62,7 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
   app.use(express.json());
 
   registerCoreRoutes(app);
+  registerContextRoutes(app);
   registerFlutterRoutes(app);
   registerProjectRoutes(app);
   registerToolRoutes(app);

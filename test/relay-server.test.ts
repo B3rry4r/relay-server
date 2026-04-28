@@ -169,6 +169,70 @@ describe('Relay server', () => {
     });
   });
 
+  it('returns a live context snapshot for the current workspace state', async () => {
+    process.env.PORT = '0';
+    process.env.AUTH_TOKEN = 'test-token';
+    process.env.WORKSPACE = await createWorkspaceFixture();
+
+    await fs.writeFile(path.join(process.env.WORKSPACE, '.bootstrap-status'), 'bootstrap=complete\n');
+    await fs.writeFile(path.join(process.env.WORKSPACE, '.bootstrapped'), '');
+
+    const relay = createRelayServer(() => new FakePty());
+    servers.push(relay);
+    const port = await relay.start();
+    const base = request(`http://127.0.0.1:${port}`);
+
+    const createProject = await base
+      .post('/api/projects')
+      .set('x-auth-token', 'test-token')
+      .send({
+        name: 'context-app',
+        template: 'blank',
+        initializeGit: true,
+      });
+
+    expect(createProject.status).toBe(201);
+
+    const snapshot = await base
+      .post('/api/context/snapshot')
+      .set('x-auth-token', 'test-token')
+      .send({
+        activeProjectId: 'context-app',
+        activeTerminalId: 'terminal-1',
+        currentView: 'git',
+        gitSelectedPath: 'src/index.ts',
+        previewPort: '4173',
+        previewViewportMode: 'portrait',
+        selectedItem: {
+          name: 'index.ts',
+          path: 'src/index.ts',
+          type: 'file',
+        },
+        sheet: 'context',
+        flutter: {
+          sdkInstalled: true,
+          isProject: false,
+          previewPort: '4173',
+        },
+      });
+
+    expect(snapshot.status).toBe(200);
+    expect(snapshot.body.server.workspace).toBe(process.env.WORKSPACE);
+    expect(snapshot.body.health.bootstrapped).toBe(true);
+    expect(snapshot.body.projects).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'context-app' }),
+    ]));
+    expect(snapshot.body.activeProject).toEqual(expect.objectContaining({
+      id: 'context-app',
+      path: path.join(process.env.WORKSPACE, 'projects', 'context-app'),
+    }));
+    expect(snapshot.body.activeProject.git.status.branch).toBe('main');
+    expect(snapshot.body.client.currentView).toBe('git');
+    expect(snapshot.body.client.previewPort).toBe('4173');
+    expect(Array.isArray(snapshot.body.server.activePorts)).toBe(true);
+    expect(Array.isArray(snapshot.body.previews)).toBe(true);
+  });
+
   it('supports project and file management APIs', async () => {
     process.env.PORT = '0';
     process.env.AUTH_TOKEN = 'test-token';

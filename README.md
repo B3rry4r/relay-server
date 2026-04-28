@@ -11,6 +11,7 @@ The frontend should live in a separate codebase and connect to this service over
 - One PTY per client connection
 - Workspace-scoped shell environment
 - First-boot workspace bootstrap for persistent Railway volumes
+- Authenticated live context snapshot API for Relay-aware tooling and UI inspection
 
 ## Local development
 
@@ -34,6 +35,8 @@ curl http://localhost:3012/
 curl http://localhost:3012/health
 curl -H 'x-auth-token: change-this-token' http://localhost:3012/api/auth/validate
 ```
+
+The live context bridge is available at `POST /api/context/snapshot` with the Relay auth token. The web client uses it to render the current workspace, terminal, Git, preview, and Flutter state as one JSON snapshot.
 
 Run tests:
 
