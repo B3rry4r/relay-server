@@ -61,6 +61,12 @@ async function waitForPort(port: number, timeoutMs = 25000): Promise<boolean> {
   return false;
 }
 
+function isPortBindError(output: string): boolean {
+  return output.includes('Failed to bind web development server: SocketException: Failed to create server socket')
+    || output.includes('Address already in use')
+    || output.includes('port = 8080');
+}
+
 function readPreviewPort(value: unknown): number | null {
   if (value === undefined || value === null || value === '') {
     return null;
@@ -86,8 +92,7 @@ function sanitizeFlutterOutput(output: string): string {
     .filter((line) => line.length > 0)
     .filter((line) => !line.startsWith('Woah! You appear to be trying to run flutter as root.'));
 
-  const bindError = lines.find((line) => line.includes('Failed to bind web development server: SocketException: Failed to create server socket'));
-  if (bindError) {
+  if (isPortBindError(lines.join('\n'))) {
     return 'Flutter could not start the web preview because the selected port is already in use. Choose another preview port and try again.';
   }
 
@@ -248,78 +253,88 @@ export function registerFlutterRoutes(app: Express): void {
 
     const flutterBin = path.join(getFlutterRoot(workspace), 'bin', 'flutter');
     const env = createTerminalEnv(workspace);
-    const existing = getRunningFlutterDevSession(projectId);
-    const preferredPort = requestedPort ?? existing?.port ?? 4173;
-    const port = await findAvailablePreviewPort(preferredPort);
-
-    if (existing?.port === port) {
-      res.json({
-        ok: true,
-        url: `/preview/${port}/`,
-        port,
-        mode: 'dev-server',
-        ready: true,
-        message: `Flutter dev preview is already running on port ${port}.`,
-      });
-      return;
-    }
-
     try {
+      const existing = getRunningFlutterDevSession(projectId);
+      const preferredPort = requestedPort ?? (existing?.port && existing.port !== 8080 ? existing.port : 4173);
+      const startPort = await findAvailablePreviewPort(preferredPort);
+
+      if (existing?.port === startPort) {
+        res.json({
+          ok: true,
+          url: `/preview/${startPort}/`,
+          port: startPort,
+          mode: 'dev-server',
+          ready: true,
+          message: `Flutter dev preview is already running on port ${startPort}.`,
+        });
+        return;
+      }
+
       if (existing) {
         stopFlutterDevSession(projectId);
       }
 
       await execFile(flutterBin, ['pub', 'get'], { cwd: projectRoot, env });
 
-      const child = spawn(flutterBin, [
-        'run',
-        '-d',
-        'web-server',
-        '--web-hostname',
-        '0.0.0.0',
-        '--web-port',
-        String(port),
-      ], {
-        cwd: projectRoot,
-        env,
-        stdio: 'pipe',
-      });
+      for (let candidate = startPort; candidate <= Math.min(startPort + 6, 65535); candidate += 1) {
+        const child = spawn(flutterBin, [
+          'run',
+          '-d',
+          'web-server',
+          '--web-hostname',
+          '0.0.0.0',
+          '--web-port',
+          String(candidate),
+        ], {
+          cwd: projectRoot,
+          env,
+          stdio: 'pipe',
+        });
 
-      const session: FlutterDevSession = {
-        port,
-        process: child,
-        projectId,
-        projectRoot,
-        startedAt: Date.now(),
-        output: '',
-      };
-      flutterDevSessions.set(projectId, session);
-      child.stdout.on('data', (chunk: Buffer) => appendSessionOutput(session, chunk));
-      child.stderr.on('data', (chunk: Buffer) => appendSessionOutput(session, chunk));
-      child.on('exit', () => {
-        if (flutterDevSessions.get(projectId)?.process === child) {
-          flutterDevSessions.delete(projectId);
+        const session: FlutterDevSession = {
+          port: candidate,
+          process: child,
+          projectId,
+          projectRoot,
+          startedAt: Date.now(),
+          output: '',
+        };
+        flutterDevSessions.set(projectId, session);
+        child.stdout.on('data', (chunk: Buffer) => appendSessionOutput(session, chunk));
+        child.stderr.on('data', (chunk: Buffer) => appendSessionOutput(session, chunk));
+        child.on('exit', () => {
+          if (flutterDevSessions.get(projectId)?.process === child) {
+            flutterDevSessions.delete(projectId);
+          }
+        });
+
+        const ready = await waitForPort(candidate);
+        if (ready) {
+          res.json({
+            ok: true,
+            url: `/preview/${candidate}/`,
+            port: candidate,
+            mode: 'dev-server',
+            ready,
+            message: `Flutter dev preview running on port ${candidate}.`,
+          });
+          return;
         }
-      });
 
-      const ready = await waitForPort(port);
-      if (!ready) {
         const output = sanitizeFlutterOutput(session.output.trim());
         stopFlutterDevSession(projectId);
-        res.status(500).json({
-          error: output.includes('selected port is already in use') ? 'port_in_use' : 'serve_failed',
-          message: output || 'Flutter dev server did not become ready in time.',
-        });
-        return;
+        if (!isPortBindError(output)) {
+          res.status(500).json({
+            error: 'serve_failed',
+            message: output || 'Flutter dev server did not become ready in time.',
+          });
+          return;
+        }
       }
 
-      res.json({
-        ok: true,
-        url: `/preview/${port}/`,
-        port,
-        mode: 'dev-server',
-        ready,
-        message: `Flutter dev preview running on port ${port}.`,
+      res.status(409).json({
+        error: 'port_in_use',
+        message: 'Flutter could not find a free web preview port. Choose another preview port and try again.',
       });
     } catch (error) {
       res.status(500).json({
