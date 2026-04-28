@@ -44,6 +44,15 @@ function getRunningFlutterDevSession(projectId: string): FlutterDevSession | nul
   return session?.process.exitCode === null ? session : null;
 }
 
+export function hasRunningFlutterDevSessionOnPort(port: number): boolean {
+  for (const session of flutterDevSessions.values()) {
+    if (session.process.exitCode === null && session.port === port) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function writeFlutterDevCommand(projectId: string, command: 'reload' | 'restart'): FlutterDevSession | null {
   const session = getRunningFlutterDevSession(projectId);
   if (!session) return null;

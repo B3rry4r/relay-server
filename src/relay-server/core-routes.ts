@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { requireAuth, extractRequestToken, isValidToken, readStringParam, resolveWorkspace } from './runtime';
 import { getWorkspaceHealth } from './monitoring';
+import { hasRunningFlutterDevSessionOnPort } from './flutter-routes';
 import {
   buildQuickSwitchProjects,
   getPinnedProjects,
@@ -174,7 +175,7 @@ export function registerCoreRoutes(app: Express): void {
     }
 
     const ports = await listListeningPorts();
-    if (!ports.includes(port)) {
+    if (!ports.includes(port) && !hasRunningFlutterDevSessionOnPort(port)) {
       res.status(502).json({ error: 'preview_not_available', message: `No server running on port ${port}` });
       return;
     }
