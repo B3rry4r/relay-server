@@ -2,11 +2,14 @@ import path from 'node:path';
 import type { Express } from 'express';
 import {
   createGitHttpEnv,
+  clearSavedGitAuth,
   ensureGitRepo,
   getGitBranches,
   getGitStatus,
   initializeGitRepository,
   runGit,
+  saveGitAuth,
+  readSavedGitAuth,
 } from './git';
 import {
   ensureProjectsRoot,
@@ -15,6 +18,7 @@ import {
   readStringParam,
   requireAuth,
   resolveProjectRoot,
+  resolveWorkspace,
   validateProjectName,
 } from './runtime';
 
@@ -26,6 +30,38 @@ function notGitRepo(res: Parameters<Express['get']>[1] extends never ? never : a
 }
 
 export function registerGitRoutes(app: Express): void {
+  app.get('/api/git/auth', requireAuth, async (_req, res) => {
+    const workspace = resolveWorkspace();
+    const auth = await readSavedGitAuth(workspace);
+    res.json({
+      saved: Boolean(auth?.token || auth?.password),
+      username: auth?.username ?? '',
+      updatedAt: auth?.updatedAt ?? null,
+    });
+  });
+
+  app.post('/api/git/auth', requireAuth, async (req, res) => {
+    const workspace = resolveWorkspace();
+    const auth = req.body?.auth ?? req.body ?? {};
+    const saved = await saveGitAuth(workspace, {
+      username: String(auth?.username || ''),
+      token: String(auth?.token || ''),
+      password: String(auth?.password || ''),
+    });
+    res.json({
+      ok: true,
+      saved: Boolean(saved?.token || saved?.password),
+      username: saved?.username ?? '',
+      updatedAt: saved?.updatedAt ?? null,
+    });
+  });
+
+  app.delete('/api/git/auth', requireAuth, async (_req, res) => {
+    const workspace = resolveWorkspace();
+    await clearSavedGitAuth(workspace);
+    res.json({ ok: true, saved: false });
+  });
+
   app.post('/api/projects/clone', requireAuth, async (req, res) => {
     const url = String(req.body?.url || '').trim();
     const requestedName = String(req.body?.name || '').trim();
@@ -64,7 +100,12 @@ export function registerGitRoutes(app: Express): void {
     args.push(url, projectPath);
 
     try {
-      await runGit(process.cwd(), args, createGitHttpEnv(req.body?.auth));
+      if (req.body?.auth && (String(req.body.auth.token || '').trim() || String(req.body.auth.password || '').trim())) {
+        const workspace = resolveWorkspace();
+        await saveGitAuth(workspace, req.body.auth);
+      }
+      const workspace = resolveWorkspace();
+      await runGit(process.cwd(), args, await createGitHttpEnv(workspace, req.body?.auth));
       res.status(201).json({ project: { id: projectName, name: projectName, path: projectPath } });
     } catch (error) {
       res.status(400).json({ error: 'git_clone_failed', message: error instanceof Error ? error.message : 'Clone failed.' });
@@ -284,7 +325,12 @@ export function registerGitRoutes(app: Express): void {
       return;
     }
     try {
-      const result = await runGit(projectRoot, ['pull', '--ff-only'], createGitHttpEnv(req.body?.auth));
+      if (req.body?.auth && (String(req.body.auth.token || '').trim() || String(req.body.auth.password || '').trim())) {
+        const workspace = resolveWorkspace();
+        await saveGitAuth(workspace, req.body.auth);
+      }
+      const workspace = resolveWorkspace();
+      const result = await runGit(projectRoot, ['pull', '--ff-only'], await createGitHttpEnv(workspace, req.body?.auth));
       res.json({ ok: true, output: `${result.stdout}${result.stderr}`.trim() });
     } catch (error) {
       res.status(400).json({ error: 'git_pull_failed', message: error instanceof Error ? error.message : 'Pull failed.' });
@@ -302,7 +348,12 @@ export function registerGitRoutes(app: Express): void {
       return;
     }
     try {
-      const result = await runGit(projectRoot, ['push'], createGitHttpEnv(req.body?.auth));
+      if (req.body?.auth && (String(req.body.auth.token || '').trim() || String(req.body.auth.password || '').trim())) {
+        const workspace = resolveWorkspace();
+        await saveGitAuth(workspace, req.body.auth);
+      }
+      const workspace = resolveWorkspace();
+      const result = await runGit(projectRoot, ['push'], await createGitHttpEnv(workspace, req.body?.auth));
       res.json({ ok: true, output: `${result.stdout}${result.stderr}`.trim() });
     } catch (error) {
       res.status(400).json({ error: 'git_push_failed', message: error instanceof Error ? error.message : 'Push failed.' });

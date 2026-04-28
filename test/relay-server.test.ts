@@ -816,6 +816,42 @@ chmod +x "$PROFILE/bin/$NAME"
     expect(cloneResponse.status).toBe(201);
     expect(cloneResponse.body.project.id).toBe('cloned-repo');
 
+    const gitAuthBefore = await base
+      .get('/api/git/auth')
+      .set('x-auth-token', 'test-token');
+
+    expect(gitAuthBefore.status).toBe(200);
+    expect(gitAuthBefore.body.saved).toBe(false);
+
+    const gitAuthSave = await base
+      .post('/api/git/auth')
+      .set('x-auth-token', 'test-token')
+      .send({
+        auth: {
+          username: 'git',
+          token: 'token-123',
+        },
+      });
+
+    expect(gitAuthSave.status).toBe(200);
+    expect(gitAuthSave.body.saved).toBe(true);
+    expect(gitAuthSave.body.username).toBe('git');
+
+    const gitAuthAfter = await base
+      .get('/api/git/auth')
+      .set('x-auth-token', 'test-token');
+
+    expect(gitAuthAfter.status).toBe(200);
+    expect(gitAuthAfter.body.saved).toBe(true);
+    expect(gitAuthAfter.body.username).toBe('git');
+
+    const gitAuthClear = await base
+      .delete('/api/git/auth')
+      .set('x-auth-token', 'test-token');
+
+    expect(gitAuthClear.status).toBe(200);
+    expect(gitAuthClear.body.saved).toBe(false);
+
     const clonedRepo = path.join(process.env.WORKSPACE, 'projects', 'cloned-repo');
     await initGitRepo(clonedRepo);
 

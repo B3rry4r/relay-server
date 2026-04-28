@@ -48,6 +48,10 @@ export function getRelayTerminalSessionsPath(workspace = resolveWorkspace()): st
   return path.join(getRelayStateRoot(workspace), 'terminal-sessions.json');
 }
 
+export function getRelayGitAuthPath(workspace = resolveWorkspace()): string {
+  return path.join(getRelayStateRoot(workspace), 'git-auth.json');
+}
+
 export function getProjectsRoot(): string {
   return path.join(resolveWorkspace(), 'projects');
 }

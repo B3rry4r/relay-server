@@ -1,6 +1,8 @@
 import { execFile as execFileCallback } from 'node:child_process';
+import fs from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { type GitFileEntry } from './types';
+import { getRelayGitAuthPath, resolveWorkspace, readJsonFile, writeJsonFile } from './runtime';
 
 const execFile = promisify(execFileCallback);
 
@@ -128,18 +130,68 @@ export async function getGitBranches(projectRoot: string): Promise<{ current: st
   };
 }
 
-export function createGitHttpEnv(auth?: {
+export type SavedGitAuth = {
   username?: string;
   token?: string;
   password?: string;
-}): NodeJS.ProcessEnv {
+  updatedAt?: string;
+} | null
+
+function normalizeGitAuth(auth?: {
+  username?: string;
+  token?: string;
+  password?: string;
+}): { username: string; secret: string } | null {
   if (!auth?.token && !auth?.password) {
+    return null;
+  }
+
+  return {
+    username: auth.username || 'git',
+    secret: auth.token || auth.password || '',
+  };
+}
+
+export async function readSavedGitAuth(workspace = resolveWorkspace()): Promise<SavedGitAuth> {
+  return readJsonFile<SavedGitAuth>(getRelayGitAuthPath(workspace), null);
+}
+
+export async function saveGitAuth(workspace: string, auth?: {
+  username?: string;
+  token?: string;
+  password?: string;
+}): Promise<SavedGitAuth> {
+  const normalized = normalizeGitAuth(auth);
+  if (!normalized) {
+    await fs.rm(getRelayGitAuthPath(workspace), { force: true });
+    return null;
+  }
+
+  const record: Exclude<SavedGitAuth, null> = {
+    username: normalized.username,
+    token: auth?.token?.trim() || undefined,
+    password: auth?.password?.trim() || undefined,
+    updatedAt: new Date().toISOString(),
+  };
+  await writeJsonFile(getRelayGitAuthPath(workspace), record);
+  return record;
+}
+
+export async function clearSavedGitAuth(workspace = resolveWorkspace()): Promise<void> {
+  await fs.rm(getRelayGitAuthPath(workspace), { force: true });
+}
+
+export async function createGitHttpEnv(workspace: string, auth?: {
+  username?: string;
+  token?: string;
+  password?: string;
+}): Promise<NodeJS.ProcessEnv> {
+  const currentAuth = normalizeGitAuth(auth) ?? normalizeGitAuth(await readSavedGitAuth(workspace) ?? undefined);
+  if (!currentAuth) {
     return {};
   }
 
-  const username = auth.username || 'git';
-  const secret = auth.token || auth.password || '';
-  const authHeader = Buffer.from(`${username}:${secret}`).toString('base64');
+  const authHeader = Buffer.from(`${currentAuth.username}:${currentAuth.secret}`).toString('base64');
 
   return {
     GIT_TERMINAL_PROMPT: '0',
