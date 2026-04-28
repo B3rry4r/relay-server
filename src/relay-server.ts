@@ -66,7 +66,7 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
   });
 
   app.use(cors());
-  app.use(express.json({ limit: '10mb' }));
+  app.use(express.json({ limit: '50mb' }));
 
   registerCoreRoutes(app);
   registerContextRoutes(app);
