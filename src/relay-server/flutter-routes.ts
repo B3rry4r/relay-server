@@ -325,13 +325,18 @@ export function registerFlutterRoutes(app: Express): void {
         });
 
         const ready = await waitForPort(candidate) || hasFlutterReadyOutput(session.output, candidate);
-        if (ready) {
+      if (ready) {
+          const buildDir = path.join(projectRoot, 'build', 'web');
+          const hasBuild = await exists(buildDir);
           res.json({
             ok: true,
             url: `/preview/${candidate}/`,
             port: candidate,
             mode: 'dev-server',
             ready,
+            indexUrl: hasBuild
+              ? '/api/projects/:projectId/flutter/preview/index.html'.replace(':projectId', projectId)
+              : undefined,
             message: `Flutter dev preview running on port ${candidate}.`,
           });
           return;
@@ -433,11 +438,16 @@ export function registerFlutterRoutes(app: Express): void {
 
     const session = getRunningFlutterDevSession(projectId);
     if (session) {
+      const buildDir = path.join(projectRoot, 'build', 'web');
+      const hasBuild = await exists(buildDir);
       res.json({
         ready: true,
         mode: 'dev-server',
         port: session.port,
         url: `/preview/${session.port}/`,
+        indexUrl: hasBuild
+          ? '/api/projects/:projectId/flutter/preview/index.html'.replace(':projectId', projectId)
+          : undefined,
         output: session.output,
       });
       return;
