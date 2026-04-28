@@ -190,6 +190,12 @@ export async function duplicateItem(
 }
 
 export async function listListeningPorts(): Promise<number[]> {
+  const excludedPorts: number[] = [22, 80, 443, 8080, 8443, 3000, 3001];
+
+  function isNotExcluded(p: number): boolean {
+    return p > 0 && !excludedPorts.includes(p);
+  }
+
   try {
     try {
       const { stdout } = await execFile('sh', ['-c', 'ss -ltnH 2>/dev/null || netstat -ltn 2>/dev/null'], {
@@ -197,7 +203,7 @@ export async function listListeningPorts(): Promise<number[]> {
         env: process.env,
       });
 
-const ports = Array.from(new Set(stdout
+      const ports = stdout
         .split('\n')
         .map((line) => line.trim())
         .filter(Boolean)
@@ -207,26 +213,26 @@ const ports = Array.from(new Set(stdout
           const port = Number(address.split(':').pop());
           return Number.isInteger(port) ? port : null;
         })
-        .filter((value): value is number => value !== null)
-        .filter((port) => port > 0 && port !== 22)))
-        .sort((left: number, right: number) => left - right);
+        .filter((v): v is number => v !== null && isNotExcluded(v));
 
-      if (ports.length > 0) return ports;
+      if (ports.length > 0) {
+        return [...new Set(ports)].sort((a, b) => a - b);
+      }
     } catch {
-      // fall through to /proc method
+      // fall through
     }
 
     const tcpPorts: number[] = [];
     try {
       const tcpData = await fs.readFile('/proc/net/tcp', 'utf8');
-      const tcpLines = tcpData.split('\n').slice(1);
-      for (const line of tcpLines) {
+      const lines = tcpData.split('\n').slice(1);
+      for (const line of lines) {
         const parts = line.trim().split(/\s+/);
         if (parts[3] === '0A') {
-          const portHex = parts[1]?.split(':')[1];
-          if (portHex) {
-            const port = parseInt(portHex, 16);
-            if (port > 0 && port !== 22) tcpPorts.push(port);
+          const hex = parts[1]?.split(':')[1];
+          if (hex) {
+            const port = parseInt(hex, 16);
+            if (isNotExcluded(port)) tcpPorts.push(port);
           }
         }
       }
@@ -234,20 +240,20 @@ const ports = Array.from(new Set(stdout
 
     try {
       const tcp6Data = await fs.readFile('/proc/net/tcp6', 'utf8');
-      const tcp6Lines = tcp6Data.split('\n').slice(1);
-      for (const line of tcp6Lines) {
+      const lines = tcp6Data.split('\n').slice(1);
+      for (const line of lines) {
         const parts = line.trim().split(/\s+/);
         if (parts[3] === '0A') {
-          const portHex = parts[1]?.split(':')[1];
-          if (portHex) {
-            const port = parseInt(portHex, 16);
-            if (port > 0 && port !== 22) tcpPorts.push(port);
+          const hex = parts[1]?.split(':')[1];
+          if (hex) {
+            const port = parseInt(hex, 16);
+            if (isNotExcluded(port)) tcpPorts.push(port);
           }
         }
       }
     } catch {}
 
-    return [...new Set(tcpPorts)].sort((left, right) => left - right);
+    return [...new Set(tcpPorts)].sort((a, b) => a - b);
   } catch {
     return [];
   }
