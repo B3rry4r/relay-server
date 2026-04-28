@@ -51,7 +51,7 @@ function writeFlutterDevCommand(projectId: string, command: 'reload' | 'restart'
   return session;
 }
 
-async function waitForPort(port: number, timeoutMs = 25000): Promise<boolean> {
+async function waitForPort(port: number, timeoutMs = 90000): Promise<boolean> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
     const ports = await listListeningPorts();
@@ -59,6 +59,13 @@ async function waitForPort(port: number, timeoutMs = 25000): Promise<boolean> {
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
   return false;
+}
+
+function hasFlutterReadyOutput(output: string, port: number): boolean {
+  return output.includes(`lib/main.dart is being served at http://0.0.0.0:${port}`)
+    || output.includes(`lib/main.dart is being served at http://127.0.0.1:${port}`)
+    || output.includes(`A Dart VM Service on Web Server is available at`)
+    || output.includes(`Flutter run key commands.`);
 }
 
 function isPortBindError(output: string): boolean {
@@ -308,7 +315,7 @@ export function registerFlutterRoutes(app: Express): void {
           }
         });
 
-        const ready = await waitForPort(candidate);
+        const ready = await waitForPort(candidate) || hasFlutterReadyOutput(session.output, candidate);
         if (ready) {
           res.json({
             ok: true,
