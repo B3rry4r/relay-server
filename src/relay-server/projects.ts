@@ -190,7 +190,7 @@ export async function duplicateItem(
 }
 
 export async function listListeningPorts(): Promise<number[]> {
-  const excludedPorts: number[] = [22, 80, 443, 8080, 8443, 3000, 3001];
+  const excludedPorts: number[] = [22, 80, 443, 8080, 8443];
 
   function isNotExcluded(p: number): boolean {
     return p > 0 && !excludedPorts.includes(p);
