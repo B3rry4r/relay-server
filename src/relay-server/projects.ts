@@ -191,24 +191,63 @@ export async function duplicateItem(
 
 export async function listListeningPorts(): Promise<number[]> {
   try {
-    const { stdout } = await execFile('sh', ['-c', 'ss -ltnH 2>/dev/null || netstat -ltn 2>/dev/null'], {
-      cwd: process.cwd(),
-      env: process.env,
-    });
+    try {
+      const { stdout } = await execFile('sh', ['-c', 'ss -ltnH 2>/dev/null || netstat -ltn 2>/dev/null'], {
+        cwd: process.cwd(),
+        env: process.env,
+      });
 
-    return Array.from(new Set(stdout
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .map((line) => {
-        const parts = line.split(/\s+/);
-        const address = parts[parts.length - 2] || parts[parts.length - 1] || '';
-        const port = Number(address.split(':').pop());
-        return Number.isInteger(port) ? port : null;
-      })
-      .filter((value): value is number => value !== null)
-      .filter((port) => port > 0 && port !== 22)))
-      .sort((left, right) => left - right);
+const ports = Array.from(new Set(stdout
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => {
+          const parts = line.split(/\s+/);
+          const address = parts[parts.length - 2] || parts[parts.length - 1] || '';
+          const port = Number(address.split(':').pop());
+          return Number.isInteger(port) ? port : null;
+        })
+        .filter((value): value is number => value !== null)
+        .filter((port) => port > 0 && port !== 22)))
+        .sort((left: number, right: number) => left - right);
+
+      if (ports.length > 0) return ports;
+    } catch {
+      // fall through to /proc method
+    }
+
+    const tcpPorts: number[] = [];
+    try {
+      const tcpData = await fs.readFile('/proc/net/tcp', 'utf8');
+      const tcpLines = tcpData.split('\n').slice(1);
+      for (const line of tcpLines) {
+        const parts = line.trim().split(/\s+/);
+        if (parts[3] === '0A') {
+          const portHex = parts[1]?.split(':')[1];
+          if (portHex) {
+            const port = parseInt(portHex, 16);
+            if (port > 0 && port !== 22) tcpPorts.push(port);
+          }
+        }
+      }
+    } catch {}
+
+    try {
+      const tcp6Data = await fs.readFile('/proc/net/tcp6', 'utf8');
+      const tcp6Lines = tcp6Data.split('\n').slice(1);
+      for (const line of tcp6Lines) {
+        const parts = line.trim().split(/\s+/);
+        if (parts[3] === '0A') {
+          const portHex = parts[1]?.split(':')[1];
+          if (portHex) {
+            const port = parseInt(portHex, 16);
+            if (port > 0 && port !== 22) tcpPorts.push(port);
+          }
+        }
+      }
+    } catch {}
+
+    return [...new Set(tcpPorts)].sort((left, right) => left - right);
   } catch {
     return [];
   }
