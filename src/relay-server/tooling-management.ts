@@ -36,6 +36,7 @@ import {
 } from './tooling';
 
 const execFile = promisify(execFileCallback);
+const managedInstallLocks = new Map<string, Promise<ManagedToolStatus>>();
 
 async function writeNixPackages(workspace: string, packages: NixPackageRecord[]): Promise<void> {
   await writeJsonFile(getNixPackagesRegistryPath(workspace), packages);
@@ -106,6 +107,7 @@ export async function listManagedToolStatuses(
     }
 
     const commandPath = relayBinaryExists ? installPath : tool.binary;
+    const gitInstallRoot = tool.installMethod === 'git' ? path.dirname(path.dirname(installPath)) : '';
 
     try {
       const { stdout, stderr } = await execFile(commandPath, tool.versionArgs, { cwd: workspace, env });
@@ -130,6 +132,22 @@ export async function listManagedToolStatuses(
         version,
       };
     } catch {
+      if (tool.installMethod === 'git' && (relayBinaryExists || (gitInstallRoot && await exists(gitInstallRoot)))) {
+        return {
+          id: tool.id,
+          kind: 'managed' as const,
+          name: tool.name,
+          description: tool.description,
+          category: tool.category,
+          installMethod: tool.installMethod,
+          installPath,
+          installed: true,
+          source: 'relay',
+          supported: tool.supported,
+          version: null,
+        };
+      }
+
       return {
         id: tool.id,
         kind: 'managed' as const,
@@ -151,6 +169,12 @@ export async function installManagedTool(
   workspace: string,
   toolId: typeof MANAGED_TOOL_IDS[number]
 ): Promise<ManagedToolStatus> {
+  const existing = managedInstallLocks.get(toolId);
+  if (existing) {
+    return existing;
+  }
+
+  const task = (async () => {
   await ensureRelayRuntimeAssets(workspace);
   const tool = getManagedToolCatalog(workspace).find((entry) => entry.id === toolId);
   if (!tool || !tool.supported) {
@@ -159,6 +183,7 @@ export async function installManagedTool(
 
   if (tool.installMethod === 'git') {
     const flutterRoot = path.join(getRelayToolsRoot(workspace), 'flutter');
+    await fs.rm(path.join(flutterRoot, '.git', 'index.lock'), { force: true });
     if (await exists(flutterRoot)) {
       await runShellCommand(workspace, `git -C '${flutterRoot}' pull --ff-only`);
     } else {
@@ -193,6 +218,14 @@ export async function installManagedTool(
   }
 
   return (await listManagedToolStatuses(workspace)).find((status) => status.id === toolId)!;
+  })();
+
+  managedInstallLocks.set(toolId, task);
+  try {
+    return await task;
+  } finally {
+    managedInstallLocks.delete(toolId);
+  }
 }
 
 export async function uninstallManagedTool(
