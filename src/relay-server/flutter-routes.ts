@@ -69,7 +69,7 @@ function readPreviewPort(value: unknown): number | null {
   return Number.isInteger(port) && port > 0 && port <= 65535 ? port : null;
 }
 
-async function findAvailablePreviewPort(preferredPort = 8080): Promise<number> {
+async function findAvailablePreviewPort(preferredPort = 4173): Promise<number> {
   const activePorts = new Set(await listListeningPorts());
   for (let candidate = Math.max(1024, preferredPort); candidate <= 65535; candidate += 1) {
     if (!activePorts.has(candidate)) {
@@ -249,7 +249,7 @@ export function registerFlutterRoutes(app: Express): void {
     const flutterBin = path.join(getFlutterRoot(workspace), 'bin', 'flutter');
     const env = createTerminalEnv(workspace);
     const existing = getRunningFlutterDevSession(projectId);
-    const preferredPort = requestedPort ?? existing?.port ?? 8080;
+    const preferredPort = requestedPort ?? existing?.port ?? 4173;
     const port = await findAvailablePreviewPort(preferredPort);
 
     if (existing?.port === port) {
