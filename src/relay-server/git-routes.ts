@@ -154,12 +154,32 @@ export function registerGitRoutes(app: Express): void {
       notGitRepo(res);
       return;
     }
+    const filePath = typeof req.query.path === 'string' ? req.query.path : '';
+    if (filePath) {
+      try {
+        const status = await getGitStatus(projectRoot);
+        const isUntracked = status.untracked.some((item) => item.path === filePath);
+        if (isUntracked) {
+          try {
+            const output = await runGit(projectRoot, ['diff', '--no-index', '--', '/dev/null', filePath]);
+            res.json({ diff: output.stdout || output.stderr || '' });
+            return;
+          } catch (error) {
+            const diffOutput = error instanceof Error && 'stdout' in error ? String((error as { stdout?: string }).stdout || '') : '';
+            res.json({ diff: diffOutput });
+            return;
+          }
+        }
+      } catch {
+        // Fall back to the regular diff path below.
+      }
+    }
     const args = ['diff'];
     if (String(req.query.staged || 'false') === 'true') {
       args.push('--cached');
     }
-    if (typeof req.query.path === 'string') {
-      args.push('--', req.query.path);
+    if (filePath) {
+      args.push('--', filePath);
     }
     res.json({ diff: (await runGit(projectRoot, args)).stdout });
   });
