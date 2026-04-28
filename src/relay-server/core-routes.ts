@@ -198,14 +198,14 @@ export function registerCoreRoutes(app: Express): void {
     };
 
     const proxy = httpProxy.createProxyServer({
-      target: `http://127.0.0.1:${port}`,
+      target: `http://0.0.0.0:${port}`,
       changeOrigin: true,
       selfHandleResponse: true,
     });
 
     proxy.on('error', (err: Error) => {
-      console.error('Preview proxy error:', err.message);
-      res.status(502).json({ error: 'proxy_error', message: 'Failed to proxy request' });
+      console.error('Preview proxy error for port', port, ':', err.message);
+      res.status(502).json({ error: 'proxy_error', message: `Flutter preview on port ${port} is not responding. Make sure the Flutter dev server is running.` });
     });
 
     proxy.on('proxyRes', (proxyRes: NodeJS.ReadableStream & { headers?: Record<string, string | string[] | undefined>; statusCode?: number }) => {
