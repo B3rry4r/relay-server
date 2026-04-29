@@ -3,7 +3,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { requireAuth, extractRequestToken, isValidToken, readStringParam, resolveWorkspace } from './runtime';
 import { getWorkspaceHealth } from './monitoring';
-import { hasRunningFlutterDevSessionOnPort } from './flutter-routes';
 import {
   buildQuickSwitchProjects,
   getPinnedProjects,
@@ -14,6 +13,29 @@ import {
 } from './projects';
 import { exists, resolveProjectRoot } from './runtime';
 import { getActiveTerminals } from './socket';
+
+
+async function probePortTarget(port: number): Promise<string | null> {
+  const { Socket } = await import('node:net');
+
+  const tryConnect = (host: string): Promise<boolean> =>
+    new Promise((resolve) => {
+      const socket = new Socket();
+      let settled = false;
+      const done = (ok: boolean) => {
+        if (!settled) { settled = true; socket.destroy(); resolve(ok); }
+      };
+      socket.setTimeout(1500);
+      socket.on('connect', () => done(true));
+      socket.on('error',   () => done(false));
+      socket.on('timeout', () => done(false));
+      socket.connect(port, host);
+    });
+
+  if (await tryConnect('127.0.0.1')) return 'http://127.0.0.1';
+  if (await tryConnect('::1'))       return 'http://[::1]';
+  return null;
+}
 
 export function registerCoreRoutes(app: Express): void {
   app.get('/', (_req, res) => {
@@ -174,11 +196,18 @@ export function registerCoreRoutes(app: Express): void {
       return;
     }
 
-    const ports = await listListeningPorts();
-    const hasDevServer = ports.includes(port) || hasRunningFlutterDevSessionOnPort(port);
+    // Probe actual TCP connectivity on both IPv4 and IPv6 loopback.
+    // listListeningPorts() only checks whether a port appears in /proc/net — it cannot
+    // tell us which address family the server is bound to. Dev servers like Vite bind to
+    // :: (IPv6 wildcard) and may refuse connections on 127.0.0.1 (IPv4), causing the
+    // proxy to throw ECONNREFUSED even though the server is running.
+    const targetBase = await probePortTarget(port);
 
-    if (!hasDevServer) {
-      res.status(502).json({ error: 'preview_not_available', message: `No server running on port ${port}` });
+    if (!targetBase) {
+      res.status(502).json({
+        error: 'preview_not_available',
+        message: `No server is responding on port ${port}. Make sure the dev server is running.`,
+      });
       return;
     }
 
@@ -191,7 +220,7 @@ export function registerCoreRoutes(app: Express): void {
     };
 
     const proxy = httpProxy.createProxyServer({
-      target: `http://127.0.0.1:${port}`,
+      target: `${targetBase}:${port}`,
       changeOrigin: true,
       selfHandleResponse: true,
     });
