@@ -13,7 +13,7 @@ import {
 } from './projects';
 import { exists, resolveProjectRoot } from './runtime';
 import { getActiveTerminals } from './socket';
-import { rewritePreviewHtml } from './preview-html';
+import { rewritePreviewHtml, rewritePreviewText } from './preview-html';
 
 
 async function probePortTarget(port: number): Promise<string | null> {
@@ -236,7 +236,11 @@ export function registerCoreRoutes(app: Express): void {
       const contentType = String(headers['content-type'] || '');
       const statusCode = proxyRes.statusCode || 200;
 
-      if (!contentType.includes('text/html')) {
+      const shouldRewriteText = contentType.includes('text/html')
+        || contentType.includes('javascript')
+        || contentType.includes('text/css');
+
+      if (!shouldRewriteText) {
         res.writeHead(statusCode, headers);
         proxyRes.pipe(res);
         return;
@@ -245,14 +249,15 @@ export function registerCoreRoutes(app: Express): void {
       const chunks: Buffer[] = [];
       proxyRes.on('data', (chunk: Buffer) => chunks.push(chunk));
       proxyRes.on('end', () => {
-        const html = rewritePreviewHtml(
-          Buffer.concat(chunks).toString('utf8'),
-          `/preview/${port}/`,
-        );
+        const body = Buffer.concat(chunks).toString('utf8');
+        const baseHref = `/preview/${port}/`;
+        const rewritten = contentType.includes('text/html')
+          ? rewritePreviewHtml(body, baseHref)
+          : rewritePreviewText(body, baseHref);
         delete headers['content-length'];
         delete headers['content-encoding'];
         res.writeHead(statusCode, headers);
-        res.end(html);
+        res.end(rewritten);
       });
     });
 
