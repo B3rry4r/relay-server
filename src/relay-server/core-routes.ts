@@ -40,11 +40,20 @@ async function probePortTarget(port: number): Promise<string | null> {
 }
 
 export function shouldBypassPreviewTextRewrite(targetPath: string): boolean {
-  return /^\/(?:dart_sdk|ddc_module_loader|stack_trace_mapper|main_module\.bootstrap|on_load_end_bootstrap)\.js(?:$|\?)/.test(targetPath)
-    || /^\/dwds\//.test(targetPath)
-    || /^\/(?:main\.dart|flutter_bootstrap|flutter|flutter_service_worker|firebase-messaging-sw)\.js(?:$|\?)/.test(targetPath)
-    || /^\/canvaskit\//.test(targetPath)
-    || /^\/assets\//.test(targetPath);
+  // Strip query string — token or other params must not affect the bypass decision.
+  // For example, dart_sdk.js?token=... must still be bypassed.
+  const pathOnly = targetPath.split('?')[0];
+
+  return /^\/(?:dart_sdk|ddc_module_loader|stack_trace_mapper|main_module\.bootstrap|on_load_end_bootstrap)\.js$/.test(pathOnly)
+    || /^\/dwds\//.test(pathOnly)
+    || /^\/(?:main\.dart|flutter_bootstrap|flutter|flutter_service_worker|firebase-messaging-sw)\.js$/.test(pathOnly)
+    || /^\/canvaskit\//.test(pathOnly)
+    || /^\/assets\//.test(pathOnly)
+    // DDC-generated module files served under /packages/ (e.g. /packages/foo/foo.dart.lib.js)
+    || /^\/packages\//.test(pathOnly)
+    // Catch any DDC module file by extension regardless of path
+    || /\.dart\.lib\.js$/.test(pathOnly)
+    || /\.ddc\.js$/.test(pathOnly);
 }
 
 export function shouldRewritePreviewResponse(
