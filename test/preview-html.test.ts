@@ -9,6 +9,7 @@ describe('preview HTML rewriting', () => {
           <script type="module">import { injectIntoGlobalHook } from "/@react-refresh";</script>
           <script type="module" src="/@vite/client"></script>
           <link rel="icon" href="/app_logo_2.svg" />
+          <link rel="manifest" href="manifest.json" />
         </head>
         <body>
           <form action="/submit"></form>
@@ -18,11 +19,12 @@ describe('preview HTML rewriting', () => {
     `, '/preview/5179/');
 
     expect(html).toContain('<head><base href="/preview/5179/">');
-    expect(html).toContain('from "@react-refresh"');
-    expect(html).toContain('src="@vite/client"');
-    expect(html).toContain('href="app_logo_2.svg"');
-    expect(html).toContain('action="submit"');
-    expect(html).toContain('src="src/main.tsx"');
+    expect(html).toContain('from "/preview/5179/@react-refresh"');
+    expect(html).toContain('src="/preview/5179/@vite/client"');
+    expect(html).toContain('href="/preview/5179/app_logo_2.svg"');
+    expect(html).toContain('href="/preview/5179/manifest.json"');
+    expect(html).toContain('action="/preview/5179/submit"');
+    expect(html).toContain('src="/preview/5179/src/main.tsx"');
     expect(html).toContain('data-relay-preview-bridge');
     expect(html).toContain("window.fetch = async (...args)");
     expect(html).toContain('window.XMLHttpRequest = function RelayXMLHttpRequest()');
