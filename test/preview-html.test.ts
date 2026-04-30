@@ -23,6 +23,9 @@ describe('preview HTML rewriting', () => {
     expect(html).toContain('href="app_logo_2.svg"');
     expect(html).toContain('action="submit"');
     expect(html).toContain('src="src/main.tsx"');
+    expect(html).toContain('data-relay-preview-bridge');
+    expect(html).toContain("window.fetch = async (...args)");
+    expect(html).toContain('window.XMLHttpRequest = function RelayXMLHttpRequest()');
   });
 
   it('routes Vite module imports through the preview path', () => {
