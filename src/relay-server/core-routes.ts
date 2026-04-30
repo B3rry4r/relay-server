@@ -17,26 +17,57 @@ import { rewritePreviewHtmlWithAuth, rewritePreviewTextWithAuth } from './previe
 import { hasRunningFlutterDevSessionOnPort } from './flutter-routes';
 
 
+// Cache probe results so we don't open a new TCP socket on every proxied request.
+// Flutter's Dart HTTP server has a small concurrent-connection limit; hammering it
+// with a probe socket per request starves the actual proxy connection — causing
+// 'Stalled' in Chrome DevTools with no response headers ever arriving for large
+// files like dart_sdk.js.
+// TTL: 10 s (fast enough to detect a server restart).
+// Deduplication: concurrent callers share one in-flight Promise per port.
+const portTargetCache = new Map<number, { result: string | null; expiresAt: number }>();
+const portTargetInFlight = new Map<number, Promise<string | null>>();
+
 async function probePortTarget(port: number): Promise<string | null> {
-  const { Socket } = await import('node:net');
+  const now = Date.now();
+  const cached = portTargetCache.get(port);
+  if (cached && now < cached.expiresAt) return cached.result;
 
-  const tryConnect = (host: string): Promise<boolean> =>
-    new Promise((resolve) => {
-      const socket = new Socket();
-      let settled = false;
-      const done = (ok: boolean) => {
-        if (!settled) { settled = true; socket.destroy(); resolve(ok); }
-      };
-      socket.setTimeout(1500);
-      socket.on('connect', () => done(true));
-      socket.on('error',   () => done(false));
-      socket.on('timeout', () => done(false));
-      socket.connect(port, host);
-    });
+  const existing = portTargetInFlight.get(port);
+  if (existing) return existing;
 
-  if (await tryConnect('127.0.0.1')) return 'http://127.0.0.1';
-  if (await tryConnect('::1'))       return 'http://[::1]';
-  return null;
+  const probe = (async () => {
+    const { Socket } = await import('node:net');
+
+    const tryConnect = (host: string): Promise<boolean> =>
+      new Promise((resolve) => {
+        const socket = new Socket();
+        let settled = false;
+        const done = (ok: boolean) => {
+          if (!settled) { settled = true; socket.destroy(); resolve(ok); }
+        };
+        socket.setTimeout(1500);
+        socket.on('connect', () => done(true));
+        socket.on('error',   () => done(false));
+        socket.on('timeout', () => done(false));
+        socket.connect(port, host);
+      });
+
+    let result: string | null = null;
+    if (await tryConnect('127.0.0.1')) result = 'http://127.0.0.1';
+    else if (await tryConnect('::1')) result = 'http://[::1]';
+
+    portTargetCache.set(port, { result, expiresAt: Date.now() + 10_000 });
+    portTargetInFlight.delete(port);
+    return result;
+  })();
+
+  portTargetInFlight.set(port, probe);
+  return probe;
+}
+
+export function invalidatePortTargetCache(port: number): void {
+  portTargetCache.delete(port);
+  // Leave in-flight probe running — it will refresh the cache when done.
 }
 
 export function shouldBypassPreviewTextRewrite(targetPath: string): boolean {
