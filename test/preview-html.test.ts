@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { rewritePreviewHtml, rewritePreviewHtmlWithAuth, rewritePreviewText } from '../src/relay-server/preview-html';
+import { shouldBypassPreviewTextRewrite } from '../src/relay-server/core-routes';
 
 describe('preview HTML rewriting', () => {
   it('routes Vite HTML assets and inline module imports through the preview base', () => {
@@ -29,6 +30,8 @@ describe('preview HTML rewriting', () => {
     expect(html).toContain("window.fetch = async (...args)");
     expect(html).toContain('window.XMLHttpRequest = function RelayXMLHttpRequest()');
     expect(html).toContain("statusText: 'Resource failed to load'");
+    expect(html).toContain('Node.prototype.appendChild = function relayAppendChild(child)');
+    expect(html).toContain('Element.prototype.append = function relayAppend(...nodes)');
   });
 
   it('keeps auth on browser-managed preview assets', () => {
@@ -43,6 +46,7 @@ describe('preview HTML rewriting', () => {
 
     expect(html).toContain('href="/preview/5179/manifest.json?token=test-token"');
     expect(html).toContain('src="/preview/5179/src/main.tsx?token=test-token"');
+    expect(html).toContain('const relayPreviewAuthQuery = "token=test-token"');
   });
 
   it('routes Vite module imports through the preview path', () => {
@@ -57,5 +61,13 @@ describe('preview HTML rewriting', () => {
     expect(script).toContain('import "/preview/5179/src/index.css"');
     expect(script).toContain('"/preview/5179/app_logo_2.svg"');
     expect(script).toContain("register('/preview/5179/sw.js')");
+  });
+
+  it('streams Flutter debug runtime files without preview text rewriting', () => {
+    expect(shouldBypassPreviewTextRewrite('/dart_sdk.js')).toBe(true);
+    expect(shouldBypassPreviewTextRewrite('/ddc_module_loader.js')).toBe(true);
+    expect(shouldBypassPreviewTextRewrite('/dwds/src/injected/client.js')).toBe(true);
+    expect(shouldBypassPreviewTextRewrite('/src/main.tsx')).toBe(false);
+    expect(shouldBypassPreviewTextRewrite('/@vite/client')).toBe(false);
   });
 });

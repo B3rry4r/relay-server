@@ -18,10 +18,68 @@ function toPreviewUrl(baseHref: string, value: string, authQuery = ''): string {
   return withPreviewAuth(path, authQuery);
 }
 
-const PREVIEW_BRIDGE_SCRIPT = `<script ${PREVIEW_BRIDGE_MARKER}>
+function createPreviewBridgeScript(baseHref: string, authQuery = ''): string {
+  return `<script ${PREVIEW_BRIDGE_MARKER}>
 (() => {
   if (window.__relayPreviewBridgeInstalled) return;
   window.__relayPreviewBridgeInstalled = true;
+  const relayPreviewBaseHref = ${JSON.stringify(baseHref)};
+  const relayPreviewAuthQuery = ${JSON.stringify(authQuery)};
+
+  const withRelayPreviewAuth = (value) => {
+    if (!relayPreviewAuthQuery || !value) return value;
+    try {
+      const url = new URL(value, window.location.href);
+      const baseUrl = new URL(relayPreviewBaseHref, window.location.origin);
+      if (url.origin !== window.location.origin || !url.pathname.startsWith(baseUrl.pathname)) return value;
+      const key = relayPreviewAuthQuery.split('=')[0];
+      if (url.searchParams.has(key)) return value;
+      const raw = url.pathname + url.search + url.hash;
+      const hashIndex = raw.indexOf('#');
+      const withoutHash = hashIndex >= 0 ? raw.slice(0, hashIndex) : raw;
+      const hash = hashIndex >= 0 ? raw.slice(hashIndex) : '';
+      return withoutHash + (withoutHash.includes('?') ? '&' : '?') + relayPreviewAuthQuery + hash;
+    } catch {
+      return value;
+    }
+  };
+
+  const normalizePreviewElement = (element) => {
+    if (!element || typeof element.getAttribute !== 'function') return element;
+    for (const attr of ['src', 'href', 'action']) {
+      const value = element.getAttribute(attr);
+      if (value) element.setAttribute(attr, withRelayPreviewAuth(value));
+    }
+    return element;
+  };
+
+  const originalSetAttribute = Element.prototype.setAttribute;
+  Element.prototype.setAttribute = function relaySetAttribute(name, value) {
+    const normalized = ['src', 'href', 'action'].includes(String(name))
+      ? withRelayPreviewAuth(String(value))
+      : value;
+    return originalSetAttribute.call(this, name, normalized);
+  };
+
+  const originalAppendChild = Node.prototype.appendChild;
+  Node.prototype.appendChild = function relayAppendChild(child) {
+    return originalAppendChild.call(this, normalizePreviewElement(child));
+  };
+
+  const originalAppend = Element.prototype.append;
+  Element.prototype.append = function relayAppend(...nodes) {
+    return originalAppend.apply(this, nodes.map(normalizePreviewElement));
+  };
+
+  const originalPrepend = Element.prototype.prepend;
+  Element.prototype.prepend = function relayPrepend(...nodes) {
+    return originalPrepend.apply(this, nodes.map(normalizePreviewElement));
+  };
+
+  const originalInsertBefore = Node.prototype.insertBefore;
+  Node.prototype.insertBefore = function relayInsertBefore(child, reference) {
+    return originalInsertBefore.call(this, normalizePreviewElement(child), reference);
+  };
 
   const serialize = (value) => {
     if (value instanceof Error) return { name: value.name, message: value.message, stack: value.stack };
@@ -179,6 +237,7 @@ const PREVIEW_BRIDGE_SCRIPT = `<script ${PREVIEW_BRIDGE_MARKER}>
     };
   }
 })();</script>`;
+}
 
 export function rewritePreviewHtml(html: string, baseHref: string): string {
   return rewritePreviewHtmlWithAuth(html, baseHref, '');
@@ -202,10 +261,10 @@ export function rewritePreviewHtmlWithAuth(html: string, baseHref: string, authQ
   }
 
   if (/<\/head>/i.test(withBase)) {
-    return withBase.replace(/<\/head>/i, `${PREVIEW_BRIDGE_SCRIPT}</head>`);
+    return withBase.replace(/<\/head>/i, `${createPreviewBridgeScript(baseHref, authQuery)}</head>`);
   }
 
-  return `${PREVIEW_BRIDGE_SCRIPT}${withBase}`;
+  return `${createPreviewBridgeScript(baseHref, authQuery)}${withBase}`;
 }
 
 export function rewritePreviewText(text: string, baseHref: string): string {

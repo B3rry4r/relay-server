@@ -38,6 +38,14 @@ async function probePortTarget(port: number): Promise<string | null> {
   return null;
 }
 
+export function shouldBypassPreviewTextRewrite(targetPath: string): boolean {
+  return /^\/(?:dart_sdk|ddc_module_loader|stack_trace_mapper|main_module\.bootstrap|on_load_end_bootstrap)\.js(?:$|\?)/.test(targetPath)
+    || /^\/dwds\//.test(targetPath)
+    || /^\/(?:main\.dart|flutter_bootstrap|flutter|flutter_service_worker|firebase-messaging-sw)\.js(?:$|\?)/.test(targetPath)
+    || /^\/canvaskit\//.test(targetPath)
+    || /^\/assets\//.test(targetPath);
+}
+
 export function registerCoreRoutes(app: Express): void {
   app.get('/', (_req, res) => {
     res.json({
@@ -237,8 +245,10 @@ export function registerCoreRoutes(app: Express): void {
       const statusCode = proxyRes.statusCode || 200;
 
       const shouldRewriteText = contentType.includes('text/html')
-        || contentType.includes('javascript')
-        || contentType.includes('text/css');
+        || (!shouldBypassPreviewTextRewrite(targetPath) && (
+          contentType.includes('javascript')
+          || contentType.includes('text/css')
+        ));
 
       if (!shouldRewriteText) {
         res.writeHead(statusCode, headers);
