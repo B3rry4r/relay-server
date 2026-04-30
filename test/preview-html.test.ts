@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { rewritePreviewHtml, rewritePreviewHtmlWithAuth, rewritePreviewText } from '../src/relay-server/preview-html';
-import { shouldBypassPreviewTextRewrite } from '../src/relay-server/core-routes';
+import { shouldBypassPreviewTextRewrite, shouldRewritePreviewResponse } from '../src/relay-server/core-routes';
 
 describe('preview HTML rewriting', () => {
   it('routes Vite HTML assets and inline module imports through the preview base', () => {
@@ -69,5 +69,11 @@ describe('preview HTML rewriting', () => {
     expect(shouldBypassPreviewTextRewrite('/dwds/src/injected/client.js')).toBe(true);
     expect(shouldBypassPreviewTextRewrite('/src/main.tsx')).toBe(false);
     expect(shouldBypassPreviewTextRewrite('/@vite/client')).toBe(false);
+  });
+
+  it('does not rewrite generated JavaScript for active Flutter debug previews', () => {
+    expect(shouldRewritePreviewResponse('text/html; charset=utf-8', '/', true)).toBe(true);
+    expect(shouldRewritePreviewResponse('application/javascript', '/packages/app/main.dart.lib.js', true)).toBe(false);
+    expect(shouldRewritePreviewResponse('application/javascript', '/src/main.tsx', false)).toBe(true);
   });
 });

@@ -14,6 +14,7 @@ import {
 import { exists, resolveProjectRoot } from './runtime';
 import { getActiveTerminals } from './socket';
 import { rewritePreviewHtmlWithAuth, rewritePreviewTextWithAuth } from './preview-html';
+import { hasRunningFlutterDevSessionOnPort } from './flutter-routes';
 
 
 async function probePortTarget(port: number): Promise<string | null> {
@@ -44,6 +45,25 @@ export function shouldBypassPreviewTextRewrite(targetPath: string): boolean {
     || /^\/(?:main\.dart|flutter_bootstrap|flutter|flutter_service_worker|firebase-messaging-sw)\.js(?:$|\?)/.test(targetPath)
     || /^\/canvaskit\//.test(targetPath)
     || /^\/assets\//.test(targetPath);
+}
+
+export function shouldRewritePreviewResponse(
+  contentType: string,
+  targetPath: string,
+  isFlutterDebugPreview: boolean
+): boolean {
+  if (contentType.includes('text/html')) return true;
+
+  // Flutter debug web-server emits many generated DDC modules under /packages.
+  // Rewriting JavaScript string literals in those files corrupts the module graph
+  // and leaves the app stuck after dart_sdk.js loads. The bridge injected into
+  // the HTML shell already adds auth to dynamically inserted script URLs.
+  if (isFlutterDebugPreview) return false;
+
+  return !shouldBypassPreviewTextRewrite(targetPath) && (
+    contentType.includes('javascript')
+    || contentType.includes('text/css')
+  );
 }
 
 export function registerCoreRoutes(app: Express): void {
@@ -244,11 +264,11 @@ export function registerCoreRoutes(app: Express): void {
       const contentType = String(headers['content-type'] || '');
       const statusCode = proxyRes.statusCode || 200;
 
-      const shouldRewriteText = contentType.includes('text/html')
-        || (!shouldBypassPreviewTextRewrite(targetPath) && (
-          contentType.includes('javascript')
-          || contentType.includes('text/css')
-        ));
+      const shouldRewriteText = shouldRewritePreviewResponse(
+        contentType,
+        targetPath,
+        hasRunningFlutterDevSessionOnPort(port)
+      );
 
       if (!shouldRewriteText) {
         res.writeHead(statusCode, headers);
