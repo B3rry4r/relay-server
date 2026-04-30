@@ -44,8 +44,19 @@ function createPreviewBridgeScript(baseHref: string, authQuery = ''): string {
     }
   };
 
+  // Flutter DDC (Dart Dev Compiler) loads scripts by setting script.src and then
+  // tracks completion via load events keyed on the exact src value it set.
+  // If we rewrite script[src] to append ?token=..., DDC's internal map no longer
+  // matches the load event URL and the script pool stalls permanently (visible as
+  // dart_sdk.js staying "Pending" in DevTools). We must never rewrite src on
+  // <script> elements — the HTML shell rewrite already adds the token to all
+  // statically declared <script src="..."> tags, and dynamic script insertion
+  // by DDC must pass through unchanged.
+  const isScriptElement = (el) => el && el.tagName && el.tagName.toUpperCase() === 'SCRIPT';
+
   const normalizePreviewElement = (element) => {
     if (!element || typeof element.getAttribute !== 'function') return element;
+    if (isScriptElement(element)) return element; // Never rewrite script[src] — breaks DDC pool
     for (const attr of ['src', 'href', 'action']) {
       const value = element.getAttribute(attr);
       if (value) element.setAttribute(attr, withRelayPreviewAuth(value));
@@ -55,6 +66,10 @@ function createPreviewBridgeScript(baseHref: string, authQuery = ''): string {
 
   const originalSetAttribute = Element.prototype.setAttribute;
   Element.prototype.setAttribute = function relaySetAttribute(name, value) {
+    // Never rewrite src on script elements — DDC pool tracks scripts by exact src value
+    if (String(name) === 'src' && isScriptElement(this)) {
+      return originalSetAttribute.call(this, name, value);
+    }
     const normalized = ['src', 'href', 'action'].includes(String(name))
       ? withRelayPreviewAuth(String(value))
       : value;
