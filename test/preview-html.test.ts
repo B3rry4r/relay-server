@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { rewritePreviewHtml, rewritePreviewText } from '../src/relay-server/preview-html';
+import { rewritePreviewHtml, rewritePreviewHtmlWithAuth, rewritePreviewText } from '../src/relay-server/preview-html';
 
 describe('preview HTML rewriting', () => {
   it('routes Vite HTML assets and inline module imports through the preview base', () => {
@@ -28,6 +28,21 @@ describe('preview HTML rewriting', () => {
     expect(html).toContain('data-relay-preview-bridge');
     expect(html).toContain("window.fetch = async (...args)");
     expect(html).toContain('window.XMLHttpRequest = function RelayXMLHttpRequest()');
+    expect(html).toContain("statusText: 'Resource failed to load'");
+  });
+
+  it('keeps auth on browser-managed preview assets', () => {
+    const html = rewritePreviewHtmlWithAuth(`
+      <html>
+        <head>
+          <link rel="manifest" href="manifest.json" />
+          <script src="/src/main.tsx"></script>
+        </head>
+      </html>
+    `, '/preview/5179/', 'token=test-token');
+
+    expect(html).toContain('href="/preview/5179/manifest.json?token=test-token"');
+    expect(html).toContain('src="/preview/5179/src/main.tsx?token=test-token"');
   });
 
   it('routes Vite module imports through the preview path', () => {

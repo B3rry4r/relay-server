@@ -5,6 +5,19 @@ const ROOT_RELATIVE_STRING_PATTERN = /([\"'`])\/(?!\/|[a-zA-Z][a-zA-Z0-9+.-]*:)(
 const ROOT_RELATIVE_CSS_URL_PATTERN = /url\((["']?)\/(?!\/|[a-zA-Z][a-zA-Z0-9+.-]*:)([^"')]+)\1\)/g;
 const PREVIEW_BRIDGE_MARKER = 'data-relay-preview-bridge';
 
+function withPreviewAuth(url: string, authQuery = ''): string {
+  if (!authQuery) return url;
+  const hashIndex = url.indexOf('#');
+  const withoutHash = hashIndex >= 0 ? url.slice(0, hashIndex) : url;
+  const hash = hashIndex >= 0 ? url.slice(hashIndex) : '';
+  return `${withoutHash}${withoutHash.includes('?') ? '&' : '?'}${authQuery}${hash}`;
+}
+
+function toPreviewUrl(baseHref: string, value: string, authQuery = ''): string {
+  const path = value.startsWith(baseHref) ? value : `${baseHref}${value.replace(/^\/+/, '')}`;
+  return withPreviewAuth(path, authQuery);
+}
+
 const PREVIEW_BRIDGE_SCRIPT = `<script ${PREVIEW_BRIDGE_MARKER}>
 (() => {
   if (window.__relayPreviewBridgeInstalled) return;
@@ -65,6 +78,45 @@ const PREVIEW_BRIDGE_SCRIPT = `<script ${PREVIEW_BRIDGE_MARKER}>
       stack: event.reason?.stack,
     });
   });
+
+  window.addEventListener('error', (event) => {
+    const target = event.target;
+    if (!target || target === window) return;
+    const url = target.currentSrc || target.src || target.href || '';
+    emit({
+      kind: 'network',
+      level: 'error',
+      method: 'GET',
+      url,
+      status: 0,
+      statusText: 'Resource failed to load',
+      args: ['Failed to load resource', url],
+    });
+  }, true);
+
+  if ('PerformanceObserver' in window) {
+    try {
+      const observer = new PerformanceObserver((list) => {
+        for (const entry of list.getEntries()) {
+          const status = entry.responseStatus;
+          if (typeof status === 'number' && status >= 400) {
+            emit({
+              kind: 'network',
+              level: 'error',
+              method: 'GET',
+              url: entry.name,
+              status,
+              statusText: 'Resource failed to load',
+              durationMs: Math.round(entry.duration),
+            });
+          }
+        }
+      });
+      observer.observe({ type: 'resource', buffered: true });
+    } catch {
+      // Older browsers do not expose resource timing status.
+    }
+  }
 
   const originalFetch = window.fetch;
   if (typeof originalFetch === 'function') {
@@ -129,13 +181,17 @@ const PREVIEW_BRIDGE_SCRIPT = `<script ${PREVIEW_BRIDGE_MARKER}>
 })();</script>`;
 
 export function rewritePreviewHtml(html: string, baseHref: string): string {
+  return rewritePreviewHtmlWithAuth(html, baseHref, '');
+}
+
+export function rewritePreviewHtmlWithAuth(html: string, baseHref: string, authQuery = ''): string {
   const rewritten = html
     .replace(ROOT_RELATIVE_ATTRIBUTE_PATTERN, (_match, attr: string, quote: string, value: string) =>
-      `${attr}=${quote}${baseHref}${value}${quote}`)
+      `${attr}=${quote}${toPreviewUrl(baseHref, value, authQuery)}${quote}`)
     .replace(RELATIVE_ATTRIBUTE_PATTERN, (_match, attr: string, quote: string, value: string) =>
-      `${attr}=${quote}${baseHref}${value}${quote}`)
+      `${attr}=${quote}${toPreviewUrl(baseHref, value, authQuery)}${quote}`)
     .replace(ROOT_RELATIVE_IMPORT_PATTERN, (_match, prefix: string, quote: string, value: string) =>
-      `${prefix}${quote}${baseHref}${value}${quote}`);
+      `${prefix}${quote}${toPreviewUrl(baseHref, value, authQuery)}${quote}`);
 
   const withBase = /<base\s+href=/i.test(rewritten)
     ? rewritten.replace(/<base\s+href=(["'])[^"']*\1\s*\/?>/i, `<base href="${baseHref}">`)
@@ -153,9 +209,13 @@ export function rewritePreviewHtml(html: string, baseHref: string): string {
 }
 
 export function rewritePreviewText(text: string, baseHref: string): string {
+  return rewritePreviewTextWithAuth(text, baseHref, '');
+}
+
+export function rewritePreviewTextWithAuth(text: string, baseHref: string, authQuery = ''): string {
   return text
     .replace(ROOT_RELATIVE_STRING_PATTERN, (_match, quote: string, value: string) =>
-      `${quote}${baseHref}${value}${quote}`)
+      `${quote}${toPreviewUrl(baseHref, value, authQuery)}${quote}`)
     .replace(ROOT_RELATIVE_CSS_URL_PATTERN, (_match, quote: string, value: string) =>
-      `url(${quote}${baseHref}${value}${quote})`);
+      `url(${quote}${toPreviewUrl(baseHref, value, authQuery)}${quote})`);
 }

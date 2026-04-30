@@ -14,7 +14,7 @@ import {
 } from './runtime';
 import { installManagedTool, listManagedToolStatuses } from './tooling-management';
 import { listListeningPorts } from './projects';
-import { rewritePreviewHtml } from './preview-html';
+import { rewritePreviewHtmlWithAuth } from './preview-html';
 
 const execFile = promisify(execFileCallback);
 
@@ -493,10 +493,14 @@ export function registerFlutterRoutes(app: Express): void {
     const ext = path.extname(requestedFile);
     if (ext === '.html') {
       const html = await fs.readFile(requestedFile, 'utf8');
+      const authQuery = typeof req.query.token === 'string'
+        ? `token=${encodeURIComponent(req.query.token)}`
+        : '';
       res.set('Content-Type', 'text/html');
-      res.send(rewritePreviewHtml(
+      res.send(rewritePreviewHtmlWithAuth(
         html,
         `/api/projects/${projectId}/flutter/preview/`,
+        authQuery,
       ));
       return;
     }

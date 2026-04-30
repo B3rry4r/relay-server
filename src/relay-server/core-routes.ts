@@ -13,7 +13,7 @@ import {
 } from './projects';
 import { exists, resolveProjectRoot } from './runtime';
 import { getActiveTerminals } from './socket';
-import { rewritePreviewHtml, rewritePreviewText } from './preview-html';
+import { rewritePreviewHtmlWithAuth, rewritePreviewTextWithAuth } from './preview-html';
 
 
 async function probePortTarget(port: number): Promise<string | null> {
@@ -251,9 +251,12 @@ export function registerCoreRoutes(app: Express): void {
       proxyRes.on('end', () => {
         const body = Buffer.concat(chunks).toString('utf8');
         const baseHref = `/preview/${port}/`;
+        const authQuery = typeof req.query.token === 'string'
+          ? `token=${encodeURIComponent(req.query.token)}`
+          : '';
         const rewritten = contentType.includes('text/html')
-          ? rewritePreviewHtml(body, baseHref)
-          : rewritePreviewText(body, baseHref);
+          ? rewritePreviewHtmlWithAuth(body, baseHref, authQuery)
+          : rewritePreviewTextWithAuth(body, baseHref, authQuery);
         delete headers['content-length'];
         delete headers['content-encoding'];
         res.writeHead(statusCode, headers);

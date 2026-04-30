@@ -220,9 +220,11 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
   }
 
   if (typeof req.query.token === 'string') {
+    const isSecureRequest = req.secure || req.header('x-forwarded-proto') === 'https';
     res.cookie('relay_auth_token', token, {
       httpOnly: true,
-      sameSite: 'lax',
+      sameSite: isSecureRequest ? 'none' : 'lax',
+      secure: isSecureRequest,
       path: '/',
     });
   }
