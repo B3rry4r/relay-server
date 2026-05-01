@@ -210,21 +210,24 @@ export async function startScreenSession(
   await new Promise((r) => setTimeout(r, 800));
 
   // 4. Start Flutter in Chrome on this display
+  // Detect chrome binary — Railway may have google-chrome or google-chrome-stable
+  const chromeBin = process.env.RELAY_CHROME_BIN
+    || await execFile('which', ['google-chrome']).then(r => r.stdout.trim()).catch(() => '')
+    || await execFile('which', ['google-chrome-stable']).then(r => r.stdout.trim()).catch(() => '')
+    || '/usr/bin/google-chrome';
+
   const flutter = spawn(flutterBin, [
     'run',
     '-d', 'chrome',
-    '--no-sound-null-safety',
+    '--web-browser-flag=--no-sandbox',
+    '--web-browser-flag=--disable-dev-shm-usage',
+    '--web-browser-flag=--disable-gpu',
   ], {
     cwd: projectRoot,
     env: {
       ...displayEnv,
-      CHROME_EXECUTABLE: process.env.RELAY_CHROME_BIN || '/usr/bin/google-chrome',
-      GOOGLE_CHROME_FLAGS: [
-        '--no-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        `--display=:${display}`,
-      ].join(' '),
+      CHROME_EXECUTABLE: chromeBin,
+      FLUTTER_SUPPRESS_ANALYTICS: '1',
     },
     stdio: 'pipe',
   });
@@ -245,23 +248,24 @@ export async function startScreenSession(
 
   sessions.set(projectId, session);
 
-  const onData = (chunk: Buffer) => appendOutput(session, chunk.toString('utf8'));
-  flutter.stdout?.on('data', onData);
-  flutter.stderr?.on('data', onData);
+  // Output captured via onFlutterData above
   x11vnc.stderr?.on('data', (c: Buffer) => appendOutput(session, c.toString('utf8')));
   websockify.stderr?.on('data', (c: Buffer) => appendOutput(session, c.toString('utf8')));
 
-  // Mark ready when Flutter signals it
-  flutter.stdout?.on('data', (chunk: Buffer) => {
+  // Mark ready when Flutter signals the app is running
+  const onFlutterData = (chunk: Buffer) => {
     const text = chunk.toString('utf8');
     if (
       text.includes('Flutter run key commands') ||
       text.includes('To hot reload changes') ||
-      text.includes('Launching lib/main.dart')
+      text.includes('is being served at') ||
+      text.includes('Syncing files to device')
     ) {
       session.ready = true;
     }
-  });
+  };
+  flutter.stdout?.on('data', onFlutterData);
+  flutter.stderr?.on('data', onFlutterData);
 
   // Clean up map if Flutter exits
   flutter.on('exit', () => {
@@ -276,7 +280,7 @@ export async function startScreenSession(
       if (!session.ready) {
         reject(new Error(`Flutter did not start within 90s. Output:\n${session.output.slice(-1000)}`));
       }
-    }, 90000);
+    }, 180_000);
     const poll = setInterval(() => {
       if (session.ready) {
         clearInterval(poll);
