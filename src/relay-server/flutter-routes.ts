@@ -1,5 +1,6 @@
 import express, { type Express } from 'express';
 import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
 import path from 'node:path';
 import { execFile as execFileCallback, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -15,8 +16,19 @@ import {
 import { installManagedTool, listManagedToolStatuses } from './tooling-management';
 import { listListeningPorts } from './projects';
 import { getTunnelUrl, closeTunnel } from './tunnel-manager';
+import {
+  startScreenSession,
+  stopScreenSession,
+  getScreenSession,
+  sendFlutterScreenCommand,
+  getNoVNCDir,
+} from './flutter-screen';
 
 const execFile = promisify(execFileCallback);
+
+// ---------------------------------------------------------------------------
+// Web-server dev session (tunnel-based, kept for reference / fallback)
+// ---------------------------------------------------------------------------
 
 type FlutterDevSession = {
   port: number;
@@ -53,11 +65,14 @@ export function hasRunningFlutterDevSessionOnPort(port: number): boolean {
   return false;
 }
 
-function writeFlutterDevCommand(projectId: string, command: 'reload' | 'restart'): FlutterDevSession | null {
+function writeFlutterDevCommand(projectId: string, command: 'reload' | 'restart'): boolean {
+  // Screen session (Chrome mode) takes priority
+  if (sendFlutterScreenCommand(projectId, command === 'restart' ? 'R' : 'r')) return true;
+  // Fall back to web-server session
   const session = getRunningFlutterDevSession(projectId);
-  if (!session) return null;
+  if (!session) return false;
   session.process.stdin.write(command === 'restart' ? 'R' : 'r');
-  return session;
+  return true;
 }
 
 async function waitForPort(port: number, timeoutMs = 90000): Promise<boolean> {
@@ -68,13 +83,6 @@ async function waitForPort(port: number, timeoutMs = 90000): Promise<boolean> {
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
   return false;
-}
-
-function hasFlutterReadyOutput(output: string, port: number): boolean {
-  return output.includes(`lib/main.dart is being served at http://0.0.0.0:${port}`)
-    || output.includes(`lib/main.dart is being served at http://127.0.0.1:${port}`)
-    || output.includes(`A Dart VM Service on Web Server is available at`)
-    || output.includes(`Flutter run key commands.`);
 }
 
 function isPortBindError(output: string): boolean {
@@ -98,16 +106,13 @@ async function findAvailablePreviewPort(preferredPort = 4173): Promise<number> {
 }
 
 function sanitizeFlutterOutput(output: string): string {
-  const lines = output
+  return output
     .split('\n')
-    .map((line) => line.trimEnd())
-    .filter((line) => line.length > 0)
-    .filter((line) => !line.startsWith('Woah! You appear to be trying to run flutter as root.'));
-
-  if (isPortBindError(lines.join('\n'))) {
-    return 'Flutter could not start the web preview because the selected port is already in use. Choose another preview port and try again.';
-  }
-  return lines.slice(-12).join('\n');
+    .map((l) => l.trimEnd())
+    .filter((l) => l.length > 0)
+    .filter((l) => !l.startsWith('Woah! You appear to be trying to run flutter as root.'))
+    .slice(-12)
+    .join('\n');
 }
 
 async function ensureFlutterInstalled(workspace: string): Promise<boolean> {
@@ -116,9 +121,7 @@ async function ensureFlutterInstalled(workspace: string): Promise<boolean> {
   try {
     await installManagedTool(workspace, 'flutter');
     return true;
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
 
 async function isFlutterProject(projectRoot: string): Promise<boolean> {
@@ -131,7 +134,14 @@ async function getFlutterProjectInfo(projectRoot: string) {
   return { isFlutter: true, buildDir, hasBuild: await exists(buildDir) };
 }
 
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+
 export function registerFlutterRoutes(app: Express): void {
+
+  // ── SDK status / install ────────────────────────────────────────────────
+
   app.get('/api/flutter/status', requireAuth, async (_req, res) => {
     const workspace = resolveWorkspace();
     const tools = await listManagedToolStatuses(workspace);
@@ -144,44 +154,32 @@ export function registerFlutterRoutes(app: Express): void {
     try {
       await installManagedTool(workspace, 'flutter');
       const tools = await listManagedToolStatuses(workspace);
-      const flutter = tools.find(t => t.id === 'flutter');
-      res.json({ ok: true, flutter });
+      res.json({ ok: true, flutter: tools.find(t => t.id === 'flutter') });
     } catch (error) {
-      res.status(500).json({
-        error: 'flutter_install_failed',
-        message: error instanceof Error ? error.message : 'Failed to install Flutter',
-      });
+      res.status(500).json({ error: 'flutter_install_failed', message: error instanceof Error ? error.message : 'Failed to install Flutter' });
     }
   });
+
+  // ── Project info ────────────────────────────────────────────────────────
 
   app.get('/api/projects/:projectId/flutter', requireAuth, async (req, res) => {
     const projectId = readStringParam(req.params.projectId);
     const projectRoot = resolveProjectRoot(projectId);
-    if (!projectRoot || !await exists(projectRoot)) {
-      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
-      return;
-    }
-    const flutterInfo = await getFlutterProjectInfo(projectRoot);
-    if (!flutterInfo) { res.json({ isFlutter: false }); return; }
-    res.json(flutterInfo);
+    if (!projectRoot || !await exists(projectRoot)) { res.status(404).json({ error: 'project_not_found' }); return; }
+    const info = await getFlutterProjectInfo(projectRoot);
+    if (!info) { res.json({ isFlutter: false }); return; }
+    res.json(info);
   });
+
+  // ── Build ───────────────────────────────────────────────────────────────
 
   app.post('/api/projects/:projectId/flutter/build', requireAuth, async (req, res) => {
     const projectId = readStringParam(req.params.projectId);
     const projectRoot = resolveProjectRoot(projectId);
-    if (!projectRoot || !await exists(projectRoot)) {
-      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
-      return;
-    }
-    if (!await isFlutterProject(projectRoot)) {
-      res.status(400).json({ error: 'not_flutter_project', message: 'This project is not a Flutter project.' });
-      return;
-    }
+    if (!projectRoot || !await exists(projectRoot)) { res.status(404).json({ error: 'project_not_found' }); return; }
+    if (!await isFlutterProject(projectRoot)) { res.status(400).json({ error: 'not_flutter_project' }); return; }
     const workspace = resolveWorkspace();
-    if (!await ensureFlutterInstalled(workspace)) {
-      res.status(503).json({ error: 'flutter_not_installed', message: 'Flutter SDK is not installed.' });
-      return;
-    }
+    if (!await ensureFlutterInstalled(workspace)) { res.status(503).json({ error: 'flutter_not_installed' }); return; }
     const flutterBin = path.join(getFlutterRoot(workspace), 'bin', 'flutter');
     const env = createTerminalEnv(workspace);
     try {
@@ -192,212 +190,253 @@ export function registerFlutterRoutes(app: Express): void {
       const buildDir = path.join(projectRoot, 'build', 'web');
       res.json({ ok: true, buildDir, outputFiles: await fs.readdir(buildDir), message: stdout + stderr });
     } catch (error) {
-      res.status(500).json({ error: 'build_failed', message: error instanceof Error ? error.message : 'Flutter build failed.' });
+      res.status(500).json({ error: 'build_failed', message: error instanceof Error ? error.message : 'Build failed.' });
     }
   });
+
+  // ── Screen stream: serve noVNC static files ─────────────────────────────
+  // GET /api/flutter/novnc/*  →  serves noVNC HTML/JS/CSS from disk
+
+  app.get('/api/flutter/novnc/*', requireAuth, async (req, res) => {
+    try {
+      const novncDir = await getNoVNCDir();
+      const filePath = req.params[0] || 'vnc.html';
+      const fullPath = path.join(novncDir, filePath);
+
+      // Path traversal guard
+      if (!fullPath.startsWith(novncDir)) { res.status(403).end(); return; }
+      if (!await exists(fullPath)) { res.status(404).end(); return; }
+
+      const mimeMap: Record<string, string> = {
+        '.html': 'text/html', '.js': 'application/javascript',
+        '.css': 'text/css',   '.ico': 'image/x-icon',
+        '.png': 'image/png',  '.svg': 'image/svg+xml',
+        '.wasm': 'application/wasm',
+      };
+      res.set('Content-Type', mimeMap[path.extname(fullPath)] || 'application/octet-stream');
+      res.set('Cache-Control', 'no-cache');
+      const { createReadStream } = await import('node:fs');
+      createReadStream(fullPath).pipe(res);
+    } catch (error) {
+      res.status(500).json({ error: 'novnc_error', message: error instanceof Error ? error.message : 'noVNC serve error' });
+    }
+  });
+
+  // ── Screen stream: WebSocket proxy to websockify ─────────────────────────
+  // The noVNC client connects to wss://.../api/flutter/screen/:projectId/ws
+  // We upgrade the HTTP request to a raw TCP tunnel into websockify's port.
+
+  app.get('/api/projects/:projectId/flutter/screen/ws', requireAuth, (req, res) => {
+    const projectId = readStringParam(req.params.projectId);
+    const session = getScreenSession(projectId);
+    if (!session) {
+      res.status(404).json({ error: 'screen_not_running', message: 'No screen session running for this project.' });
+      return;
+    }
+    // The actual WebSocket upgrade is handled by the HTTP server upgrade event
+    // registered in relay-server.ts. We just need the session wsPort to be known.
+    // Respond with the wsPort so the frontend can construct the correct WS URL.
+    res.json({ wsPort: session.wsPort, ready: session.ready });
+  });
+
+  // ── Screen stream: start ────────────────────────────────────────────────
+
+  app.post('/api/projects/:projectId/flutter/screen/start', requireAuth, async (req, res) => {
+    const projectId = readStringParam(req.params.projectId);
+    const projectRoot = resolveProjectRoot(projectId);
+    if (!projectRoot || !await exists(projectRoot)) { res.status(404).json({ error: 'project_not_found' }); return; }
+    if (!await isFlutterProject(projectRoot)) { res.status(400).json({ error: 'not_flutter_project' }); return; }
+
+    const workspace = resolveWorkspace();
+    if (!await ensureFlutterInstalled(workspace)) { res.status(503).json({ error: 'flutter_not_installed' }); return; }
+
+    // If already running, return current session info
+    const existing = getScreenSession(projectId);
+    if (existing) {
+      res.json({
+        ok: true,
+        mode: 'screen',
+        wsPort: existing.wsPort,
+        display: existing.display,
+        novncPath: `/api/flutter/novnc/vnc.html`,
+        message: 'Screen session already running.',
+      });
+      return;
+    }
+
+    const flutterBin = path.join(getFlutterRoot(workspace), 'bin', 'flutter');
+    const env = createTerminalEnv(workspace);
+
+    try {
+      await execFile(flutterBin, ['pub', 'get'], { cwd: projectRoot, env });
+      const session = await startScreenSession(projectId, projectRoot, flutterBin, env);
+      res.json({
+        ok: true,
+        mode: 'screen',
+        wsPort: session.wsPort,
+        display: session.display,
+        novncPath: `/api/flutter/novnc/vnc.html`,
+        message: 'Flutter screen session started.',
+      });
+    } catch (error) {
+      res.status(500).json({
+        error: 'screen_start_failed',
+        message: error instanceof Error ? error.message : 'Failed to start screen session.',
+      });
+    }
+  });
+
+  // ── Screen stream: stop ─────────────────────────────────────────────────
+
+  app.post('/api/projects/:projectId/flutter/screen/stop', requireAuth, async (req, res) => {
+    const projectId = readStringParam(req.params.projectId);
+    const session = getScreenSession(projectId);
+    if (!session) { res.json({ ok: true, running: false }); return; }
+    await stopScreenSession(projectId);
+    res.json({ ok: true, running: false, message: 'Screen session stopped.' });
+  });
+
+  // ── Screen stream: status ───────────────────────────────────────────────
+
+  app.get('/api/projects/:projectId/flutter/screen/status', requireAuth, (req, res) => {
+    const projectId = readStringParam(req.params.projectId);
+    const session = getScreenSession(projectId);
+    if (!session) { res.json({ running: false }); return; }
+    res.json({
+      running: true,
+      ready: session.ready,
+      wsPort: session.wsPort,
+      display: session.display,
+      novncPath: `/api/flutter/novnc/vnc.html`,
+      output: session.output.slice(-3000),
+    });
+  });
+
+  // ── Hot reload / restart ────────────────────────────────────────────────
+
+  app.post('/api/projects/:projectId/flutter/reload', requireAuth, (req, res) => {
+    const projectId = readStringParam(req.params.projectId);
+    if (!writeFlutterDevCommand(projectId, 'reload')) {
+      res.status(404).json({ error: 'flutter_preview_not_running' }); return;
+    }
+    res.json({ ok: true, message: 'Flutter hot reload requested.' });
+  });
+
+  app.post('/api/projects/:projectId/flutter/restart', requireAuth, (req, res) => {
+    const projectId = readStringParam(req.params.projectId);
+    if (!writeFlutterDevCommand(projectId, 'restart')) {
+      res.status(404).json({ error: 'flutter_preview_not_running' }); return;
+    }
+    res.json({ ok: true, message: 'Flutter hot restart requested.' });
+  });
+
+  // ── Stop all (unified) ──────────────────────────────────────────────────
+
+  app.post('/api/projects/:projectId/flutter/stop', requireAuth, async (req, res) => {
+    const projectId = readStringParam(req.params.projectId);
+    const screenSession = getScreenSession(projectId);
+    const devSession = getRunningFlutterDevSession(projectId);
+    if (!screenSession && !devSession) { res.json({ ok: true, running: false }); return; }
+    if (screenSession) await stopScreenSession(projectId);
+    if (devSession) stopFlutterDevSession(projectId);
+    res.json({ ok: true, running: false, message: 'Flutter preview stopped.' });
+  });
+
+  // ── Serve (web-server / tunnel fallback) ───────────────────────────────
 
   app.post('/api/projects/:projectId/flutter/serve', requireAuth, async (req, res) => {
     const projectId = readStringParam(req.params.projectId);
     const projectRoot = resolveProjectRoot(projectId);
     const requestedPort = readPreviewPort(req.body?.port);
-
-    if (!projectRoot || !await exists(projectRoot)) {
-      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
-      return;
-    }
-    if (!await isFlutterProject(projectRoot)) {
-      res.status(400).json({ error: 'not_flutter_project', message: 'This project is not a Flutter project.' });
-      return;
-    }
+    if (!projectRoot || !await exists(projectRoot)) { res.status(404).json({ error: 'project_not_found' }); return; }
+    if (!await isFlutterProject(projectRoot)) { res.status(400).json({ error: 'not_flutter_project' }); return; }
     const workspace = resolveWorkspace();
-    if (!await ensureFlutterInstalled(workspace)) {
-      res.status(503).json({ error: 'flutter_not_installed', message: 'Flutter SDK is not installed.' });
-      return;
-    }
+    if (!await ensureFlutterInstalled(workspace)) { res.status(503).json({ error: 'flutter_not_installed' }); return; }
     const flutterBin = path.join(getFlutterRoot(workspace), 'bin', 'flutter');
     const env = createTerminalEnv(workspace);
-
     try {
       const existing = getRunningFlutterDevSession(projectId);
-
-      // Already running — get or create the tunnel and return
       if (existing) {
         const tunnelUrl = await getTunnelUrl(existing.port);
-        res.json({
-          ok: true,
-          url: tunnelUrl,
-          port: existing.port,
-          mode: 'tunnel',
-          ready: true,
-          message: `Flutter dev preview already running at ${tunnelUrl}`,
-        });
+        res.json({ ok: true, url: tunnelUrl, port: existing.port, mode: 'tunnel', ready: true, message: `Already running at ${tunnelUrl}` });
         return;
       }
-
       const startPort = await findAvailablePreviewPort(requestedPort ?? 4173);
       await execFile(flutterBin, ['pub', 'get'], { cwd: projectRoot, env });
-
       for (let candidate = startPort; candidate <= Math.min(startPort + 6, 65535); candidate += 1) {
-        const child = spawn(flutterBin, [
-          'run', '-d', 'web-server',
-          '--web-hostname', '0.0.0.0',
-          '--web-port', String(candidate),
-        ], { cwd: projectRoot, env, stdio: 'pipe' });
-
-        const session: FlutterDevSession = {
-          port: candidate,
-          process: child,
-          projectId,
-          projectRoot,
-          startedAt: Date.now(),
-          output: '',
-        };
-        flutterDevSessions.set(projectId, session);
-        child.stdout.on('data', (chunk: Buffer) => appendSessionOutput(session, chunk));
-        child.stderr.on('data', (chunk: Buffer) => appendSessionOutput(session, chunk));
-        child.on('exit', () => {
-          if (flutterDevSessions.get(projectId)?.process === child) {
-            flutterDevSessions.delete(projectId);
-          }
+        const child = spawn(flutterBin, ['run', '-d', 'web-server', '--web-hostname', '0.0.0.0', '--web-port', String(candidate)], {
+          cwd: projectRoot, env, stdio: 'pipe',
         });
-
-        const ready = await waitForPort(candidate) || hasFlutterReadyOutput(session.output, candidate);
-
+        const session: FlutterDevSession = { port: candidate, process: child, projectId, projectRoot, startedAt: Date.now(), output: '' };
+        flutterDevSessions.set(projectId, session);
+        child.stdout.on('data', (c: Buffer) => appendSessionOutput(session, c));
+        child.stderr.on('data', (c: Buffer) => appendSessionOutput(session, c));
+        child.on('exit', () => { if (flutterDevSessions.get(projectId)?.process === child) flutterDevSessions.delete(projectId); });
+        const ready = await waitForPort(candidate);
         if (ready) {
-          try {
-            const tunnelUrl = await getTunnelUrl(candidate);
-            res.json({
-              ok: true,
-              url: tunnelUrl,
-              port: candidate,
-              mode: 'tunnel',
-              ready: true,
-              message: `Flutter dev preview running at ${tunnelUrl}`,
-            });
-          } catch (tunnelError) {
-            res.status(500).json({
-              error: 'tunnel_failed',
-              message: tunnelError instanceof Error ? tunnelError.message : 'Tunnel failed to start.',
-            });
-          }
+          const tunnelUrl = await getTunnelUrl(candidate);
+          res.json({ ok: true, url: tunnelUrl, port: candidate, mode: 'tunnel', ready: true, message: `Flutter dev preview running at ${tunnelUrl}` });
           return;
         }
-
         const output = sanitizeFlutterOutput(session.output.trim());
         stopFlutterDevSession(projectId);
-        if (!isPortBindError(output)) {
-          res.status(500).json({ error: 'serve_failed', message: output || 'Flutter dev server did not become ready in time.' });
-          return;
-        }
+        if (!isPortBindError(output)) { res.status(500).json({ error: 'serve_failed', message: output || 'Flutter dev server did not become ready.' }); return; }
       }
-
       res.status(409).json({ error: 'port_in_use', message: 'Flutter could not find a free web preview port.' });
     } catch (error) {
-      res.status(500).json({ error: 'serve_failed', message: error instanceof Error ? error.message : 'Failed to start preview server.' });
+      res.status(500).json({ error: 'serve_failed', message: error instanceof Error ? error.message : 'Failed to start preview.' });
     }
   });
 
-  app.post('/api/projects/:projectId/flutter/reload', requireAuth, async (req, res) => {
-    const projectId = readStringParam(req.params.projectId);
-    const session = writeFlutterDevCommand(projectId, 'reload');
-    if (!session) {
-      res.status(404).json({ error: 'flutter_preview_not_running', message: 'Start the Flutter dev preview before using hot reload.' });
-      return;
-    }
-    res.json({ ok: true, port: session.port, mode: 'tunnel', message: 'Flutter hot reload requested.' });
-  });
-
-  app.post('/api/projects/:projectId/flutter/restart', requireAuth, async (req, res) => {
-    const projectId = readStringParam(req.params.projectId);
-    const session = writeFlutterDevCommand(projectId, 'restart');
-    if (!session) {
-      res.status(404).json({ error: 'flutter_preview_not_running', message: 'Start the Flutter dev preview before using hot restart.' });
-      return;
-    }
-    res.json({ ok: true, port: session.port, mode: 'tunnel', message: 'Flutter hot restart requested.' });
-  });
-
-  app.post('/api/projects/:projectId/flutter/stop', requireAuth, async (req, res) => {
-    const projectId = readStringParam(req.params.projectId);
-    const session = getRunningFlutterDevSession(projectId);
-    if (!session) {
-      res.json({ ok: true, running: false, message: 'Flutter dev preview is not running.' });
-      return;
-    }
-    stopFlutterDevSession(projectId);
-    res.json({ ok: true, running: false, port: session.port, message: `Flutter dev preview on port ${session.port} stopped.` });
-  });
+  // ── Preview status ──────────────────────────────────────────────────────
 
   app.get('/api/projects/:projectId/flutter/preview', requireAuth, async (req, res) => {
     const projectId = readStringParam(req.params.projectId);
     const projectRoot = resolveProjectRoot(projectId);
-    if (!projectRoot || !await exists(projectRoot)) {
-      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+    if (!projectRoot || !await exists(projectRoot)) { res.status(404).json({ error: 'project_not_found' }); return; }
+
+    const screenSession = getScreenSession(projectId);
+    if (screenSession) {
+      res.json({ ready: screenSession.ready, mode: 'screen', wsPort: screenSession.wsPort, novncPath: '/api/flutter/novnc/vnc.html', output: screenSession.output.slice(-3000) });
       return;
     }
-    const session = getRunningFlutterDevSession(projectId);
-    if (session) {
-      // Return existing tunnel URL if tunnel already running, else create one
+    const devSession = getRunningFlutterDevSession(projectId);
+    if (devSession) {
       try {
-        const tunnelUrl = await getTunnelUrl(session.port);
-        res.json({ ready: true, mode: 'tunnel', port: session.port, url: tunnelUrl, output: session.output });
+        const tunnelUrl = await getTunnelUrl(devSession.port);
+        res.json({ ready: true, mode: 'tunnel', port: devSession.port, url: tunnelUrl, output: devSession.output });
       } catch {
-        res.json({ ready: true, mode: 'tunnel', port: session.port, url: null, output: session.output });
+        res.json({ ready: true, mode: 'tunnel', port: devSession.port, url: null, output: devSession.output });
       }
       return;
     }
     const buildDir = path.join(projectRoot, 'build', 'web');
-    if (!await exists(buildDir)) {
-      res.status(404).json({ error: 'no_build', message: 'No build found. Call /flutter/build first.' });
-      return;
-    }
-    res.json({
-      ready: true,
-      buildDir,
-      indexUrl: `/api/projects/${projectId}/flutter/preview/index.html`,
-    });
+    if (!await exists(buildDir)) { res.status(404).json({ error: 'no_build' }); return; }
+    res.json({ ready: true, buildDir, indexUrl: `/api/projects/${projectId}/flutter/preview/index.html` });
   });
 
-  // Static build file serving (release build) — no proxy, direct disk streaming
+  // ── Static build file serving ───────────────────────────────────────────
+
   app.get('/api/projects/:projectId/flutter/preview/*', requireAuth, async (req, res) => {
     const projectId = readStringParam(req.params.projectId);
     const projectRoot = resolveProjectRoot(projectId);
     const filePath = req.params[0] || 'index.html';
-
-    if (!projectRoot || !await exists(projectRoot)) {
-      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
-      return;
-    }
-
+    if (!projectRoot || !await exists(projectRoot)) { res.status(404).json({ error: 'project_not_found' }); return; }
     const buildDir = path.join(projectRoot, 'build', 'web');
     const requestedFile = path.join(buildDir, filePath);
-
-    if (!requestedFile.startsWith(buildDir)) {
-      res.status(403).json({ error: 'forbidden' });
-      return;
-    }
-    if (!await exists(requestedFile)) {
-      res.status(404).json({ error: 'not_found' });
-      return;
-    }
-
+    if (!requestedFile.startsWith(buildDir)) { res.status(403).json({ error: 'forbidden' }); return; }
+    if (!await exists(requestedFile)) { res.status(404).json({ error: 'not_found' }); return; }
     const mimeTypes: Record<string, string> = {
       '.html': 'text/html', '.js': 'application/javascript', '.mjs': 'application/javascript',
       '.css': 'text/css', '.json': 'application/json', '.png': 'image/png',
-      '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
-      '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.woff': 'font/woff',
-      '.woff2': 'font/woff2', '.ttf': 'font/ttf', '.wasm': 'application/wasm',
+      '.jpg': 'image/jpeg', '.svg': 'image/svg+xml', '.ico': 'image/x-icon',
+      '.woff': 'font/woff', '.woff2': 'font/woff2', '.wasm': 'application/wasm',
     };
-    const ext = path.extname(requestedFile).toLowerCase();
-    res.set('Content-Type', mimeTypes[ext] || 'application/octet-stream');
+    res.set('Content-Type', mimeTypes[path.extname(requestedFile)] || 'application/octet-stream');
     res.set('Cache-Control', 'no-cache');
-
     const { createReadStream } = await import('node:fs');
     const stream = createReadStream(requestedFile);
-    stream.on('error', (err) => {
-      if (!res.headersSent) res.status(500).json({ error: 'read_error', message: err.message });
-      else res.destroy();
-    });
+    stream.on('error', (err) => { if (!res.headersSent) res.status(500).json({ error: err.message }); else res.destroy(); });
     stream.pipe(res);
   });
 }
