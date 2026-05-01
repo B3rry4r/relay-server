@@ -15,12 +15,15 @@ import {
 import { installManagedTool, listManagedToolStatuses } from './tooling-management';
 import { listListeningPorts } from './projects';
 import { rewritePreviewHtmlWithAuth } from './preview-html';
+import { invalidatePortTargetCache } from './core-routes';
 
 const execFile = promisify(execFileCallback);
 
 type FlutterDevSession = {
   port: number;
   process: ChildProcessWithoutNullStreams;
+  tunnelProcess: ChildProcessWithoutNullStreams | null;
+  tunnelUrl: string | null;
   projectId: string;
   projectRoot: string;
   startedAt: number;
@@ -37,7 +40,11 @@ function stopFlutterDevSession(projectId: string): void {
   const session = flutterDevSessions.get(projectId);
   if (!session) return;
   session.process.kill('SIGTERM');
+  if (session.tunnelProcess) {
+    session.tunnelProcess.kill('SIGTERM');
+  }
   flutterDevSessions.delete(projectId);
+  invalidatePortTargetCache(session.port);
 }
 
 function getRunningFlutterDevSession(projectId: string): FlutterDevSession | null {
@@ -148,6 +155,78 @@ async function getFlutterProjectInfo(projectRoot: string) {
     buildDir,
     hasBuild,
   };
+}
+
+// Downloads cloudflared binary if not already present and returns its path.
+async function ensureCloudflared(workspace: string): Promise<string> {
+  const binDir = path.join(workspace, '.relay', 'bin');
+  const cloudflaredBin = path.join(binDir, 'cloudflared');
+
+  if (await exists(cloudflaredBin)) {
+    return cloudflaredBin;
+  }
+
+  await fs.mkdir(binDir, { recursive: true });
+
+  // Download the correct binary for linux amd64 (Railway runs linux/amd64)
+  const url = 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64';
+  await execFile('curl', ['-fsSL', '-o', cloudflaredBin, url]);
+  await fs.chmod(cloudflaredBin, 0o755);
+
+  return cloudflaredBin;
+}
+
+// Starts a cloudflared quick tunnel for the given local port.
+// Resolves with the public https URL once the tunnel is ready (up to 30s).
+// The returned process must be killed when the session ends.
+async function startTunnel(
+  cloudflaredBin: string,
+  port: number,
+): Promise<{ tunnelUrl: string; tunnelProcess: ChildProcessWithoutNullStreams }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cloudflaredBin, [
+      'tunnel',
+      '--url',
+      `http://localhost:${port}`,
+      '--no-autoupdate',
+    ], {
+      stdio: 'pipe',
+    }) as ChildProcessWithoutNullStreams;
+
+    let output = '';
+    let settled = false;
+
+    const timeout = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        child.kill('SIGTERM');
+        reject(new Error('Cloudflare tunnel did not start within 30 seconds.'));
+      }
+    }, 30000);
+
+    const onData = (chunk: Buffer) => {
+      output += chunk.toString('utf8');
+      // cloudflared prints the public URL in a line like:
+      //   https://xxxx.trycloudflare.com
+      const match = output.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
+      if (match && !settled) {
+        settled = true;
+        clearTimeout(timeout);
+        resolve({ tunnelUrl: match[0], tunnelProcess: child });
+      }
+    };
+
+    child.stdout.on('data', onData);
+    child.stderr.on('data', onData);
+
+    child.on('exit', (code) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timeout);
+        reject(new Error(`cloudflared exited with code ${code}. Output: ${output.slice(-500)}`));
+      }
+    });
+  });
 }
 
 export function registerFlutterRoutes(app: Express): void {
@@ -270,19 +349,19 @@ export function registerFlutterRoutes(app: Express): void {
 
     const flutterBin = path.join(getFlutterRoot(workspace), 'bin', 'flutter');
     const env = createTerminalEnv(workspace);
+
     try {
       const existing = getRunningFlutterDevSession(projectId);
-      const preferredPort = requestedPort ?? (existing?.port && existing.port !== 8080 ? existing.port : 4173);
-      const startPort = await findAvailablePreviewPort(preferredPort);
 
-      if (existing?.port === startPort) {
+      // If already running and has a tunnel, return immediately
+      if (existing && existing.tunnelUrl) {
         res.json({
           ok: true,
-          url: `/preview/${startPort}/`,
-          port: startPort,
-          mode: 'dev-server',
+          url: existing.tunnelUrl,
+          port: existing.port,
+          mode: 'tunnel',
           ready: true,
-          message: `Flutter dev preview is already running on port ${startPort}.`,
+          message: `Flutter dev preview already running at ${existing.tunnelUrl}`,
         });
         return;
       }
@@ -290,6 +369,9 @@ export function registerFlutterRoutes(app: Express): void {
       if (existing) {
         stopFlutterDevSession(projectId);
       }
+
+      const preferredPort = requestedPort ?? 4173;
+      const startPort = await findAvailablePreviewPort(preferredPort);
 
       await execFile(flutterBin, ['pub', 'get'], { cwd: projectRoot, env });
 
@@ -311,6 +393,8 @@ export function registerFlutterRoutes(app: Express): void {
         const session: FlutterDevSession = {
           port: candidate,
           process: child,
+          tunnelProcess: null,
+          tunnelUrl: null,
           projectId,
           projectRoot,
           startedAt: Date.now(),
@@ -326,20 +410,45 @@ export function registerFlutterRoutes(app: Express): void {
         });
 
         const ready = await waitForPort(candidate) || hasFlutterReadyOutput(session.output, candidate);
-      if (ready) {
-          const buildDir = path.join(projectRoot, 'build', 'web');
-          const hasBuild = await exists(buildDir);
-          res.json({
-            ok: true,
-            url: `/preview/${candidate}/`,
-            port: candidate,
-            mode: 'dev-server',
-            ready,
-            indexUrl: hasBuild
-              ? '/api/projects/:projectId/flutter/preview/index.html'.replace(':projectId', projectId)
-              : undefined,
-            message: `Flutter dev preview running on port ${candidate}.`,
-          });
+
+        if (ready) {
+          // Flutter is up — now start the tunnel so the browser can reach it directly
+          try {
+            const cloudflaredBin = await ensureCloudflared(workspace);
+            const { tunnelUrl, tunnelProcess } = await startTunnel(cloudflaredBin, candidate);
+
+            session.tunnelUrl = tunnelUrl;
+            session.tunnelProcess = tunnelProcess;
+
+            tunnelProcess.on('exit', () => {
+              // If the tunnel dies but Flutter is still running, clear the URL
+              // so the next status check knows it needs a new tunnel
+              if (flutterDevSessions.get(projectId)?.process === child) {
+                session.tunnelUrl = null;
+                session.tunnelProcess = null;
+              }
+            });
+
+            res.json({
+              ok: true,
+              url: tunnelUrl,
+              port: candidate,
+              mode: 'tunnel',
+              ready: true,
+              message: `Flutter dev preview running at ${tunnelUrl}`,
+            });
+          } catch (tunnelError) {
+            // Tunnel failed — fall back to the relay proxy URL so something works
+            res.json({
+              ok: true,
+              url: `/preview/${candidate}/`,
+              port: candidate,
+              mode: 'proxy',
+              ready: true,
+              tunnelError: tunnelError instanceof Error ? tunnelError.message : 'Tunnel failed',
+              message: `Flutter dev preview running on port ${candidate} (tunnel unavailable, using proxy).`,
+            });
+          }
           return;
         }
 
@@ -381,7 +490,7 @@ export function registerFlutterRoutes(app: Express): void {
     res.json({
       ok: true,
       port: session.port,
-      mode: 'dev-server',
+      mode: 'tunnel',
       message: 'Flutter hot reload requested.',
     });
   });
@@ -401,7 +510,7 @@ export function registerFlutterRoutes(app: Express): void {
     res.json({
       ok: true,
       port: session.port,
-      mode: 'dev-server',
+      mode: 'tunnel',
       message: 'Flutter hot restart requested.',
     });
   });
@@ -439,16 +548,12 @@ export function registerFlutterRoutes(app: Express): void {
 
     const session = getRunningFlutterDevSession(projectId);
     if (session) {
-      const buildDir = path.join(projectRoot, 'build', 'web');
-      const hasBuild = await exists(buildDir);
       res.json({
         ready: true,
-        mode: 'dev-server',
+        mode: session.tunnelUrl ? 'tunnel' : 'proxy',
         port: session.port,
-        url: `/preview/${session.port}/`,
-        indexUrl: hasBuild
-          ? '/api/projects/:projectId/flutter/preview/index.html'.replace(':projectId', projectId)
-          : undefined,
+        url: session.tunnelUrl ?? `/preview/${session.port}/`,
+        tunnelUrl: session.tunnelUrl,
         output: session.output,
       });
       return;
@@ -490,24 +595,12 @@ export function registerFlutterRoutes(app: Express): void {
       return;
     }
 
-    const ext = path.extname(requestedFile);
-    if (ext === '.html') {
-      const html = await fs.readFile(requestedFile, 'utf8');
-      const authQuery = typeof req.query.token === 'string'
-        ? `token=${encodeURIComponent(req.query.token)}`
-        : '';
-      res.set('Content-Type', 'text/html');
-      res.send(rewritePreviewHtmlWithAuth(
-        html,
-        `/api/projects/${projectId}/flutter/preview/`,
-        authQuery,
-      ));
-      return;
-    }
+    const ext = path.extname(requestedFile).toLowerCase();
 
     const mimeTypes: Record<string, string> = {
       '.html': 'text/html',
       '.js': 'application/javascript',
+      '.mjs': 'application/javascript',
       '.css': 'text/css',
       '.json': 'application/json',
       '.png': 'image/png',
@@ -519,10 +612,39 @@ export function registerFlutterRoutes(app: Express): void {
       '.woff': 'font/woff',
       '.woff2': 'font/woff2',
       '.ttf': 'font/ttf',
+      '.wasm': 'application/wasm',
       '.dart': 'application/dart',
     };
 
-    res.set('Content-Type', mimeTypes[ext] || 'application/octet-stream');
-    res.sendFile(requestedFile);
+    const contentType = mimeTypes[ext] || 'application/octet-stream';
+
+    if (ext === '.html') {
+      const html = await fs.readFile(requestedFile, 'utf8');
+      const authQuery = typeof req.query.token === 'string'
+        ? `token=${encodeURIComponent(req.query.token)}`
+        : '';
+      res.set('Content-Type', 'text/html; charset=utf-8');
+      res.send(rewritePreviewHtmlWithAuth(
+        html,
+        `/api/projects/${projectId}/flutter/preview/`,
+        authQuery,
+      ));
+      return;
+    }
+
+    // Stream directly from disk — no rewriting, no proxy, no auth per-asset
+    res.set('Content-Type', contentType);
+    res.set('Cache-Control', 'no-cache');
+
+    const { createReadStream } = await import('node:fs');
+    const stream = createReadStream(requestedFile);
+    stream.on('error', (err) => {
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'read_error', message: err.message });
+      } else {
+        res.destroy();
+      }
+    });
+    stream.pipe(res);
   });
 }
