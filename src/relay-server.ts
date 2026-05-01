@@ -6,6 +6,7 @@ import { Server as SocketIOServer } from 'socket.io';
 import { registerCoreRoutes } from './relay-server/core-routes';
 import { registerContextRoutes } from './relay-server/context-routes';
 import { registerFlutterRoutes } from './relay-server/flutter-routes';
+import { getScreenSession } from './relay-server/flutter-screen';
 import { registerGitRoutes } from './relay-server/git-routes';
 import { registerProjectRoutes } from './relay-server/project-routes';
 import {
@@ -98,6 +99,33 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
         httpServer.once('error', onError);
         httpServer.once('listening', onListening);
         httpServer.listen(port);
+
+        // Proxy WebSocket upgrades for Flutter screen sessions.
+        // noVNC connects to /api/projects/:id/flutter/screen/websocket
+        // and we pipe it straight to the session's local websockify port.
+        httpServer.on('upgrade', (req, socket, head) => {
+          const match = req.url?.match(/^\/api\/projects\/([^/]+)\/flutter\/screen\/websocket/);
+          if (!match) return; // let socket.io handle other upgrades
+          const projectId = decodeURIComponent(match[1]);
+          const session = getScreenSession(projectId);
+          if (!session) { socket.destroy(); return; }
+          import('node:net').then(({ createConnection }) => {
+            const upstream = createConnection({ host: '127.0.0.1', port: session.wsPort }, () => {
+              // Forward the raw HTTP upgrade request to websockify
+              const CRLF = '\r\n';
+              const reqLine = req.method + ' ' + req.url + ' HTTP/1.1' + CRLF;
+              const headers = Object.entries(req.headers)
+                .map(([k, v]) => k + ': ' + (Array.isArray(v) ? v.join(', ') : v))
+                .join(CRLF);
+              upstream.write(reqLine + headers + CRLF + CRLF);
+              if (head.length > 0) upstream.write(head);
+              upstream.pipe(socket);
+              socket.pipe(upstream);
+            });
+            upstream.on('error', () => socket.destroy());
+            socket.on('error', () => upstream.destroy());
+          });
+        });
       });
 
       const address = httpServer.address();
