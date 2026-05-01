@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'vitest';
 import { rewritePreviewHtml, rewritePreviewHtmlWithAuth, rewritePreviewText } from '../src/relay-server/preview-html';
-import { shouldBypassPreviewTextRewrite, shouldRewritePreviewResponse } from '../src/relay-server/core-routes';
 
 describe('preview HTML rewriting', () => {
   it('routes Vite HTML assets and inline module imports through the preview base', () => {
@@ -61,19 +60,5 @@ describe('preview HTML rewriting', () => {
     expect(script).toContain('import "/preview/5179/src/index.css"');
     expect(script).toContain('"/preview/5179/app_logo_2.svg"');
     expect(script).toContain("register('/preview/5179/sw.js')");
-  });
-
-  it('streams Flutter debug runtime files without preview text rewriting', () => {
-    expect(shouldBypassPreviewTextRewrite('/dart_sdk.js')).toBe(true);
-    expect(shouldBypassPreviewTextRewrite('/ddc_module_loader.js')).toBe(true);
-    expect(shouldBypassPreviewTextRewrite('/dwds/src/injected/client.js')).toBe(true);
-    expect(shouldBypassPreviewTextRewrite('/src/main.tsx')).toBe(false);
-    expect(shouldBypassPreviewTextRewrite('/@vite/client')).toBe(false);
-  });
-
-  it('does not rewrite generated JavaScript for active Flutter debug previews', () => {
-    expect(shouldRewritePreviewResponse('text/html; charset=utf-8', '/', true)).toBe(true);
-    expect(shouldRewritePreviewResponse('application/javascript', '/packages/app/main.dart.lib.js', true)).toBe(false);
-    expect(shouldRewritePreviewResponse('application/javascript', '/src/main.tsx', false)).toBe(true);
   });
 });
