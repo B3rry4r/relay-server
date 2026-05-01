@@ -62,6 +62,9 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     wget \
     gnupg \
+    xvfb \
+    x11vnc \
+    python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
 RUN wget -q -O - https://dl.google.com/linux/linux_signing_key.pub \
