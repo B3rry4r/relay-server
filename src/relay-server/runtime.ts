@@ -298,5 +298,5 @@ export async function readJsonFile<T>(targetPath: string, fallback: T): Promise<
 
 export async function writeJsonFile(targetPath: string, value: unknown): Promise<void> {
   await ensureRelayStateRoot();
-  await fs.writeFile(targetPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  await fs.writeFile(targetPath, `${JSON.stringify(value)}\n`, 'utf8');
 }

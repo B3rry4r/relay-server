@@ -17,6 +17,10 @@ import { listManagedToolStatuses } from './tooling-management';
 
 const execFile = promisify(execFileCallback);
 
+let lastHealth: any = null;
+let lastHealthTime = 0;
+const HEALTH_CACHE_TTL_MS = 5000;
+
 export async function getWorkspaceHealth(): Promise<{
   workspace: string;
   bootstrapped: boolean;
@@ -35,6 +39,10 @@ export async function getWorkspaceHealth(): Promise<{
   disk: { available: number | null; total: number | null };
   activePorts: number[];
 }> {
+  if (lastHealth && Date.now() - lastHealthTime < HEALTH_CACHE_TTL_MS) {
+    return lastHealth;
+  }
+
   const workspace = resolveWorkspace();
   await ensureRelayRuntimeAssets(workspace);
   const [status, activePorts, managedTools, customTools, nixPackages] = await Promise.all([
@@ -69,7 +77,7 @@ export async function getWorkspaceHealth(): Promise<{
     disk = { available: null, total: null };
   }
 
-  return {
+  const result = {
     workspace,
     bootstrapped: await exists(`${workspace}/.bootstrapped`),
     relay: {
@@ -87,6 +95,10 @@ export async function getWorkspaceHealth(): Promise<{
     disk,
     activePorts,
   };
+
+  lastHealth = result;
+  lastHealthTime = Date.now();
+  return result;
 }
 
 export function parseCommandResult(command: string, output: string): {

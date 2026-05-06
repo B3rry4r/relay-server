@@ -323,14 +323,15 @@ export async function buildQuickSwitchProjects(): Promise<Array<{
 export async function buildTree(
   projectRoot: string,
   relativePath = '',
-  depth = 2
+  depth = 2,
+  statusMap?: Map<string, string>
 ): Promise<TreeNode[]> {
   const targetPath = resolveProjectRelativePath(projectRoot, relativePath);
   if (!targetPath) {
     return [];
   }
 
-  const statusMap = await getGitStatusMap(projectRoot);
+  const actualStatusMap = statusMap ?? await getGitStatusMap(projectRoot);
   const entries = await fs.readdir(targetPath, { withFileTypes: true });
   const nodes = await Promise.all(entries.map(async (entry) => {
     const entryAbsolutePath = path.join(targetPath, entry.name);
@@ -339,13 +340,13 @@ export async function buildTree(
     if (entry.isDirectory()) {
       const node: TreeNode = { name: entry.name, path: entryRelativePath, type: 'directory' };
       if (depth > 1) {
-        return [node, ...(await buildTree(projectRoot, entryRelativePath, depth - 1))];
+        return [node, ...(await buildTree(projectRoot, entryRelativePath, depth - 1, actualStatusMap))];
       }
       return [node];
     }
 
     const stat = await fs.stat(entryAbsolutePath);
-    const gitStatus = statusMap.get(entryRelativePath);
+    const gitStatus = actualStatusMap.get(entryRelativePath);
     return [{
       name: entry.name,
       path: entryRelativePath,
