@@ -64,6 +64,23 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
       origin: true,
       credentials: true,
     },
+    // Keep connections alive through Railway's proxy (60s idle timeout).
+    // pingInterval must be well below the proxy idle timeout so the connection
+    // never goes quiet long enough for the upstream to kill it.
+    pingInterval: 10000,  // send a ping every 10 s
+    pingTimeout: 20000,   // wait up to 20 s for a pong before disconnecting
+    // Prefer the persistent WebSocket transport.  Falling back to polling
+    // creates a new HTTP request per chunk which is both slow and breaks
+    // streaming for long-running AI CLI tools.
+    transports: ['websocket', 'polling'],
+    // Increase the per-message buffer so large streaming chunks from AI CLI
+    // tools (claude, gemini, etc.) are never silently dropped.
+    maxHttpBufferSize: 1e7, // 10 MB
+    // Disable per-message deflate — it adds CPU overhead and latency for the
+    // high-frequency small messages that a terminal emits.
+    perMessageDeflate: false,
+    // Allow the client up to 30 s to complete the initial handshake.
+    connectTimeout: 30000,
   });
 
   app.use(cors());
@@ -99,6 +116,14 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
         httpServer.once('error', onError);
         httpServer.once('listening', onListening);
         httpServer.listen(port);
+
+        // Railway's upstream proxy has a 60 s idle timeout. Node's default
+        // keepAliveTimeout is 5 s, which means the proxy kills keep-alive
+        // connections before Node closes them — causing sporadic ECONNRESET
+        // errors and the disconnect/reconnect loop seen in the terminal.
+        // Setting keepAliveTimeout > proxy idle timeout prevents this.
+        httpServer.keepAliveTimeout = 65000; // 65 s — just above Railway's 60 s
+        httpServer.headersTimeout = 70000;   // must be > keepAliveTimeout
 
         // Proxy WebSocket upgrades for Flutter screen sessions.
         // noVNC connects to /api/projects/:id/flutter/screen/websocket

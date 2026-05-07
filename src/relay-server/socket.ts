@@ -219,6 +219,27 @@ export function registerSocketHandlers(
       if (boundTerminalIds.has(terminalId)) return;
       boundTerminalIds.add(terminalId);
 
+      // Coalesce rapid successive data events into a single socket emit.
+      // node-pty fires onData many times per second when AI CLI tools stream
+      // output (claude, gemini, etc.).  Emitting one WebSocket frame per PTY
+      // chunk causes head-of-line blocking on the socket and makes the output
+      // appear slow and choppy — exactly like "broken internet".  Batching
+      // within a 8 ms window keeps latency imperceptible while drastically
+      // reducing the number of frames in flight.
+      let flushTimer: ReturnType<typeof setTimeout> | null = null;
+      let pendingChunk = '';
+
+      const flushPending = (): void => {
+        flushTimer = null;
+        if (!pendingChunk) return;
+        const chunk = pendingChunk;
+        pendingChunk = '';
+        if (selectedTerminalId === terminalId) {
+          socket.emit('output', chunk);
+          handleShellOutput(socket, transcript, chunk);
+        }
+      };
+
       const dataDisposable = shell.onData((data: string) => {
         const session = terminalSessions.get(terminalId);
         if (session) {
@@ -226,11 +247,17 @@ export function registerSocketHandlers(
           schedulePersistTerminalState();
         }
         if (selectedTerminalId === terminalId) {
-          socket.emit('output', data);
-          handleShellOutput(socket, transcript, data);
+          pendingChunk += data;
+          if (!flushTimer) {
+            flushTimer = setTimeout(flushPending, 8);
+          }
         }
       });
       if (dataDisposable) disposables.push(dataDisposable);
+
+      // Make sure we flush any pending data when the terminal exits.
+      const flushDisposable = { dispose: () => { if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; } flushPending(); } };
+      disposables.push(flushDisposable);
 
       if (typeof shell.onExit === 'function') {
         const exitDisposable = shell.onExit(() => onTerminalExit(terminalId));
