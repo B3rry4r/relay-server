@@ -13,6 +13,7 @@ import {
   resolveWorkspace,
 } from './runtime';
 import { installManagedTool, listManagedToolStatuses } from './tooling-management';
+import { rewritePreviewHtml } from './preview-html';
 
 const execFile = promisify(execFileCallback);
 
@@ -148,7 +149,8 @@ export function registerFlutterRoutes(app: Express): void {
   app.get('/flutter-preview/:projectId/*', async (req, res) => {
     const projectId = readStringParam(req.params.projectId);
     const projectRoot = resolveProjectRoot(projectId);
-    const rawParam = (req.params as unknown as Record<string, string | string[]>)[0]; const filePath = Array.isArray(rawParam) ? rawParam.join('/') : (rawParam || 'index.html');
+    const rawParam = (req.params as unknown as Record<string, string | string[]>)[0];
+    const filePath = Array.isArray(rawParam) ? rawParam.join('/') : (rawParam || 'index.html');
 
     if (!projectRoot) {
       res.status(404).send('Project not found'); return;
@@ -186,11 +188,26 @@ export function registerFlutterRoutes(app: Express): void {
     };
 
     const ext = path.extname(requestedFile).toLowerCase();
-    res.set('Content-Type', mimeTypes[ext] || 'application/octet-stream');
     res.set('Cache-Control', 'no-cache');
     // Never set X-Frame-Options — we want iframe embedding to work
     res.removeHeader('X-Frame-Options');
 
+    // For HTML files, rewrite the <base href> so that all asset paths
+    // (dart_sdk.js, main.dart.js, flutter.js, etc.) resolve relative to
+    // this route's prefix instead of the server root "/".
+    // Flutter's web build always bakes in <base href="/"> which makes every
+    // asset request go to /{asset} → 404, because the files are actually
+    // served under /flutter-preview/:projectId/{asset}.
+    if (ext === '.html') {
+      const baseHref = `/flutter-preview/${encodeURIComponent(projectId)}/`;
+      const raw = await fs.readFile(requestedFile, 'utf-8');
+      const rewritten = rewritePreviewHtml(raw, baseHref);
+      res.set('Content-Type', 'text/html; charset=utf-8');
+      res.send(rewritten);
+      return;
+    }
+
+    res.set('Content-Type', mimeTypes[ext] || 'application/octet-stream');
     const { createReadStream } = await import('node:fs');
     const stream = createReadStream(requestedFile);
     stream.on('error', (err) => {
