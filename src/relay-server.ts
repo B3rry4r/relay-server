@@ -20,9 +20,30 @@ import {
 import { registerToolRoutes } from './relay-server/tool-routes';
 import { ensureRelayRuntimeAssets } from './relay-server/tooling';
 import { resolveWorkspace } from './relay-server/runtime';
+import {
+  createPtyBridgeFactory,
+  isPtyBridgeEnabled,
+} from './relay-server/pty-bridge-factory';
 import type { PtyFactory, PtyLike, RelayServer } from './relay-server/types';
 
 export type { PtyFactory, PtyLike, RelayServer } from './relay-server/types';
+
+// Memoise so we only resolve the bridge binary path and create the
+// closure once. Lazy so unit tests that pass their own PtyFactory
+// never load the bridge code.
+let cachedBridgeFactory: PtyFactory | null = null;
+function getBridgeFactory(): PtyFactory | null {
+  if (cachedBridgeFactory) return cachedBridgeFactory;
+  if (!isPtyBridgeEnabled()) return null;
+  try {
+    cachedBridgeFactory = createPtyBridgeFactory();
+    console.log('[relay] pty bridge enabled — using native C bridge for PTYs');
+    return cachedBridgeFactory;
+  } catch (error) {
+    console.warn('[relay] pty bridge requested but factory creation failed; falling back to node-pty', error);
+    return null;
+  }
+}
 
 export function defaultPtyFactory(options: {
   cols: number;
@@ -31,6 +52,11 @@ export function defaultPtyFactory(options: {
   env: NodeJS.ProcessEnv;
   rows: number;
 }): PtyLike {
+  const bridge = getBridgeFactory();
+  if (bridge) {
+    return bridge(options);
+  }
+
   // Delayed require keeps tests free from loading the native module when mocked.
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const nodePty = require('node-pty') as {

@@ -17,9 +17,15 @@ import {
   handleShellOutput,
   handleTerminalInput,
 } from './transcript';
+import { ScrollbackBuffer } from './scrollback';
 
 const activeShells = new Map<string, PtyLike>();
 const terminalSessions = new Map<string, TerminalSession>();
+// Side map: active in-memory scrollback ring buffers keyed by terminal id.
+// We keep TerminalSession.scrollback as the persisted-string snapshot but
+// stop appending to it on every onData chunk — that O(n²) string concat was
+// the main cause of "terminal freezes during AI streaming".
+const scrollbackBuffers = new Map<string, ScrollbackBuffer>();
 const MAX_SCROLLBACK_BYTES = 1024 * 1024;
 let lastSelectedTerminalId: string | null = null;
 let persistTimer: NodeJS.Timeout | null = null;
@@ -35,12 +41,18 @@ type PersistedTerminalState = {
 function snapshotTerminalState(): PersistedTerminalState {
   return {
     lastSelectedTerminalId,
-    sessions: getActiveTerminals().map((session) => ({
-      id: session.id,
-      createdAt: session.createdAt,
-      cwd: session.cwd,
-      scrollback: session.scrollback.slice(-MAX_SCROLLBACK_BYTES),
-    })),
+    sessions: getActiveTerminals().map((session) => {
+      const buffer = scrollbackBuffers.get(session.id);
+      const scrollback = buffer
+        ? buffer.toString()
+        : session.scrollback.slice(-MAX_SCROLLBACK_BYTES);
+      return {
+        id: session.id,
+        createdAt: session.createdAt,
+        cwd: session.cwd,
+        scrollback,
+      };
+    }),
   };
 }
 
@@ -88,7 +100,9 @@ async function restorePersistedTerminalSessions(ptyFactory: PtyFactory): Promise
       const session = createTerminalSession(persisted.id, ptyFactory, persisted.cwd || workspaceRoot, workspaceRoot);
       if (session) {
         session.createdAt = persisted.createdAt || session.createdAt;
-        session.scrollback = (persisted.scrollback || '').slice(-MAX_SCROLLBACK_BYTES);
+        const restored = (persisted.scrollback || '').slice(-MAX_SCROLLBACK_BYTES);
+        session.scrollback = restored;
+        scrollbackBuffers.get(persisted.id)?.reset(restored);
       }
     }
 
@@ -137,6 +151,7 @@ export function createTerminalSession(
 
   activeShells.set(terminalId, shell);
   terminalSessions.set(terminalId, session);
+  scrollbackBuffers.set(terminalId, new ScrollbackBuffer(MAX_SCROLLBACK_BYTES));
   schedulePersistTerminalState();
 
   return session;
@@ -146,6 +161,7 @@ export function closeTerminalSession(terminalId: string, skipPersist = false): v
   const shell = activeShells.get(terminalId);
   activeShells.delete(terminalId);
   terminalSessions.delete(terminalId);
+  scrollbackBuffers.delete(terminalId);
   if (shell) {
     shell.kill();
   }
@@ -209,9 +225,10 @@ export function registerSocketHandlers(
     };
 
     const replayTerminal = (terminalId: string): void => {
-      const session = terminalSessions.get(terminalId);
-      if (session?.scrollback) {
-        socket.emit('terminal:replay', { id: terminalId, data: session.scrollback });
+      const buffer = scrollbackBuffers.get(terminalId);
+      const data = buffer ? buffer.toString() : terminalSessions.get(terminalId)?.scrollback ?? '';
+      if (data) {
+        socket.emit('terminal:replay', { id: terminalId, data });
       }
     };
 
@@ -251,9 +268,14 @@ export function registerSocketHandlers(
       };
 
       const dataDisposable = shell.onData((data: string) => {
-        const session = terminalSessions.get(terminalId);
-        if (session) {
-          session.scrollback = `${session.scrollback}${data}`.slice(-MAX_SCROLLBACK_BYTES);
+        const buffer = scrollbackBuffers.get(terminalId);
+        if (buffer) {
+          // O(chunk.length) ring-buffer append — replaces the previous
+          // `session.scrollback = ${session.scrollback}${data}.slice(-N)`
+          // pattern which allocated and copied the full buffer on every
+          // chunk and was the main cause of GC-induced terminal freezes
+          // during AI tool streaming.
+          buffer.append(data);
           bytesSinceLastPersist += data.length;
           if (bytesSinceLastPersist >= PERSIST_AFTER_BYTES) {
             bytesSinceLastPersist = 0;

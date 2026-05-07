@@ -34,6 +34,11 @@ RUN npm ci
 COPY . .
 RUN npm run build
 
+# Compile the native PTY bridge. The bridge moves the hot read/write loop
+# off the Node.js event loop entirely — see native/pty-bridge.c. We need
+# libutil for forkpty(), which is part of build-essential on Ubuntu.
+RUN gcc -O2 -Wall -Wextra -o /app/native/pty-bridge native/pty-bridge.c -lutil
+
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -81,6 +86,7 @@ RUN curl -fsSL https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-x64.tar.gz |
 
 WORKDIR /app
 COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/native/pty-bridge /app/native/pty-bridge
 COPY package.json package-lock.json .
 RUN npm ci --omit=dev --ignore-scripts
 COPY setup-workspace.sh .
