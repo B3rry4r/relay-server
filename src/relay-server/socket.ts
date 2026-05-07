@@ -228,12 +228,22 @@ export function registerSocketHandlers(
       // reducing the number of frames in flight.
       let flushTimer: ReturnType<typeof setTimeout> | null = null;
       let pendingChunk = '';
+      // Track bytes accumulated since last disk persist to avoid hammering the
+      // filesystem on every chunk during heavy AI streaming (opencode, claude,
+      // gemini, etc.).  Scheduling a persist on every chunk means hundreds of
+      // 250ms-debounced writeFile calls per second, which competes with the PTY
+      // and is the primary cause of the "stuck / can't type" freeze.
+      let bytesSinceLastPersist = 0;
+      const PERSIST_AFTER_BYTES = 8192; // ~8 KB of new output between persists
 
       const flushPending = (): void => {
         flushTimer = null;
         if (!pendingChunk) return;
         const chunk = pendingChunk;
         pendingChunk = '';
+        // Re-read selectedTerminalId at flush time rather than capture time so
+        // that switching terminals mid-stream doesn't send stale output to the
+        // newly-selected terminal.
         if (selectedTerminalId === terminalId) {
           socket.emit('output', chunk);
           handleShellOutput(socket, transcript, chunk);
@@ -244,7 +254,11 @@ export function registerSocketHandlers(
         const session = terminalSessions.get(terminalId);
         if (session) {
           session.scrollback = `${session.scrollback}${data}`.slice(-MAX_SCROLLBACK_BYTES);
-          schedulePersistTerminalState();
+          bytesSinceLastPersist += data.length;
+          if (bytesSinceLastPersist >= PERSIST_AFTER_BYTES) {
+            bytesSinceLastPersist = 0;
+            schedulePersistTerminalState();
+          }
         }
         if (selectedTerminalId === terminalId) {
           pendingChunk += data;
@@ -255,8 +269,17 @@ export function registerSocketHandlers(
       });
       if (dataDisposable) disposables.push(dataDisposable);
 
-      // Make sure we flush any pending data when the terminal exits.
-      const flushDisposable = { dispose: () => { if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; } flushPending(); } };
+      // Flush pending output and do a final scrollback persist on dispose.
+      const flushDisposable = {
+        dispose: () => {
+          if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+          flushPending();
+          if (bytesSinceLastPersist > 0) {
+            bytesSinceLastPersist = 0;
+            schedulePersistTerminalState();
+          }
+        },
+      };
       disposables.push(flushDisposable);
 
       if (typeof shell.onExit === 'function') {
@@ -359,23 +382,37 @@ export function registerSocketHandlers(
 
     socket.on('terminal:close', (_payload: { id: string }) => {
       const terminalId = _payload?.id;
-      if (terminalId && terminalSessions.has(terminalId)) {
-        onTerminalExit(terminalId);
-        if (terminalSessions.size === 0) {
-          const newId = socket.id + '-' + Date.now();
-          const session = createTerminalSession(newId, ptyFactory, workspaceRoot, workspaceRoot);
-          if (session) {
-            selectedTerminalId = newId;
-            lastSelectedTerminalId = newId;
-            const shell = activeShells.get(newId);
-            if (shell) {
-              bindShellToSocket(newId, shell);
-            }
-            socket.emit('terminal:created', session);
-            socket.emit('terminal:selected', { id: newId, cwd: session.cwd });
-            socket.emit('terminals:updated', { terminals: getTerminalSummaries() });
-            schedulePersistTerminalState();
+      if (!terminalId || !terminalSessions.has(terminalId)) return;
+
+      const wasSelected = selectedTerminalId === terminalId;
+      onTerminalExit(terminalId);
+
+      if (terminalSessions.size === 0) {
+        // No terminals left — spawn a fresh one so the user always has a shell.
+        const newId = socket.id + '-' + Date.now();
+        const session = createTerminalSession(newId, ptyFactory, workspaceRoot, workspaceRoot);
+        if (session) {
+          selectedTerminalId = newId;
+          lastSelectedTerminalId = newId;
+          const shell = activeShells.get(newId);
+          if (shell) {
+            bindShellToSocket(newId, shell);
           }
+          socket.emit('terminal:created', session);
+          socket.emit('terminal:selected', { id: newId, cwd: session.cwd });
+          socket.emit('terminals:updated', { terminals: getTerminalSummaries() });
+          schedulePersistTerminalState();
+        }
+      } else if (wasSelected) {
+        // The active terminal was closed — switch to the most recent remaining one
+        // so the client gets a `terminal:selected` event and re-binds its input.
+        const next = getActiveTerminals()
+          .sort((a, b) => b.createdAt - a.createdAt)[0];
+        if (next) {
+          selectedTerminalId = next.id;
+          lastSelectedTerminalId = next.id;
+          socket.emit('terminal:selected', { id: next.id, cwd: next.cwd });
+          replayTerminal(next.id);
         }
       }
     });
