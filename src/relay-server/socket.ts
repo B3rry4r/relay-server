@@ -419,6 +419,14 @@ export function registerSocketHandlers(
 
     socket.on('input', (data: string) => {
       if (typeof data !== 'string' || data.length === 0) return;
+      // Drop mouse reporting sequences that xterm.js emits via onData when a
+      // TUI app (opencode, vim, htop …) has enabled mouse mode.  These are NOT
+      // keyboard input — forwarding them to the PTY clogs its write buffer and
+      // makes the terminal completely unresponsive.
+      // SGR mouse: ESC [ < … M/m
+      if (data.startsWith('\x1b[<') && (data.endsWith('M') || data.endsWith('m'))) return;
+      // X10/normal mouse: ESC [ M Cb X Y (6 bytes)
+      if (data.startsWith('\x1b[M') && data.length === 6) return;
       const shell = getShell();
       if (shell) {
         handleTerminalInput(socket, transcript, data);
