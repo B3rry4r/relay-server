@@ -243,6 +243,13 @@ export function registerSocketHandlers(
       // appear slow and choppy — exactly like "broken internet".  Batching
       // within a 8 ms window keeps latency imperceptible while drastically
       // reducing the number of frames in flight.
+      //
+      // Hard cap: if the accumulated chunk exceeds 64 KB we flush immediately
+      // rather than waiting for the timer. Without this cap, commands that dump
+      // megabytes of output (e.g. `history` on a large bash history file) send
+      // a single multi-MB WebSocket frame, causing xterm.js to block the
+      // browser's main thread and freeze the entire tab.
+      const MAX_PENDING_BYTES = 64 * 1024;
       let flushTimer: ReturnType<typeof setTimeout> | null = null;
       let pendingChunk = '';
       // Track bytes accumulated since last disk persist to avoid hammering the
@@ -284,7 +291,11 @@ export function registerSocketHandlers(
         }
         if (selectedTerminalId === terminalId) {
           pendingChunk += data;
-          if (!flushTimer) {
+          if (pendingChunk.length >= MAX_PENDING_BYTES) {
+            // Flush immediately to avoid a single huge WS frame.
+            if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+            flushPending();
+          } else if (!flushTimer) {
             flushTimer = setTimeout(flushPending, 8);
           }
         }

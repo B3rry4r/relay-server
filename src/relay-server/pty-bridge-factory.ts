@@ -16,6 +16,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import path from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 import type { PtyLike } from './types';
 
 /**
@@ -99,14 +100,16 @@ export function createPtyBridgeFactory(): (options: BridgeFactoryOptions) => Pty
     const ctrl = proc.stdio[3] as NodeJS.WritableStream | undefined;
 
     const emitter = new EventEmitter();
+    // UTF-8 decoder that preserves multi-byte sequences across chunk boundaries.
+    // The previous chunk.toString('binary') treated every byte as a Latin-1
+    // character — garbling any non-ASCII output (box-drawing chars, accented
+    // letters, emoji) because multi-byte UTF-8 sequences were split into
+    // individual Latin-1 chars instead of being decoded as single code points.
+    const decoder = new StringDecoder('utf8');
     let exited = false;
 
     proc.stdout.on('data', (chunk: Buffer) => {
-      // Match node-pty's behaviour: emit data as a string. xterm.js
-      // and the relay both expect strings here. We use 'binary'
-      // encoding (1 char = 1 byte) so escape bytes pass through
-      // untouched — same as node-pty's default.
-      emitter.emit('data', chunk.toString('binary'));
+      emitter.emit('data', decoder.write(chunk));
     });
 
     // Surface stderr to the host log stream — useful if the bridge
@@ -151,9 +154,10 @@ export function createPtyBridgeFactory(): (options: BridgeFactoryOptions) => Pty
       },
       write(data: string) {
         if (proc.stdin.destroyed || proc.stdin.writableEnded) return;
-        // Use 'binary' encoding so each char maps to one byte — keeps
-        // escape sequences intact across the pipe, same as node-pty.
-        proc.stdin.write(data, 'binary');
+        // Encode as UTF-8 bytes so multi-byte keyboard input (IME, accented
+        // chars) reaches the shell correctly. Escape sequences are pure ASCII
+        // so this is a no-op for them.
+        proc.stdin.write(Buffer.from(data, 'utf8'));
       },
       resize(cols: number, rows: number) {
         if (!ctrl || (ctrl as { writableEnded?: boolean }).writableEnded) return;
