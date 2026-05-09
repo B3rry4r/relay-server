@@ -103,9 +103,12 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
     // Increase the per-message buffer so large streaming chunks from AI CLI
     // tools (claude, gemini, etc.) are never silently dropped.
     maxHttpBufferSize: 1e7, // 10 MB
-    // Disable per-message deflate — it adds CPU overhead and latency for the
-    // high-frequency small messages that a terminal emits.
-    perMessageDeflate: false,
+    // Compress frames only above 4 KB. Small messages (keystrokes, resize
+    // events, short command output) are sent raw to avoid zlib overhead and
+    // latency. Large frames (AI streaming chunks, scrollback replays) are
+    // text-heavy and compress 60-80%, which meaningfully cuts bandwidth on
+    // slow connections — exactly the "needs fast internet" symptom.
+    perMessageDeflate: { threshold: 4096 },
     // Allow the client up to 30 s to complete the initial handshake.
     connectTimeout: 30000,
   });

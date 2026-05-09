@@ -226,10 +226,15 @@ export function registerSocketHandlers(
 
     const replayTerminal = (terminalId: string): void => {
       const buffer = scrollbackBuffers.get(terminalId);
-      const data = buffer ? buffer.toString() : terminalSessions.get(terminalId)?.scrollback ?? '';
-      if (data) {
-        socket.emit('terminal:replay', { id: terminalId, data });
-      }
+      const raw = buffer ? buffer.toString() : terminalSessions.get(terminalId)?.scrollback ?? '';
+      if (!raw) return;
+      // Cap replay at 128 KB. The in-memory scrollback is up to 1 MB but
+      // sending the full buffer on every reconnect wastes bandwidth and
+      // slows the initial paint. 128 KB covers ~1500 typical lines —
+      // far more than the viewport needs to show a useful history.
+      const MAX_REPLAY_BYTES = 128 * 1024;
+      const data = raw.length > MAX_REPLAY_BYTES ? raw.slice(raw.length - MAX_REPLAY_BYTES) : raw;
+      socket.emit('terminal:replay', { id: terminalId, data });
     };
 
     const bindShellToSocket = (terminalId: string, shell: PtyLike): void => {
