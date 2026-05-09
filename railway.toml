@@ -4,9 +4,5 @@ dockerfile = "Dockerfile"
 [deploy]
 startCommand = "node dist/src/index.js"
 restartPolicyType = "ON_FAILURE"
-# Pin to the Railway region closest to you to eliminate the 1-2s proxy
-# routing stall seen in DevTools. Uncomment ONE line and redeploy:
-# region = "us-west2"      # Oregon, USA
-# region = "us-east4"      # Virginia, USA
-# region = "eu-west4"      # Netherlands
-# region = "ap-southeast1" # Singapore
+# Pinned to eu-west4 (Netherlands) — closest Railway region to Nigeria.
+region = "eu-west4"
