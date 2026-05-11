@@ -27,6 +27,21 @@ const terminalSessions = new Map<string, TerminalSession>();
 // the main cause of "terminal freezes during AI streaming".
 const scrollbackBuffers = new Map<string, ScrollbackBuffer>();
 const MAX_SCROLLBACK_BYTES = 1024 * 1024;
+
+// Persistent exit handlers keyed by terminalId — these are NOT cleaned up on
+// socket disconnect so we can detect PTY process death even while no client
+// is connected.  Without this, the handler is disposed on disconnect; when the
+// process exits while disconnected the zombie session stays in terminalSessions;
+// on the next reconnect a new listener is registered on the dying process and
+// fires ~80ms later, producing the "terminal force-closed on reopen" bug.
+const persistentExitHandlers = new Map<string, { dispose(): void }>();
+
+// Check whether the underlying OS process is still running (signal 0 = no-op).
+function isShellAlive(shell: PtyLike): boolean {
+  const pid = shell.pid;
+  if (!pid) return false;
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
 let lastSelectedTerminalId: string | null = null;
 let persistTimer: NodeJS.Timeout | null = null;
 let restorePromise: Promise<void> | null = null;
@@ -158,6 +173,12 @@ export function createTerminalSession(
 }
 
 export function closeTerminalSession(terminalId: string, skipPersist = false): void {
+  // Dispose the persistent exit handler FIRST so that shell.kill() below
+  // does not re-trigger onTerminalExit through the still-registered listener.
+  const exitHandler = persistentExitHandlers.get(terminalId);
+  persistentExitHandlers.delete(terminalId);
+  exitHandler?.dispose();
+
   const shell = activeShells.get(terminalId);
   activeShells.delete(terminalId);
   terminalSessions.delete(terminalId);
@@ -239,6 +260,15 @@ export function registerSocketHandlers(
 
     const bindShellToSocket = (terminalId: string, shell: PtyLike): void => {
       if (boundTerminalIds.has(terminalId)) return;
+
+      // Liveness guard: if the underlying PTY process has already exited while
+      // disconnected, trigger cleanup now instead of binding listeners to a corpse
+      // and watching the terminal close ~80ms after it appears.
+      if (!isShellAlive(shell)) {
+        setTimeout(() => onTerminalExit(terminalId), 0);
+        return;
+      }
+
       boundTerminalIds.add(terminalId);
 
       // Coalesce rapid successive data events into a single socket emit.
@@ -320,25 +350,51 @@ export function registerSocketHandlers(
       };
       disposables.push(flushDisposable);
 
-      if (typeof shell.onExit === 'function') {
-        const exitDisposable = shell.onExit(() => onTerminalExit(terminalId));
-        if (exitDisposable) disposables.push(exitDisposable);
+      // Register the exit handler persistently (module-level, NOT in socket
+      // disposables).  This ensures that if the PTY exits while the socket is
+      // disconnected, onTerminalExit still runs and cleans up the zombie session.
+      // We guard with persistentExitHandlers.has() so we only register once even
+      // if multiple sockets reconnect before the terminal exits.
+      if (typeof shell.onExit === 'function' && !persistentExitHandlers.has(terminalId)) {
+        const exitDisposable = shell.onExit(() => {
+          persistentExitHandlers.delete(terminalId);
+          onTerminalExit(terminalId);
+        });
+        if (exitDisposable) persistentExitHandlers.set(terminalId, exitDisposable);
+        // Intentionally NOT pushed to socket-scoped disposables.
       }
     };
 
     const onTerminalExit = (terminalId: string) => {
       closeTerminalSession(terminalId, suppressTerminalPersistence);
-      if (selectedTerminalId === terminalId) {
-        selectedTerminalId = null;
-      }
+      if (selectedTerminalId === terminalId) selectedTerminalId = null;
       if (lastSelectedTerminalId === terminalId) {
         lastSelectedTerminalId = getActiveTerminals()
           .sort((left, right) => right.createdAt - left.createdAt)[0]?.id ?? null;
       }
       socket.emit('terminal:closed', { id: terminalId });
-      socket.emit('terminals:updated', {
-        terminals: getTerminalSummaries(),
-      });
+
+      // Auto-respawn: if all terminals are gone (process crashed / exited on its
+      // own), immediately create a fresh shell so the user is never left without
+      // a terminal.  Explicit user-initiated closes (terminal:close event) already
+      // handle this case themselves; here we cover unexpected exits.
+      if (terminalSessions.size === 0 && socket.connected) {
+        const newId = socket.id + '-' + Date.now();
+        const session = createTerminalSession(newId, ptyFactory, workspaceRoot, workspaceRoot);
+        if (session) {
+          selectedTerminalId = newId;
+          lastSelectedTerminalId = newId;
+          const newShell = activeShells.get(newId);
+          if (newShell) bindShellToSocket(newId, newShell);
+          socket.emit('terminal:created', session);
+          socket.emit('terminal:selected', { id: newId, cwd: session.cwd });
+          socket.emit('terminals:updated', { terminals: getTerminalSummaries() });
+          schedulePersistTerminalState();
+          return; // terminals:updated already sent above
+        }
+      }
+
+      socket.emit('terminals:updated', { terminals: getTerminalSummaries() });
       schedulePersistTerminalState();
     };
 
@@ -472,14 +528,23 @@ export function registerSocketHandlers(
       }
     });
 
+    // Debounce resize to avoid sending SIGWINCH on every rapid layout reflow.
+    // xterm.js FitAddon fires resize many times during mount; all with identical
+    // dimensions. We coalesce them into a single PTY resize call.
+    let lastResizeCols = 0, lastResizeRows = 0;
+    let resizeTimer: ReturnType<typeof setTimeout> | null = null;
     socket.on('resize', (payload: { cols?: number; rows?: number } = {}) => {
       const cols = Number(payload.cols);
       const rows = Number(payload.rows);
       if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 1 || rows < 1) return;
-      const shell = getShell();
-      if (shell) {
-        shell.resize(cols, rows);
-      }
+      if (cols === lastResizeCols && rows === lastResizeRows) return; // identical — skip
+      lastResizeCols = cols; lastResizeRows = rows;
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        resizeTimer = null;
+        const shell = getShell();
+        if (shell) shell.resize(cols, rows);
+      }, 50);
     });
 
     socket.on('cd', async (payload: { path: string; projectId?: string }) => {
@@ -514,11 +579,14 @@ export function registerSocketHandlers(
     });
 
     socket.on('disconnect', () => {
+      if (resizeTimer) { clearTimeout(resizeTimer); resizeTimer = null; }
       while (disposables.length > 0) {
         disposables.pop()?.dispose();
       }
       boundTerminalIds.clear();
       selectedTerminalId = null;
+      // Persistent exit handlers intentionally NOT cleared here —
+      // they must survive disconnects to catch PTY exits between sessions.
     });
   });
 }
