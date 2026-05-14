@@ -14,6 +14,8 @@ import {
 } from './runtime';
 import { installManagedTool, listManagedToolStatuses } from './tooling-management';
 import { rewritePreviewHtml } from './preview-html';
+import { startFlutterPreviewServer, stopFlutterPreviewServer, getFlutterPreviewPort } from './flutter-preview-server';
+import { getTunnelUrl } from './tunnel-manager';
 
 const execFile = promisify(execFileCallback);
 
@@ -105,10 +107,26 @@ export function registerFlutterRoutes(app: Express): void {
         { cwd: projectRoot, env, maxBuffer: 100 * 1024 * 1024 }
       );
       const buildDir = path.join(projectRoot, 'build', 'web');
+
+      // Restart preview server so it picks up the fresh build.
+      await stopFlutterPreviewServer(projectId);
+      let tunnelUrl: string | null = null;
+      try {
+        const port = await startFlutterPreviewServer(projectId, buildDir);
+        tunnelUrl = await getTunnelUrl(port);
+      } catch (tunnelErr) {
+        // Don't fail the build response if tunnel setup fails — frontend can
+        // still fall back to the relay-served previewIndexUrl below.
+        // eslint-disable-next-line no-console
+        console.warn('[flutter] tunnel setup failed:', tunnelErr instanceof Error ? tunnelErr.message : tunnelErr);
+      }
+
       res.json({
         ok: true,
         buildDir,
-        // Tell the frontend the direct preview URL — no token needed
+        // Direct iframe URL — bypasses relay-server's HTTP origin entirely
+        previewTunnelUrl: tunnelUrl,
+        // Legacy proxied path (kept for fallback/compat)
         previewIndexUrl: `/flutter-preview/${projectId}/index.html`,
         outputFiles: await fs.readdir(buildDir),
         message: stdout + stderr,
@@ -132,12 +150,31 @@ export function registerFlutterRoutes(app: Express): void {
     if (!await exists(buildDir)) {
       res.status(404).json({ error: 'no_build', message: 'Run a release build first.' }); return;
     }
+
+    // Ensure the static preview server is running and tunneled.
+    let tunnelUrl: string | null = null;
+    try {
+      let port = getFlutterPreviewPort(projectId);
+      if (!port) port = await startFlutterPreviewServer(projectId, buildDir);
+      tunnelUrl = await getTunnelUrl(port);
+    } catch (tunnelErr) {
+      // eslint-disable-next-line no-console
+      console.warn('[flutter] preview tunnel setup failed:', tunnelErr instanceof Error ? tunnelErr.message : tunnelErr);
+    }
+
     res.json({
       ready: true,
       buildDir,
-      // Plain public URL — no auth, no token
+      previewTunnelUrl: tunnelUrl,
       previewIndexUrl: `/flutter-preview/${projectId}/index.html`,
     });
+  });
+
+  // ── Stop a project's preview server (for project switch / cleanup) ───
+  app.post('/api/projects/:projectId/flutter/preview/stop', requireAuth, async (req, res) => {
+    const projectId = readStringParam(req.params.projectId);
+    await stopFlutterPreviewServer(projectId);
+    res.json({ ok: true });
   });
 
   // ── Static file serving — NO AUTH ──────────────────────────────────────
