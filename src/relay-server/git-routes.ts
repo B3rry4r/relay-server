@@ -7,7 +7,10 @@ import {
   getGitBranches,
   getGitStatus,
   initializeGitRepository,
+  installGitCredentialHelper,
   runGit,
+  sanitizeRemoteUrl,
+  sanitizeRepoRemotes,
   saveGitAuth,
   readSavedGitAuth,
 } from './git';
@@ -30,6 +33,10 @@ function notGitRepo(res: Parameters<Express['get']>[1] extends never ? never : a
 }
 
 export function registerGitRoutes(app: Express): void {
+  // Configure the global credential helper at startup so manual terminal git
+  // and relay-driven git both authenticate from the secure store / env.
+  void installGitCredentialHelper();
+
   app.get('/api/git/auth', requireAuth, async (_req, res) => {
     const workspace = resolveWorkspace();
     const auth = await readSavedGitAuth(workspace);
@@ -48,6 +55,8 @@ export function registerGitRoutes(app: Express): void {
       token: String(auth?.token || ''),
       password: String(auth?.password || ''),
     });
+    // Ensure terminal git can use these creds too (no URL-embedded tokens).
+    await installGitCredentialHelper(workspace);
     res.json({
       ok: true,
       saved: Boolean(saved?.token || saved?.password),
@@ -93,19 +102,28 @@ export function registerGitRoutes(app: Express): void {
       return;
     }
 
+    // Never persist credentials inside the saved remote URL.
+    const cleanUrl = sanitizeRemoteUrl(url);
     const args = ['clone'];
     if (branch) {
       args.push('--branch', branch);
     }
-    args.push(url, projectPath);
+    args.push(cleanUrl, projectPath);
 
     try {
-      if (req.body?.auth && (String(req.body.auth.token || '').trim() || String(req.body.auth.password || '').trim())) {
-        const workspace = resolveWorkspace();
-        await saveGitAuth(workspace, req.body.auth);
-      }
       const workspace = resolveWorkspace();
+      const embedded = url.match(/^https?:\/\/([^/@]+)@/i);
+      if (req.body?.auth && (String(req.body.auth.token || '').trim() || String(req.body.auth.password || '').trim())) {
+        await saveGitAuth(workspace, req.body.auth);
+      } else if (embedded) {
+        // Migrate credentials pasted into the URL into the secure store.
+        const [user, ...rest] = embedded[1].split(':');
+        const secret = rest.join(':');
+        if (secret) await saveGitAuth(workspace, { username: user, token: secret });
+      }
+      await installGitCredentialHelper(workspace);
       await runGit(process.cwd(), args, await createGitHttpEnv(workspace, req.body?.auth));
+      await sanitizeRepoRemotes(projectPath);
       res.status(201).json({ project: { id: projectName, name: projectName, path: projectPath } });
     } catch (error) {
       res.status(400).json({ error: 'git_clone_failed', message: error instanceof Error ? error.message : 'Clone failed.' });
