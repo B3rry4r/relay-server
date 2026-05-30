@@ -18,7 +18,7 @@ import path from 'node:path';
 import { spawn, execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createServer } from 'node:http';
-import { resolveWorkspace, getFlutterRoot, createTerminalEnv } from './runtime';
+import { resolveWorkspace, getFlutterRoot, getRelayCacheRoot, createTerminalEnv } from './runtime';
 
 const execFile = promisify(execFileCb);
 
@@ -110,7 +110,109 @@ async function serveDir(dir: string): Promise<{ url: string; close: () => void }
   return { url: `http://127.0.0.1:${port}/index.html`, close: () => server.close() };
 }
 
+// ── Web (React + Vite) scratch-build screenshot ──────────────────────────────
+
+const WEB_TEMPLATE_PKG = JSON.stringify({
+  name: 'relay-visual-web-template', private: true, type: 'module', version: '0.0.0',
+  dependencies: { react: '^18.3.1', 'react-dom': '^18.3.1', 'lucide-react': '^0.452.0' },
+  devDependencies: { vite: '^5.4.0', '@vitejs/plugin-react': '^4.3.1', tailwindcss: '^3.4.0', postcss: '^8.4.0', autoprefixer: '^10.4.0' },
+}, null, 2);
+
+// Lazily create + `npm install` a shared template once; per-request builds reuse
+// its node_modules (symlinked) so only `vite build` runs per check. Returns the
+// template dir, or null if npm/install isn't available.
+let _webTemplateReady: Promise<string | null> | null = null;
+function ensureWebTemplate(env: NodeJS.ProcessEnv): Promise<string | null> {
+  if (_webTemplateReady) return _webTemplateReady;
+  _webTemplateReady = (async () => {
+    try {
+      const dir = path.join(getRelayCacheRoot(), 'visual-web-template');
+      await fs.mkdir(dir, { recursive: true });
+      if (!fsSync.existsSync(path.join(dir, 'node_modules', 'vite'))) {
+        await fs.writeFile(path.join(dir, 'package.json'), WEB_TEMPLATE_PKG);
+        await execFile('npm', ['install', '--no-audit', '--no-fund', '--loglevel=error'], { cwd: dir, env, timeout: 600000 });
+      }
+      return dir;
+    } catch { return null; }
+  })();
+  return _webTemplateReady;
+}
+
+// Collect the icon names a piece of code imports from lucide-react so the build
+// can shim exactly those (avoids resolving the real icon set / missing names).
+function lucideImportNames(code: string): string[] {
+  const names = new Set<string>();
+  const re = /import\s*\{([^}]*)\}\s*from\s*['"]lucide-react['"]/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(code)) !== null) {
+    for (const part of m[1].split(',')) {
+      const n = part.trim().split(/\s+as\s+/)[0].trim();
+      if (/^[A-Za-z_$][\w$]*$/.test(n)) names.add(n);
+    }
+  }
+  return [...names];
+}
+
 export function registerVisualRoutes(app: Express): void {
+  /**
+   * POST /api/visual/web-screenshot
+   * Body: { code: string, width?, height? }
+   * Builds the assembled React component in a scratch Vite project (reusing a
+   * pre-installed template) and screenshots it. Returns image/png (or 503).
+   */
+  app.post('/api/visual/web-screenshot', async (req, res) => {
+    const code = String(req.body?.code || '');
+    const width = Number(req.body?.width) || 393;
+    const height = Number(req.body?.height) || 852;
+    if (!code.trim()) { res.status(400).json({ error: 'code is required' }); return; }
+
+    const workspace = resolveWorkspace();
+    const env = createTerminalEnv(workspace);
+    const template = await ensureWebTemplate(env);
+    if (!template) { res.status(503).json({ error: 'web build toolchain unavailable' }); return; }
+
+    const proj = await fs.mkdtemp(path.join(os.tmpdir(), 'relay-wvis-'));
+    let serverHandle: { url: string; close: () => void } | null = null;
+    try {
+      await fs.mkdir(path.join(proj, 'src'), { recursive: true });
+      // Reuse the template's installed deps without copying them.
+      await fs.symlink(path.join(template, 'node_modules'), path.join(proj, 'node_modules'), 'dir').catch(() => {});
+
+      const icons = lucideImportNames(code);
+      const lucideShim = `import React from 'react';
+const P = (props) => React.createElement('span', { 'data-icon': '', style: { display: 'inline-block', width: 16, height: 16 }, ...props });
+${icons.map((n) => `export const ${n} = P;`).join('\n')}
+export default P;
+`;
+      await fs.writeFile(path.join(proj, 'src', 'lucide-shim.tsx'), lucideShim);
+      await fs.writeFile(path.join(proj, 'src', 'App.tsx'), code);
+      await fs.writeFile(path.join(proj, 'src', 'index.css'), '@tailwind base;@tailwind components;@tailwind utilities;');
+      await fs.writeFile(path.join(proj, 'src', 'main.tsx'),
+        `import React from 'react';\nimport { createRoot } from 'react-dom/client';\nimport App from './App';\nimport './index.css';\ncreateRoot(document.getElementById('root')).render(React.createElement(App));\n`);
+      await fs.writeFile(path.join(proj, 'index.html'),
+        `<!doctype html><html><head><meta charset="utf-8"/><style>html,body,#root{margin:0;background:#fff}</style></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>`);
+      await fs.writeFile(path.join(proj, 'tailwind.config.js'),
+        `export default { content: ['./index.html','./src/**/*.{ts,tsx}'], theme:{extend:{}}, plugins:[] };`);
+      await fs.writeFile(path.join(proj, 'postcss.config.js'), 'export default { plugins: { tailwindcss: {}, autoprefixer: {} } };');
+      await fs.writeFile(path.join(proj, 'vite.config.ts'),
+        `import { defineConfig } from 'vite';\nimport react from '@vitejs/plugin-react';\nimport path from 'node:path';\nexport default defineConfig({ plugins:[react()], resolve:{ alias:{ 'lucide-react': path.resolve(__dirname,'src/lucide-shim.tsx') } } });\n`);
+
+      await execFile(path.join(template, 'node_modules', '.bin', 'vite'), ['build', '--logLevel', 'error'], { cwd: proj, env, timeout: 180000 });
+
+      serverHandle = await serveDir(path.join(proj, 'dist'));
+      const png = await captureUrlScreenshot(serverHandle.url, width, height, 45000);
+      if (!png) { res.status(502).json({ error: 'screenshot failed' }); return; }
+      res.setHeader('Content-Type', 'image/png');
+      res.end(png);
+    } catch (err: any) {
+      res.status(500).json({ error: err?.message || 'web screenshot failed' });
+    } finally {
+      if (serverHandle) serverHandle.close();
+      try { await fs.rm(proj, { recursive: true, force: true }); } catch { /* ignore */ }
+    }
+  });
+
+
   /**
    * POST /api/visual/flutter-screenshot
    * Body: { code: string, width?: number, height?: number }
