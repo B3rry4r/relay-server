@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createTerminalEnv, resolveWorkspace } from './runtime';
 import { AI_ADAPTERS, getAdapter, isAIModel, type AIModel, type AIFormat } from './ai-adapters';
+import { appendTurn, getConversation, listConversations } from './conversation-store';
 
 const execFileAsync = promisify(execFile);
 
@@ -14,12 +15,15 @@ interface GenerateRequest {
   model?: AIModel;
   sessionId?: string;
   format?: AIFormat;
+  conversationId?: string;  // when set, the turn is recorded for durable context
+  projectId?: string;
 }
 
 interface GenerateResponse {
   code: string;
   model: AIModel;
   sessionId?: string;
+  conversationId?: string;
 }
 
 // Run a model through its adapter (structured args + session continuity).
@@ -54,7 +58,7 @@ export function registerAIRoutes(app: Express): void {
    * Returns: { code: string, model: string }
    */
   app.post('/api/ai/generate', async (req, res) => {
-    const { prompt, model = 'claude', sessionId, format } = req.body as GenerateRequest;
+    const { prompt, model = 'claude', sessionId, format, conversationId, projectId } = req.body as GenerateRequest;
 
     if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
       res.status(400).json({ error: 'prompt is required' });
@@ -71,11 +75,20 @@ export function registerAIRoutes(app: Express): void {
 
     try {
       const code = await runModel(model, prompt.trim(), env, workspace, { sessionId, format });
-      // Echo the sessionId back when the adapter can resume, so the caller can
-      // continue the conversation on the next turn.
+      // Durable context: record the user prompt + assistant output when a
+      // conversation is in play (survives reconnect/restart).
+      let convId = conversationId;
+      if (conversationId !== undefined) {
+        // First append may create the conversation; chain the assistant turn onto
+        // the SAME id so we don't spawn two conversations.
+        const c1 = await appendTurn(conversationId || undefined, { role: 'user', content: prompt.trim(), model }, { projectId });
+        const c2 = await appendTurn(c1.id, { role: 'assistant', content: code, model }, { projectId });
+        convId = c2.id;
+      }
       const response: GenerateResponse = {
         code, model,
         ...(getAdapter(model).capabilities.resume && sessionId ? { sessionId } : {}),
+        ...(convId ? { conversationId: convId } : {}),
       };
       res.json(response);
     } catch (err: any) {
@@ -112,5 +125,18 @@ export function registerAIRoutes(app: Express): void {
     );
 
     res.json({ models: checks });
+  });
+
+  /** GET /api/ai/conversations?projectId=… — durable conversation list. */
+  app.get('/api/ai/conversations', async (req, res) => {
+    const projectId = typeof req.query.projectId === 'string' ? req.query.projectId : undefined;
+    res.json({ conversations: await listConversations(projectId) });
+  });
+
+  /** GET /api/ai/conversations/:id — full conversation with turns. */
+  app.get('/api/ai/conversations/:id', async (req, res) => {
+    const c = await getConversation(req.params.id);
+    if (!c) { res.status(404).json({ error: 'conversation not found' }); return; }
+    res.json(c);
   });
 }
