@@ -3,6 +3,7 @@ import path from 'node:path';
 import type { Express } from 'express';
 import { marked } from 'marked';
 import { initializeGitRepository } from './git';
+import { buildAndCacheProjectGraph } from './project-graph';
 import {
   buildTree,
   duplicateItem,
@@ -24,6 +25,16 @@ import {
 } from './runtime';
 
 export function registerProjectRoutes(app: Express): void {
+  // Project graph: products ↔ repos ↔ figma/IR/generation (manifest-first,
+  // inferred otherwise). The connective tissue for the control plane + workspace.
+  app.get('/api/projects/graph', requireAuth, async (_req, res) => {
+    try {
+      res.json(await buildAndCacheProjectGraph());
+    } catch (err) {
+      res.status(500).json({ error: 'graph_failed', message: err instanceof Error ? err.message : 'failed' });
+    }
+  });
+
   app.post('/api/projects', requireAuth, async (req, res) => {
     const projectName = validateProjectName(String(req.body?.name || ''));
     if (!projectName) {
