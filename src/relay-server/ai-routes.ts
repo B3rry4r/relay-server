@@ -2,70 +2,47 @@ import { type Express } from 'express';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createTerminalEnv, resolveWorkspace } from './runtime';
+import { AI_ADAPTERS, getAdapter, isAIModel, type AIModel, type AIFormat } from './ai-adapters';
 
 const execFileAsync = promisify(execFile);
 
 // Timeout for AI generation calls (2 minutes)
 const AI_TIMEOUT_MS = 120_000;
 
-type AIModel = 'claude' | 'codex' | 'gemini';
-
 interface GenerateRequest {
   prompt: string;
   model?: AIModel;
   sessionId?: string;
+  format?: AIFormat;
 }
 
 interface GenerateResponse {
   code: string;
   model: AIModel;
+  sessionId?: string;
 }
 
-// ── Adapters ──────────────────────────────────────────────────────────────────
-
-async function runClaude(prompt: string, env: NodeJS.ProcessEnv, cwd: string): Promise<string> {
-  // Claude Code CLI uses OAuth login (claude auth login), not ANTHROPIC_API_KEY.
-  // `claude -p "prompt" --output-format text` runs non-interactively and
-  // uses the session established by `claude auth login` in the workspace.
-  const { stdout, stderr } = await execFileAsync(
-    'claude',
-    ['-p', prompt, '--output-format', 'text'],
-    { env, cwd, timeout: AI_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024 },
-  );
+// Run a model through its adapter (structured args + session continuity).
+async function runModel(
+  model: AIModel,
+  prompt: string,
+  env: NodeJS.ProcessEnv,
+  cwd: string,
+  opts: { sessionId?: string; format?: AIFormat } = {},
+): Promise<string> {
+  const adapter = getAdapter(model);
+  const args = adapter.buildArgs(prompt, {
+    // honor continuity / json only when the adapter supports it
+    sessionId: adapter.capabilities.resume ? opts.sessionId : undefined,
+    format: adapter.capabilities.json ? opts.format : undefined,
+  });
+  const { stdout, stderr } = await execFileAsync(adapter.bin, args, {
+    env, cwd, timeout: AI_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024,
+  });
   const out = stdout.trim();
-  if (!out && stderr.trim()) throw new Error(`Claude error: ${stderr.trim().slice(0, 300)}`);
+  if (!out && stderr.trim()) throw new Error(`${model} error: ${stderr.trim().slice(0, 300)}`);
   return out;
 }
-
-async function runCodex(prompt: string, env: NodeJS.ProcessEnv, cwd: string): Promise<string> {
-  // OpenAI Codex CLI: `codex --prompt "..." --quiet`
-  const { stdout, stderr } = await execFileAsync(
-    'codex',
-    ['--prompt', prompt, '--quiet', '--no-interactive'],
-    { env, cwd, timeout: AI_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024 },
-  );
-  const out = stdout.trim();
-  if (!out && stderr.trim()) throw new Error(`Codex error: ${stderr.trim().slice(0, 300)}`);
-  return out;
-}
-
-async function runGemini(prompt: string, env: NodeJS.ProcessEnv, cwd: string): Promise<string> {
-  // Gemini CLI: `gemini --prompt "..."` or `gemini -p "..."`
-  const { stdout, stderr } = await execFileAsync(
-    'gemini',
-    ['-p', prompt],
-    { env, cwd, timeout: AI_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024 },
-  );
-  const out = stdout.trim();
-  if (!out && stderr.trim()) throw new Error(`Gemini error: ${stderr.trim().slice(0, 300)}`);
-  return out;
-}
-
-const adapters: Record<AIModel, (prompt: string, env: NodeJS.ProcessEnv, cwd: string) => Promise<string>> = {
-  claude: runClaude,
-  codex: runCodex,
-  gemini: runGemini,
-};
 
 // ── Route registration ────────────────────────────────────────────────────────
 
@@ -77,25 +54,29 @@ export function registerAIRoutes(app: Express): void {
    * Returns: { code: string, model: string }
    */
   app.post('/api/ai/generate', async (req, res) => {
-    const { prompt, model = 'claude' } = req.body as GenerateRequest;
+    const { prompt, model = 'claude', sessionId, format } = req.body as GenerateRequest;
 
     if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
       res.status(400).json({ error: 'prompt is required' });
       return;
     }
 
-    if (!['claude', 'codex', 'gemini'].includes(model)) {
+    if (!isAIModel(model)) {
       res.status(400).json({ error: 'model must be claude, codex, or gemini' });
       return;
     }
 
     const workspace = resolveWorkspace();
     const env = createTerminalEnv(workspace);
-    const adapter = adapters[model as AIModel];
 
     try {
-      const code = await adapter(prompt.trim(), env, workspace);
-      const response: GenerateResponse = { code, model: model as AIModel };
+      const code = await runModel(model, prompt.trim(), env, workspace, { sessionId, format });
+      // Echo the sessionId back when the adapter can resume, so the caller can
+      // continue the conversation on the next turn.
+      const response: GenerateResponse = {
+        code, model,
+        ...(getAdapter(model).capabilities.resume && sessionId ? { sessionId } : {}),
+      };
       res.json(response);
     } catch (err: any) {
       const msg = err?.message ?? 'AI generation failed';
@@ -119,12 +100,13 @@ export function registerAIRoutes(app: Express): void {
     const env = createTerminalEnv(workspace);
 
     const checks = await Promise.all(
-      (['claude', 'codex', 'gemini'] as AIModel[]).map(async model => {
+      (Object.keys(AI_ADAPTERS) as AIModel[]).map(async model => {
+        const adapter = getAdapter(model);
         try {
-          await execFileAsync('sh', ['-c', `command -v ${model}`], { env, cwd: workspace, timeout: 3000 });
-          return { model, available: true };
+          await execFileAsync('sh', ['-c', `command -v ${adapter.bin}`], { env, cwd: workspace, timeout: 3000 });
+          return { model, available: true, capabilities: adapter.capabilities };
         } catch {
-          return { model, available: false };
+          return { model, available: false, capabilities: adapter.capabilities };
         }
       }),
     );
