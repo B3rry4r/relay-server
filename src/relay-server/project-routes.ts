@@ -3,7 +3,7 @@ import path from 'node:path';
 import type { Express } from 'express';
 import { marked } from 'marked';
 import { initializeGitRepository } from './git';
-import { buildAndCacheProjectGraph } from './project-graph';
+import { buildAndCacheProjectGraph, buildProjectGraph, proposeManifests, planReorg } from './project-graph';
 import {
   buildTree,
   duplicateItem,
@@ -32,6 +32,39 @@ export function registerProjectRoutes(app: Express): void {
       res.json(await buildAndCacheProjectGraph());
     } catch (err) {
       res.status(500).json({ error: 'graph_failed', message: err instanceof Error ? err.message : 'failed' });
+    }
+  });
+
+  // Proposed product.json manifests (the source of truth). Dry-run by default;
+  // ?write=true commits them to disk so the grouping becomes authoritative.
+  app.post('/api/projects/graph/manifests', requireAuth, async (req, res) => {
+    try {
+      const graph = await buildProjectGraph();
+      const manifests = proposeManifests(graph);
+      const write = String(req.query.write || req.body?.write || '') === 'true';
+      const written: string[] = [];
+      if (write) {
+        for (const m of manifests) {
+          const dir = path.join(getProjectsRoot(), m.product);
+          if (!(await exists(dir))) continue; // only into an existing product dir
+          const file = path.join(dir, 'product.json');
+          if (await exists(file)) continue;   // never overwrite an existing manifest
+          await fs.writeFile(file, JSON.stringify(m.content, null, 2));
+          written.push(`${m.product}/product.json`);
+        }
+      }
+      res.json({ dryRun: !write, manifests, written });
+    } catch (err) {
+      res.status(500).json({ error: 'manifests_failed', message: err instanceof Error ? err.message : 'failed' });
+    }
+  });
+
+  // Non-destructive reorg plan (products/<product>/<role>). Plan only.
+  app.get('/api/projects/graph/reorg-plan', requireAuth, async (_req, res) => {
+    try {
+      res.json({ note: 'Proposed moves only — nothing is moved.', moves: planReorg(await buildProjectGraph()) });
+    } catch (err) {
+      res.status(500).json({ error: 'reorg_failed', message: err instanceof Error ? err.message : 'failed' });
     }
   });
 

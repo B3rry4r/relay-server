@@ -2,7 +2,7 @@ import { describe, it, expect, afterAll } from 'vitest';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { buildProjectGraph } from '../src/relay-server/project-graph';
+import { buildProjectGraph, proposeManifests, planReorg } from '../src/relay-server/project-graph';
 
 const tmpRoots: string[] = [];
 async function makeRoot(): Promise<string> {
@@ -42,6 +42,25 @@ describe('project-graph', () => {
 
     // platform repo excluded from products
     expect(g.products.find(p => p.id === 'relay-web')).toBeFalsy();
+  });
+
+  it('proposes a product.json per product and a non-destructive reorg plan', async () => {
+    const root = await makeRoot();
+    await repo(root, 'Kudimata-API', { 'composer.json': '{}' });
+    await repo(root, 'Kudimata-Web', { 'package.json': JSON.stringify({ dependencies: { next: '14' } }) });
+    const g = await buildProjectGraph(root);
+
+    const manifests = proposeManifests(g);
+    const kudimata = manifests.find(m => m.product === 'kudimata');
+    expect(kudimata!.path).toBe('kudimata/product.json');
+    expect(kudimata!.content.product).toBe('kudimata');
+    expect(kudimata!.content.repos!.length).toBe(2);
+
+    const moves = planReorg(g);
+    expect(moves).toEqual(expect.arrayContaining([
+      { from: 'Kudimata-API', to: 'products/kudimata/backend' },
+      { from: 'Kudimata-Web', to: 'products/kudimata/web' },
+    ]));
   });
 
   it('a committed product.json is authoritative and strips remote creds', async () => {

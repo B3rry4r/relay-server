@@ -161,6 +161,53 @@ export async function buildProjectGraph(projectsRoot = getProjectsRoot()): Promi
   };
 }
 
+// ── P5: manifest generation + reorg planning ────────────────────────────────
+
+export interface ProposedManifest {
+  product: string;
+  /** Where the manifest should be committed, relative to the projects root. */
+  path: string;
+  content: ProductManifest;
+}
+
+/** Propose a product.json for each product so the inferred grouping can be
+ *  committed and become authoritative. Does not write anything. */
+export function proposeManifests(graph: ProjectGraph): ProposedManifest[] {
+  return graph.products.map((p) => ({
+    product: p.id,
+    path: `${p.id}/product.json`,
+    content: {
+      product: p.id,
+      displayName: p.displayName,
+      repos: p.repos.map((r) => ({ role: r.role, path: r.path, stack: r.stack, ...(r.remote ? { remote: r.remote } : {}) })),
+      ...(p.figma ? { figma: p.figma } : {}),
+      ...(p.generation ? { generation: p.generation } : {}),
+      ...(p.shared ? { shared: p.shared } : {}),
+    },
+  }));
+}
+
+export interface ReorgMove { from: string; to: string; }
+
+/** A NON-DESTRUCTIVE plan for the products/<product>/<role> layout: a list of
+ *  proposed moves the user can review/execute. Never moves anything itself. */
+export function planReorg(graph: ProjectGraph): ReorgMove[] {
+  const moves: ReorgMove[] = [];
+  const seen = new Map<string, number>();
+  for (const p of graph.products) {
+    for (const r of p.repos) {
+      if (r.path === '.' ) continue; // already a manifest-relative repo
+      let role = r.role === 'unknown' || r.role === 'app' ? 'app' : r.role;
+      // disambiguate duplicate roles within a product (e.g. two web repos)
+      const key = `${p.id}/${role}`;
+      const n = seen.get(key) ?? 0; seen.set(key, n + 1);
+      if (n > 0) role = `${role}${n + 1}`;
+      moves.push({ from: r.path, to: `products/${p.id}/${role}` });
+    }
+  }
+  return moves;
+}
+
 /** Build the graph and cache it to .relay/state/projects.graph.json. */
 export async function buildAndCacheProjectGraph(projectsRoot = getProjectsRoot()): Promise<ProjectGraph> {
   const graph = await buildProjectGraph(projectsRoot);
