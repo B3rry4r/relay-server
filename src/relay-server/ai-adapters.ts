@@ -22,6 +22,10 @@ export interface AICapabilities {
 export interface AIRunOptions {
   sessionId?: string;
   format?: AIFormat;
+  /** Agentic mode: let the CLI use its native file/bash tools WITHOUT
+   *  interactive permission prompts. The caller MUST run with cwd set to the
+   *  target project so writes are scoped to that folder. */
+  agent?: boolean;
 }
 
 export interface AIAdapter {
@@ -40,6 +44,10 @@ const claude: AIAdapter = {
     const args = ['-p', prompt, '--output-format', opts.format ?? 'text'];
     // Continue a prior conversation when a session id is supplied (continuity).
     if (opts.sessionId) args.push('--resume', opts.sessionId);
+    // Agent mode: headless autonomous. `acceptEdits` auto-approves file edits
+    // AND bash in -p mode and (unlike --dangerously-skip-permissions) is
+    // allowed to run as root, which the relay host is. Scope = the cwd.
+    if (opts.agent) args.push('--permission-mode', 'acceptEdits');
     return args;
   },
 };
@@ -48,8 +56,15 @@ const codex: AIAdapter = {
   id: 'codex',
   bin: 'codex',
   capabilities: { resume: false, json: false, images: false },
-  buildArgs(prompt) {
-    return ['--prompt', prompt, '--quiet', '--no-interactive'];
+  buildArgs(prompt, opts = {}) {
+    // Agent mode uses `codex exec` (non-interactive — approval is implicitly
+    // "never"). `--sandbox workspace-write` confines writes to the cwd workspace;
+    // --skip-git-repo-check lets it run in a not-yet-git project.
+    if (opts.agent) {
+      return ['exec', '--sandbox', 'workspace-write', '--skip-git-repo-check', prompt];
+    }
+    // Non-agent: plain non-interactive print (read-only sandbox).
+    return ['exec', '--sandbox', 'read-only', '--skip-git-repo-check', prompt];
   },
 };
 
@@ -57,8 +72,11 @@ const gemini: AIAdapter = {
   id: 'gemini',
   bin: 'gemini',
   capabilities: { resume: false, json: false, images: false },
-  buildArgs(prompt) {
-    return ['-p', prompt];
+  buildArgs(prompt, opts = {}) {
+    const args = ['-p', prompt];
+    // Agent mode: auto-approve all tool calls (yolo). Scope is the cwd.
+    if (opts.agent) args.push('--approval-mode', 'yolo');
+    return args;
   },
 };
 

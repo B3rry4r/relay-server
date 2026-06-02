@@ -1,14 +1,16 @@
 import { type Express } from 'express';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { createTerminalEnv, resolveWorkspace } from './runtime';
+import { createTerminalEnv, resolveWorkspace, resolveProjectRoot } from './runtime';
 import { AI_ADAPTERS, getAdapter, isAIModel, type AIModel, type AIFormat } from './ai-adapters';
 import { appendTurn, getConversation, listConversations } from './conversation-store';
 
 const execFileAsync = promisify(execFile);
 
-// Timeout for AI generation calls (2 minutes)
+// Timeout for AI generation calls (2 minutes for plain text; agentic runs that
+// scaffold + install + build need much longer).
 const AI_TIMEOUT_MS = 120_000;
+const AI_AGENT_TIMEOUT_MS = 600_000;
 
 interface GenerateRequest {
   prompt: string;
@@ -17,6 +19,9 @@ interface GenerateRequest {
   format?: AIFormat;
   conversationId?: string;  // when set, the turn is recorded for durable context
   projectId?: string;
+  /** Agentic mode: the CLI writes files / installs deps directly into the
+   *  project (projectId) using its native tools, no permission prompts. */
+  agent?: boolean;
 }
 
 interface GenerateResponse {
@@ -32,16 +37,17 @@ async function runModel(
   prompt: string,
   env: NodeJS.ProcessEnv,
   cwd: string,
-  opts: { sessionId?: string; format?: AIFormat } = {},
+  opts: { sessionId?: string; format?: AIFormat; agent?: boolean } = {},
 ): Promise<string> {
   const adapter = getAdapter(model);
   const args = adapter.buildArgs(prompt, {
     // honor continuity / json only when the adapter supports it
     sessionId: adapter.capabilities.resume ? opts.sessionId : undefined,
     format: adapter.capabilities.json ? opts.format : undefined,
+    agent: opts.agent,
   });
   const { stdout, stderr } = await execFileAsync(adapter.bin, args, {
-    env, cwd, timeout: AI_TIMEOUT_MS, maxBuffer: 10 * 1024 * 1024,
+    env, cwd, timeout: opts.agent ? AI_AGENT_TIMEOUT_MS : AI_TIMEOUT_MS, maxBuffer: 32 * 1024 * 1024,
   });
   const out = stdout.trim();
   if (!out && stderr.trim()) throw new Error(`${model} error: ${stderr.trim().slice(0, 300)}`);
@@ -58,7 +64,7 @@ export function registerAIRoutes(app: Express): void {
    * Returns: { code: string, model: string }
    */
   app.post('/api/ai/generate', async (req, res) => {
-    const { prompt, model = 'claude', sessionId, format, conversationId, projectId } = req.body as GenerateRequest;
+    const { prompt, model = 'claude', sessionId, format, conversationId, projectId, agent } = req.body as GenerateRequest;
 
     if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
       res.status(400).json({ error: 'prompt is required' });
@@ -70,11 +76,20 @@ export function registerAIRoutes(app: Express): void {
       return;
     }
 
+    // Agent mode writes into the project — it MUST run with cwd = that project
+    // so the CLI's auto-approved file/bash tools are scoped to that folder.
     const workspace = resolveWorkspace();
-    const env = createTerminalEnv(workspace);
+    let cwd = workspace;
+    if (agent) {
+      if (!projectId) { res.status(400).json({ error: 'projectId is required for agent mode' }); return; }
+      const root = resolveProjectRoot(projectId);
+      if (!root) { res.status(404).json({ error: 'project not found' }); return; }
+      cwd = root;
+    }
+    const env = createTerminalEnv(cwd);
 
     try {
-      const code = await runModel(model, prompt.trim(), env, workspace, { sessionId, format });
+      const code = await runModel(model, prompt.trim(), env, cwd, { sessionId, format, agent });
       // Durable context: record the user prompt + assistant output when a
       // conversation is in play (survives reconnect/restart).
       let convId = conversationId;

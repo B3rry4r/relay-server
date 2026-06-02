@@ -518,6 +518,80 @@ server.registerTool(
   },
 );
 
+// ── UIX design-inspection tools (debug loop: IR + rendered image) ────────────
+const uixUrl = new URL(process.env.UIX_URL || 'https://uix-production.up.railway.app');
+
+async function uixJson(path, init = {}) {
+  const r = await fetch(new URL(path, uixUrl), { ...init, headers: { 'content-type': 'application/json', ...(init.headers || {}) } });
+  const t = await r.text();
+  if (!r.ok) throw new Error(t || `UIX ${r.status}`);
+  return t ? JSON.parse(t) : null;
+}
+
+// Collect a node + its subtree from the compact IR (nodes+links adjacency).
+function subtree(ir, nodeId, depth = 0, max = 400, out = {}) {
+  if (depth > 40 || Object.keys(out).length > max) return out;
+  const n = ir.nodes?.[nodeId];
+  if (!n) return out;
+  out[nodeId] = n;
+  for (const c of ir.links?.[nodeId] ?? []) subtree(ir, c, depth + 1, max, out);
+  return out;
+}
+
+server.registerTool(
+  'uix_list_frames',
+  {
+    title: 'List Figma frames',
+    description: 'List the frames in an uploaded .fig (for picking one to inspect).',
+    inputSchema: z.object({ figStorageKey: z.string() }),
+  },
+  async ({ figStorageKey }) => {
+    const ir = await uixJson(`/api/v1/figma/ir/data?figStorageKey=${encodeURIComponent(figStorageKey)}`);
+    const frames = (ir?.frames ?? []).map((f) => ({ id: f.id, name: f.name, w: f.width, h: f.height }));
+    return textResult(`${frames.length} frame(s)`, { figStorageKey, frames });
+  },
+);
+
+server.registerTool(
+  'uix_inspect_frame',
+  {
+    title: 'Inspect a frame (IR + rendered image)',
+    description: 'Return a frame\'s compact IR subtree (with clip/fill/layout fields) AND its rendered PNG, so clipping/overflow can be diagnosed against the design.',
+    inputSchema: z.object({
+      figStorageKey: z.string(),
+      nodeId: z.string(),
+      scale: z.number().min(0.1).max(3).optional(),
+    }),
+  },
+  async ({ figStorageKey, nodeId, scale = 1 }) => {
+    const ir = await uixJson(`/api/v1/figma/ir/data?figStorageKey=${encodeURIComponent(figStorageKey)}`);
+    if (!ir) throw new Error('No IR for that figStorageKey — generate it first.');
+    const nodes = subtree(ir, nodeId);
+    const clipStats = Object.values(nodes).reduce((a, n) => {
+      if (n.t === 'container' || n.t === 'frame') { a.containers++; if (n.clip === 1) a.clipped++; }
+      return a;
+    }, { containers: 0, clipped: 0 });
+
+    // Render the frame (server-side renderer) and inline the PNG so it's viewable.
+    let image = null;
+    try {
+      const render = await uixJson('/api/v1/figma/render', { method: 'POST', body: JSON.stringify({ figStorageKey, nodeId, format: 'png', scale }) });
+      if (render?.url) {
+        const png = await fetch(render.url);
+        if (png.ok) {
+          const buf = Buffer.from(await png.arrayBuffer());
+          image = { type: 'image', data: buf.toString('base64'), mimeType: 'image/png' };
+        }
+      }
+    } catch { /* render best-effort */ }
+
+    const summary = `Frame ${nodeId}: ${Object.keys(nodes).length} nodes, ${clipStats.clipped}/${clipStats.containers} containers clipped.`;
+    const content = [{ type: 'text', text: JSON.stringify({ summary, clipStats, nodeCount: Object.keys(nodes).length, nodes }, null, 2) }];
+    if (image) content.push(image);
+    return { content, structuredContent: { clipStats, nodeCount: Object.keys(nodes).length }, _meta: { summary } };
+  },
+);
+
 const transport = new StdioServerTransport();
 await server.connect(transport);
 
