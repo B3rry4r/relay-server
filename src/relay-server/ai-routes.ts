@@ -38,12 +38,16 @@ async function runModel(
   env: NodeJS.ProcessEnv,
   cwd: string,
   opts: { sessionId?: string; format?: AIFormat; agent?: boolean } = {},
-): Promise<string> {
+): Promise<{ text: string; sessionId?: string }> {
   const adapter = getAdapter(model);
+  // In agent mode for a resume-capable model (claude), use JSON output so we
+  // can capture the CLI's own session_id — that's what makes the agent
+  // remember prior screens across calls (true resumable build session).
+  const format: AIFormat | undefined =
+    opts.agent && adapter.capabilities.resume ? 'json' : (adapter.capabilities.json ? opts.format : undefined);
   const args = adapter.buildArgs(prompt, {
-    // honor continuity / json only when the adapter supports it
     sessionId: adapter.capabilities.resume ? opts.sessionId : undefined,
-    format: adapter.capabilities.json ? opts.format : undefined,
+    format,
     agent: opts.agent,
   });
   const { stdout, stderr } = await execFileAsync(adapter.bin, args, {
@@ -51,7 +55,15 @@ async function runModel(
   });
   const out = stdout.trim();
   if (!out && stderr.trim()) throw new Error(`${model} error: ${stderr.trim().slice(0, 300)}`);
-  return out;
+  // claude --output-format json → { result, session_id, ... }. Unwrap so the
+  // caller gets clean text + the resumable session id.
+  if (format === 'json') {
+    try {
+      const j = JSON.parse(out);
+      return { text: String(j.result ?? j.text ?? out), sessionId: j.session_id ?? j.sessionId };
+    } catch { /* not JSON — fall through */ }
+  }
+  return { text: out };
 }
 
 // ── Route registration ────────────────────────────────────────────────────────
@@ -89,7 +101,7 @@ export function registerAIRoutes(app: Express): void {
     const env = createTerminalEnv(cwd);
 
     try {
-      const code = await runModel(model, prompt.trim(), env, cwd, { sessionId, format, agent });
+      const { text: code, sessionId: newSessionId } = await runModel(model, prompt.trim(), env, cwd, { sessionId, format, agent });
       // Durable context: record the user prompt + assistant output when a
       // conversation is in play (survives reconnect/restart).
       let convId = conversationId;
@@ -100,9 +112,12 @@ export function registerAIRoutes(app: Express): void {
         const c2 = await appendTurn(c1.id, { role: 'assistant', content: code, model }, { projectId });
         convId = c2.id;
       }
+      // Prefer the FRESH session id from this run (resumable continuity); fall
+      // back to the one the caller sent.
+      const outSessionId = newSessionId ?? (getAdapter(model).capabilities.resume ? sessionId : undefined);
       const response: GenerateResponse = {
         code, model,
-        ...(getAdapter(model).capabilities.resume && sessionId ? { sessionId } : {}),
+        ...(outSessionId ? { sessionId: outSessionId } : {}),
         ...(convId ? { conversationId: convId } : {}),
       };
       res.json(response);
