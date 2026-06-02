@@ -55,7 +55,8 @@ const claude: AIAdapter = {
 const codex: AIAdapter = {
   id: 'codex',
   bin: 'codex',
-  capabilities: { resume: false, json: false, images: false },
+  // Multimodal: codex reads images referenced by path from the workspace.
+  capabilities: { resume: false, json: false, images: true },
   buildArgs(prompt, opts = {}) {
     // Agent mode uses `codex exec` (non-interactive — approval is implicitly
     // "never"). `--sandbox workspace-write` confines writes to the cwd workspace;
@@ -71,7 +72,8 @@ const codex: AIAdapter = {
 const gemini: AIAdapter = {
   id: 'gemini',
   bin: 'gemini',
-  capabilities: { resume: false, json: false, images: false },
+  // Multimodal: gemini reads images referenced by path from the workspace.
+  capabilities: { resume: false, json: false, images: true },
   buildArgs(prompt, opts = {}) {
     const args = ['-p', prompt];
     // Agent mode: auto-approve all tool calls (yolo). Scope is the cwd.
