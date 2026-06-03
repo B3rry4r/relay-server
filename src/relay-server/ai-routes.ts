@@ -1,11 +1,26 @@
 import { type Express } from 'express';
-import { execFile } from 'node:child_process';
+import { execFile, type ChildProcess } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createTerminalEnv, resolveWorkspace, resolveProjectRoot } from './runtime';
 import { AI_ADAPTERS, getAdapter, isAIModel, type AIModel, type AIFormat } from './ai-adapters';
 import { appendTurn, getConversation, listConversations } from './conversation-store';
 
 const execFileAsync = promisify(execFile);
+
+// ── In-flight generation registry (for cancellation / Stop button) ───────────
+// Each agent/codegen run registers its child process so POST /api/ai/cancel can
+// kill it (and its whole process group — npm/build children included).
+interface RunningJob { child: ChildProcess; projectId?: string; startedAt: number }
+const runningJobs = new Map<string, RunningJob>();
+
+function killJob(job: RunningJob): void {
+  const pid = job.child.pid;
+  if (!pid) return;
+  // The CLI is its own process-group leader (spawned detached), so a negative
+  // pid signals the whole group — kills npm/install/build descendants too.
+  try { process.kill(-pid, 'SIGTERM'); } catch { try { job.child.kill('SIGTERM'); } catch { /* gone */ } }
+  setTimeout(() => { try { process.kill(-pid, 'SIGKILL'); } catch { /* already dead */ } }, 2500);
+}
 
 // Timeout for AI generation calls (2 minutes for plain text; agentic runs that
 // scaffold + install + build need much longer).
@@ -19,6 +34,8 @@ interface GenerateRequest {
   format?: AIFormat;
   conversationId?: string;  // when set, the turn is recorded for durable context
   projectId?: string;
+  /** Client-supplied id for this run so it can be cancelled via /api/ai/cancel. */
+  jobId?: string;
   /** Agentic mode: the CLI writes files / installs deps directly into the
    *  project (projectId) using its native tools, no permission prompts. */
   agent?: boolean;
@@ -37,7 +54,7 @@ async function runModel(
   prompt: string,
   env: NodeJS.ProcessEnv,
   cwd: string,
-  opts: { sessionId?: string; format?: AIFormat; agent?: boolean } = {},
+  opts: { sessionId?: string; format?: AIFormat; agent?: boolean; jobId?: string; projectId?: string } = {},
 ): Promise<{ text: string; sessionId?: string }> {
   const adapter = getAdapter(model);
   // In agent mode for a resume-capable model (claude), use JSON output so we
@@ -50,9 +67,23 @@ async function runModel(
     format,
     agent: opts.agent,
   });
-  const { stdout, stderr } = await execFileAsync(adapter.bin, args, {
+  // `detached: true` makes the CLI a process-group leader so cancellation can
+  // kill the whole tree (the CLI + any npm/build children it spawns).
+  const promise = execFileAsync(adapter.bin, args, {
     env, cwd, timeout: opts.agent ? AI_AGENT_TIMEOUT_MS : AI_TIMEOUT_MS, maxBuffer: 32 * 1024 * 1024,
-  });
+    // `detached` is honoured by execFile at runtime (forwarded to spawn) but is
+    // absent from its options type — cast so we can group-kill on cancel.
+    detached: true,
+  } as Parameters<typeof execFileAsync>[2]);
+  const jobKey = opts.jobId || opts.projectId;
+  if (jobKey && promise.child) runningJobs.set(jobKey, { child: promise.child, projectId: opts.projectId, startedAt: Date.now() });
+  let result;
+  try {
+    result = await promise;
+  } finally {
+    if (jobKey) runningJobs.delete(jobKey);
+  }
+  const { stdout, stderr } = result as { stdout: string; stderr: string };
   const out = stdout.trim();
   if (!out && stderr.trim()) throw new Error(`${model} error: ${stderr.trim().slice(0, 300)}`);
   // claude --output-format json → { result, session_id, ... }. Unwrap so the
@@ -76,7 +107,7 @@ export function registerAIRoutes(app: Express): void {
    * Returns: { code: string, model: string }
    */
   app.post('/api/ai/generate', async (req, res) => {
-    const { prompt, model = 'claude', sessionId, format, conversationId, projectId, agent } = req.body as GenerateRequest;
+    const { prompt, model = 'claude', sessionId, format, conversationId, projectId, agent, jobId } = req.body as GenerateRequest;
 
     if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
       res.status(400).json({ error: 'prompt is required' });
@@ -101,7 +132,7 @@ export function registerAIRoutes(app: Express): void {
     const env = createTerminalEnv(cwd);
 
     try {
-      const { text: code, sessionId: newSessionId } = await runModel(model, prompt.trim(), env, cwd, { sessionId, format, agent });
+      const { text: code, sessionId: newSessionId } = await runModel(model, prompt.trim(), env, cwd, { sessionId, format, agent, jobId, projectId });
       // Durable context: record the user prompt + assistant output when a
       // conversation is in play (survives reconnect/restart).
       let convId = conversationId;
@@ -123,8 +154,10 @@ export function registerAIRoutes(app: Express): void {
       res.json(response);
     } catch (err: any) {
       const msg = err?.message ?? 'AI generation failed';
-      // Distinguish "binary not found" from other errors
-      if (msg.includes('ENOENT') || msg.includes('not found') || msg.includes('command not found')) {
+      // A cancelled run was killed with SIGTERM/SIGKILL — report it as such.
+      if (err?.killed || err?.signal === 'SIGTERM' || err?.signal === 'SIGKILL') {
+        res.status(499).json({ error: 'generation cancelled', cancelled: true, model });
+      } else if (msg.includes('ENOENT') || msg.includes('not found') || msg.includes('command not found')) {
         res.status(503).json({ error: `${model} is not installed in this workspace`, model });
       } else if (err?.code === 'ETIMEDOUT' || msg.includes('timeout')) {
         res.status(504).json({ error: `${model} timed out after ${AI_TIMEOUT_MS / 1000}s`, model });
@@ -132,6 +165,26 @@ export function registerAIRoutes(app: Express): void {
         res.status(500).json({ error: msg, model });
       }
     }
+  });
+
+  /**
+   * POST /api/ai/cancel
+   * Body: { jobId?: string, projectId?: string }
+   * Kills the in-flight generation (and its process group) matching jobId or
+   * projectId. Safe to call when nothing is running (returns cancelled: 0).
+   */
+  app.post('/api/ai/cancel', (req, res) => {
+    const { jobId, projectId } = req.body as { jobId?: string; projectId?: string };
+    if (!jobId && !projectId) { res.status(400).json({ error: 'jobId or projectId is required' }); return; }
+    let cancelled = 0;
+    for (const [key, job] of runningJobs) {
+      if ((jobId && key === jobId) || (projectId && job.projectId === projectId)) {
+        killJob(job);
+        runningJobs.delete(key);
+        cancelled++;
+      }
+    }
+    res.json({ cancelled });
   });
 
   /**
