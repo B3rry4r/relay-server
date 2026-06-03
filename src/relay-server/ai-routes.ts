@@ -7,6 +7,24 @@ import { appendTurn, getConversation, listConversations } from './conversation-s
 
 const execFileAsync = promisify(execFile);
 
+// Resolve a CLI's ABSOLUTE path. execFile only searches the env PATH, but a CLI
+// the user installed may live on a PATH that only their shell PROFILE adds
+// (nvm/fnm/mise shims, custom exports). So: try the env PATH, then a login shell
+// (`bash -lc`) which sources the profile. Returns null if genuinely not found.
+// `bin` comes from our adapter registry (never user input) → safe to interpolate.
+const binPathCache = new Map<string, string>();
+async function resolveBin(bin: string, env: NodeJS.ProcessEnv, cwd: string): Promise<string | null> {
+  if (binPathCache.has(bin)) return binPathCache.get(bin)!;
+  for (const cmd of [`command -v ${bin}`, `command -v ${bin} || bash -lc 'command -v ${bin}'`]) {
+    try {
+      const { stdout } = await execFileAsync('sh', ['-c', cmd], { env, cwd, timeout: 6000 });
+      const p = stdout.trim().split('\n').filter(Boolean).pop()?.trim();
+      if (p) { binPathCache.set(bin, p); return p; }
+    } catch { /* try the next resolution strategy */ }
+  }
+  return null;
+}
+
 // ── In-flight generation registry (for cancellation / Stop button) ───────────
 // Each agent/codegen run registers its child process so POST /api/ai/cancel can
 // kill it (and its whole process group — npm/build children included).
@@ -67,9 +85,12 @@ async function runModel(
     format,
     agent: opts.agent,
   });
+  // Resolve the absolute binary path (login-shell aware) so installs on a
+  // profile-only PATH are found — otherwise execFile ENOENTs → false "not installed".
+  const binPath = (await resolveBin(adapter.bin, env, cwd)) ?? adapter.bin;
   // `detached: true` makes the CLI a process-group leader so cancellation can
   // kill the whole tree (the CLI + any npm/build children it spawns).
-  const promise = execFileAsync(adapter.bin, args, {
+  const promise = execFileAsync(binPath, args, {
     env, cwd, timeout: opts.agent ? AI_AGENT_TIMEOUT_MS : AI_TIMEOUT_MS, maxBuffer: 32 * 1024 * 1024,
     // `detached` is honoured by execFile at runtime (forwarded to spawn) but is
     // absent from its options type — cast so we can group-kill on cancel.
@@ -198,12 +219,8 @@ export function registerAIRoutes(app: Express): void {
     const checks = await Promise.all(
       (Object.keys(AI_ADAPTERS) as AIModel[]).map(async model => {
         const adapter = getAdapter(model);
-        try {
-          await execFileAsync('sh', ['-c', `command -v ${adapter.bin}`], { env, cwd: workspace, timeout: 3000 });
-          return { model, available: true, capabilities: adapter.capabilities };
-        } catch {
-          return { model, available: false, capabilities: adapter.capabilities };
-        }
+        const resolved = await resolveBin(adapter.bin, env, workspace);
+        return { model, available: !!resolved, capabilities: adapter.capabilities };
       }),
     );
 
