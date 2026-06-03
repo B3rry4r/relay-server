@@ -210,6 +210,36 @@ export function registerAIRoutes(app: Express): void {
     res.json({ models: checks });
   });
 
+  /**
+   * POST /api/ai/install  { model }
+   * Install a missing AI CLI into the workspace npm-global prefix. Lets the user
+   * enable gemini/opencode/etc. without a manual terminal step.
+   */
+  app.post('/api/ai/install', async (req, res) => {
+    const model = (req.body?.model ?? '') as string;
+    if (!isAIModel(model)) { res.status(400).json({ error: `Unknown model: ${model}` }); return; }
+    const PKG: Record<AIModel, string> = {
+      claude: '@anthropic-ai/claude-code',
+      codex: '@openai/codex',
+      gemini: '@google/gemini-cli',
+      opencode: 'opencode-ai',
+    };
+    const pkg = PKG[model];
+    const workspace = resolveWorkspace();
+    const env = createTerminalEnv(workspace);
+    try {
+      const { stdout, stderr } = await execFileAsync('npm', ['install', '-g', pkg], {
+        env, cwd: workspace, timeout: 300_000, maxBuffer: 1024 * 1024 * 16,
+      });
+      // Confirm it's now on PATH.
+      let available = false;
+      try { await execFileAsync('sh', ['-c', `command -v ${getAdapter(model).bin}`], { env, cwd: workspace, timeout: 3000 }); available = true; } catch { /* not found */ }
+      res.json({ model, pkg, available, log: (stdout || '') + (stderr || '') });
+    } catch (err: any) {
+      res.status(500).json({ error: `Failed to install ${pkg}: ${err?.message ?? err}`, model, pkg });
+    }
+  });
+
   /** GET /api/ai/conversations?projectId=… — durable conversation list. */
   app.get('/api/ai/conversations', async (req, res) => {
     const projectId = typeof req.query.projectId === 'string' ? req.query.projectId : undefined;
