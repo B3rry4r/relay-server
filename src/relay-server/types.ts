@@ -33,6 +33,7 @@ export type TreeNode = {
   type: 'directory' | 'file';
   size?: number;
   status?: 'modified' | 'added' | 'deleted' | 'untracked' | 'staged' | 'renamed' | 'conflicted';
+  children?: TreeNode[];
 };
 
 export type GitFileEntry = {

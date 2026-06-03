@@ -333,28 +333,34 @@ export async function buildTree(
 
   const actualStatusMap = statusMap ?? await getGitStatusMap(projectRoot);
   const entries = await fs.readdir(targetPath, { withFileTypes: true });
-  const nodes = await Promise.all(entries.map(async (entry) => {
+  const nodes = await Promise.all(entries.map(async (entry): Promise<TreeNode> => {
     const entryAbsolutePath = path.join(targetPath, entry.name);
     const entryRelativePath = path.relative(projectRoot, entryAbsolutePath) || entry.name;
 
     if (entry.isDirectory()) {
-      const node: TreeNode = { name: entry.name, path: entryRelativePath, type: 'directory' };
-      if (depth > 1) {
-        return [node, ...(await buildTree(projectRoot, entryRelativePath, depth - 1, actualStatusMap))];
-      }
-      return [node];
+      // NEST children under node.children (the client renders node.children).
+      // Recurse to `depth` levels; deeper dirs come back with no children yet
+      // and the client can lazy-load on expand if needed.
+      const children = depth > 1
+        ? await buildTree(projectRoot, entryRelativePath, depth - 1, actualStatusMap)
+        : undefined;
+      return { name: entry.name, path: entryRelativePath, type: 'directory', children };
     }
 
     const stat = await fs.stat(entryAbsolutePath);
     const gitStatus = actualStatusMap.get(entryRelativePath);
-    return [{
+    return {
       name: entry.name,
       path: entryRelativePath,
       type: 'file' as const,
       size: stat.size,
       status: gitStatus as TreeNode['status'],
-    }];
+    };
   }));
 
-  return nodes.flat().sort((left, right) => left.path.localeCompare(right.path));
+  // Folders first, then files; each group alphabetical (VS Code ordering).
+  return nodes.sort((a, b) => {
+    if (a.type !== b.type) return a.type === 'directory' ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
 }
