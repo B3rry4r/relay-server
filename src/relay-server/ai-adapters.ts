@@ -10,7 +10,7 @@
 // route layer does the execFile.
 // =============================================================================
 
-export type AIModel = 'claude' | 'codex' | 'gemini';
+export type AIModel = 'claude' | 'codex' | 'gemini' | 'opencode';
 export type AIFormat = 'text' | 'json';
 
 export interface AICapabilities {
@@ -82,10 +82,26 @@ const gemini: AIAdapter = {
   },
 };
 
-export const AI_ADAPTERS: Record<AIModel, AIAdapter> = { claude, codex, gemini };
+// opencode (sst/opencode) — open-source autonomous coding agent. `run` is the
+// non-interactive headless mode: it reads/edits files in the cwd with its tools
+// auto-executed (no prompts), same intent as the others' agent mode. Supports
+// resumable sessions (--session) and is multimodal (reads images by path).
+const opencode: AIAdapter = {
+  id: 'opencode',
+  bin: 'opencode',
+  capabilities: { resume: true, json: false, images: true },
+  buildArgs(prompt, opts = {}) {
+    const args = ['run'];
+    if (opts.sessionId) args.push('--session', opts.sessionId);
+    args.push(prompt);
+    return args;
+  },
+};
+
+export const AI_ADAPTERS: Record<AIModel, AIAdapter> = { claude, codex, gemini, opencode };
 
 export function isAIModel(v: unknown): v is AIModel {
-  return v === 'claude' || v === 'codex' || v === 'gemini';
+  return v === 'claude' || v === 'codex' || v === 'gemini' || v === 'opencode';
 }
 
 export function getAdapter(model: AIModel): AIAdapter {
