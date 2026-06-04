@@ -86,6 +86,11 @@ async function ensureOpencodeAgentConfig(cwd: string): Promise<void> {
     if (parsed && typeof parsed === 'object') config = parsed;
   } catch { /* missing/invalid — start fresh */ }
   config.permission = { ...(config.permission as object ?? {}), edit: 'allow', bash: 'allow', webfetch: 'allow' };
+  // Default to a FREE opencode-zen model so generation never burns paid tokens.
+  // Override with OPENCODE_MODEL (e.g. "opencode/kimi-k2.5-free",
+  // "opencode/qwen3.6-plus-free", "opencode/deepseek-v4-flash-free", or any
+  // provider/model you've authed). Only set if the user hasn't pinned one.
+  if (!config.model) config.model = process.env.OPENCODE_MODEL || 'opencode/minimax-m2.1-free';
   await fsp.mkdir(dir, { recursive: true });
   await fsp.writeFile(file, JSON.stringify(config, null, 2), 'utf-8');
 }
