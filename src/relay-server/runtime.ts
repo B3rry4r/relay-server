@@ -163,6 +163,14 @@ export function createTerminalEnv(workspace: string): NodeJS.ProcessEnv {
     if (key.startsWith('VSCODE_') || key.startsWith('BASH_FUNC__vsc_')) {
       delete env[key];
     }
+    // Railway injects RAILWAY_* vars describing THIS container (the relay-server
+    // service in the WAWUAfrica project). The Railway CLI prioritises these over
+    // its per-directory config, so they pin every `railway` command to WAWUAfrica
+    // no matter which project a terminal/agent is working in. Strip them so the
+    // CLI falls back to config-file linking and `railway link` works per project.
+    if (key.startsWith('RAILWAY_')) {
+      delete env[key];
+    }
   }
 
   delete env.TERM_PROGRAM;
