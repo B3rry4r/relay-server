@@ -71,6 +71,8 @@ const AI_AGENT_TIMEOUT_MS = 600_000;
 interface GenerateRequest {
   prompt: string;
   model?: AIModel;
+  /** Specific model for the chosen CLI (--model), e.g. opus/sonnet/haiku. */
+  modelId?: string;
   sessionId?: string;
   format?: AIFormat;
   conversationId?: string;  // when set, the turn is recorded for durable context
@@ -122,7 +124,7 @@ async function runModel(
   prompt: string,
   env: NodeJS.ProcessEnv,
   cwd: string,
-  opts: { sessionId?: string; format?: AIFormat; agent?: boolean; jobId?: string; projectId?: string } = {},
+  opts: { sessionId?: string; format?: AIFormat; agent?: boolean; jobId?: string; projectId?: string; modelId?: string } = {},
 ): Promise<{ text: string; sessionId?: string }> {
   const adapter = getAdapter(model);
   // In agent mode for a resume-capable model (claude), use JSON output so we
@@ -134,6 +136,7 @@ async function runModel(
     sessionId: adapter.capabilities.resume ? opts.sessionId : undefined,
     format,
     agent: opts.agent,
+    modelId: opts.modelId,
   });
   // Resolve the absolute binary path (login-shell aware) so installs on a
   // profile-only PATH are found — otherwise execFile ENOENTs → false "not installed".
@@ -190,7 +193,7 @@ export function registerAIRoutes(app: Express): void {
    * Returns: { code: string, model: string }
    */
   app.post('/api/ai/generate', async (req, res) => {
-    const { prompt, model = 'claude', sessionId, format, conversationId, projectId, agent, jobId } = req.body as GenerateRequest;
+    const { prompt, model = 'claude', modelId, sessionId, format, conversationId, projectId, agent, jobId } = req.body as GenerateRequest;
 
     if (!prompt || typeof prompt !== 'string' || !prompt.trim()) {
       res.status(400).json({ error: 'prompt is required' });
@@ -217,7 +220,7 @@ export function registerAIRoutes(app: Express): void {
     const env = createTerminalEnv(cwd);
 
     try {
-      const { text: code, sessionId: newSessionId } = await runModel(model, prompt.trim(), env, cwd, { sessionId, format, agent, jobId, projectId });
+      const { text: code, sessionId: newSessionId } = await runModel(model, prompt.trim(), env, cwd, { sessionId, format, agent, jobId, projectId, modelId });
       // Durable context: record the user prompt + assistant output when a
       // conversation is in play (survives reconnect/restart).
       let convId = conversationId;

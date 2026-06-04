@@ -26,6 +26,9 @@ export interface AIRunOptions {
    *  interactive permission prompts. The caller MUST run with cwd set to the
    *  target project so writes are scoped to that folder. */
   agent?: boolean;
+  /** Specific model for the CLI's --model flag (e.g. "opus"/"sonnet"/"haiku"
+   *  for claude). Empty/undefined → the CLI default. */
+  modelId?: string;
 }
 
 export interface AIAdapter {
@@ -42,6 +45,8 @@ const claude: AIAdapter = {
   capabilities: { resume: true, json: true, images: true },
   buildArgs(prompt, opts = {}) {
     const args = ['-p', prompt, '--output-format', opts.format ?? 'text'];
+    // Specific model (alias or full id), e.g. opus / sonnet / haiku.
+    if (opts.modelId) args.push('--model', opts.modelId);
     // Continue a prior conversation when a session id is supplied (continuity).
     if (opts.sessionId) args.push('--resume', opts.sessionId);
     // Agent mode: headless autonomous. `acceptEdits` auto-approves file edits
@@ -61,11 +66,12 @@ const codex: AIAdapter = {
     // Agent mode uses `codex exec` (non-interactive — approval is implicitly
     // "never"). `--sandbox workspace-write` confines writes to the cwd workspace;
     // --skip-git-repo-check lets it run in a not-yet-git project.
+    const model = opts.modelId ? ['--model', opts.modelId] : [];
     if (opts.agent) {
-      return ['exec', '--sandbox', 'workspace-write', '--skip-git-repo-check', prompt];
+      return ['exec', '--sandbox', 'workspace-write', '--skip-git-repo-check', ...model, prompt];
     }
     // Non-agent: plain non-interactive print (read-only sandbox).
-    return ['exec', '--sandbox', 'read-only', '--skip-git-repo-check', prompt];
+    return ['exec', '--sandbox', 'read-only', '--skip-git-repo-check', ...model, prompt];
   },
 };
 
@@ -76,6 +82,7 @@ const gemini: AIAdapter = {
   capabilities: { resume: false, json: false, images: true },
   buildArgs(prompt, opts = {}) {
     const args = ['-p', prompt];
+    if (opts.modelId) args.push('--model', opts.modelId);
     // Agent mode: auto-approve all tool calls (yolo). Scope is the cwd.
     if (opts.agent) args.push('--approval-mode', 'yolo');
     return args;
