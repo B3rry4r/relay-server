@@ -33,6 +33,27 @@ async function resolveBin(bin: string, env: NodeJS.ProcessEnv, cwd: string): Pro
 interface RunningJob { child: ChildProcess; projectId?: string; startedAt: number }
 const runningJobs = new Map<string, RunningJob>();
 
+// Live progress: the agent CLI's stdout/stderr lines, per job, so the canvas
+// Generate tab can show "what the agent is doing". Capped + auto-expired.
+interface JobLog { lines: string[]; done: boolean; ts: number }
+const jobLogs = new Map<string, JobLog>();
+const MAX_LOG_LINES = 400;
+function appendJobLog(jobKey: string, chunk: string): void {
+  const entry = jobLogs.get(jobKey);
+  if (!entry) return;
+  for (const raw of chunk.split('\n')) {
+    const line = raw.replace(/\[[0-9;]*m/g, '').trimEnd();   // strip ANSI colour
+    if (line) entry.lines.push(line);
+  }
+  if (entry.lines.length > MAX_LOG_LINES) entry.lines.splice(0, entry.lines.length - MAX_LOG_LINES);
+  entry.ts = Date.now();
+}
+// Drop logs older than 10 min so the map can't grow unbounded.
+function pruneJobLogs(): void {
+  const cutoff = Date.now() - 600_000;
+  for (const [k, v] of jobLogs) if (v.done && v.ts < cutoff) jobLogs.delete(k);
+}
+
 function killJob(job: RunningJob): void {
   const pid = job.child.pid;
   if (!pid) return;
@@ -126,12 +147,24 @@ async function runModel(
     detached: true,
   } as Parameters<typeof execFileAsync>[2]);
   const jobKey = opts.jobId || opts.projectId;
-  if (jobKey && promise.child) runningJobs.set(jobKey, { child: promise.child, projectId: opts.projectId, startedAt: Date.now() });
+  if (jobKey && promise.child) {
+    runningJobs.set(jobKey, { child: promise.child, projectId: opts.projectId, startedAt: Date.now() });
+    // Tee live output into the job log for the canvas progress view. Listening
+    // on the child's streams doesn't disturb execFile's own buffered capture.
+    pruneJobLogs();
+    jobLogs.set(jobKey, { lines: [], done: false, ts: Date.now() });
+    promise.child.stdout?.on('data', (d: Buffer) => appendJobLog(jobKey, d.toString()));
+    promise.child.stderr?.on('data', (d: Buffer) => appendJobLog(jobKey, d.toString()));
+  }
   let result;
   try {
     result = await promise;
   } finally {
-    if (jobKey) runningJobs.delete(jobKey);
+    if (jobKey) {
+      runningJobs.delete(jobKey);
+      const entry = jobLogs.get(jobKey);
+      if (entry) { entry.done = true; entry.ts = Date.now(); }
+    }
   }
   const { stdout, stderr } = result as { stdout: string; stderr: string };
   const out = stdout.trim();
@@ -243,6 +276,27 @@ export function registerAIRoutes(app: Express): void {
       }
     }
     res.json({ cancelled });
+  });
+
+  /**
+   * GET /api/ai/progress?jobId=...  (or ?projectId=...)
+   * Live tail of the agent CLI's output for the canvas Generate progress view.
+   * Returns { lines, done, running }. `?since=N` returns only lines after index N.
+   */
+  app.get('/api/ai/progress', (req, res) => {
+    const jobId = typeof req.query.jobId === 'string' ? req.query.jobId : '';
+    const projectId = typeof req.query.projectId === 'string' ? req.query.projectId : '';
+    const key = jobId || projectId;
+    if (!key) { res.status(400).json({ error: 'jobId or projectId is required' }); return; }
+    // Match by exact jobId, else by a running job's projectId.
+    let entry = jobLogs.get(key);
+    if (!entry && projectId) {
+      for (const [k, j] of runningJobs) if (j.projectId === projectId) { entry = jobLogs.get(k); break; }
+    }
+    const since = Number(req.query.since) || 0;
+    const running = [...runningJobs].some(([k, j]) => k === key || j.projectId === projectId);
+    if (!entry) { res.json({ lines: [], total: 0, done: !running, running }); return; }
+    res.json({ lines: entry.lines.slice(since), total: entry.lines.length, done: entry.done, running });
   });
 
   /**
