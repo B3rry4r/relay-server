@@ -320,6 +320,44 @@ export function registerProjectRoutes(app: Express): void {
     res.json({ content, parsed });
   });
 
+  // Save edits back to a text file (in-IDE editor). Path is resolved + sandboxed
+  // to the project root; refuses to overwrite a binary file.
+  app.put('/api/projects/:projectId/file', requireAuth, async (req, res) => {
+    const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
+    const itemPath = projectRoot ? resolveProjectRelativePath(projectRoot, String(req.body?.path || '')) : null;
+    if (!projectRoot || !await exists(projectRoot)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+    if (!itemPath) {
+      res.status(400).json({ error: 'invalid_path', message: 'A file path is required.' });
+      return;
+    }
+    const content = req.body?.content;
+    if (typeof content !== 'string') {
+      res.status(400).json({ error: 'invalid_content', message: 'File content must be a string.' });
+      return;
+    }
+    if (content.length > 2 * 1024 * 1024) {
+      res.status(413).json({ error: 'file_too_large', message: 'File is too large to save.' });
+      return;
+    }
+    if (await exists(itemPath)) {
+      const stats = await fs.stat(itemPath);
+      if (!stats.isFile()) {
+        res.status(400).json({ error: 'not_a_file', message: 'Selected item is not a file.' });
+        return;
+      }
+      const existing = await fs.readFile(itemPath);
+      if (existing.includes(0)) {
+        res.status(400).json({ error: 'binary_file', message: 'Cannot edit a binary file.' });
+        return;
+      }
+    }
+    await fs.writeFile(itemPath, content, 'utf-8');
+    res.json({ saved: { path: path.relative(projectRoot, itemPath), bytes: Buffer.byteLength(content, 'utf-8') } });
+  });
+
   app.post('/api/projects/:projectId/upload', requireAuth, async (req, res) => {
     const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
     if (!projectRoot || !await exists(projectRoot)) {
