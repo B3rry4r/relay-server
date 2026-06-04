@@ -121,6 +121,48 @@ export function registerProjectRoutes(app: Express): void {
     });
   });
 
+  // Closed-loop: the UIX canvas writes the currently-selected frame's context
+  // here so a terminal agent (any CLI) can read the live target. Writes
+  // .uix/active-frame.json (machine) + .uix/ACTIVE_FRAME.md (readable).
+  app.post('/api/projects/:projectId/active-frame', requireAuth, async (req, res) => {
+    const projectId = readStringParam(req.params.projectId);
+    const projectRoot = resolveProjectRoot(projectId);
+    if (!projectRoot || !await exists(projectRoot)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    const frameId = String(body.frameId ?? '').trim();
+    if (!frameId) { res.status(400).json({ error: 'frameId required' }); return; }
+    const ctx = {
+      frameId,
+      name: String(body.name ?? ''),
+      width: Number(body.width) || undefined,
+      height: Number(body.height) || undefined,
+      framework: body.framework ? String(body.framework) : undefined,
+      figStorageKey: body.figStorageKey ? String(body.figStorageKey) : undefined,
+      refImage: body.refImage ? String(body.refImage) : undefined,
+      tree: typeof body.tree === 'string' ? body.tree : undefined,
+      updatedAt: new Date().toISOString(),
+    };
+    const dir = path.join(projectRoot, '.uix');
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, 'active-frame.json'), JSON.stringify(ctx, null, 2));
+    const md = [
+      '# Active frame (selected on the UIX canvas)',
+      '',
+      `**${ctx.name || ctx.frameId}**` +
+        (ctx.width && ctx.height ? ` — ${ctx.width}×${ctx.height}` : '') +
+        (ctx.framework ? ` · ${ctx.framework}` : ''),
+      ctx.refImage ? `\nReference render: \`${ctx.refImage}\`` : '',
+      ctx.tree ? `\n## IR tree\n\n\`\`\`\n${ctx.tree}\n\`\`\`` : '',
+      '',
+      `_Updated ${ctx.updatedAt}. When asked to build/modify the "active frame", this is the target._`,
+    ].filter(Boolean).join('\n');
+    await fs.writeFile(path.join(dir, 'ACTIVE_FRAME.md'), md);
+    res.json({ ok: true, path: '.uix/active-frame.json' });
+  });
+
   app.post('/api/projects/:projectId/files', requireAuth, async (req, res) => {
     const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
     if (!projectRoot || !await exists(projectRoot)) {
