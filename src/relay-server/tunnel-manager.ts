@@ -78,6 +78,30 @@ function spawnTunnel(bin: string, port: number): Promise<TunnelEntry> {
 }
 
 /**
+ * Wait until a freshly-created quick tunnel actually routes to the origin.
+ * cloudflared prints the public URL the moment it registers, but the Cloudflare
+ * edge needs a few seconds before requests reach the local port — until then it
+ * serves its own 502/503/530 error pages. Without this probe the first preview
+ * load lands on a blank/error page and only works after a manual close+reopen
+ * (once the tunnel is warm). Best-effort: resolves early on the first good
+ * response, gives up after the deadline so we never block forever.
+ */
+async function waitForTunnelReady(url: string, timeoutMs = 20_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  // Cloudflare edge cold-start / origin-not-yet-reachable status codes.
+  const edgeColdStart = new Set([502, 503, 530, 504]);
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(url, { method: 'GET', redirect: 'manual', signal: AbortSignal.timeout(4000) });
+      if (!edgeColdStart.has(res.status)) return; // a real response came back from the app
+    } catch {
+      // Network hiccup / DNS not propagated yet — keep polling.
+    }
+    await new Promise((r) => setTimeout(r, 700));
+  }
+}
+
+/**
  * Returns the public trycloudflare.com URL for a local port.
  * Creates a tunnel if none exists, reuses if already running.
  */
@@ -91,11 +115,16 @@ export async function getTunnelUrl(port: number): Promise<string> {
   if (flying) return flying;
 
   const promise = (async () => {
-    const bin = await ensureCloudflared();
-    const entry = await spawnTunnel(bin, port);
-    tunnels.set(port, entry);
-    inFlight.delete(port);
-    return entry.url;
+    try {
+      const bin = await ensureCloudflared();
+      const entry = await spawnTunnel(bin, port);
+      tunnels.set(port, entry);
+      // Block until the edge actually routes, so the iframe's first load works.
+      await waitForTunnelReady(entry.url);
+      return entry.url;
+    } finally {
+      inFlight.delete(port);
+    }
   })();
 
   inFlight.set(port, promise);
