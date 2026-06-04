@@ -205,16 +205,22 @@ export function registerAIRoutes(app: Express): void {
       };
       res.json(response);
     } catch (err: any) {
+      // execFile rejections carry the REAL reason on .stderr (auth errors, rate
+      // limits, etc.) — surface it instead of the bare "Command failed: <cmd>".
+      const stderr = typeof err?.stderr === 'string' ? err.stderr.trim() : '';
       const msg = err?.message ?? 'AI generation failed';
+      const detail = (stderr || msg).slice(0, 600);
       // A cancelled run was killed with SIGTERM/SIGKILL — report it as such.
       if (err?.killed || err?.signal === 'SIGTERM' || err?.signal === 'SIGKILL') {
         res.status(499).json({ error: 'generation cancelled', cancelled: true, model });
-      } else if (msg.includes('ENOENT') || msg.includes('not found') || msg.includes('command not found')) {
+      } else if (msg.includes('ENOENT') || /not found|command not found/.test(detail)) {
         res.status(503).json({ error: `${model} is not installed in this workspace`, model });
-      } else if (err?.code === 'ETIMEDOUT' || msg.includes('timeout')) {
-        res.status(504).json({ error: `${model} timed out after ${AI_TIMEOUT_MS / 1000}s`, model });
+      } else if (/not (logged in|authenticated)|auth|API key|GEMINI_API_KEY|login|credential|unauthor/i.test(detail)) {
+        res.status(401).json({ error: `${model} needs auth — log in / set its API key in a relay terminal. Detail: ${detail}`, model, detail });
+      } else if (err?.code === 'ETIMEDOUT' || /timeout/i.test(detail)) {
+        res.status(504).json({ error: `${model} timed out after ${AI_AGENT_TIMEOUT_MS / 1000}s`, model });
       } else {
-        res.status(500).json({ error: msg, model });
+        res.status(500).json({ error: `${model}: ${detail}`, model, detail });
       }
     }
   });
