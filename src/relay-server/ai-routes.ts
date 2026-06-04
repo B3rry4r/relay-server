@@ -1,6 +1,8 @@
 import { type Express } from 'express';
 import { execFile, type ChildProcess } from 'node:child_process';
 import { promisify } from 'node:util';
+import { promises as fsp } from 'node:fs';
+import * as path from 'node:path';
 import { createTerminalEnv, resolveWorkspace, resolveProjectRoot } from './runtime';
 import { AI_ADAPTERS, getAdapter, isAIModel, type AIModel, type AIFormat } from './ai-adapters';
 import { appendTurn, getConversation, listConversations } from './conversation-store';
@@ -64,6 +66,28 @@ interface GenerateResponse {
   model: AIModel;
   sessionId?: string;
   conversationId?: string;
+}
+
+// opencode controls tool permissions via its CONFIG, not a CLI flag (unlike
+// claude/gemini/codex). In headless `run` mode it can't answer permission
+// prompts, so without this it stalls when the agent tries to edit/bash → no
+// files written (it just sits until cancelled). HOME = the project cwd in agent
+// runs, so opencode reads $cwd/.config/opencode/opencode.jsonc. Grant edit/bash/
+// webfetch up front (the run is already scoped to the project folder).
+async function ensureOpencodeAgentConfig(cwd: string): Promise<void> {
+  const dir = path.join(cwd, '.config', 'opencode');
+  const file = path.join(dir, 'opencode.jsonc');
+  let config: Record<string, unknown> = { $schema: 'https://opencode.ai/config.json' };
+  try {
+    const raw = await fsp.readFile(file, 'utf-8');
+    // Tolerate JSONC: strip /* */ and // comments before parsing.
+    const stripped = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+    const parsed = JSON.parse(stripped);
+    if (parsed && typeof parsed === 'object') config = parsed;
+  } catch { /* missing/invalid — start fresh */ }
+  config.permission = { ...(config.permission as object ?? {}), edit: 'allow', bash: 'allow', webfetch: 'allow' };
+  await fsp.mkdir(dir, { recursive: true });
+  await fsp.writeFile(file, JSON.stringify(config, null, 2), 'utf-8');
 }
 
 // Run a model through its adapter (structured args + session continuity).
@@ -149,6 +173,8 @@ export function registerAIRoutes(app: Express): void {
       const root = resolveProjectRoot(projectId);
       if (!root) { res.status(404).json({ error: 'project not found' }); return; }
       cwd = root;
+      // opencode needs its permission config written before it can edit/bash headlessly.
+      if (model === 'opencode') { try { await ensureOpencodeAgentConfig(cwd); } catch { /* non-fatal */ } }
     }
     const env = createTerminalEnv(cwd);
 
