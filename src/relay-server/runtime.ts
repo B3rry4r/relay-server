@@ -144,6 +144,12 @@ export function createTerminalEnv(workspace: string): NodeJS.ProcessEnv {
     BROWSER: getRelayBrowserPath(workspace),
     RELAY_BROWSER: '1',
     RELAY_BROWSER_STATE_PATH: path.join(getRelayStateRoot(workspace), 'browser-url.txt'),
+    // Never let git block the terminal on an interactive credential/askpass
+    // prompt. The relay credential helper supplies auth non-interactively; if
+    // it has nothing, git must FAIL FAST instead of hanging on a prompt that
+    // no one can answer (which previously wedged the whole command channel).
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_ASKPASS: '/bin/true',
     PROMPT_COMMAND: '',
     TERM: 'xterm-256color',
     COLORTERM: 'truecolor',
