@@ -149,6 +149,11 @@ async function runModel(
     // absent from its options type — cast so we can group-kill on cancel.
     detached: true,
   } as Parameters<typeof execFileAsync>[2]);
+  // Close the child's stdin immediately. The prompt is passed via argv, so the
+  // CLIs (claude -p, gemini -p, …) have nothing to read from stdin — but if the
+  // pipe is left open they BLOCK on it: claude warns "no stdin data received in
+  // 3s" and that warning was surfacing to the user as an error. EOF → proceed now.
+  try { promise.child?.stdin?.end(); } catch { /* no stdin pipe */ }
   const jobKey = opts.jobId || opts.projectId;
   if (jobKey && promise.child) {
     runningJobs.set(jobKey, { child: promise.child, projectId: opts.projectId, startedAt: Date.now() });
@@ -171,7 +176,17 @@ async function runModel(
   }
   const { stdout, stderr } = result as { stdout: string; stderr: string };
   const out = stdout.trim();
-  if (!out && stderr.trim()) throw new Error(`${model} error: ${stderr.trim().slice(0, 300)}`);
+  // We only reach here on exit code 0 (execFile rejects non-zero). So treat a
+  // non-empty stderr as a HARD error only when it isn't just warnings — CLIs emit
+  // advisory warnings (deprecations, "no stdin", telemetry notes) on stderr while
+  // still succeeding, and those must not fail an otherwise-valid run.
+  const stderrTrim = stderr.trim();
+  const stderrIsOnlyWarnings = stderrTrim
+    .split('\n')
+    .every((line) => !line.trim() || /^\s*(warning|warn|note|info|deprecat)/i.test(line));
+  if (!out && stderrTrim && !stderrIsOnlyWarnings) {
+    throw new Error(`${model} error: ${stderrTrim.slice(0, 300)}`);
+  }
   // claude --output-format json → { result, session_id, ... }. Unwrap so the
   // caller gets clean text + the resumable session id.
   if (format === 'json') {
