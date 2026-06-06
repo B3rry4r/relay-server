@@ -17,12 +17,19 @@ const execFileAsync = promisify(execFile);
 const binPathCache = new Map<string, string>();
 async function resolveBin(bin: string, env: NodeJS.ProcessEnv, cwd: string): Promise<string | null> {
   if (binPathCache.has(bin)) return binPathCache.get(bin)!;
+  // Fall back to the workspace root if the requested cwd doesn't exist yet
+  // (e.g. first agent run before the project dir is created).  An absent cwd
+  // causes `sh` itself to fail with ENOENT, which was misidentified as the
+  // binary being missing.
+  const candidates = [cwd, resolveWorkspace()];
   for (const cmd of [`command -v ${bin}`, `command -v ${bin} || bash -lc 'command -v ${bin}'`]) {
-    try {
-      const { stdout } = await execFileAsync('sh', ['-c', cmd], { env, cwd, timeout: 6000 });
-      const p = stdout.trim().split('\n').filter(Boolean).pop()?.trim();
-      if (p) { binPathCache.set(bin, p); return p; }
-    } catch { /* try the next resolution strategy */ }
+    for (const dir of candidates) {
+      try {
+        const { stdout } = await execFileAsync('sh', ['-c', cmd], { env, cwd: dir, timeout: 6000 });
+        const p = stdout.trim().split('\n').filter(Boolean).pop()?.trim();
+        if (p) { binPathCache.set(bin, p); return p; }
+      } catch { /* try next */ }
+    }
   }
   return null;
 }
@@ -232,7 +239,10 @@ export function registerAIRoutes(app: Express): void {
       // opencode needs its permission config written before it can edit/bash headlessly.
       if (model === 'opencode') { try { await ensureOpencodeAgentConfig(cwd); } catch { /* non-fatal */ } }
     }
-    const env = createTerminalEnv(cwd);
+    // Always base the env on the WORKSPACE root so the relay PATH (npm-global,
+    // mise, etc.) is correct regardless of where cwd points.  The project root
+    // (cwd) is passed separately as the working directory for the child process.
+    const env = createTerminalEnv(workspace);
 
     try {
       const { text: code, sessionId: newSessionId } = await runModel(model, prompt.trim(), env, cwd, { sessionId, format, agent, jobId, projectId, modelId });
