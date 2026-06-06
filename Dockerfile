@@ -84,6 +84,11 @@ ENV RELAY_CHROME_BIN=/usr/bin/google-chrome
 
 RUN curl -fsSL https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-x64.tar.gz | tar -xz -C /usr/local --strip-components=1
 
+# Pre-install AI CLIs so they survive container redeploys.
+# These land in /usr/local/bin (the system npm global prefix), which is on
+# the inherited PATH and found by resolveBin() via command -v.
+RUN npm install -g @anthropic-ai/claude-code @google/gemini-cli @openai/codex opencode-ai || true
+
 WORKDIR /app
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/native/pty-bridge /app/native/pty-bridge
