@@ -22,8 +22,38 @@ import { resolveWorkspace, getFlutterRoot, getRelayCacheRoot, createTerminalEnv 
 
 const execFile = promisify(execFileCb);
 
-function chromeBin(): string {
-  return process.env.RELAY_CHROME_BIN || '/usr/bin/google-chrome';
+// Resolve the headless-Chrome binary once and cache it: honor RELAY_CHROME_BIN
+// when it actually exists on disk, otherwise search PATH for the usual names.
+let _chromeBinCached: string | null = null;
+async function chromeBin(): Promise<string> {
+  if (_chromeBinCached) return _chromeBinCached;
+  const envBin = process.env.RELAY_CHROME_BIN;
+  if (envBin && fsSync.existsSync(envBin)) { _chromeBinCached = envBin; return envBin; }
+  for (const name of ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser']) {
+    try {
+      const { stdout } = await execFile('which', [name], { timeout: 5000 });
+      const p = stdout.trim();
+      if (p && fsSync.existsSync(p)) { _chromeBinCached = p; return p; }
+    } catch { /* not on PATH — try next */ }
+  }
+  throw new Error('Chrome not found — set RELAY_CHROME_BIN');
+}
+
+// Run a build step capturing stderr into the thrown error (execFile's default
+// "Command failed: <cmd>" loses the actual reason). 10MB buffer — flutter and
+// vite builds are chatty.
+async function runStep(
+  label: string,
+  bin: string,
+  args: string[],
+  opts: { cwd: string; env: NodeJS.ProcessEnv; timeout: number },
+): Promise<{ stdout: string; stderr: string }> {
+  try {
+    return await execFile(bin, args, { ...opts, maxBuffer: 10 * 1024 * 1024 });
+  } catch (err: any) {
+    const tail = String(err?.stderr || err?.stdout || err?.message || 'unknown error').trim().slice(-500);
+    throw new Error(`${label} failed: ${tail}`);
+  }
 }
 
 /**
@@ -46,7 +76,7 @@ export async function captureUrlScreenshot(
     url,
   ];
   try {
-    await execFile(chromeBin(), args, { timeout: timeoutMs });
+    await execFile(await chromeBin(), args, { timeout: timeoutMs });
     const buf = await fs.readFile(out);
     return buf;
   } catch {
@@ -105,7 +135,11 @@ async function serveDir(dir: string): Promise<{ url: string; close: () => void }
       res.end(await fs.readFile(file));
     } catch { res.statusCode = 500; res.end(); }
   });
-  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  // Reject on bind failures instead of hanging forever waiting for 'listening'.
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => { server.removeListener('error', reject); resolve(); });
+  });
   const port = (server.address() as { port: number }).port;
   return { url: `http://127.0.0.1:${port}/index.html`, close: () => server.close() };
 }
@@ -170,6 +204,10 @@ export function registerVisualRoutes(app: Express): void {
     const env = createTerminalEnv(workspace);
     const template = await ensureWebTemplate(env);
     if (!template) { res.status(503).json({ error: 'web build toolchain unavailable' }); return; }
+    try { await chromeBin(); } catch (err: any) {
+      res.status(503).json({ error: err?.message || 'Chrome not found — set RELAY_CHROME_BIN' });
+      return;
+    }
 
     const proj = await fs.mkdtemp(path.join(os.tmpdir(), 'relay-wvis-'));
     let serverHandle: { url: string; close: () => void } | null = null;
@@ -197,7 +235,7 @@ export default P;
       await fs.writeFile(path.join(proj, 'vite.config.ts'),
         `import { defineConfig } from 'vite';\nimport react from '@vitejs/plugin-react';\nimport path from 'node:path';\nexport default defineConfig({ plugins:[react()], resolve:{ alias:{ 'lucide-react': path.resolve(__dirname,'src/lucide-shim.tsx') } } });\n`);
 
-      await execFile(path.join(template, 'node_modules', '.bin', 'vite'), ['build', '--logLevel', 'error'], { cwd: proj, env, timeout: 180000 });
+      await runStep('vite build', path.join(template, 'node_modules', '.bin', 'vite'), ['build', '--logLevel', 'error'], { cwd: proj, env, timeout: 180000 });
 
       serverHandle = await serveDir(path.join(proj, 'dist'));
       const png = await captureUrlScreenshot(serverHandle.url, width, height, 45000);
@@ -226,6 +264,12 @@ export default P;
 
     const flutter = path.join(getFlutterRoot(), 'bin', 'flutter');
     if (!fsSync.existsSync(flutter)) { res.status(503).json({ error: 'Flutter SDK not available' }); return; }
+    // Fail fast with an actionable message before spending minutes on a build
+    // that could never be screenshotted.
+    try { await chromeBin(); } catch (err: any) {
+      res.status(503).json({ error: err?.message || 'Chrome not found — set RELAY_CHROME_BIN' });
+      return;
+    }
 
     const workspace = resolveWorkspace();
     const env = createTerminalEnv(workspace);
@@ -239,14 +283,23 @@ export default P;
       await fs.writeFile(path.join(projDir, 'pubspec.yaml'), PREVIEW_PUBSPEC);
       await fs.writeFile(path.join(projDir, 'lib', 'main.dart'), mainDartFor(code));
 
-      await execFile(flutter, ['create', '--platforms=web', '.'], { cwd: projDir, env, timeout: 180000 });
+      await runStep('flutter create', flutter, ['create', '--platforms=web', '.'], { cwd: projDir, env, timeout: 180000 });
       // Rewrite main.dart again (flutter create overwrites it).
       await fs.writeFile(path.join(projDir, 'lib', 'main.dart'), mainDartFor(code));
-      await execFile(flutter, ['build', 'web', '--release'], { cwd: projDir, env, timeout: 300000 });
+      const build = await runStep('flutter build web', flutter, ['build', 'web', '--release'], { cwd: projDir, env, timeout: 300000 });
 
-      serverHandle = await serveDir(path.join(projDir, 'build', 'web'));
+      // A zero-exit build can still produce nothing usable (plugin/tool quirks)
+      // — validate the output before serving it.
+      const webDir = path.join(projDir, 'build', 'web');
+      if (!fsSync.existsSync(path.join(webDir, 'index.html'))) {
+        const tail = `${build.stderr || ''}\n${build.stdout || ''}`.trim().slice(-500);
+        res.status(502).json({ error: `flutter build web produced no build/web/index.html. Build output: ${tail}` });
+        return;
+      }
+
+      serverHandle = await serveDir(webDir);
       const png = await captureUrlScreenshot(serverHandle.url, width, height, 60000);
-      if (!png) { res.status(502).json({ error: 'screenshot failed' }); return; }
+      if (!png) { res.status(502).json({ error: 'Chrome screenshot of the built app failed' }); return; }
       res.setHeader('Content-Type', 'image/png');
       res.end(png);
     } catch (err: any) {

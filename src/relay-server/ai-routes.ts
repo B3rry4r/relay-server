@@ -1,10 +1,13 @@
 import { type Express } from 'express';
 import { execFile, type ChildProcess } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
 import { promises as fsp } from 'node:fs';
 import * as path from 'node:path';
 import { createTerminalEnv, resolveWorkspace, resolveProjectRoot } from './runtime';
 import { AI_ADAPTERS, getAdapter, isAIModel, type AIModel, type AIFormat } from './ai-adapters';
+import { appendJobLog, finishJobLog, findJobLogByProject, getJobLog, startJobLog } from './ai-job-log';
+import { createClaudeStreamParser } from './ai-stream';
 import { appendTurn, getConversation, listConversations } from './conversation-store';
 
 const execFileAsync = promisify(execFile);
@@ -40,26 +43,8 @@ async function resolveBin(bin: string, env: NodeJS.ProcessEnv, cwd: string): Pro
 interface RunningJob { child: ChildProcess; projectId?: string; startedAt: number }
 const runningJobs = new Map<string, RunningJob>();
 
-// Live progress: the agent CLI's stdout/stderr lines, per job, so the canvas
-// Generate tab can show "what the agent is doing". Capped + auto-expired.
-interface JobLog { lines: string[]; done: boolean; ts: number }
-const jobLogs = new Map<string, JobLog>();
-const MAX_LOG_LINES = 400;
-function appendJobLog(jobKey: string, chunk: string): void {
-  const entry = jobLogs.get(jobKey);
-  if (!entry) return;
-  for (const raw of chunk.split('\n')) {
-    const line = raw.replace(/\[[0-9;]*m/g, '').trimEnd();   // strip ANSI colour
-    if (line) entry.lines.push(line);
-  }
-  if (entry.lines.length > MAX_LOG_LINES) entry.lines.splice(0, entry.lines.length - MAX_LOG_LINES);
-  entry.ts = Date.now();
-}
-// Drop logs older than 10 min so the map can't grow unbounded.
-function pruneJobLogs(): void {
-  const cutoff = Date.now() - 600_000;
-  for (const [k, v] of jobLogs) if (v.done && v.ts < cutoff) jobLogs.delete(k);
-}
+// Live progress lines per job live in ai-job-log.ts (seeded by the route
+// BEFORE the CLI spawns so the first poll already sees a running job).
 
 function killJob(job: RunningJob): void {
   const pid = job.child.pid;
@@ -92,10 +77,13 @@ interface GenerateRequest {
 }
 
 interface GenerateResponse {
+  /** Plain assistant text (NEVER a JSON envelope) — clients depend on this. */
   code: string;
   model: AIModel;
   sessionId?: string;
   conversationId?: string;
+  /** Id for /api/ai/progress + /api/ai/cancel (server-generated if absent). */
+  jobId: string;
 }
 
 // opencode controls tool permissions via its CONFIG, not a CLI flag (unlike
@@ -134,11 +122,16 @@ async function runModel(
   opts: { sessionId?: string; format?: AIFormat; agent?: boolean; jobId?: string; projectId?: string; modelId?: string } = {},
 ): Promise<{ text: string; sessionId?: string }> {
   const adapter = getAdapter(model);
-  // In agent mode for a resume-capable model (claude), use JSON output so we
-  // can capture the CLI's own session_id — that's what makes the agent
-  // remember prior screens across calls (true resumable build session).
+  // In agent mode for claude (resume + json capable), use stream-json output:
+  // it emits NDJSON events DURING the run (assistant text, tool uses) so the
+  // progress endpoint shows live activity, and the terminal "result" event
+  // carries the final text + session_id (resumable build session). Plain
+  // --output-format json prints nothing until completion — that was the
+  // "starting..." forever bug.
   const format: AIFormat | undefined =
-    opts.agent && adapter.capabilities.resume ? 'json' : (adapter.capabilities.json ? opts.format : undefined);
+    opts.agent && adapter.capabilities.resume
+      ? (adapter.capabilities.json ? 'stream-json' : 'json')
+      : (adapter.capabilities.json ? opts.format : undefined);
   const args = adapter.buildArgs(prompt, {
     sessionId: adapter.capabilities.resume ? opts.sessionId : undefined,
     format,
@@ -164,22 +157,27 @@ async function runModel(
   const jobKey = opts.jobId || opts.projectId;
   if (jobKey && promise.child) {
     runningJobs.set(jobKey, { child: promise.child, projectId: opts.projectId, startedAt: Date.now() });
-    // Tee live output into the job log for the canvas progress view. Listening
-    // on the child's streams doesn't disturb execFile's own buffered capture.
-    pruneJobLogs();
-    jobLogs.set(jobKey, { lines: [], done: false, ts: Date.now() });
-    promise.child.stdout?.on('data', (d: Buffer) => appendJobLog(jobKey, d.toString()));
-    promise.child.stderr?.on('data', (d: Buffer) => appendJobLog(jobKey, d.toString()));
+  }
+  // Live progress. The job log entry was seeded by the route BEFORE spawning.
+  // stream-json stdout is NDJSON — parse it incrementally into SHORT readable
+  // lines (and capture the terminal result event); other formats tee raw
+  // stdout. stderr is always teed raw. Listening on the child's streams
+  // doesn't disturb execFile's own buffered capture.
+  const streamParser = format === 'stream-json'
+    ? createClaudeStreamParser((line) => { if (jobKey) appendJobLog(jobKey, line); })
+    : null;
+  if (promise.child) {
+    promise.child.stdout?.on('data', (d: Buffer) => {
+      if (streamParser) streamParser.feed(d.toString());
+      else if (jobKey) appendJobLog(jobKey, d.toString());
+    });
+    if (jobKey) promise.child.stderr?.on('data', (d: Buffer) => appendJobLog(jobKey, d.toString()));
   }
   let result;
   try {
     result = await promise;
   } finally {
-    if (jobKey) {
-      runningJobs.delete(jobKey);
-      const entry = jobLogs.get(jobKey);
-      if (entry) { entry.done = true; entry.ts = Date.now(); }
-    }
+    if (jobKey) runningJobs.delete(jobKey);
   }
   const { stdout, stderr } = result as { stdout: string; stderr: string };
   const out = stdout.trim();
@@ -194,9 +192,26 @@ async function runModel(
   if (!out && stderrTrim && !stderrIsOnlyWarnings) {
     throw new Error(`${model} error: ${stderrTrim.slice(0, 300)}`);
   }
+  // stream-json: the parser assembled the final text + session_id from the
+  // terminal "result" event as the stream arrived.
+  if (streamParser) {
+    streamParser.flush();
+    if (streamParser.result.text !== undefined) {
+      return { text: streamParser.result.text, sessionId: streamParser.result.sessionId };
+    }
+    // Fallback: scan the buffered NDJSON for a result event the live parser
+    // missed (shouldn't happen, but the buffered copy is authoritative).
+    for (const line of out.split('\n').reverse()) {
+      try {
+        const j = JSON.parse(line);
+        if (j?.type === 'result') return { text: String(j.result ?? ''), sessionId: j.session_id };
+      } catch { /* not a JSON line */ }
+    }
+    // Last resort: a single buffered JSON envelope (older CLI behaviour).
+  }
   // claude --output-format json → { result, session_id, ... }. Unwrap so the
   // caller gets clean text + the resumable session id.
-  if (format === 'json') {
+  if (format === 'json' || streamParser) {
     try {
       const j = JSON.parse(out);
       return { text: String(j.result ?? j.text ?? out), sessionId: j.session_id ?? j.sessionId };
@@ -211,8 +226,10 @@ export function registerAIRoutes(app: Express): void {
 
   /**
    * POST /api/ai/generate
-   * Body: { prompt: string, model?: 'claude' | 'codex' | 'gemini' }
-   * Returns: { code: string, model: string }
+   * Body: { prompt: string, model?: 'claude' | 'codex' | 'gemini' | 'opencode', jobId?, ... }
+   * Returns: { code, model, sessionId?, conversationId?, jobId } — `code` is
+   * ALWAYS plain assistant text. `jobId` (client-supplied or server-generated)
+   * keys /api/ai/progress and /api/ai/cancel.
    */
   app.post('/api/ai/generate', async (req, res) => {
     const { prompt, model = 'claude', modelId, sessionId, format, conversationId, projectId, agent, jobId } = req.body as GenerateRequest;
@@ -244,8 +261,17 @@ export function registerAIRoutes(app: Express): void {
     // (cwd) is passed separately as the working directory for the child process.
     const env = createTerminalEnv(workspace);
 
+    // Register the job SYNCHRONOUSLY, before the CLI spawns, so the very first
+    // progress poll already sees a running job (no "no entry yet" race).
+    const effectiveJobId = (typeof jobId === 'string' && jobId.trim()) ? jobId.trim() : `job-${randomUUID()}`;
+    startJobLog(effectiveJobId, {
+      projectId,
+      firstLine: `[relay] starting ${model}${agent ? ' agent' : ''}...`,
+    });
+
     try {
-      const { text: code, sessionId: newSessionId } = await runModel(model, prompt.trim(), env, cwd, { sessionId, format, agent, jobId, projectId, modelId });
+      const { text: code, sessionId: newSessionId } = await runModel(model, prompt.trim(), env, cwd, { sessionId, format, agent, jobId: effectiveJobId, projectId, modelId });
+      finishJobLog(effectiveJobId, `[relay] ${model} finished`);
       // Durable context: record the user prompt + assistant output when a
       // conversation is in play (survives reconnect/restart).
       let convId = conversationId;
@@ -263,6 +289,7 @@ export function registerAIRoutes(app: Express): void {
         code, model,
         ...(outSessionId ? { sessionId: outSessionId } : {}),
         ...(convId ? { conversationId: convId } : {}),
+        jobId: effectiveJobId,
       };
       res.json(response);
     } catch (err: any) {
@@ -271,6 +298,7 @@ export function registerAIRoutes(app: Express): void {
       const stderr = typeof err?.stderr === 'string' ? err.stderr.trim() : '';
       const msg = err?.message ?? 'AI generation failed';
       const detail = (stderr || msg).slice(0, 600);
+      finishJobLog(effectiveJobId, `[relay] error: ${detail}`);
       // A cancelled run was killed with SIGTERM/SIGKILL — report it as such.
       if (err?.killed || err?.signal === 'SIGTERM' || err?.signal === 'SIGKILL') {
         res.status(499).json({ error: 'generation cancelled', cancelled: true, model });
@@ -316,10 +344,15 @@ export function registerAIRoutes(app: Express): void {
     const projectId = typeof req.query.projectId === 'string' ? req.query.projectId : '';
     const key = jobId || projectId;
     if (!key) { res.status(400).json({ error: 'jobId or projectId is required' }); return; }
-    // Match by exact jobId, else by a running job's projectId.
-    let entry = jobLogs.get(key);
-    if (!entry && projectId) {
-      for (const [k, j] of runningJobs) if (j.projectId === projectId) { entry = jobLogs.get(k); break; }
+    // Match by exact jobId, else by projectId (running job first, else the
+    // most recent finished log — so the final lines survive job completion).
+    // The fallback only applies when NO jobId was supplied: a fresh jobId the
+    // server hasn't registered yet must return empty lines, not replay the
+    // previous run's finished log.
+    let entry = getJobLog(key);
+    if (!entry && !jobId && projectId) {
+      for (const [k, j] of runningJobs) if (j.projectId === projectId) { entry = getJobLog(k); break; }
+      if (!entry) entry = findJobLogByProject(projectId);
     }
     const since = Number(req.query.since) || 0;
     const running = [...runningJobs].some(([k, j]) => k === key || j.projectId === projectId);

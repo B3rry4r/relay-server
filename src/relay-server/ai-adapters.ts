@@ -11,7 +11,7 @@
 // =============================================================================
 
 export type AIModel = 'claude' | 'codex' | 'gemini' | 'opencode';
-export type AIFormat = 'text' | 'json';
+export type AIFormat = 'text' | 'json' | 'stream-json';
 
 export interface AICapabilities {
   resume: boolean;   // can continue a prior session by id
@@ -45,6 +45,9 @@ const claude: AIAdapter = {
   capabilities: { resume: true, json: true, images: true },
   buildArgs(prompt, opts = {}) {
     const args = ['-p', prompt, '--output-format', opts.format ?? 'text'];
+    // stream-json in -p mode requires --verbose (the CLI rejects it otherwise).
+    // The NDJSON event stream is what powers live progress for agent runs.
+    if (opts.format === 'stream-json') args.push('--verbose');
     // Specific model (alias or full id), e.g. opus / sonnet / haiku.
     if (opts.modelId) args.push('--model', opts.modelId);
     // Continue a prior conversation when a session id is supplied (continuity).
