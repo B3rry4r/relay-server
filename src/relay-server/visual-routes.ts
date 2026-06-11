@@ -19,6 +19,7 @@ import { spawn, execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createServer } from 'node:http';
 import { resolveWorkspace, getFlutterRoot, getRelayCacheRoot, createTerminalEnv } from './runtime';
+import { mainDartFor, pubspecFor, ScaffoldError } from './visual-flutter-scaffold';
 
 const execFile = promisify(execFileCb);
 
@@ -39,9 +40,23 @@ async function chromeBin(): Promise<string> {
   throw new Error('Chrome not found — set RELAY_CHROME_BIN');
 }
 
-// Run a build step capturing stderr into the thrown error (execFile's default
-// "Command failed: <cmd>" loses the actual reason). 10MB buffer — flutter and
-// vite builds are chatty.
+// Error carrying the failing step label plus the (long) captured output so the
+// route can split a short reason from a detailed tail for the JSON response.
+class StepError extends Error {
+  label: string;
+  detail: string;
+  constructor(label: string, detail: string) {
+    super(`${label} failed`);
+    this.name = 'StepError';
+    this.label = label;
+    this.detail = detail;
+  }
+}
+
+// Run a build step capturing stdout+stderr into the thrown error (execFile's
+// default "Command failed: <cmd>" loses the actual reason). 10MB buffer —
+// flutter and vite builds are chatty. We keep ~1500 chars of the tail so the
+// real compiler diagnostic survives to the client (was truncated to 500).
 async function runStep(
   label: string,
   bin: string,
@@ -51,8 +66,8 @@ async function runStep(
   try {
     return await execFile(bin, args, { ...opts, maxBuffer: 10 * 1024 * 1024 });
   } catch (err: any) {
-    const tail = String(err?.stderr || err?.stdout || err?.message || 'unknown error').trim().slice(-500);
-    throw new Error(`${label} failed: ${tail}`);
+    const full = `${err?.stdout || ''}\n${err?.stderr || err?.message || ''}`.trim();
+    throw new StepError(label, full.slice(-1500) || 'unknown error');
   }
 }
 
@@ -85,39 +100,6 @@ export async function captureUrlScreenshot(
     try { await fs.rm(out, { force: true }); } catch { /* ignore */ }
   }
 }
-
-// Minimal Flutter web app wrapping the generated widget as the home screen.
-function mainDartFor(widgetCode: string): string {
-  return `import 'package:flutter/material.dart';
-
-void main() => runApp(const _PreviewApp());
-
-class _PreviewApp extends StatelessWidget {
-  const _PreviewApp();
-  @override
-  Widget build(BuildContext context) {
-    return const MaterialApp(
-      debugShowCheckedModeBanner: false,
-      home: _GeneratedRoot(),
-    );
-  }
-}
-
-${widgetCode}
-`;
-}
-
-const PREVIEW_PUBSPEC = `name: relay_visual_preview
-description: scratch app for visual diff
-publish_to: "none"
-environment:
-  sdk: ">=3.0.0 <4.0.0"
-dependencies:
-  flutter:
-    sdk: flutter
-flutter:
-  uses-material-design: true
-`;
 
 // Serve a directory over an ephemeral localhost port; returns { url, close }.
 async function serveDir(dir: string): Promise<{ url: string; close: () => void }> {
@@ -271,29 +253,48 @@ export default P;
       return;
     }
 
+    // Derive the harness + pubspec from the generated code BEFORE any build, so
+    // unrunnable code (no widget class / no main) is rejected as a 422 instead
+    // of starting a doomed multi-minute build.
+    let mainDart: string;
+    let pubspec: string;
+    try {
+      mainDart = mainDartFor(code);
+      pubspec = pubspecFor(code);
+    } catch (err: any) {
+      if (err instanceof ScaffoldError) {
+        res.status(422).json({ error: err.message, detail: '' });
+        return;
+      }
+      throw err;
+    }
+
     const workspace = resolveWorkspace();
     const env = createTerminalEnv(workspace);
     const projDir = await fs.mkdtemp(path.join(os.tmpdir(), 'relay-fvis-'));
     let serverHandle: { url: string; close: () => void } | null = null;
     try {
-      // The generated root widget must be named `_GeneratedRoot`; the assembled
-      // screen is appended and referenced as the home. If the code defines its
-      // own screen class, alias it.
+      // Scaffold a runnable web app: harness main.dart references the generated
+      // widget class (or runs its own main()), and the pubspec declares every
+      // non-flutter package the code imports so `pub get` resolves.
       await fs.mkdir(path.join(projDir, 'lib'), { recursive: true });
-      await fs.writeFile(path.join(projDir, 'pubspec.yaml'), PREVIEW_PUBSPEC);
-      await fs.writeFile(path.join(projDir, 'lib', 'main.dart'), mainDartFor(code));
+      await fs.writeFile(path.join(projDir, 'pubspec.yaml'), pubspec);
+      await fs.writeFile(path.join(projDir, 'lib', 'main.dart'), mainDart);
 
+      // `flutter create` overwrites pubspec.yaml + lib/main.dart, so rewrite
+      // both afterward, then resolve packages and build.
       await runStep('flutter create', flutter, ['create', '--platforms=web', '.'], { cwd: projDir, env, timeout: 180000 });
-      // Rewrite main.dart again (flutter create overwrites it).
-      await fs.writeFile(path.join(projDir, 'lib', 'main.dart'), mainDartFor(code));
+      await fs.writeFile(path.join(projDir, 'pubspec.yaml'), pubspec);
+      await fs.writeFile(path.join(projDir, 'lib', 'main.dart'), mainDart);
+      await runStep('flutter pub get', flutter, ['pub', 'get'], { cwd: projDir, env, timeout: 180000 });
       const build = await runStep('flutter build web', flutter, ['build', 'web', '--release'], { cwd: projDir, env, timeout: 300000 });
 
       // A zero-exit build can still produce nothing usable (plugin/tool quirks)
       // — validate the output before serving it.
       const webDir = path.join(projDir, 'build', 'web');
       if (!fsSync.existsSync(path.join(webDir, 'index.html'))) {
-        const tail = `${build.stderr || ''}\n${build.stdout || ''}`.trim().slice(-500);
-        res.status(502).json({ error: `flutter build web produced no build/web/index.html. Build output: ${tail}` });
+        const tail = `${build.stdout || ''}\n${build.stderr || ''}`.trim().slice(-1500);
+        res.status(422).json({ error: 'flutter build web produced no output', detail: tail });
         return;
       }
 
@@ -303,6 +304,22 @@ export default P;
       res.setHeader('Content-Type', 'image/png');
       res.end(png);
     } catch (err: any) {
+      // Map build-step failures to a precise status: SDK/web-not-enabled is an
+      // environment problem (503); pub-get / compile failures are the code's
+      // fault (422 with the dart diagnostic); anything else is 500.
+      if (err instanceof StepError) {
+        const detail = err.detail;
+        const sdkBroken = /web (?:is )?not enabled|run "flutter config|No web devices|Unable to find git in your PATH|requires the Flutter SDK/i.test(detail);
+        if (sdkBroken) {
+          res.status(503).json({ error: 'Flutter web build environment is not ready', detail });
+          return;
+        }
+        const reason = err.label === 'flutter pub get'
+          ? 'dependency resolution failed (flutter pub get)'
+          : 'generated Flutter code failed to compile for web';
+        res.status(422).json({ error: reason, detail });
+        return;
+      }
       res.status(500).json({ error: err?.message || 'flutter screenshot failed' });
     } finally {
       if (serverHandle) serverHandle.close();
