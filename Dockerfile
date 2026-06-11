@@ -47,6 +47,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PORT=3000
 
 RUN apt-get update && apt-get install -y \
+    tini \
     git \
     curl \
     build-essential \
@@ -93,4 +94,7 @@ COPY setup-workspace.sh .
 
 RUN mkdir -p $WORKSPACE/.relay
 
+# tini reaps orphaned grandchildren (headless Chrome from the screenshot
+# endpoints double-forks); without an init, zombies exhaust the pid cgroup.
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["node", "dist/src/index.js"]
