@@ -45,6 +45,7 @@ interface BuildScreenReq {
   height?: number;
   referenceImagePath: string; // project-relative path to the reference render
   implementPrompt: string;    // the client-built agent packet
+  tree?: string;              // IR tree notation — snapshotted for cross-session context
   maxIterations?: number;
   jobId?: string;
 }
@@ -178,6 +179,9 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
   const screenDir = path.join(projectRoot, '.uix', 'screens', sanitizeId(frameId));
   await fs.mkdir(screenDir, { recursive: true });
   const relScreenDir = path.join('.uix', 'screens', sanitizeId(frameId));
+  // Snapshot the IR tree so a future session has this screen's design context
+  // (exact colours/text/layout) without re-fetching from the design source.
+  if (req.tree) { try { await fs.writeFile(path.join(screenDir, 'ir.txt'), req.tree); } catch { /* non-fatal */ } }
 
   let session = req.sessionId;
   let finalVerdict: Verdict | null = null;
@@ -228,6 +232,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     iterations: iterationsRun, maxIterations,
     finalVerdict, sessionId: session,
     referenceImage: referenceImagePath,
+    ir: req.tree ? path.join(relScreenDir, 'ir.txt') : undefined,
     at: new Date().toISOString(),
   };
   await fs.writeFile(path.join(screenDir, 'result.json'), JSON.stringify(result, null, 2));
