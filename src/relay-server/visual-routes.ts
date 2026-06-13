@@ -102,7 +102,9 @@ export async function captureUrlScreenshot(
 }
 
 // Serve a directory over an ephemeral localhost port; returns { url, close }.
-async function serveDir(dir: string): Promise<{ url: string; close: () => void }> {
+// Exported for the screen-build loop, which serves a real project's build/web
+// output to screenshot a generated screen against its reference render.
+export async function serveDir(dir: string): Promise<{ url: string; close: () => void }> {
   const types: Record<string, string> = {
     '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css',
     '.json': 'application/json', '.png': 'image/png', '.wasm': 'application/wasm',

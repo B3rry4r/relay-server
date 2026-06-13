@@ -114,7 +114,10 @@ async function ensureOpencodeAgentConfig(cwd: string): Promise<void> {
 }
 
 // Run a model through its adapter (structured args + session continuity).
-async function runModel(
+// Exported so the screen-build loop (ai-screen-loop.ts) can spawn implement /
+// verify / fix agents through the exact same path (job streaming, session
+// resume, cancellation registry) the /api/ai/generate route uses.
+export async function runModel(
   model: AIModel,
   prompt: string,
   env: NodeJS.ProcessEnv,

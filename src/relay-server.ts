@@ -10,6 +10,7 @@ import { registerFlutterRoutes } from './relay-server/flutter-routes';
 import { getScreenSession } from './relay-server/flutter-screen';
 import { registerGitRoutes } from './relay-server/git-routes';
 import { registerVisualRoutes } from './relay-server/visual-routes';
+import { registerScreenLoopRoutes } from './relay-server/ai-screen-loop';
 import { registerProjectRoutes } from './relay-server/project-routes';
 import {
   closeAllTerminalSessions,
@@ -125,6 +126,7 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
   registerToolRoutes(app);
   registerGitRoutes(app);
   registerVisualRoutes(app);
+  registerScreenLoopRoutes(app);
   registerSocketHandlers(io, ptyFactory);
 
   return {
