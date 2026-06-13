@@ -51,7 +51,12 @@ interface BuildScreenReq {
 }
 
 interface Discrepancy { area?: string; issue: string; severity?: string }
-interface Verdict { match: boolean; score?: number; discrepancies: Discrepancy[] }
+// `recommendation` lets the verify agent — not a fixed counter — drive whether
+// another fix pass is worthwhile: 'accept' (done / only trivial cosmetic diffs),
+// 'fix' (real fixable discrepancies remain), 'stop' (broken or not converging —
+// another auto-pass won't help; defer to a human).
+type Recommendation = 'accept' | 'fix' | 'stop';
+interface Verdict { match: boolean; score?: number; discrepancies: Discrepancy[]; recommendation: Recommendation }
 
 // ── manifest the implement/fix agent writes (.uix/last-gen.json) ──────────────
 interface LastGen {
@@ -72,17 +77,21 @@ async function readLastGen(projectRoot: string): Promise<LastGen> {
 
 // ── prompt builders ───────────────────────────────────────────────────────────
 
-function verifyPrompt(refPath: string, candPath: string, frameName: string): string {
+function verifyPrompt(refPath: string, candPath: string, frameName: string, prevScore: number | null): string {
   return [
     `You are a STRICT visual-QA reviewer. Do not write or edit any files.`,
     `Open these two images with your file-reading tool:`,
     `  - REFERENCE (ground truth, the target design): ${refPath}`,
     `  - CANDIDATE (a screenshot of the current build of screen "${frameName}"): ${candPath}`,
     `Compare them carefully: layout & hierarchy, spacing/proportions, colours, typography, text content, icons/illustrations, and overall fidelity.`,
+    prevScore != null ? `The previous pass scored ${prevScore}/100 — judge whether this pass actually improved; if it's no better, another automated fix is unlikely to help (lean towards "stop").` : '',
+    `If the reference shows a MODAL / OVERLAY / SHEET / POPUP over a base screen, the candidate should render that overlay ON TOP of the (reused) base screen — flag a discrepancy if the candidate rebuilt the whole screen or rendered the overlay as a standalone full page.`,
     `Respond with ONLY a single JSON object (no prose, no code fences):`,
-    `{"match": <true|false>, "score": <0-100>, "discrepancies": [{"area":"<where>","issue":"<what's wrong vs the reference>","severity":"high|med|low"}]}`,
-    `Set "match" true ONLY if the candidate is visually near-identical to the reference (no high/med discrepancies). List every concrete difference you see; be specific and actionable.`,
-  ].join('\n');
+    `{"match": <true|false>, "score": <0-100>, "recommendation": "accept|fix|stop", "discrepancies": [{"area":"<where>","issue":"<what's wrong vs the reference>","severity":"high|med|low"}]}`,
+    `- "match": true ONLY if visually near-identical (no high/med discrepancies).`,
+    `- "recommendation": "accept" = good enough, stop now (a match, or only trivial cosmetic diffs); "fix" = real fixable discrepancies remain and another pass is worthwhile; "stop" = broken / way off / clearly NOT converging, so another automated pass won't help — defer to a human.`,
+    `List every concrete difference; be specific and actionable.`,
+  ].filter(Boolean).join('\n');
 }
 
 function fixPrompt(frameName: string, refPath: string, candPath: string, v: Verdict): string {
@@ -100,7 +109,9 @@ function fixPrompt(frameName: string, refPath: string, candPath: string, v: Verd
 
 // ── parse the verify agent's JSON verdict (robust to fences / stray prose) ─────
 function parseVerdict(text: string): Verdict {
-  const fail = (issue: string): Verdict => ({ match: false, discrepancies: [{ issue, severity: 'high' }] });
+  // A broken/unparseable verify result is itself a reason to stop (not to keep
+  // burning fix passes blindly), so default recommendation 'stop'.
+  const fail = (issue: string): Verdict => ({ match: false, discrepancies: [{ issue, severity: 'high' }], recommendation: 'stop' });
   if (!text) return fail('verify agent produced no output');
   // Grab the largest brace-balanced JSON object in the text.
   const start = text.indexOf('{');
@@ -108,13 +119,14 @@ function parseVerdict(text: string): Verdict {
   if (start < 0 || end <= start) return fail('verify output had no JSON object');
   try {
     const j = JSON.parse(text.slice(start, end + 1));
-    return {
-      match: !!j.match,
-      score: typeof j.score === 'number' ? j.score : undefined,
-      discrepancies: Array.isArray(j.discrepancies)
-        ? j.discrepancies.map((d: any) => ({ area: d?.area, issue: String(d?.issue ?? d ?? 'unspecified'), severity: d?.severity }))
-        : [],
-    };
+    const match = !!j.match;
+    const discrepancies = Array.isArray(j.discrepancies)
+      ? j.discrepancies.map((d: any) => ({ area: d?.area, issue: String(d?.issue ?? d ?? 'unspecified'), severity: d?.severity }))
+      : [];
+    const rec: Recommendation = j.recommendation === 'accept' || j.recommendation === 'fix' || j.recommendation === 'stop'
+      ? j.recommendation
+      : (match ? 'accept' : (discrepancies.length ? 'fix' : 'accept'));
+    return { match, score: typeof j.score === 'number' ? j.score : undefined, discrepancies, recommendation: rec };
   } catch { return fail('verify output JSON was malformed'); }
 }
 
@@ -174,7 +186,10 @@ async function renderPreview(
 async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: string): Promise<void> {
   const { model, modelId, framework, frameId, frameName, referenceImagePath, implementPrompt } = req;
   const width = req.width || 393, height = req.height || 852;
-  const maxIterations = Math.min(Math.max(req.maxIterations ?? 3, 1), 5);
+  // maxIterations is a SAFETY BACKSTOP, not the policy: the verify agent's
+  // recommendation + score-plateau detection decide when to actually stop, so a
+  // screen that matches on pass 1 costs 1 pass, not N.
+  const maxIterations = Math.min(Math.max(req.maxIterations ?? 4, 1), 6);
   const env = createTerminalEnv(projectRoot);
   const screenDir = path.join(projectRoot, '.uix', 'screens', sanitizeId(frameId));
   await fs.mkdir(screenDir, { recursive: true });
@@ -186,14 +201,18 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
   let session = req.sessionId;
   let finalVerdict: Verdict | null = null;
   let matched = false;
+  let accepted = false;
+  let stopReason = 'reached iteration cap';
   let iterationsRun = 0;
+  let prevScore: number | null = null;
 
   // 1. IMPLEMENT
   appendJobLog(jobId, `[loop] implement: "${frameName}"`);
   const impl = await runModel(model, implementPrompt, env, projectRoot, { agent: true, modelId, jobId, projectId: req.projectId });
   if (impl.sessionId) session = impl.sessionId;
 
-  // 2/3. VERIFY ↔ FIX
+  // 2/3. VERIFY ↔ FIX — the verify agent's recommendation + score plateau drive
+  // when to stop; maxIterations is only a runaway backstop.
   for (let iter = 1; iter <= maxIterations; iter++) {
     iterationsRun = iter;
     const lastGen = await readLastGen(projectRoot);
@@ -203,22 +222,33 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     let verdict: Verdict;
     let candRel: string | null = null;
     if (shot.error || !shot.png) {
-      // A failed build IS a failure to fix — feed the compiler error back.
-      verdict = { match: false, score: 0, discrepancies: [{ area: 'build', issue: shot.error || 'the screen failed to build/screenshot', severity: 'high' }] };
+      // A failed build IS a failure to fix — feed the compiler error back (and
+      // keep fixing: a build error is exactly what another pass should repair).
+      verdict = { match: false, score: 0, discrepancies: [{ area: 'build', issue: shot.error || 'the screen failed to build/screenshot', severity: 'high' }], recommendation: 'fix' };
       appendJobLog(jobId, `[loop] verify ${iter}: build/screenshot failed`);
     } else {
       const candAbs = path.join(screenDir, `cand-${iter}.png`);
       await fs.writeFile(candAbs, shot.png);
       candRel = path.join(relScreenDir, `cand-${iter}.png`);
       appendJobLog(jobId, `[loop] verify ${iter}: comparing to reference`);
-      const v = await runModel(model, verifyPrompt(referenceImagePath, candRel, frameName), env, projectRoot, { agent: true, modelId, jobId, projectId: req.projectId });
+      const v = await runModel(model, verifyPrompt(referenceImagePath, candRel, frameName, prevScore), env, projectRoot, { agent: true, modelId, jobId, projectId: req.projectId });
       verdict = parseVerdict(v.text);
     }
     finalVerdict = verdict;
     await fs.writeFile(path.join(screenDir, `iter-${iter}.json`), JSON.stringify({ iter, verdict, candidate: candRel, at: new Date().toISOString() }, null, 2));
-    appendJobLog(jobId, `[loop] verify ${iter}: match=${verdict.match} score=${verdict.score ?? '?'} issues=${verdict.discrepancies.length}`);
+    appendJobLog(jobId, `[loop] verify ${iter}: match=${verdict.match} score=${verdict.score ?? '?'} rec=${verdict.recommendation} issues=${verdict.discrepancies.length}`);
 
-    if (verdict.match) { matched = true; break; }
+    // STOP CONDITIONS (verify-agent driven, not a fixed count):
+    if (verdict.match || verdict.recommendation === 'accept') {
+      matched = verdict.match; accepted = true; stopReason = verdict.match ? 'matched the reference' : 'verify agent accepted (good enough)';
+      break;
+    }
+    if (verdict.recommendation === 'stop') { stopReason = 'verify agent said stop (broken / not converging)'; break; }
+    // Plateau guard: after a real attempt, if the score didn't improve, more
+    // automated passes are unlikely to help — stop rather than waste calls.
+    const score = verdict.score ?? 0;
+    if (iter >= 2 && prevScore != null && score <= prevScore) { stopReason = `score plateaued (${prevScore}→${score})`; break; }
+    prevScore = score;
     if (iter === maxIterations) break;
 
     // FIX (resume the implementation session so the agent keeps full context).
@@ -228,7 +258,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
   }
 
   const result = {
-    frameId, frameName, framework, matched,
+    frameId, frameName, framework, matched, accepted, stopReason,
     iterations: iterationsRun, maxIterations,
     finalVerdict, sessionId: session,
     referenceImage: referenceImagePath,
@@ -236,7 +266,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     at: new Date().toISOString(),
   };
   await fs.writeFile(path.join(screenDir, 'result.json'), JSON.stringify(result, null, 2));
-  finishJobLog(jobId, `[loop] done: "${frameName}" matched=${matched} after ${iterationsRun} iteration(s)`);
+  finishJobLog(jobId, `[loop] done: "${frameName}" ${matched ? 'MATCHED' : accepted ? 'accepted' : 'needs review'} after ${iterationsRun} iteration(s) — ${stopReason}`);
 }
 
 export function registerScreenLoopRoutes(app: Express): void {
