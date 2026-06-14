@@ -448,7 +448,7 @@ export function registerSocketHandlers(
       }
     }
 
-    socket.on('terminal:create', (_payload: { cwd?: string }) => {
+    socket.on('terminal:create', (_payload: { cwd?: string; run?: string }) => {
       const terminalId = socket.id + '-' + Date.now();
       const targetCwd = _payload?.cwd || workspaceRoot;
       const session = createTerminalSession(terminalId, ptyFactory, targetCwd, workspaceRoot);
@@ -457,6 +457,10 @@ export function registerSocketHandlers(
         const shell = activeShells.get(terminalId);
         if (shell) {
           bindShellToSocket(terminalId, shell);
+          // Optional initial command (e.g. "Resume in terminal" → claude --resume).
+          // Written to the PTY here so it can't race client-side input routing.
+          const run = typeof _payload?.run === 'string' ? _payload.run.trim() : '';
+          if (run) setTimeout(() => { try { shell.write(run + '\n'); } catch { /* shell gone */ } }, 250);
         }
 
         selectedTerminalId = terminalId;
