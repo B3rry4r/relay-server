@@ -115,7 +115,21 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
     connectTimeout: 30000,
   });
 
-  app.use(cors());
+  const corsOptions: cors.CorsOptions = {
+    origin: (origin, callback) => {
+      // Allow requests with no origin (curl, mobile apps, server-to-server)
+      // and any origin — the relay server authenticates via token, not origin.
+      callback(null, true);
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-auth-token'],
+    optionsSuccessStatus: 204,
+  };
+
+  // Handle OPTIONS preflight for every route BEFORE any other middleware.
+  app.options('*', cors(corsOptions));
+  app.use(cors(corsOptions));
   app.use(express.json({ limit: '50mb' }));
 
   registerCoreRoutes(app);
