@@ -17,6 +17,7 @@
     "@cfworker/json-schema": "^4.1.1",
     "@modelcontextprotocol/node": "^2.0.0-alpha.2",
     "@modelcontextprotocol/server": "^2.0.0-alpha.2",
+    "chokidar": "^5.0.0",
     "cors": "^2.8.5",
     "express": "^4.21.2",
     "http-proxy": "^1.18.1",
