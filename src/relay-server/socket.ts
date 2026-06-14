@@ -300,11 +300,12 @@ export function registerSocketHandlers(
         if (!pendingChunk) return;
         const chunk = pendingChunk;
         pendingChunk = '';
-        // Re-read selectedTerminalId at flush time rather than capture time so
-        // that switching terminals mid-stream doesn't send stale output to the
-        // newly-selected terminal.
+        // MULTIPLEX: stream EVERY terminal's output tagged by id, so split /
+        // background terminals stay live (not just the focused one). The client
+        // routes by id. Shell-event parsing (cwd tracking) only for the focused
+        // terminal, where input is routed.
+        socket.emit('terminal:output', { id: terminalId, data: chunk });
         if (selectedTerminalId === terminalId) {
-          socket.emit('output', chunk);
           handleShellOutput(socket, transcript, chunk);
         }
       };
@@ -324,15 +325,14 @@ export function registerSocketHandlers(
             schedulePersistTerminalState();
           }
         }
-        if (selectedTerminalId === terminalId) {
-          pendingChunk += data;
-          if (pendingChunk.length >= MAX_PENDING_BYTES) {
-            // Flush immediately to avoid a single huge WS frame.
-            if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
-            flushPending();
-          } else if (!flushTimer) {
-            flushTimer = setTimeout(flushPending, 8);
-          }
+        // Batch + emit for EVERY terminal (multiplex), not just the focused one.
+        pendingChunk += data;
+        if (pendingChunk.length >= MAX_PENDING_BYTES) {
+          // Flush immediately to avoid a single huge WS frame.
+          if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+          flushPending();
+        } else if (!flushTimer) {
+          flushTimer = setTimeout(flushPending, 8);
         }
       });
       if (dataDisposable) disposables.push(dataDisposable);
@@ -417,7 +417,9 @@ export function registerSocketHandlers(
       lastSelectedTerminalId = selectedTerminalId;
       socket.emit('terminals:ready', { terminals: getTerminalSummaries() });
       socket.emit('terminal:selected', { id: selectedTerminalId, cwd: selectedSession.cwd });
-      replayTerminal(selectedTerminalId);
+      // MULTIPLEX: seed EVERY terminal's host with its scrollback (each replay
+      // does clear+reseed on the client), since all of them now stream live.
+      for (const session of existing) replayTerminal(session.id);
     } else {
       const terminalId = socket.id + '-' + Date.now();
       const session = createTerminalSession(terminalId, ptyFactory, workspaceRoot, workspaceRoot);
