@@ -27,10 +27,17 @@ import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import { resolveProjectRoot, resolveWorkspace, createTerminalEnv, getFlutterRoot } from './runtime';
 import { runModel } from './ai-routes';
-import { startJobLog, appendJobLog, finishJobLog } from './ai-job-log';
+import { startJobLog, appendJobLog, finishJobLog, subscribeJobLog } from './ai-job-log';
 import { captureUrlScreenshot, serveDir } from './visual-routes';
 import { isAIModel, type AIModel } from './ai-adapters';
-import { createRun, getRun, listRuns, updateRunScreen } from './build-run-store';
+import {
+  createRun, getRun, listRuns, updateRunScreen, setRunStatus, setRunSession,
+  saveRun, restartRun, appendRunLog, readRunLog,
+  markRunCancelled, isRunCancelled, clearRunCancelled,
+  isRunActive, markRunActive, clearRunActive,
+  type ScreenSpec,
+} from './build-run-store';
+import { getProjectsRoot } from './runtime';
 
 const execFile = promisify(execFileCb);
 
@@ -51,6 +58,7 @@ interface BuildScreenReq {
   jobId?: string;
   runId?: string;             // durable multi-screen run this screen belongs to
   userNotes?: string;         // the human's design rules — shared with verify/fix
+  verify?: boolean;           // when false, implement only (no verify↔fix loop)
 }
 
 interface Discrepancy { area?: string; issue: string; severity?: string }
@@ -190,7 +198,7 @@ async function renderPreview(
 }
 
 // ── the loop ──────────────────────────────────────────────────────────────────
-async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: string): Promise<void> {
+async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: string): Promise<string | undefined> {
   const { model, modelId, framework, frameId, frameName, referenceImagePath, implementPrompt } = req;
   const width = req.width || 393, height = req.height || 852;
   // maxIterations is a SAFETY BACKSTOP, not the policy: the verify agent's
@@ -224,6 +232,21 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
   appendJobLog(jobId, `[loop] implement: "${frameName}"`);
   const impl = await runModel(model, implementPrompt, env, projectRoot, { agent: true, modelId, jobId, projectId: req.projectId });
   if (impl.sessionId) session = impl.sessionId;
+
+  // verify:false (or no reference render to compare against) → implement-only.
+  // Write a result and mark the screen done so the run still completes.
+  if (req.verify === false || !referenceImagePath) {
+    const result = {
+      frameId, frameName, framework, matched: false, accepted: true,
+      stopReason: 'verify disabled — implemented only', iterations: 1, maxIterations,
+      finalVerdict: null, sessionId: session, referenceImage: referenceImagePath,
+      ir: req.tree ? path.join(relScreenDir, 'ir.txt') : undefined, at: new Date().toISOString(),
+    };
+    await fs.writeFile(path.join(screenDir, 'result.json'), JSON.stringify(result, null, 2));
+    if (req.runId) { try { await updateRunScreen(req.projectId, req.runId, frameId, { status: 'done', matched: false, sessionId: session }); } catch { /* non-fatal */ } }
+    finishJobLog(jobId, `[loop] done: "${frameName}" implemented (verify off)`);
+    return session;
+  }
 
   // 2/3. VERIFY ↔ FIX — the verify agent's recommendation + score plateau drive
   // when to stop; maxIterations is only a runaway backstop.
@@ -284,6 +307,106 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
   // quality flag, not a completion flag).
   if (req.runId) { try { await updateRunScreen(req.projectId, req.runId, frameId, { status: 'done', matched, sessionId: session }); } catch { /* non-fatal */ } }
   finishJobLog(jobId, `[loop] done: "${frameName}" ${matched ? 'MATCHED' : accepted ? 'accepted' : 'needs review'} after ${iterationsRun} iteration(s) — ${stopReason}`);
+  return session;
+}
+
+// ── server-orchestrated full-app build ─────────────────────────────────────────
+// Builds every screen in a durable run SERVER-SIDE, one after another, threading
+// the CLI session for cross-screen context. Survives the browser tab closing;
+// resumable after Stop / rate-limit / redeploy (already-done screens are skipped).
+// Every job-log line for the run's screens is teed to the durable run log so the
+// client can replay the full history on reconnect.
+async function runAppLoop(projectId: string, runId: string): Promise<void> {
+  if (isRunActive(runId)) return;          // already orchestrating in this process
+  markRunActive(runId);
+  clearRunCancelled(runId);
+  const projectRoot = resolveProjectRoot(projectId);
+  if (!projectRoot || !fsSync.existsSync(projectRoot)) { clearRunActive(runId); return; }
+
+  // Tee every screen job's log line to the run's durable, replayable log.
+  const unsub = subscribeJobLog((e) => {
+    if (e.kind !== 'line' || !e.line || !e.jobKey.startsWith(`${runId}:`)) return;
+    void appendRunLog(projectId, runId, e.line);
+  });
+
+  try {
+    const run = await getRun(projectId, runId);
+    if (!run) return;
+    await appendRunLog(projectId, runId, `[run] start — ${run.screens.length} screen(s), model=${run.model}, verify=${run.verify !== false}`);
+    let session = run.sessionId;
+
+    for (const screen of run.screens) {
+      if (isRunCancelled(runId)) {
+        await appendRunLog(projectId, runId, '[run] stopped by user');
+        await setRunStatus(projectId, runId, 'stopped');
+        return;
+      }
+      // Skip screens already built (resume): re-read live status each time.
+      const fresh = await getRun(projectId, runId);
+      const cur = fresh?.screens.find(s => s.frameId === screen.frameId);
+      if (cur?.status === 'done') { session = cur.sessionId || session; continue; }
+      if (!screen.spec) {
+        await appendRunLog(projectId, runId, `[run] skip "${screen.frameName}" — no build spec`);
+        await updateRunScreen(projectId, runId, screen.frameId, { status: 'failed' });
+        continue;
+      }
+      const jobId = `${runId}:${screen.frameId}`;
+      startJobLog(jobId, { projectId, firstLine: `[loop] queued "${screen.frameName}"` });
+      const sreq: BuildScreenReq = {
+        projectId, model: run.model as AIModel, modelId: run.modelId, sessionId: session,
+        framework: run.framework || 'flutter', frameId: screen.frameId, frameName: screen.frameName,
+        width: screen.spec.width, height: screen.spec.height,
+        referenceImagePath: screen.spec.referenceImagePath, implementPrompt: screen.spec.packet,
+        tree: screen.spec.tree, maxIterations: run.maxIterations, jobId, runId,
+        userNotes: run.userNotes, verify: run.verify,
+      };
+      try {
+        const sess = await runScreenLoop(sreq, projectRoot, jobId);
+        if (sess) { session = sess; await setRunSession(projectId, runId, session); }
+      } catch (e: any) {
+        appendJobLog(jobId, `[loop] error: ${e?.message || 'unknown'}`);
+        finishJobLog(jobId, '[loop] failed');
+        await updateRunScreen(projectId, runId, screen.frameId, { status: 'failed' });
+      }
+    }
+
+    if (isRunCancelled(runId)) {
+      await appendRunLog(projectId, runId, '[run] stopped by user');
+      await setRunStatus(projectId, runId, 'stopped');
+      return;
+    }
+    const done = await getRun(projectId, runId);
+    const built = done?.screens.filter(s => s.status === 'done').length ?? 0;
+    await setRunStatus(projectId, runId, 'done');
+    await appendRunLog(projectId, runId, `[run] complete — ${built}/${done?.screens.length ?? 0} built`);
+  } catch (e: any) {
+    await appendRunLog(projectId, runId, `[run] error: ${e?.message || 'unknown'}`);
+  } finally {
+    unsub();
+    clearRunActive(runId);
+    clearRunCancelled(runId);
+  }
+}
+
+/**
+ * Re-start any run that was 'running' when the process died (e.g. a redeploy).
+ * Called once on server boot so a full-app build survives a container restart.
+ */
+export async function resumeInterruptedRuns(): Promise<void> {
+  try {
+    const root = getProjectsRoot();
+    if (!fsSync.existsSync(root)) return;
+    const projectIds = (await fs.readdir(root, { withFileTypes: true })).filter(d => d.isDirectory()).map(d => d.name);
+    for (const projectId of projectIds) {
+      const runs = await listRuns(projectId, 50);
+      for (const r of runs) {
+        if (r.status === 'running' && !isRunActive(r.id)) {
+          void appendRunLog(projectId, r.id, '[run] resuming after server restart');
+          void runAppLoop(projectId, r.id);
+        }
+      }
+    }
+  } catch { /* boot resume is best-effort */ }
 }
 
 export function registerScreenLoopRoutes(app: Express): void {
@@ -324,13 +447,73 @@ export function registerScreenLoopRoutes(app: Express): void {
       res.status(400).json({ error: 'projectId and a non-empty screens[] are required' });
       return;
     }
+    if (!isAIModel(b.model)) { res.status(400).json({ error: 'a valid model is required' }); return; }
     const run = await createRun(b.projectId, {
       kind: b.kind === 'selected' || b.kind === 'single' ? b.kind : 'whole-app',
       framework: b.framework, figStorageKey: b.figStorageKey,
-      screens: b.screens.map((s: any) => ({ frameId: String(s.frameId), frameName: String(s.frameName ?? s.frameId) })),
+      model: b.model, modelId: b.modelId,
+      maxIterations: typeof b.maxIterations === 'number' ? b.maxIterations : undefined,
+      verify: b.verify !== false,
+      userNotes: typeof b.userNotes === 'string' ? b.userNotes : undefined,
+      screens: b.screens.map((s: any): { frameId: string; frameName: string; spec?: ScreenSpec } => ({
+        frameId: String(s.frameId),
+        frameName: String(s.frameName ?? s.frameId),
+        spec: s.spec && s.spec.packet ? {
+          packet: String(s.spec.packet),
+          referenceImagePath: String(s.spec.referenceImagePath ?? ''),
+          tree: typeof s.spec.tree === 'string' ? s.spec.tree : undefined,
+          width: typeof s.spec.width === 'number' ? s.spec.width : undefined,
+          height: typeof s.spec.height === 'number' ? s.spec.height : undefined,
+        } : undefined,
+      })),
     });
     if (!run) { res.status(404).json({ error: `project not found: ${b.projectId}` }); return; }
     res.json({ run });
+  });
+
+  // POST /api/ai/runs/:runId/start { projectId, steerNotes?, restart? } — kick off
+  // (or resume) the SERVER-SIDE orchestration of the whole run. Returns immediately.
+  app.post('/api/ai/runs/:runId/start', async (req, res) => {
+    const b = req.body ?? {};
+    const projectId = b.projectId as string;
+    if (!projectId) { res.status(400).json({ error: 'projectId is required' }); return; }
+    const runId = req.params.runId;
+    let run = await getRun(projectId, runId);
+    if (!run) { res.status(404).json({ error: 'run not found' }); return; }
+    if (isRunActive(runId)) { res.json({ run, started: false, alreadyRunning: true }); return; }
+    clearRunCancelled(runId);
+    if (b.restart) run = await restartRun(projectId, runId) ?? run;
+    const steer = typeof b.steerNotes === 'string' ? b.steerNotes.trim() : '';
+    if (steer) {
+      run.userNotes = [run.userNotes?.trim(), steer].filter(Boolean).join('\n\n');
+      if (run.status !== 'running') run.status = 'running';
+      await saveRun(projectId, run);
+    } else if (run.status === 'stopped') {
+      run.status = 'running';
+      await saveRun(projectId, run);
+    }
+    void runAppLoop(projectId, runId).catch(() => {});
+    res.json({ run, started: true });
+  });
+
+  // POST /api/ai/runs/:runId/stop { projectId } — request a graceful stop after
+  // the in-flight screen finishes. Marks the run 'stopped' (resumable later).
+  app.post('/api/ai/runs/:runId/stop', async (req, res) => {
+    const projectId = (req.body?.projectId ?? req.query.projectId) as string;
+    if (!projectId) { res.status(400).json({ error: 'projectId is required' }); return; }
+    const runId = req.params.runId;
+    markRunCancelled(runId);
+    await appendRunLog(projectId, runId, '[run] stop requested');
+    if (!isRunActive(runId)) await setRunStatus(projectId, runId, 'stopped');
+    res.json({ stopped: true });
+  });
+
+  // GET /api/ai/runs/:runId/log?projectId= — the durable, replayable run log.
+  app.get('/api/ai/runs/:runId/log', async (req, res) => {
+    const projectId = req.query.projectId as string;
+    if (!projectId) { res.status(400).json({ error: 'projectId is required' }); return; }
+    const log = await readRunLog(projectId, req.params.runId);
+    res.json({ log, active: isRunActive(req.params.runId) });
   });
 
   // GET /api/ai/runs?projectId= — list recent runs (newest first).

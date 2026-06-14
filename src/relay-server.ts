@@ -10,7 +10,7 @@ import { registerFlutterRoutes } from './relay-server/flutter-routes';
 import { getScreenSession } from './relay-server/flutter-screen';
 import { registerGitRoutes } from './relay-server/git-routes';
 import { registerVisualRoutes } from './relay-server/visual-routes';
-import { registerScreenLoopRoutes } from './relay-server/ai-screen-loop';
+import { registerScreenLoopRoutes, resumeInterruptedRuns } from './relay-server/ai-screen-loop';
 import { registerProjectRoutes } from './relay-server/project-routes';
 import {
   closeAllTerminalSessions,
@@ -201,6 +201,10 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
           });
         });
       });
+
+      // Resume any full-app build run that was interrupted by this restart
+      // (e.g. a redeploy) so it keeps building server-side. Best-effort.
+      void resumeInterruptedRuns();
 
       const address = httpServer.address();
       return address && typeof address === 'object' ? address.port : port;
