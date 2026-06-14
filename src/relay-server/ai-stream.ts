@@ -22,8 +22,12 @@ export interface ClaudeStreamParser {
   result: ClaudeStreamResult;
 }
 
-const SNIPPET_LEN = 120;
-const TOOL_SUMMARY_LEN = 80;
+// Generous caps so the UI can show the FULL line on tap (the client clamps long
+// lines to 3 rows and expands on click). These used to be 120/80, which threw
+// away the rest server-side — so "expand" had nothing to reveal. Kept bounded so
+// a pathological huge tool arg can't bloat the in-memory log / WS broadcast.
+const SNIPPET_LEN = 6000;
+const TOOL_SUMMARY_LEN = 2000;
 
 function snippet(text: string, max: number): string {
   const oneLine = text.replace(/\s+/g, ' ').trim();
