@@ -19,6 +19,8 @@ import {
 } from './transcript';
 import { ScrollbackBuffer } from './scrollback';
 import { subscribeJobLog } from './ai-job-log';
+import { watchProject, type ProjectWatcher } from './project-watcher';
+import fsSync from 'node:fs';
 
 const activeShells = new Map<string, PtyLike>();
 const terminalSessions = new Map<string, TerminalSession>();
@@ -240,6 +242,24 @@ export function registerSocketHandlers(
     let selectedTerminalId: string | null = null;
     const disposables: Array<{ dispose(): void }> = [];
     const boundTerminalIds = new Set<string>();
+
+    // Live file/git watcher for the client's active project (replaces refresh
+    // buttons). The client emits 'watch:project' on connect + when it switches
+    // projects; we (re)watch and push 'fs:changed' / 'git:changed'.
+    let projectWatcher: ProjectWatcher | null = null;
+    socket.on('watch:project', (payload: { projectId?: string } = {}) => {
+      projectWatcher?.stop();
+      projectWatcher = null;
+      const projectId = payload?.projectId;
+      if (!projectId) return;
+      const root = resolveProjectRoot(projectId);
+      if (!root || !fsSync.existsSync(root)) return;
+      projectWatcher = watchProject(
+        root,
+        () => socket.emit('fs:changed', { projectId }),
+        () => socket.emit('git:changed', { projectId }),
+      );
+    });
 
     const getShell = (): PtyLike | null => {
       const fallbackId =
@@ -593,6 +613,8 @@ export function registerSocketHandlers(
     });
 
     socket.on('disconnect', () => {
+      projectWatcher?.stop();
+      projectWatcher = null;
       while (disposables.length > 0) {
         disposables.pop()?.dispose();
       }
