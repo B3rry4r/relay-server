@@ -30,6 +30,7 @@ import { runModel } from './ai-routes';
 import { startJobLog, appendJobLog, finishJobLog } from './ai-job-log';
 import { captureUrlScreenshot, serveDir } from './visual-routes';
 import { isAIModel, type AIModel } from './ai-adapters';
+import { createRun, getRun, listRuns, updateRunScreen } from './build-run-store';
 
 const execFile = promisify(execFileCb);
 
@@ -48,6 +49,7 @@ interface BuildScreenReq {
   tree?: string;              // IR tree notation — snapshotted for cross-session context
   maxIterations?: number;
   jobId?: string;
+  runId?: string;             // durable multi-screen run this screen belongs to
 }
 
 interface Discrepancy { area?: string; issue: string; severity?: string }
@@ -203,6 +205,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
   // Snapshot the IR tree so a future session has this screen's design context
   // (exact colours/text/layout) without re-fetching from the design source.
   if (req.tree) { try { await fs.writeFile(path.join(screenDir, 'ir.txt'), req.tree); } catch { /* non-fatal */ } }
+  if (req.runId) { try { await updateRunScreen(req.projectId, req.runId, frameId, { status: 'building' }); } catch { /* non-fatal */ } }
 
   let session = req.sessionId;
   let finalVerdict: Verdict | null = null;
@@ -272,6 +275,9 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     at: new Date().toISOString(),
   };
   await fs.writeFile(path.join(screenDir, 'result.json'), JSON.stringify(result, null, 2));
+  // Mark this screen DONE in its durable run (the screen built; matched is a
+  // quality flag, not a completion flag).
+  if (req.runId) { try { await updateRunScreen(req.projectId, req.runId, frameId, { status: 'done', matched, sessionId: session }); } catch { /* non-fatal */ } }
   finishJobLog(jobId, `[loop] done: "${frameName}" ${matched ? 'MATCHED' : accepted ? 'accepted' : 'needs review'} after ${iterationsRun} iteration(s) — ${stopReason}`);
 }
 
@@ -300,6 +306,41 @@ export function registerScreenLoopRoutes(app: Express): void {
     void runScreenLoop(b as BuildScreenReq, projectRoot, jobId).catch((e: any) => {
       appendJobLog(jobId, `[loop] error: ${e?.message || 'unknown'}`);
       finishJobLog(jobId, '[loop] failed');
+      // Mark the screen FAILED in its run so resume re-attempts it.
+      if (b.runId) void updateRunScreen(b.projectId, b.runId, b.frameId, { status: 'failed' }).catch(() => {});
     });
+  });
+
+  // ── Durable build runs (resumable after Stop / error / rate limit / redeploy) ──
+  // POST /api/ai/runs — create a run for a set of screens. Returns the run.
+  app.post('/api/ai/runs', async (req, res) => {
+    const b = req.body ?? {};
+    if (!b.projectId || !Array.isArray(b.screens) || b.screens.length === 0) {
+      res.status(400).json({ error: 'projectId and a non-empty screens[] are required' });
+      return;
+    }
+    const run = await createRun(b.projectId, {
+      kind: b.kind === 'selected' || b.kind === 'single' ? b.kind : 'whole-app',
+      framework: b.framework, figStorageKey: b.figStorageKey,
+      screens: b.screens.map((s: any) => ({ frameId: String(s.frameId), frameName: String(s.frameName ?? s.frameId) })),
+    });
+    if (!run) { res.status(404).json({ error: `project not found: ${b.projectId}` }); return; }
+    res.json({ run });
+  });
+
+  // GET /api/ai/runs?projectId= — list recent runs (newest first).
+  app.get('/api/ai/runs', async (req, res) => {
+    const projectId = req.query.projectId as string;
+    if (!projectId) { res.status(400).json({ error: 'projectId is required' }); return; }
+    res.json({ runs: await listRuns(projectId) });
+  });
+
+  // GET /api/ai/runs/:runId?projectId= — one run.
+  app.get('/api/ai/runs/:runId', async (req, res) => {
+    const projectId = req.query.projectId as string;
+    if (!projectId) { res.status(400).json({ error: 'projectId is required' }); return; }
+    const run = await getRun(projectId, req.params.runId);
+    if (!run) { res.status(404).json({ error: 'run not found' }); return; }
+    res.json({ run });
   });
 }
