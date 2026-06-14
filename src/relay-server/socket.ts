@@ -18,6 +18,7 @@ import {
   handleTerminalInput,
 } from './transcript';
 import { ScrollbackBuffer } from './scrollback';
+import { subscribeJobLog } from './ai-job-log';
 
 const activeShells = new Map<string, PtyLike>();
 const terminalSessions = new Map<string, TerminalSession>();
@@ -215,6 +216,13 @@ export function registerSocketHandlers(
   io: SocketIOServer,
   ptyFactory: PtyFactory
 ): void {
+  // PUSH AI job-log progress to connected clients over WS (replaces HTTP polling
+  // for the UIX agent-progress view). Subscribed ONCE; broadcast to all sockets
+  // (single-user relay) — the client filters by jobId/projectId.
+  subscribeJobLog((e) => {
+    io.emit('ai:progress', { jobId: e.jobKey, kind: e.kind, line: e.line, projectId: e.projectId, done: e.kind === 'done' });
+  });
+
   io.use((socket, next) => {
     const authToken = typeof socket.handshake.auth.token === 'string'
       ? socket.handshake.auth.token
