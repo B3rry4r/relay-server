@@ -25,7 +25,7 @@ import fsSync from 'node:fs';
 import path from 'node:path';
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
-import { resolveProjectRoot, createTerminalEnv, getFlutterRoot } from './runtime';
+import { resolveProjectRoot, resolveWorkspace, createTerminalEnv, getFlutterRoot } from './runtime';
 import { runModel } from './ai-routes';
 import { startJobLog, appendJobLog, finishJobLog } from './ai-job-log';
 import { captureUrlScreenshot, serveDir } from './visual-routes';
@@ -190,7 +190,13 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
   // recommendation + score-plateau detection decide when to actually stop, so a
   // screen that matches on pass 1 costs 1 pass, not N.
   const maxIterations = Math.min(Math.max(req.maxIterations ?? 4, 1), 6);
-  const env = createTerminalEnv(projectRoot);
+  // Build the env from the WORKSPACE root (like /api/ai/generate), NOT the
+  // project: createTerminalEnv sets HOME to its arg, and the claude/gemini CLIs
+  // read their login from $HOME/.claude (etc.). Rooting it at the project made
+  // the spawned agent look for credentials in <project>/.claude → "claude error
+  // login", and mis-rooted every tool path (Flutter/npm/mise). The project is
+  // the cwd of each runModel/build call, passed separately.
+  const env = createTerminalEnv(resolveWorkspace());
   const screenDir = path.join(projectRoot, '.uix', 'screens', sanitizeId(frameId));
   await fs.mkdir(screenDir, { recursive: true });
   const relScreenDir = path.join('.uix', 'screens', sanitizeId(frameId));
