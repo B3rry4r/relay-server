@@ -270,6 +270,24 @@ export function registerProjectRoutes(app: Express): void {
     res.json({ deleted: { path: path.relative(projectRoot, itemPath) } });
   });
 
+  // Delete a whole project (folder). Guarded: the resolved path MUST live under
+  // the projects root so a bad id can never rm something outside it.
+  app.delete('/api/projects/:projectId', requireAuth, async (req, res) => {
+    const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
+    if (!projectRoot || !await exists(projectRoot)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+    const root = getProjectsRoot();
+    const rel = path.relative(root, projectRoot);
+    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+      res.status(400).json({ error: 'invalid_project', message: 'Refusing to delete outside the projects root.' });
+      return;
+    }
+    await fs.rm(projectRoot, { recursive: true, force: true });
+    res.json({ deleted: { projectId: req.params.projectId } });
+  });
+
   app.get('/api/projects/:projectId/download', requireAuth, async (req, res) => {
     const projectRoot = resolveProjectRoot(readStringParam(req.params.projectId));
     const itemPath = projectRoot ? resolveProjectRelativePath(projectRoot, String(req.query.path || '')) : null;
