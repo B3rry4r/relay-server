@@ -33,6 +33,13 @@ export interface RunScreen {
   spec?: ScreenSpec;
 }
 export type RunStatus = 'running' | 'done' | 'stopped';
+
+/** Navigation flow graph — stored ON the run so the SERVER owns build order +
+ *  the global app plan it injects into every screen's prompt (the flow shapes the
+ *  output, instead of the client pre-chewing a flat list). */
+export interface RunFlowConn { from: string; to: string; type: string; label?: string }
+export interface RunFlow { entryFrameId: string | null; connections: RunFlowConn[] }
+
 export interface BuildRun {
   id: string;
   projectId: string;
@@ -45,6 +52,7 @@ export interface BuildRun {
   maxIterations?: number;
   verify?: boolean;
   userNotes?: string;
+  flow?: RunFlow;
   sessionId?: string;          // shared CLI session threaded across screens
   screens: RunScreen[];
   status: RunStatus;
@@ -66,11 +74,36 @@ function deriveStatus(screens: RunScreen[]): RunStatus {
   return 'done';
 }
 
+/** Order screens by the flow graph: entry first, then DFS along connections, then
+ *  tab destinations, then any remaining. Traverses edges even through nodes that
+ *  aren't in the build set (e.g. the entry/splash already built), so the flow is
+ *  always honored. THE SERVER owns this ordering. */
+export function orderScreensByFlow<T extends { frameId: string }>(screens: T[], flow?: RunFlow): T[] {
+  if (!flow || (!flow.entryFrameId && !flow.connections.length)) return screens;
+  const byId = new Map(screens.map(s => [s.frameId, s]));
+  const adj = new Map<string, string[]>();
+  for (const c of flow.connections) { const a = adj.get(c.from) ?? []; a.push(c.to); adj.set(c.from, a); }
+  const out: T[] = [];
+  const seen = new Set<string>();
+  const visit = (id: string): void => {
+    if (seen.has(id)) return;
+    seen.add(id);
+    const s = byId.get(id);
+    if (s) out.push(s);                       // build it if it's in the set
+    for (const t of (adj.get(id) ?? [])) visit(t);   // always follow edges
+  };
+  if (flow.entryFrameId) visit(flow.entryFrameId);
+  for (const c of flow.connections) if (c.type === 'tab') visit(c.to);
+  for (const s of screens) if (!seen.has(s.frameId)) { seen.add(s.frameId); out.push(s); }
+  return out;
+}
+
 export async function createRun(
   projectId: string,
   data: {
     kind: BuildRun['kind']; framework?: string; figStorageKey?: string;
     model: string; modelId?: string; maxIterations?: number; verify?: boolean; userNotes?: string;
+    flow?: RunFlow;
     screens: Array<{ frameId: string; frameName: string; spec?: ScreenSpec }>;
   },
 ): Promise<BuildRun | null> {
@@ -78,10 +111,13 @@ export async function createRun(
   if (!root) return null;
   const now = new Date().toISOString();
   const id = `run_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  // THE SERVER orders the batch by the flow graph (not the client's order).
+  const orderedScreens = orderScreensByFlow(data.screens, data.flow);
   const run: BuildRun = {
     id, projectId, kind: data.kind, framework: data.framework, figStorageKey: data.figStorageKey,
     model: data.model, modelId: data.modelId, maxIterations: data.maxIterations, verify: data.verify, userNotes: data.userNotes,
-    screens: data.screens.map(s => ({ frameId: s.frameId, frameName: s.frameName, status: 'pending' as const, spec: s.spec })),
+    flow: data.flow,
+    screens: orderedScreens.map(s => ({ frameId: s.frameId, frameName: s.frameName, status: 'pending' as const, spec: s.spec })),
     status: 'running', createdAt: now, updatedAt: now,
   };
   await fs.mkdir(runsDir(root), { recursive: true });

@@ -79,6 +79,38 @@ interface LastGen {
 
 const sanitizeId = (id: string) => id.replace(/[^a-zA-Z0-9._-]+/g, '_');
 
+const routeNameFor = (name: string): string =>
+  '/' + ((name || 'screen').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'screen');
+
+/**
+ * The GLOBAL app plan the server injects into EVERY screen's prompt: the complete,
+ * fixed screen inventory + route table + navigation graph, plus a hard rule that
+ * the agent must wire only to these screens and NEVER invent new ones. This is the
+ * fix for "the AI builds its own screens" — each screen is built with the whole
+ * app in view, so it registers routes to known screens instead of improvising.
+ */
+function buildAppPlan(run: import('./build-run-store').BuildRun): string {
+  const nameById = new Map(run.screens.map(s => [s.frameId, s.frameName]));
+  const out: string[] = [
+    `APP PLAN — the COMPLETE, FIXED set of screens in this app. Wire navigation ONLY to these screens; NEVER create, invent, rename, or stub a screen that is not in this list. If a navigation target is not built yet, route to its route name below — a later step fills it in.`,
+  ];
+  if (run.flow?.entryFrameId) {
+    const en = nameById.get(run.flow.entryFrameId) || run.flow.entryFrameId;
+    out.push(`Entry / start screen: "${en}" (route ${routeNameFor(en)}).`);
+  }
+  out.push(`Screens (name → route):`);
+  for (const s of run.screens) out.push(`- "${s.frameName}" → ${routeNameFor(s.frameName)}`);
+  if (run.flow?.connections?.length) {
+    out.push(`Navigation graph (build these transitions, no dead ends):`);
+    for (const c of run.flow.connections) {
+      const f = nameById.get(c.from) || c.from, t = nameById.get(c.to) || c.to;
+      out.push(`- "${f}" --(${c.type}${c.label ? ` "${c.label}"` : ''})--> "${t}"`);
+    }
+  }
+  out.push(`Register ALL these routes in the central router by name (a placeholder/empty screen is fine for ones not built yet). Build ONLY the current screen below; do not implement, overwrite, or duplicate the others.`);
+  return out.join('\n');
+}
+
 async function readLastGen(projectRoot: string): Promise<LastGen> {
   try {
     const raw = await fs.readFile(path.join(projectRoot, '.uix', 'last-gen.json'), 'utf8');
@@ -332,7 +364,11 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
   try {
     const run = await getRun(projectId, runId);
     if (!run) return;
-    await appendRunLog(projectId, runId, `[run] start — ${run.screens.length} screen(s), model=${run.model}, verify=${run.verify !== false}`);
+    // The global app plan (screen inventory + routes + nav graph + "never invent
+    // screens" rule) — prepended to every screen's prompt so the flow shapes the
+    // whole build, not just per-screen nav lines.
+    const appPlan = buildAppPlan(run);
+    await appendRunLog(projectId, runId, `[run] start — ${run.screens.length} screen(s), model=${run.model}, verify=${run.verify !== false}, flow=${run.flow?.connections?.length ?? 0} link(s)`);
     let session = run.sessionId;
 
     for (const screen of run.screens) {
@@ -356,7 +392,8 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
         projectId, model: run.model as AIModel, modelId: run.modelId, sessionId: session,
         framework: run.framework || 'flutter', frameId: screen.frameId, frameName: screen.frameName,
         width: screen.spec.width, height: screen.spec.height,
-        referenceImagePath: screen.spec.referenceImagePath, implementPrompt: screen.spec.packet,
+        referenceImagePath: screen.spec.referenceImagePath,
+        implementPrompt: `${appPlan}\n\n— — —\nNOW BUILD THIS SCREEN:\n${screen.spec.packet}`,
         tree: screen.spec.tree, maxIterations: run.maxIterations, jobId, runId,
         userNotes: run.userNotes, verify: run.verify,
       };
@@ -455,6 +492,12 @@ export function registerScreenLoopRoutes(app: Express): void {
       maxIterations: typeof b.maxIterations === 'number' ? b.maxIterations : undefined,
       verify: b.verify !== false,
       userNotes: typeof b.userNotes === 'string' ? b.userNotes : undefined,
+      flow: b.flow && (Array.isArray(b.flow.connections) || b.flow.entryFrameId !== undefined) ? {
+        entryFrameId: b.flow.entryFrameId ?? null,
+        connections: Array.isArray(b.flow.connections) ? b.flow.connections.map((c: any) => ({
+          from: String(c.from), to: String(c.to), type: String(c.type ?? 'push'), label: c.label ? String(c.label) : undefined,
+        })) : [],
+      } : undefined,
       screens: b.screens.map((s: any): { frameId: string; frameName: string; spec?: ScreenSpec } => ({
         frameId: String(s.frameId),
         frameName: String(s.frameName ?? s.frameId),
