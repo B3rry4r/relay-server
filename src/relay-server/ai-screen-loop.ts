@@ -50,6 +50,7 @@ interface BuildScreenReq {
   maxIterations?: number;
   jobId?: string;
   runId?: string;             // durable multi-screen run this screen belongs to
+  userNotes?: string;         // the human's design rules — shared with verify/fix
 }
 
 interface Discrepancy { area?: string; issue: string; severity?: string }
@@ -79,13 +80,15 @@ async function readLastGen(projectRoot: string): Promise<LastGen> {
 
 // ── prompt builders ───────────────────────────────────────────────────────────
 
-function verifyPrompt(refPath: string, candPath: string, frameName: string, prevScore: number | null): string {
+function verifyPrompt(refPath: string, candPath: string, frameName: string, prevScore: number | null, userNotes?: string): string {
+  const notes = (userNotes ?? '').trim();
   return [
     `You are a STRICT visual-QA reviewer. Do not write or edit any files.`,
     `Open these two images with your file-reading tool:`,
     `  - REFERENCE (ground truth, the target design): ${refPath}`,
     `  - CANDIDATE (a screenshot of the current build of screen "${frameName}"): ${candPath}`,
     `Compare them carefully: layout & hierarchy, spacing/proportions, colours, typography, text content, icons/illustrations, and overall fidelity.`,
+    notes ? `USER RULES / INTENT (authoritative) — respect these when judging; do NOT flag an INTENTIONAL omission as a discrepancy (e.g. if the user said no OS status bar / no default keyboard, then a missing status bar or keyboard is CORRECT, not a discrepancy):\n${notes}` : '',
     prevScore != null ? `The previous pass scored ${prevScore}/100 — judge whether this pass actually improved; if it's no better, another automated fix is unlikely to help (lean towards "stop").` : '',
     `If the reference shows a MODAL / OVERLAY / SHEET / POPUP over a base screen, the candidate should render that overlay ON TOP of the (reused) base screen — flag a discrepancy if the candidate rebuilt the whole screen or rendered the overlay as a standalone full page.`,
     `Respond with ONLY a single JSON object (no prose, no code fences):`,
@@ -96,17 +99,19 @@ function verifyPrompt(refPath: string, candPath: string, frameName: string, prev
   ].filter(Boolean).join('\n');
 }
 
-function fixPrompt(frameName: string, refPath: string, candPath: string, v: Verdict): string {
+function fixPrompt(frameName: string, refPath: string, candPath: string, v: Verdict, userNotes?: string): string {
   const items = v.discrepancies.map((d, i) => `  ${i + 1}. [${d.severity ?? 'med'}] ${d.area ? d.area + ': ' : ''}${d.issue}`).join('\n');
+  const notes = (userNotes ?? '').trim();
   return [
     `The screen "${frameName}" you built does NOT yet match its reference design (visual score ${v.score ?? '?'} / 100).`,
     `Reference (ground truth): ${refPath}`,
     `Current build screenshot:  ${candPath}`,
-    `Open BOTH images, then revise the EXISTING screen file(s) to fix these specific discrepancies:`,
+    notes ? `USER RULES / INTENT (authoritative — DO NOT violate, even to satisfy a discrepancy below; e.g. do NOT add an OS status bar or default keyboard if the user excluded them):\n${notes}\n` : '',
+    `Open BOTH images, then revise the EXISTING screen file(s) to fix these specific discrepancies — but skip any that contradict the user rules above:`,
     items || '  (general fidelity — bring it closer to the reference)',
     `Reuse the project's existing design system / theme / shared components — do not restyle inline.`,
     `Keep the preview entrypoint working and keep .uix/last-gen.json accurate (including "previewEntry"). Output a one-line summary.`,
-  ].join('\n');
+  ].filter(Boolean).join('\n');
 }
 
 // ── parse the verify agent's JSON verdict (robust to fences / stray prose) ─────
@@ -240,7 +245,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
       await fs.writeFile(candAbs, shot.png);
       candRel = path.join(relScreenDir, `cand-${iter}.png`);
       appendJobLog(jobId, `[loop] verify ${iter}: comparing to reference`);
-      const v = await runModel(model, verifyPrompt(referenceImagePath, candRel, frameName, prevScore), env, projectRoot, { agent: true, modelId, jobId, projectId: req.projectId });
+      const v = await runModel(model, verifyPrompt(referenceImagePath, candRel, frameName, prevScore, req.userNotes), env, projectRoot, { agent: true, modelId, jobId, projectId: req.projectId });
       verdict = parseVerdict(v.text);
     }
     finalVerdict = verdict;
@@ -262,7 +267,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
 
     // FIX (resume the implementation session so the agent keeps full context).
     appendJobLog(jobId, `[loop] fix ${iter}: applying ${verdict.discrepancies.length} change(s)`);
-    const fix = await runModel(model, fixPrompt(frameName, referenceImagePath, candRel ?? '(build failed — no screenshot)', verdict), env, projectRoot, { agent: true, modelId, sessionId: session, jobId, projectId: req.projectId });
+    const fix = await runModel(model, fixPrompt(frameName, referenceImagePath, candRel ?? '(build failed — no screenshot)', verdict, req.userNotes), env, projectRoot, { agent: true, modelId, sessionId: session, jobId, projectId: req.projectId });
     if (fix.sessionId) session = fix.sessionId;
   }
 
