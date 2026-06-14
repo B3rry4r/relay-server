@@ -531,22 +531,22 @@ export function registerSocketHandlers(
     });
 
     // Debounce resize to avoid sending SIGWINCH on every rapid layout reflow.
-    // xterm.js FitAddon fires resize many times during mount; all with identical
-    // dimensions. We coalesce them into a single PTY resize call.
-    let lastResizeCols = 0, lastResizeRows = 0;
-    let resizeTimer: ReturnType<typeof setTimeout> | null = null;
-    socket.on('resize', (payload: { cols?: number; rows?: number } = {}) => {
+    // Per-terminal resize: every visible terminal sizes its OWN PTY (multiplex),
+    // so a TUI in a split/background pane isn't left at the wrong dimensions (the
+    // "scattered until you resize" bug). Dedup identical sizes PER id — xterm's
+    // FitAddon fires many identical resizes during mount.
+    const lastResize = new Map<string, string>();
+    socket.on('resize', (payload: { id?: string; cols?: number; rows?: number } = {}) => {
       const cols = Number(payload.cols);
       const rows = Number(payload.rows);
       if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 1 || rows < 1) return;
-      if (cols === lastResizeCols && rows === lastResizeRows) return; // identical — skip
-      lastResizeCols = cols; lastResizeRows = rows;
-      if (resizeTimer) clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(() => {
-        resizeTimer = null;
-        const shell = getShell();
-        if (shell) shell.resize(cols, rows);
-      }, 50);
+      const id = typeof payload.id === 'string' && payload.id ? payload.id : (selectedTerminalId ?? '');
+      if (!id) return;
+      const key = `${cols}x${rows}`;
+      if (lastResize.get(id) === key) return; // identical for this terminal — skip
+      lastResize.set(id, key);
+      const shell = activeShells.get(id);
+      if (shell) shell.resize(cols, rows);
     });
 
     socket.on('cd', async (payload: { path: string; projectId?: string }) => {
@@ -581,7 +581,6 @@ export function registerSocketHandlers(
     });
 
     socket.on('disconnect', () => {
-      if (resizeTimer) { clearTimeout(resizeTimer); resizeTimer = null; }
       while (disposables.length > 0) {
         disposables.pop()?.dispose();
       }
