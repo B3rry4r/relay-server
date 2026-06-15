@@ -48,6 +48,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update && apt-get install -y \
     tini \
+    gosu \
     git \
     curl \
     build-essential \
@@ -92,9 +93,17 @@ COPY package.json package-lock.json .
 RUN npm ci --omit=dev --ignore-scripts
 COPY setup-workspace.sh .
 
-RUN mkdir -p $WORKSPACE/.relay
+# Non-root user. Claude Code and Flutter refuse to run as root, and Chrome is
+# happier non-root too. The volume (/workspace) and /app are handed to dev.
+RUN useradd --create-home --shell /bin/bash dev \
+    && mkdir -p $WORKSPACE/.relay \
+    && chown -R dev:dev $WORKSPACE /app
+
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # tini reaps orphaned grandchildren (headless Chrome from the screenshot
 # endpoints double-forks); without an init, zombies exhaust the pid cgroup.
-ENTRYPOINT ["/usr/bin/tini", "--"]
+# entrypoint.sh fixes volume ownership as root, then drops to dev via gosu.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
 CMD ["node", "dist/src/index.js"]
