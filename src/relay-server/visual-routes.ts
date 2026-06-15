@@ -119,6 +119,50 @@ export async function captureUrlScreenshot(
   }
 }
 
+/**
+ * P1 (RFC §4.6): TALL-FRAME TILING. A reference taller than ~1500 logical px is
+ * downsampled below the model's vision long-edge cap when judged as one image,
+ * losing fidelity exactly on the big screens that matter. Instead of one
+ * downsampled full-page shot we capture the page in ~viewport-tall vertical TILES
+ * (with overlap so no element is split across a boundary), each at the matched
+ * device-scale and full resolution. Each tile is verified independently.
+ *
+ * No image-decode dependency (sharp/jimp aren't installed and adding a native dep
+ * is unsafe per the deploy guard): we tile in the BROWSER. The served origin
+ * exposes a virtual `/__tile.html?top=&w=&h=` wrapper that iframes the app and
+ * scrolls it to each tile offset; a viewport-clipped screenshot (NOT full-page)
+ * then captures exactly that band at full resolution. Same-origin with the app, so
+ * the iframe scroll isn't blocked.
+ *
+ * `serverUrl` is the served base (the `.url` serveDir returns, ending /index.html).
+ * Returns the vertical tiles top→bottom, or null on failure.
+ */
+export async function captureUrlTiles(
+  serverUrl: string,
+  width: number,
+  totalHeight: number,
+  timeoutMs = 60000,
+  opts: { deviceScale?: number; viewportH?: number; overlap?: number } = {},
+): Promise<Buffer[] | null> {
+  const viewportH = Math.max(opts.viewportH ?? 852, 200);
+  const overlap = Math.max(opts.overlap ?? 120, 0);
+  const step = Math.max(viewportH - overlap, 1);
+  const nTiles = Math.max(1, Math.ceil((totalHeight - overlap) / step));
+  const scale = opts.deviceScale && opts.deviceScale > 0 ? opts.deviceScale : 1;
+  const base = serverUrl.replace(/\/index\.html$/, '');
+  const W = Math.round(width), H = Math.round(viewportH);
+
+  const tiles: Buffer[] = [];
+  for (let i = 0; i < nTiles; i++) {
+    const top = Math.round(i * step);
+    const tileUrl = `${base}/__tile.html?top=${top}&w=${W}&h=${H}`;
+    // Viewport-clipped (NOT full-page) → exactly one band at full resolution.
+    const png = await captureUrlScreenshot(tileUrl, width, viewportH, timeoutMs, { deviceScale: scale });
+    if (png) tiles.push(png);
+  }
+  return tiles.length ? tiles : null;
+}
+
 // Serve a directory over an ephemeral localhost port; returns { url, close }.
 // Exported for the screen-build loop, which serves a real project's build/web
 // output to screenshot a generated screen against its reference render.
@@ -130,7 +174,28 @@ export async function serveDir(dir: string): Promise<{ url: string; close: () =>
   };
   const server = createServer(async (req, res) => {
     try {
-      const rel = decodeURIComponent((req.url || '/').split('?')[0]);
+      const rawPath = (req.url || '/').split('?')[0];
+      const rel = decodeURIComponent(rawPath);
+      // Virtual SAME-ORIGIN tiling wrapper (RFC §4.6): iframes /index.html and is
+      // scrolled to a query offset (?top=<logicalPx>&w=&h=) so a viewport-clipped
+      // screenshot captures exactly one vertical band of a tall screen. Same-origin
+      // with the app → the iframe scroll isn't blocked.
+      if (rel === '/__tile.html') {
+        const q = new URLSearchParams((req.url || '').split('?')[1] || '');
+        const top = Math.max(0, parseInt(q.get('top') || '0', 10) || 0);
+        const w = Math.max(1, parseInt(q.get('w') || '393', 10) || 393);
+        const h = Math.max(1, parseInt(q.get('h') || '852', 10) || 852);
+        res.setHeader('Content-Type', 'text/html');
+        res.end(
+          `<!doctype html><html><head><meta charset="utf-8"/>` +
+          `<style>html,body{margin:0;padding:0;overflow:hidden;background:#fff}iframe{border:0;width:${w}px;height:${h}px;display:block}</style>` +
+          `</head><body><iframe id="f" src="/index.html"></iframe>` +
+          `<script>var f=document.getElementById('f');` +
+          `f.addEventListener('load',function(){setTimeout(function(){try{f.contentWindow.scrollTo(0,${top});}catch(e){}},400);});` +
+          `</script></body></html>`,
+        );
+        return;
+      }
       const file = path.join(dir, rel === '/' ? 'index.html' : rel);
       if (!file.startsWith(dir) || !fsSync.existsSync(file)) { res.statusCode = 404; res.end(); return; }
       res.setHeader('Content-Type', types[path.extname(file)] || 'application/octet-stream');

@@ -24,11 +24,12 @@ import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import path from 'node:path';
 import { execFile as execFileCb } from 'node:child_process';
+import crypto from 'node:crypto';
 import { promisify } from 'node:util';
 import { resolveProjectRoot, resolveWorkspace, createTerminalEnv, getFlutterRoot, resolveProjectRelativePath } from './runtime';
 import { runModel } from './ai-routes';
 import { startJobLog, appendJobLog, finishJobLog, subscribeJobLog } from './ai-job-log';
-import { captureUrlScreenshot, serveDir } from './visual-routes';
+import { captureUrlScreenshot, captureUrlTiles, serveDir } from './visual-routes';
 import { isAIModel, type AIModel } from './ai-adapters';
 import {
   createRun, getRun, listRuns, updateRunScreen, setRunStatus, setRunSession,
@@ -46,6 +47,7 @@ import {
   type Canonical, type CanonicalScreen,
 } from './canonicalize';
 import { computePreflight } from './preflight';
+import { reconcileScreen, reconcileSummary, type ReconcileResult } from './reconcile';
 
 const execFile = promisify(execFileCb);
 
@@ -73,6 +75,11 @@ interface BuildScreenReq {
   // the shared CLI session. The within-screen fix loop still resumes the session
   // started by THIS screen's implement call (full local context for the fixes).
   freshSession?: boolean;
+  // P3 (RFC §4.5/§4.8): canonical context for the deterministic reconciliation gate
+  // + amendment emitter. Present only on canonical runs; absent → both are no-ops
+  // (existing per-frame behavior unchanged).
+  canonical?: Canonical;
+  canonicalId?: string;
 }
 
 interface Discrepancy { area?: string; issue: string; severity?: string }
@@ -127,6 +134,10 @@ async function withBuildLock<T>(projectRoot: string, fn: () => Promise<T>): Prom
 // SAME scale and at FULL height (not clipped to the device viewport).
 const REF_DEVICE_SCALE = 2;
 const CAPTURE_SHOT_OPTS = { deviceScale: REF_DEVICE_SCALE, fullPage: true } as const;
+// P1 (RFC §4.6): a reference taller than this (logical px) is downsampled below the
+// model's vision long-edge cap when judged as ONE image. Above it, capture the
+// candidate as vertical viewport-tall tiles (full resolution) and verify per band.
+const TALL_FRAME_THRESHOLD = 1500;
 
 const routeNameFor = (name: string): string =>
   '/' + ((name || 'screen').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'screen');
@@ -327,6 +338,17 @@ function buildWrittenContract(
       `No .uix/context.md exists yet — you are establishing the project contract. Create .uix/context.md (design system, routing, screens index) so every later screen builds against it.`,
     );
   }
+  // P5 (RFC §4.8): AMENDMENT PROTOCOL. The plan is append-only + namespace-locked,
+  // NOT frozen — but the agent must not silently invent routes/components. When a
+  // route/component it genuinely needs is missing from the plan above, it REQUESTS
+  // it instead of improvising, by writing .uix/amendment-request.json. The
+  // orchestrator reads it after this screen and either auto-approves (whitelisted)
+  // or queues it for human approval, then regenerates the skeleton.
+  parts.push([
+    `PLAN AMENDMENT PROTOCOL — the route/screen list above is the COMPLETE plan; do NOT invent a new top-level route or shared component. If you genuinely need one that is missing, DO NOT improvise it: write a request file at .uix/amendment-request.json and route to the nearest existing screen for now. The file is a JSON object (or an array of them):`,
+    `{"kind": "add-route" | "add-component", "proposedApi": "<route slug like /foo, or a component name + props sketch>", "rationale": "<why the plan needs it>"}`,
+    `Only emit this for a real gap — the reconciliation gate flags routes/components that are referenced but not in the plan.`,
+  ].join('\n'));
   return parts.join('\n\n— — —\n');
 }
 
@@ -434,6 +456,29 @@ function verifyPrompt(refPath: string, candPath: string, frameName: string, prev
   ].filter(Boolean).join('\n');
 }
 
+// P1 (RFC §4.6): verify a TALL screen judged as vertical tiles. The candidate is
+// supplied as full-resolution top→bottom bands (with overlap); the single
+// reference covers the whole screen. The agent reads every band and judges the
+// WHOLE screen — tiling exists to keep candidate detail above the model's
+// downsample cap, not to compare bands in isolation.
+function tiledVerifyPrompt(refPath: string, candTilePaths: string[], frameName: string, prevScore: number | null, userNotes?: string): string {
+  const notes = (userNotes ?? '').trim();
+  return [
+    `You are a STRICT visual-QA reviewer. Do not write or edit any files.`,
+    `The screen "${frameName}" is TALL, so its current build is given as ${candTilePaths.length} full-resolution VERTICAL TILES (top→bottom, slightly overlapping) instead of one downsized image. Open ALL of these with your file-reading tool:`,
+    `  - REFERENCE (ground truth, the WHOLE screen): ${refPath}`,
+    ...candTilePaths.map((p, i) => `  - CANDIDATE tile ${i + 1}/${candTilePaths.length} (top→bottom band of the current build): ${p}`),
+    `Mentally stack the candidate tiles into the full screen and compare it to the reference: layout & hierarchy, spacing/proportions, colours, typography, text content, icons/illustrations, and overall fidelity across the ENTIRE height (the lower portion matters too).`,
+    notes ? `USER RULES / INTENT (authoritative) — respect these; do NOT flag an INTENTIONAL omission as a discrepancy:\n${notes}` : '',
+    prevScore != null ? `The previous pass scored ${prevScore}/100 — judge whether this pass actually improved; if it's no better, another automated fix is unlikely to help (lean towards "stop").` : '',
+    `Respond with ONLY a single JSON object (no prose, no code fences):`,
+    `{"match": <true|false>, "score": <0-100>, "recommendation": "accept|fix|stop", "discrepancies": [{"area":"<where, incl. which band>","issue":"<what's wrong vs the reference>","severity":"high|med|low"}]}`,
+    `- "match": true ONLY if visually near-identical (no high/med discrepancies) across all bands.`,
+    `- "recommendation": "accept" = good enough; "fix" = real fixable discrepancies remain; "stop" = broken / not converging.`,
+    `List every concrete difference; be specific and actionable.`,
+  ].filter(Boolean).join('\n');
+}
+
 function fixPrompt(frameName: string, refPath: string, candPath: string, v: Verdict, userNotes?: string): string {
   const items = v.discrepancies.map((d, i) => `  ${i + 1}. [${d.severity ?? 'med'}] ${d.area ? d.area + ': ' : ''}${d.issue}`).join('\n');
   const notes = (userNotes ?? '').trim();
@@ -472,22 +517,75 @@ function parseVerdict(text: string): Verdict {
   } catch { return fail('verify output JSON was malformed'); }
 }
 
+// ── BUILD-ONCE GUARD (RFC §4.6) ──────────────────────────────────────────────
+// The old loop ran a full `flutter build web --release` (or `npm run build`) on
+// EVERY verify iteration — up to 6×N builds at N=100, the dominant wall-clock cost
+// and the reason the parallel pool buys little. The fully-correct fix (a held dev
+// server hot-swapping the entrypoint per iteration) is a larger change; the SAFE
+// SUBSET we land here:
+//   (a) a content-hash GUARD over the screen's source (lib/ for Flutter, src/ +
+//       config for web) + the target entrypoint: re-verifies whose source is
+//       byte-identical to the last successful build REUSE that build instead of
+//       rebuilding. A fix pass changes source so it rebuilds; a transient
+//       screenshot retry / unchanged re-verify does not.
+//   (b) Flutter builds default to the FASTER non-`--release` web build (the
+//       dev/profile compiler), opt back into release with RELAY_PREVIEW_RELEASE=1.
+// TODO(P1, RFC §4.6 full): hold ONE persistent dev server (`flutter run -d
+// web-server` / `vite dev`) per run and hot-swap only the preview entrypoint per
+// screen/iteration — removes even the incremental rebuild. Deferred (needs a
+// long-lived process lifecycle + readiness/recompile signaling), guarded behind
+// this build-once subset so it stays correct + compiling in the meantime.
+const FLUTTER_RELEASE_PREVIEW = process.env.RELAY_PREVIEW_RELEASE === '1';
+
+/** Hash the source that determines a build's output, so an unchanged re-verify can
+ *  skip the rebuild. Walks the framework's source dir(s) + the target entrypoint;
+ *  cheap (mtime+size) so it doesn't read every byte of a large project. */
+function sourceFingerprint(projectRoot: string, framework: string, target: string): string {
+  const fw = framework.toLowerCase();
+  const roots = fw === 'flutter'
+    ? ['lib', 'pubspec.yaml', 'pubspec.lock']
+    : ['src', 'package.json', 'index.html', 'vite.config.ts', 'vite.config.js'];
+  const parts: string[] = [target];
+  const walk = (rel: string): void => {
+    const abs = path.join(projectRoot, rel);
+    let st: fsSync.Stats;
+    try { st = fsSync.statSync(abs); } catch { return; }
+    if (st.isDirectory()) {
+      let entries: string[] = [];
+      try { entries = fsSync.readdirSync(abs); } catch { return; }
+      for (const e of entries.sort()) walk(path.join(rel, e));
+    } else {
+      parts.push(`${rel}:${st.size}:${Math.round(st.mtimeMs)}`);
+    }
+  };
+  for (const r of roots) walk(r);
+  return crypto.createHash('sha1').update(parts.join('\n')).digest('hex');
+}
+// Per-project last successful build: fingerprint of the source + the served output
+// dir. A matching fingerprint means the existing build/web (or dist/) is still
+// valid → reuse it (no rebuild). Cleared implicitly when the fingerprint changes.
+const lastBuild = new Map<string, { fingerprint: string; outDir: string }>();
+
 // ── render the preview entrypoint of the REAL project to a PNG ────────────────
 // Builds the screen's standalone entrypoint within the actual project (real
 // theme/fonts/router) and screenshots it. Returns the PNG or a build-error tail.
-// TODO(P1): build-once/hot-swap. RFC §4.6 wants ONE bundle build per run with the
-// preview entrypoint hot-swapped per iteration, instead of a full release build
-// every verify pass (up to 6×N builds at N=100). The trustworthy-verify half of
-// §4.6 (same-scale + full-height capture) ships here now; the build-once half is
-// deferred because it needs a persistent dev server / incremental compiler held
-// across iterations (flutter run -d web-server / vite dev + entry swap), which is
-// a larger, separate change. Each iteration still does a fresh release build.
+// Build-once subset (above) skips the rebuild when source is unchanged.
 async function renderPreview(
   projectRoot: string, framework: string, previewEntry: string | undefined,
   width: number, height: number, env: NodeJS.ProcessEnv,
-  shot: { deviceScale?: number; fullPage?: boolean } = {},
-): Promise<{ png?: Buffer; error?: string }> {
+  shot: { deviceScale?: number; fullPage?: boolean; tiles?: boolean } = {},
+): Promise<{ png?: Buffer; tiles?: Buffer[]; error?: string }> {
   const fw = framework.toLowerCase();
+  // Capture the screenshot (or vertical tiles for a tall reference) from a served
+  // dir, shared by the cached + freshly-built paths.
+  const capture = async (url: string): Promise<{ png?: Buffer; tiles?: Buffer[]; error?: string }> => {
+    if (shot.tiles) {
+      const tiles = await captureUrlTiles(url, width, height, 60000, { deviceScale: shot.deviceScale });
+      return tiles?.length ? { tiles } : { error: 'tiled screenshot of built app failed' };
+    }
+    const png = await captureUrlScreenshot(url, width, height, 60000, shot);
+    return png ? { png } : { error: 'screenshot of built app failed' };
+  };
   try {
     if (fw === 'flutter') {
       const flutter = path.join(getFlutterRoot(), 'bin', 'flutter');
@@ -496,36 +594,51 @@ async function renderPreview(
         await execFile(flutter, ['create', '--platforms=web', '.'], { cwd: projectRoot, env, timeout: 180000, maxBuffer: 10 * 1024 * 1024 });
       }
       const target = previewEntry && fsSync.existsSync(path.join(projectRoot, previewEntry)) ? previewEntry : 'lib/main.dart';
-      const args = ['build', 'web', '--release', '-t', target];
-      try {
-        await execFile(flutter, args, { cwd: projectRoot, env, timeout: 360000, maxBuffer: 10 * 1024 * 1024 });
-      } catch (e: any) {
-        return { error: `flutter build web failed:\n${`${e?.stdout || ''}\n${e?.stderr || e?.message || ''}`.trim().slice(-1500)}` };
-      }
       const webDir = path.join(projectRoot, 'build', 'web');
-      if (!fsSync.existsSync(path.join(webDir, 'index.html'))) return { error: 'flutter build produced no web output' };
+      // Build-once guard: reuse the existing build when the source is unchanged.
+      const fp = sourceFingerprint(projectRoot, fw, target);
+      const cached = lastBuild.get(projectRoot);
+      const reuse = cached && cached.fingerprint === fp && cached.outDir === webDir
+        && fsSync.existsSync(path.join(webDir, 'index.html'));
+      if (!reuse) {
+        const args = ['build', 'web', ...(FLUTTER_RELEASE_PREVIEW ? ['--release'] : []), '-t', target];
+        try {
+          await execFile(flutter, args, { cwd: projectRoot, env, timeout: 360000, maxBuffer: 10 * 1024 * 1024 });
+        } catch (e: any) {
+          lastBuild.delete(projectRoot);
+          return { error: `flutter build web failed:\n${`${e?.stdout || ''}\n${e?.stderr || e?.message || ''}`.trim().slice(-1500)}` };
+        }
+        if (!fsSync.existsSync(path.join(webDir, 'index.html'))) { lastBuild.delete(projectRoot); return { error: 'flutter build produced no web output' }; }
+        lastBuild.set(projectRoot, { fingerprint: fp, outDir: webDir });
+      }
       const srv = await serveDir(webDir);
-      try {
-        const png = await captureUrlScreenshot(srv.url, width, height, 60000, shot);
-        return png ? { png } : { error: 'screenshot of built Flutter app failed' };
-      } finally { srv.close(); }
+      try { return await capture(srv.url); } finally { srv.close(); }
     }
 
     // Web (Vite/React/Next static export). Best-effort: build, serve the output
     // dir, navigate to the preview route if one was provided.
-    try {
-      await execFile('npm', ['run', 'build'], { cwd: projectRoot, env, timeout: 360000, maxBuffer: 10 * 1024 * 1024 });
-    } catch (e: any) {
-      return { error: `web build (npm run build) failed:\n${`${e?.stdout || ''}\n${e?.stderr || e?.message || ''}`.trim().slice(-1500)}` };
+    const target = previewEntry && previewEntry.startsWith('/') ? previewEntry : 'lib/main.dart';
+    const fp = sourceFingerprint(projectRoot, fw, target);
+    const cached = lastBuild.get(projectRoot);
+    let outDir = cached && cached.fingerprint === fp && fsSync.existsSync(path.join(cached.outDir, 'index.html'))
+      ? cached.outDir : '';
+    if (!outDir) {
+      try {
+        await execFile('npm', ['run', 'build'], { cwd: projectRoot, env, timeout: 360000, maxBuffer: 10 * 1024 * 1024 });
+      } catch (e: any) {
+        lastBuild.delete(projectRoot);
+        return { error: `web build (npm run build) failed:\n${`${e?.stdout || ''}\n${e?.stderr || e?.message || ''}`.trim().slice(-1500)}` };
+      }
+      const found = ['dist', 'out', 'build'].map(d => path.join(projectRoot, d)).find(d => fsSync.existsSync(path.join(d, 'index.html')));
+      if (!found) { lastBuild.delete(projectRoot); return { error: 'web build produced no servable output (dist/ out/ build/)' }; }
+      outDir = found;
+      lastBuild.set(projectRoot, { fingerprint: fp, outDir });
     }
-    const outDir = ['dist', 'out', 'build'].map(d => path.join(projectRoot, d)).find(d => fsSync.existsSync(path.join(d, 'index.html')));
-    if (!outDir) return { error: 'web build produced no servable output (dist/ out/ build/)' };
     const srv = await serveDir(outDir);
     try {
       const route = previewEntry && previewEntry.startsWith('/') ? previewEntry : '';
       const url = route ? `${srv.url.replace(/\/index\.html$/, '')}${route}` : srv.url;
-      const png = await captureUrlScreenshot(url, width, height, 60000, shot);
-      return png ? { png } : { error: 'screenshot of built web app failed' };
+      return await capture(url);
     } finally { srv.close(); }
   } catch (e: any) {
     return { error: e?.message || 'preview render failed' };
@@ -618,20 +731,39 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     // use THIS screen's snapshotted previewEntry/framework (captured right after its
     // own agent call) — NOT a fresh read of the shared last-gen.json, which a sibling
     // worker may have overwritten with a different screen between our agent + build.
+    // P1 (RFC §4.6): tall screens are captured as vertical tiles (full-res bands)
+    // rather than one downsampled full-page image so the lower portion is judged at
+    // the right resolution.
+    const tall = height > TALL_FRAME_THRESHOLD;
     const shot = await withBuildLock(projectRoot, () =>
-      renderPreview(projectRoot, screenFramework, screenPreviewEntry, width, height, env, CAPTURE_SHOT_OPTS),
+      renderPreview(projectRoot, screenFramework, screenPreviewEntry, width, height, env,
+        tall ? { deviceScale: REF_DEVICE_SCALE, tiles: true } : CAPTURE_SHOT_OPTS),
     );
 
     let verdict: Verdict;
     let candRel: string | null = null;
-    if (shot.error || !shot.png) {
+    const hasShot = !shot.error && (shot.png || (shot.tiles && shot.tiles.length));
+    if (!hasShot) {
       // A failed build IS a failure to fix — feed the compiler error back (and
       // keep fixing: a build error is exactly what another pass should repair).
       verdict = { match: false, score: 0, discrepancies: [{ area: 'build', issue: shot.error || 'the screen failed to build/screenshot', severity: 'high' }], recommendation: 'fix' };
       appendJobLog(jobId, `[loop] verify ${iter}: build/screenshot failed`);
+    } else if (shot.tiles && shot.tiles.length) {
+      // Tiled tall-screen verify: persist every band, compare the stack to the ref.
+      const tileRels: string[] = [];
+      for (let t = 0; t < shot.tiles.length; t++) {
+        const rel = path.join(relScreenDir, `cand-${iter}-tile${t + 1}.png`);
+        await fs.writeFile(path.join(projectRoot, rel), shot.tiles[t]);
+        tileRels.push(rel);
+      }
+      candRel = tileRels[0];
+      lastCandRel = tileRels[0];   // first band is the representative thumbnail for review
+      appendJobLog(jobId, `[loop] verify ${iter}: comparing to reference (${tileRels.length} tiles)`);
+      const v = await runModel(model, tiledVerifyPrompt(referenceImagePath, tileRels, frameName, prevScore, req.userNotes), env, projectRoot, { agent: true, modelId, jobId, projectId: req.projectId });
+      verdict = parseVerdict(v.text);
     } else {
       const candAbs = path.join(screenDir, `cand-${iter}.png`);
-      await fs.writeFile(candAbs, shot.png);
+      await fs.writeFile(candAbs, shot.png!);
       candRel = path.join(relScreenDir, `cand-${iter}.png`);
       lastCandRel = candRel;
       appendJobLog(jobId, `[loop] verify ${iter}: comparing to reference`);
@@ -662,25 +794,55 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     await snapshotLastGen();   // re-capture in case the fix moved/renamed the previewEntry (audit A.2)
   }
 
+  // P3 (RFC §4.5): DETERMINISTIC RECONCILIATION GATE (no LLM). The visual loop only
+  // judges appearance — it never catches an invented route, an un-imported theme, or
+  // inline colour/text literals. Grep the just-built screen on disk for structural
+  // drift; a HIGH-severity flag DEMOTES even a visual match to needs-review (with the
+  // recon reason) so it isn't shipped silently. No-op without canonical context, so
+  // existing per-frame runs are unaffected.
+  let recon: ReconcileResult | null = null;
+  try {
+    recon = await reconcileScreen({
+      projectRoot, framework: screenFramework, canonical: req.canonical, canonicalId: req.canonicalId,
+      previewEntry: screenPreviewEntry,
+    });
+    if (recon.flags.length) appendJobLog(jobId, `[loop] ${reconcileSummary(recon)}`);
+  } catch { /* recon is best-effort — never block on a grep error */ }
+  const reconBlocked = !!recon && !recon.ok;
+  if (reconBlocked && matched) {
+    matched = false;
+    stopReason = `reconciliation failed (${recon!.flags.filter(f => f.severity === 'high').map(f => f.code).join(', ')})`;
+  }
+
+  // P5 (RFC §4.8): AMENDMENT EMITTER. The packet instructs the agent to write
+  // .uix/amendment-request.json when it legitimately needs a route/component not in
+  // the plan. Read it here and store the amendment(s) (whitelisted → auto-approved +
+  // skeleton regen; else pending for the rolling gate). Consume the file so it isn't
+  // re-read for the next screen. No-op (no file) for the common case.
+  if (req.runId) { try { await consumeAmendmentRequests(req.projectId, req.runId, projectRoot, frameId, jobId); } catch { /* non-fatal */ } }
+
   const result = {
     frameId, frameName, framework, matched, accepted, stopReason,
     iterations: iterationsRun, maxIterations,
     finalVerdict, sessionId: session,
+    reconciliation: recon ? { ok: recon.ok, flags: recon.flags } : undefined,
     referenceImage: referenceImagePath,
     candidateImage: lastCandRel ?? undefined,
     ir: req.tree ? path.join(relScreenDir, 'ir.txt') : undefined,
     at: new Date().toISOString(),
   };
   await fs.writeFile(path.join(screenDir, 'result.json'), JSON.stringify(result, null, 2));
-  // RFC §4.7: `done` requires a TRUSTWORTHY visual match. A screen that only the
-  // automated verify "accepted" (not matched), plateaued, was stopped, or hit the
-  // cap is NOT shipped silently — it goes to the needs-review queue for a human to
-  // Accept as-is or Corrected-retry. Only matched:true is marked 'done' here.
+  // RFC §4.7: `done` requires a TRUSTWORTHY visual match AND a clean reconciliation.
+  // A screen that only the automated verify "accepted" (not matched), plateaued, was
+  // stopped, hit the cap, OR failed reconciliation is NOT shipped silently — it goes
+  // to the needs-review queue. Only matched:true (recon-clean) is marked 'done'.
   if (req.runId) {
     try {
       if (matched) {
         await updateRunScreen(req.projectId, req.runId, frameId, { status: 'done', matched: true, sessionId: session, review: undefined });
       } else {
+        // Surface recon flags alongside the visual discrepancies in the review queue.
+        const reconDiscs = (recon?.flags ?? []).map(f => ({ area: `recon:${f.code}`, issue: f.message, severity: f.severity }));
         await updateRunScreen(req.projectId, req.runId, frameId, {
           status: 'needs-review', matched: false, sessionId: session,
           review: {
@@ -688,7 +850,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
             referenceImagePath,
             score: finalVerdict?.score,
             reason: stopReason,
-            discrepancies: finalVerdict?.discrepancies,
+            discrepancies: [...(finalVerdict?.discrepancies ?? []), ...reconDiscs],
           },
         });
       }
@@ -755,6 +917,8 @@ async function buildRunScreen(
     implementPrompt: `${contract}\n\n— — —\nNOW BUILD THIS SCREEN:\n${cleanPacket}`,
     tree: hygieneIR(screen.spec.tree), maxIterations: run.maxIterations, jobId, runId,
     userNotes: run.userNotes, verify: run.verify, freshSession: fresh,
+    // P3 (RFC §4.5): canonical context for the reconciliation gate (no-op without it).
+    canonical, canonicalId: canonicalCtx?.screen.canonicalId,
   };
   try {
     return await runScreenLoop(sreq, projectRoot, jobId);
@@ -1047,6 +1211,8 @@ async function retryScreenLoop(projectId: string, runId: string, frameId: string
       implementPrompt: `${contract}\n\n— — —\n${correction}\n\n— — —\nNOW REVISE THIS SCREEN:\n${hygieneIR(screen.spec.packet) ?? screen.spec.packet}`,
       tree: hygieneIR(screen.spec.tree), maxIterations: run.maxIterations, jobId: startJobId, runId,
       userNotes: [run.userNotes?.trim(), note.trim()].filter(Boolean).join('\n\n'), verify: run.verify,
+      // P3 (RFC §4.5): reconciliation gate also applies to a corrected-retry.
+      canonical, canonicalId: canonical?.frameMap[frameId],
     };
     try {
       const sess = await runScreenLoop(sreq, projectRoot, startJobId);
@@ -1116,6 +1282,43 @@ async function regenSkeletonForRun(projectId: string, run: BuildRun): Promise<vo
     await appendRunLog(projectId, run.id, `[amend] skeleton regenerated for plan v${run.planVersion ?? 1}: ${sk.files.length} file(s), ${sk.routes.length} route(s)`);
   } catch (e: any) {
     await appendRunLog(projectId, run.id, `[amend] skeleton regen failed (continuing): ${e?.message || 'unknown'}`);
+  }
+}
+
+// ── P5 (RFC §4.8): AMENDMENT EMITTER — orchestrator side ─────────────────────
+// The build packet tells the agent to write .uix/amendment-request.json when it
+// legitimately needs a route/component not in the plan. After a screen builds we
+// read that file (a single request or an array), record each via addAmendment
+// (whitelisted classes auto-approve + regen the skeleton; else they queue pending
+// for the rolling gate), then DELETE the file so it isn't re-applied next screen.
+// No-op when the file is absent (the common case).
+interface AmendmentFileEntry { kind?: string; rationale?: string; proposedApi?: string }
+async function consumeAmendmentRequests(
+  projectId: string, runId: string, projectRoot: string, fromFrameId: string, jobId: string,
+): Promise<void> {
+  const file = path.join(projectRoot, '.uix', 'amendment-request.json');
+  let raw: string;
+  try { raw = await fs.readFile(file, 'utf8'); } catch { return; }   // no request → no-op
+  // Consume immediately so a parse/store failure can't loop on a poison file.
+  try { await fs.rm(file, { force: true }); } catch { /* ignore */ }
+  let entries: AmendmentFileEntry[] = [];
+  try {
+    const parsed = JSON.parse(raw);
+    entries = Array.isArray(parsed) ? parsed : [parsed];
+  } catch {
+    appendJobLog(jobId, `[loop] amendment-request.json was malformed — ignored`);
+    return;
+  }
+  for (const e of entries) {
+    const kind = e?.kind === 'add-route' || e?.kind === 'add-component' ? e.kind as AmendmentKind : null;
+    const proposedApi = typeof e?.proposedApi === 'string' ? e.proposedApi.trim() : '';
+    if (!kind || !proposedApi) { appendJobLog(jobId, `[loop] amendment skipped — needs kind ('add-route'|'add-component') + proposedApi`); continue; }
+    const rationale = typeof e?.rationale === 'string' ? e.rationale.trim() : '';
+    const result = await addAmendment(projectId, runId, { kind, rationale, proposedApi, fromFrameId });
+    if (!result) continue;
+    const { run, amendment } = result;
+    await appendRunLog(projectId, runId, `[amend] ${amendment.kind} "${amendment.proposedApi}" requested by "${fromFrameId}" — ${amendment.status}${amendment.auto ? ' (auto, whitelisted)' : ' (queued for rolling-gate approval)'}`);
+    if (amendment.status === 'approved') await regenSkeletonForRun(projectId, run);
   }
 }
 
