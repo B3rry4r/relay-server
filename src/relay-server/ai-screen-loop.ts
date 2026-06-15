@@ -25,7 +25,7 @@ import fsSync from 'node:fs';
 import path from 'node:path';
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
-import { resolveProjectRoot, resolveWorkspace, createTerminalEnv, getFlutterRoot } from './runtime';
+import { resolveProjectRoot, resolveWorkspace, createTerminalEnv, getFlutterRoot, resolveProjectRelativePath } from './runtime';
 import { runModel } from './ai-routes';
 import { startJobLog, appendJobLog, finishJobLog, subscribeJobLog } from './ai-job-log';
 import { captureUrlScreenshot, serveDir } from './visual-routes';
@@ -78,6 +78,12 @@ interface LastGen {
 }
 
 const sanitizeId = (id: string) => id.replace(/[^a-zA-Z0-9._-]+/g, '_');
+
+// References are exported @2× by the renderer (a 393px frame → 786px PNG). To make
+// "match" verdicts trustworthy (RFC §4.6) the candidate MUST be captured at the
+// SAME scale and at FULL height (not clipped to the device viewport).
+const REF_DEVICE_SCALE = 2;
+const CAPTURE_SHOT_OPTS = { deviceScale: REF_DEVICE_SCALE, fullPage: true } as const;
 
 const routeNameFor = (name: string): string =>
   '/' + ((name || 'screen').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'screen');
@@ -180,9 +186,17 @@ function parseVerdict(text: string): Verdict {
 // ── render the preview entrypoint of the REAL project to a PNG ────────────────
 // Builds the screen's standalone entrypoint within the actual project (real
 // theme/fonts/router) and screenshots it. Returns the PNG or a build-error tail.
+// TODO(P1): build-once/hot-swap. RFC §4.6 wants ONE bundle build per run with the
+// preview entrypoint hot-swapped per iteration, instead of a full release build
+// every verify pass (up to 6×N builds at N=100). The trustworthy-verify half of
+// §4.6 (same-scale + full-height capture) ships here now; the build-once half is
+// deferred because it needs a persistent dev server / incremental compiler held
+// across iterations (flutter run -d web-server / vite dev + entry swap), which is
+// a larger, separate change. Each iteration still does a fresh release build.
 async function renderPreview(
   projectRoot: string, framework: string, previewEntry: string | undefined,
   width: number, height: number, env: NodeJS.ProcessEnv,
+  shot: { deviceScale?: number; fullPage?: boolean } = {},
 ): Promise<{ png?: Buffer; error?: string }> {
   const fw = framework.toLowerCase();
   try {
@@ -203,7 +217,7 @@ async function renderPreview(
       if (!fsSync.existsSync(path.join(webDir, 'index.html'))) return { error: 'flutter build produced no web output' };
       const srv = await serveDir(webDir);
       try {
-        const png = await captureUrlScreenshot(srv.url, width, height, 60000);
+        const png = await captureUrlScreenshot(srv.url, width, height, 60000, shot);
         return png ? { png } : { error: 'screenshot of built Flutter app failed' };
       } finally { srv.close(); }
     }
@@ -221,7 +235,7 @@ async function renderPreview(
     try {
       const route = previewEntry && previewEntry.startsWith('/') ? previewEntry : '';
       const url = route ? `${srv.url.replace(/\/index\.html$/, '')}${route}` : srv.url;
-      const png = await captureUrlScreenshot(url, width, height, 60000);
+      const png = await captureUrlScreenshot(url, width, height, 60000, shot);
       return png ? { png } : { error: 'screenshot of built web app failed' };
     } finally { srv.close(); }
   } catch (e: any) {
@@ -259,6 +273,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
   let stopReason = 'reached iteration cap';
   let iterationsRun = 0;
   let prevScore: number | null = null;
+  let lastCandRel: string | null = null;   // newest candidate screenshot (for review)
 
   // 1. IMPLEMENT
   appendJobLog(jobId, `[loop] implement: "${frameName}"`);
@@ -286,7 +301,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     iterationsRun = iter;
     const lastGen = await readLastGen(projectRoot);
     appendJobLog(jobId, `[loop] verify ${iter}/${maxIterations}: building & screenshotting`);
-    const shot = await renderPreview(projectRoot, lastGen.framework || framework, lastGen.previewEntry, width, height, env);
+    const shot = await renderPreview(projectRoot, lastGen.framework || framework, lastGen.previewEntry, width, height, env, CAPTURE_SHOT_OPTS);
 
     let verdict: Verdict;
     let candRel: string | null = null;
@@ -299,6 +314,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
       const candAbs = path.join(screenDir, `cand-${iter}.png`);
       await fs.writeFile(candAbs, shot.png);
       candRel = path.join(relScreenDir, `cand-${iter}.png`);
+      lastCandRel = candRel;
       appendJobLog(jobId, `[loop] verify ${iter}: comparing to reference`);
       const v = await runModel(model, verifyPrompt(referenceImagePath, candRel, frameName, prevScore, req.userNotes), env, projectRoot, { agent: true, modelId, jobId, projectId: req.projectId });
       verdict = parseVerdict(v.text);
@@ -331,14 +347,34 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     iterations: iterationsRun, maxIterations,
     finalVerdict, sessionId: session,
     referenceImage: referenceImagePath,
+    candidateImage: lastCandRel ?? undefined,
     ir: req.tree ? path.join(relScreenDir, 'ir.txt') : undefined,
     at: new Date().toISOString(),
   };
   await fs.writeFile(path.join(screenDir, 'result.json'), JSON.stringify(result, null, 2));
-  // Mark this screen DONE in its durable run (the screen built; matched is a
-  // quality flag, not a completion flag).
-  if (req.runId) { try { await updateRunScreen(req.projectId, req.runId, frameId, { status: 'done', matched, sessionId: session }); } catch { /* non-fatal */ } }
-  finishJobLog(jobId, `[loop] done: "${frameName}" ${matched ? 'MATCHED' : accepted ? 'accepted' : 'needs review'} after ${iterationsRun} iteration(s) — ${stopReason}`);
+  // RFC §4.7: `done` requires a TRUSTWORTHY visual match. A screen that only the
+  // automated verify "accepted" (not matched), plateaued, was stopped, or hit the
+  // cap is NOT shipped silently — it goes to the needs-review queue for a human to
+  // Accept as-is or Corrected-retry. Only matched:true is marked 'done' here.
+  if (req.runId) {
+    try {
+      if (matched) {
+        await updateRunScreen(req.projectId, req.runId, frameId, { status: 'done', matched: true, sessionId: session, review: undefined });
+      } else {
+        await updateRunScreen(req.projectId, req.runId, frameId, {
+          status: 'needs-review', matched: false, sessionId: session,
+          review: {
+            candidateImagePath: lastCandRel ?? undefined,
+            referenceImagePath,
+            score: finalVerdict?.score,
+            reason: stopReason,
+            discrepancies: finalVerdict?.discrepancies,
+          },
+        });
+      }
+    } catch { /* non-fatal */ }
+  }
+  finishJobLog(jobId, `[loop] done: "${frameName}" ${matched ? 'MATCHED' : 'needs review'} after ${iterationsRun} iteration(s) — ${stopReason}`);
   return session;
 }
 
@@ -413,15 +449,78 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
       return;
     }
     const done = await getRun(projectId, runId);
+    const total = done?.screens.length ?? 0;
     const built = done?.screens.filter(s => s.status === 'done').length ?? 0;
-    await setRunStatus(projectId, runId, 'done');
-    await appendRunLog(projectId, runId, `[run] complete — ${built}/${done?.screens.length ?? 0} built`);
+    const needsReview = done?.screens.filter(s => s.status === 'needs-review').length ?? 0;
+    // RFC §4.7: a run does NOT report complete while needs-review > 0 — it parks in
+    // 'needs-review' until a human Accepts / Corrected-retries every queued screen.
+    if (needsReview > 0) {
+      await setRunStatus(projectId, runId, 'needs-review');
+      await appendRunLog(projectId, runId, `[run] paused for review — ${built}/${total} matched, ${needsReview} need review`);
+    } else {
+      await setRunStatus(projectId, runId, 'done');
+      await appendRunLog(projectId, runId, `[run] complete — ${built}/${total} built`);
+    }
   } catch (e: any) {
     await appendRunLog(projectId, runId, `[run] error: ${e?.message || 'unknown'}`);
   } finally {
     unsub();
     clearRunActive(runId);
     clearRunCancelled(runId);
+  }
+}
+
+// ── Needs-review: human Corrected-retry (RFC §4.7) ─────────────────────────────
+// Re-build ONE needs-review screen with a concrete human correction note injected
+// into a fresh fix pass (the automated 3-pass loop already failed, so the human's
+// input is what's new). Runs server-side like the main loop; survives tab close.
+async function retryScreenLoop(projectId: string, runId: string, frameId: string, note: string): Promise<void> {
+  const jobKey = `${runId}:${frameId}`;
+  if (isRunActive(jobKey)) return;
+  markRunActive(jobKey);
+  const projectRoot = resolveProjectRoot(projectId);
+  if (!projectRoot || !fsSync.existsSync(projectRoot)) { clearRunActive(jobKey); return; }
+  const unsub = subscribeJobLog((e) => {
+    if (e.kind !== 'line' || !e.line || !e.jobKey.startsWith(`${runId}:`)) return;
+    void appendRunLog(projectId, runId, e.line);
+  });
+  try {
+    const run = await getRun(projectId, runId);
+    const screen = run?.screens.find(s => s.frameId === frameId);
+    if (!run || !screen || !screen.spec) {
+      await appendRunLog(projectId, runId, `[review] retry skipped "${frameId}" — no build spec`);
+      return;
+    }
+    await updateRunScreen(projectId, runId, frameId, { status: 'building' });
+    const appPlan = buildAppPlan(run);
+    // The human correction is authoritative and injected up-front so the fresh pass
+    // acts on it (the previous automated discrepancies didn't converge).
+    const correction = `HUMAN CORRECTION (authoritative — the automated loop did NOT converge; apply this specific guidance):\n${note}`;
+    const startJobId = jobKey;
+    startJobLog(startJobId, { projectId, firstLine: `[loop] corrected-retry "${screen.frameName}"` });
+    await appendRunLog(projectId, runId, `[review] corrected-retry "${screen.frameName}": ${note.replace(/\s+/g, ' ').trim()}`);
+    const sreq: BuildScreenReq = {
+      projectId, model: run.model as AIModel, modelId: run.modelId, sessionId: screen.sessionId || run.sessionId,
+      framework: run.framework || 'flutter', frameId, frameName: screen.frameName,
+      width: screen.spec.width, height: screen.spec.height,
+      referenceImagePath: screen.spec.referenceImagePath,
+      implementPrompt: `${appPlan}\n\n— — —\n${correction}\n\n— — —\nNOW REVISE THIS SCREEN:\n${screen.spec.packet}`,
+      tree: screen.spec.tree, maxIterations: run.maxIterations, jobId: startJobId, runId,
+      userNotes: [run.userNotes?.trim(), note.trim()].filter(Boolean).join('\n\n'), verify: run.verify,
+    };
+    try {
+      const sess = await runScreenLoop(sreq, projectRoot, startJobId);
+      if (sess) await setRunSession(projectId, runId, sess);
+    } catch (e: any) {
+      appendJobLog(startJobId, `[loop] error: ${e?.message || 'unknown'}`);
+      finishJobLog(startJobId, '[loop] failed');
+      await updateRunScreen(projectId, runId, frameId, { status: 'needs-review' });
+    }
+    // Re-derive the run status: if this was the last needs-review screen and it now
+    // matched, deriveStatus (via updateRunScreen) already flipped the run to 'done'.
+  } finally {
+    unsub();
+    clearRunActive(jobKey);
   }
 }
 
@@ -551,12 +650,75 @@ export function registerScreenLoopRoutes(app: Express): void {
     res.json({ stopped: true });
   });
 
+  // ── Needs-review workflow (RFC §4.7) ─────────────────────────────────────────
+  // POST /api/ai/runs/:runId/accept { projectId, frameId } — human accepts a
+  // needs-review screen AS-IS. Marks it 'done' (matched stays false; accepted by a
+  // human). If it was the last needs-review screen the run flips to 'done'.
+  app.post('/api/ai/runs/:runId/accept', async (req, res) => {
+    const b = req.body ?? {};
+    const projectId = b.projectId as string;
+    const frameId = b.frameId as string;
+    if (!projectId || !frameId) { res.status(400).json({ error: 'projectId and frameId are required' }); return; }
+    const runId = req.params.runId;
+    const run = await getRun(projectId, runId);
+    if (!run) { res.status(404).json({ error: 'run not found' }); return; }
+    const screen = run.screens.find(s => s.frameId === frameId);
+    if (!screen) { res.status(404).json({ error: 'screen not found in run' }); return; }
+    if (screen.status !== 'needs-review') { res.status(409).json({ error: `screen is not needs-review (status: ${screen.status})` }); return; }
+    const updated = await updateRunScreen(projectId, runId, frameId, { status: 'done', review: undefined });
+    await appendRunLog(projectId, runId, `[review] accepted "${screen.frameName}" as-is (human)`);
+    res.json({ run: updated });
+  });
+
+  // POST /api/ai/runs/:runId/retry { projectId, frameId, note } — human Corrected-
+  // retry: rebuild this needs-review screen with the human's correction injected
+  // into a fresh fix pass. Returns immediately; the rebuild runs server-side.
+  app.post('/api/ai/runs/:runId/retry', async (req, res) => {
+    const b = req.body ?? {};
+    const projectId = b.projectId as string;
+    const frameId = b.frameId as string;
+    const note = typeof b.note === 'string' ? b.note.trim() : '';
+    if (!projectId || !frameId) { res.status(400).json({ error: 'projectId and frameId are required' }); return; }
+    if (!note) { res.status(400).json({ error: 'a correction note is required for a corrected-retry' }); return; }
+    const runId = req.params.runId;
+    const run = await getRun(projectId, runId);
+    if (!run) { res.status(404).json({ error: 'run not found' }); return; }
+    const screen = run.screens.find(s => s.frameId === frameId);
+    if (!screen) { res.status(404).json({ error: 'screen not found in run' }); return; }
+    if (isRunActive(`${runId}:${frameId}`)) { res.json({ started: false, alreadyRunning: true }); return; }
+    res.json({ started: true });
+    void retryScreenLoop(projectId, runId, frameId, note).catch((e: any) => {
+      void appendRunLog(projectId, runId, `[review] retry error: ${e?.message || 'unknown'}`);
+    });
+  });
+
   // GET /api/ai/runs/:runId/log?projectId= — the durable, replayable run log.
   app.get('/api/ai/runs/:runId/log', async (req, res) => {
     const projectId = req.query.projectId as string;
     if (!projectId) { res.status(400).json({ error: 'projectId is required' }); return; }
     const log = await readRunLog(projectId, req.params.runId);
     res.json({ log, active: isRunActive(req.params.runId) });
+  });
+
+  // GET /api/ai/review-image?projectId=&path= — serve a needs-review screenshot
+  // (candidate or reference PNG) as raw bytes. Path is sandboxed to the project's
+  // .uix dir so the Runs UI can show candidate-vs-reference inline.
+  app.get('/api/ai/review-image', async (req, res) => {
+    const projectId = req.query.projectId as string;
+    const rel = String(req.query.path || '');
+    if (!projectId || !rel) { res.status(400).json({ error: 'projectId and path are required' }); return; }
+    const projectRoot = resolveProjectRoot(projectId);
+    if (!projectRoot || !fsSync.existsSync(projectRoot)) { res.status(404).json({ error: 'project not found' }); return; }
+    const abs = resolveProjectRelativePath(projectRoot, rel);
+    // Only ever serve images out of .uix/ (refs + per-screen candidates live there).
+    if (!abs || !abs.startsWith(path.join(projectRoot, '.uix') + path.sep) || !fsSync.existsSync(abs)) {
+      res.status(404).json({ error: 'image not found' }); return;
+    }
+    try {
+      const ext = path.extname(abs).toLowerCase();
+      res.setHeader('Content-Type', ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : 'image/png');
+      res.end(await fs.readFile(abs));
+    } catch { res.status(500).json({ error: 'failed to read image' }); }
   });
 
   // GET /api/ai/runs?projectId= — list recent runs (newest first).

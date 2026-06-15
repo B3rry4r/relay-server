@@ -72,20 +72,38 @@ async function runStep(
 }
 
 /**
- * Screenshot a URL with headless Chrome at a fixed window size. Returns PNG
- * bytes, or null if Chrome isn't available / the capture fails.
+ * Screenshot a URL with headless Chrome. Returns PNG bytes, or null if Chrome
+ * isn't available / the capture fails.
+ *
+ * P1 (RFC §4.6): the candidate MUST be captured at the SAME device-scale as the
+ * reference render (refs are exported @2× → 786px wide for a 393px frame) and at
+ * FULL height, not clipped to the device viewport — otherwise long screens are
+ * judged at the wrong resolution and their lower portion is never seen, making
+ * "match" verdicts unreliable on exactly the big screens that matter.
+ *
+ * - `deviceScale` maps to --force-device-scale-factor (default 1; pass 2 to match
+ *   a 2× reference). The output PNG is then width·scale × height·scale px.
+ * - `fullPage` sizes the window tall enough to capture the whole document, so a
+ *   frame taller than the viewport is captured in full (no 852px clip).
  */
 export async function captureUrlScreenshot(
   url: string,
   width: number,
   height: number,
   timeoutMs = 30000,
+  opts: { deviceScale?: number; fullPage?: boolean } = {},
 ): Promise<Buffer | null> {
   const out = path.join(os.tmpdir(), `relay-shot-${Date.now()}-${Math.random().toString(36).slice(2)}.png`);
+  const scale = opts.deviceScale && opts.deviceScale > 0 ? opts.deviceScale : 1;
+  // For full-height capture, make the window very tall in CSS px so the whole
+  // page lands in one shot (headless captures the window, and --hide-scrollbars
+  // keeps the bar out of the frame). Cap it so a runaway-tall page can't OOM.
+  const winH = opts.fullPage ? Math.min(Math.max(Math.round(height), 4000), 20000) : Math.round(height);
   const args = [
     '--headless=new', '--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu',
-    '--disable-dev-shm-usage', '--hide-scrollbars', '--force-device-scale-factor=1',
-    `--window-size=${Math.round(width)},${Math.round(height)}`,
+    '--disable-dev-shm-usage', '--hide-scrollbars',
+    `--force-device-scale-factor=${scale}`,
+    `--window-size=${Math.round(width)},${winH}`,
     '--virtual-time-budget=8000',
     `--screenshot=${out}`,
     url,

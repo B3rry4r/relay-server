@@ -13,7 +13,11 @@ import * as fsSync from 'fs';
 import * as path from 'path';
 import { resolveProjectRoot } from './runtime';
 
-export type RunScreenStatus = 'pending' | 'building' | 'done' | 'failed';
+// 'needs-review' = built but NOT a trustworthy visual match (accepted-but-not-matched,
+// verify said stop, or the deterministic reconciliation failed). It is NOT 'done':
+// a run must not report complete while any screen is 'needs-review'. A human then
+// Accepts it as-is (→ 'done') or does a Corrected-retry (→ rebuild with a note).
+export type RunScreenStatus = 'pending' | 'building' | 'needs-review' | 'done' | 'failed';
 
 /** Everything the server needs to build ONE screen without the client. */
 export interface ScreenSpec {
@@ -23,6 +27,14 @@ export interface ScreenSpec {
   width?: number;
   height?: number;
 }
+/** The verify evidence surfaced in the needs-review UI (candidate vs reference). */
+export interface ReviewInfo {
+  candidateImagePath?: string;   // project-relative latest candidate screenshot
+  referenceImagePath?: string;   // project-relative reference render
+  score?: number;                // last verify score (0-100)
+  reason?: string;               // why it needs review (stopReason / recon failure)
+  discrepancies?: Array<{ area?: string; issue: string; severity?: string }>;
+}
 export interface RunScreen {
   frameId: string;
   frameName: string;
@@ -31,8 +43,13 @@ export interface RunScreen {
   sessionId?: string;
   at?: string;
   spec?: ScreenSpec;
+  /** Populated when status === 'needs-review' (candidate-vs-reference + verdict). */
+  review?: ReviewInfo;
 }
-export type RunStatus = 'running' | 'done' | 'stopped';
+// 'needs-review' = the orchestrator finished every screen but one or more landed in
+// the needs-review queue, so the run is NOT complete (it must not deploy) until a
+// human clears the queue. Distinct from 'running' (still building) and 'done'.
+export type RunStatus = 'running' | 'needs-review' | 'done' | 'stopped';
 
 /** Navigation flow graph — stored ON the run so the SERVER owns build order +
  *  the global app plan it injects into every screen's prompt (the flow shapes the
@@ -71,6 +88,9 @@ function rootFor(projectId: string): string | null {
 
 function deriveStatus(screens: RunScreen[]): RunStatus {
   if (screens.some(s => s.status === 'pending' || s.status === 'building')) return 'running';
+  // Built-but-unverified screens hold the run open for human review — a run must
+  // NOT report complete while needs-review > 0 (RFC §4.7).
+  if (screens.some(s => s.status === 'needs-review')) return 'needs-review';
   return 'done';
 }
 
@@ -174,7 +194,7 @@ export async function saveRun(projectId: string, run: BuildRun): Promise<void> {
 export async function restartRun(projectId: string, runId: string): Promise<BuildRun | null> {
   const run = await getRun(projectId, runId);
   if (!run) return null;
-  for (const s of run.screens) { s.status = 'pending'; s.matched = undefined; s.at = undefined; }
+  for (const s of run.screens) { s.status = 'pending'; s.matched = undefined; s.at = undefined; s.review = undefined; }
   run.sessionId = undefined;
   run.status = 'running';
   await saveRun(projectId, run);
