@@ -191,9 +191,13 @@ function rootFor(projectId: string): string | null {
 
 function deriveStatus(screens: RunScreen[]): RunStatus {
   if (screens.some(s => s.status === 'pending' || s.status === 'building')) return 'running';
-  // Built-but-unverified screens hold the run open for human review — a run must
-  // NOT report complete while needs-review > 0 (RFC §4.7).
-  if (screens.some(s => s.status === 'needs-review')) return 'needs-review';
+  // A run must NEVER report 'done' while a screen is 'failed' or 'needs-review'
+  // (audit A.1 — 'failed' silently fell through to 'done' = silent ship). Both
+  // hold the run open in the needs-review queue: a built-but-unverified screen and
+  // a screen that errored both require a human to Accept / Corrected-retry / restart
+  // before the run can complete or deploy (RFC §4.7). A 'failed' screen is surfaced
+  // as needs-review (the orchestrator attaches a review payload at the failure site).
+  if (screens.some(s => s.status === 'needs-review' || s.status === 'failed')) return 'needs-review';
   return 'done';
 }
 

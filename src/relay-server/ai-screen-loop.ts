@@ -99,12 +99,13 @@ const sanitizeId = (id: string) => id.replace(/[^a-zA-Z0-9._-]+/g, '_');
 // builds at once would clobber each other. We serialize ONLY that step per project:
 // agents think in parallel, the bundle builds one at a time. (RFC §4.6's build-once/
 // hot-swap would remove even this serialization; deferred — see renderPreview TODO.)
-// TODO(P2/P3): per-screen last-gen isolation. Today the implement agent writes a
-// single shared .uix/last-gen.json; the build mutex makes the build itself safe but
-// a sibling worker can still overwrite previewEntry between this screen's implement
-// and its verify. The robust fix is P3's write-locked deterministic skeleton (each
-// screen owns its file + route slot) — until then prefer parallel ≤ 2 and expect
-// the mutex to dominate wall-time on build-heavy frameworks.
+// Audit A.2 (FIXED): per-screen previewEntry isolation. The implement agent still
+// writes a single shared .uix/last-gen.json, but runScreenLoop now SNAPSHOTS this
+// screen's previewEntry right after its own agent call (snapshotLastGen) and feeds
+// that snapshot into the build — it no longer re-reads the shared file inside the
+// lock, so a sibling worker overwriting last-gen can't make worker A screenshot
+// worker B's screen. With that, parallel>1 verifies the right screen. (The mutex
+// still dominates wall-time on build-heavy frameworks until RFC §4.6 build-once.)
 const buildLocks = new Map<string, Promise<void>>();
 async function withBuildLock<T>(projectRoot: string, fn: () => Promise<T>): Promise<T> {
   const prev = buildLocks.get(projectRoot) ?? Promise.resolve();
@@ -187,8 +188,33 @@ function buildDesignDigest(run: import('./build-run-store').BuildRun): DesignDig
   return { colors: topN(colorCounts, 8), fonts: topN(fontCounts, 4), components };
 }
 
-function buildAppPlan(run: import('./build-run-store').BuildRun): string {
+/**
+ * Build a frameId → canonical route resolver. In canonical mode (RFC §4.2) routes
+ * MUST derive from canonical.screens / canonicalId (the single identity axis), NOT
+ * the mutable frameName — otherwise the skeleton (canonical routes) and the injected
+ * app plan / API surface (frameName routes) disagree and the agent is handed two
+ * route schemes (audit A.3). Every member frame (states/modals folded into a lead)
+ * resolves to its canonical screen's route. Returns null when not canonical so the
+ * legacy frameName scheme is used unchanged.
+ */
+function canonicalRouteResolver(canonical?: Canonical): ((frameId: string) => string) | null {
+  if (!canonical) return null;
+  const routeByFrame = new Map<string, string>();
+  for (const cs of canonical.screens) {
+    for (const fid of cs.frameIds) routeByFrame.set(fid, cs.route);
+    for (const st of cs.states) routeByFrame.set(st.frameId, cs.route);
+    for (const m of cs.modals) routeByFrame.set(m.frameId, cs.route);
+  }
+  return (frameId: string) => routeByFrame.get(frameId) ?? routeNameFor(frameId);
+}
+
+function buildAppPlan(run: import('./build-run-store').BuildRun, canonical?: Canonical): string {
   const nameById = new Map(run.screens.map(s => [s.frameId, s.frameName]));
+  // ONE route scheme: canonical (canonicalId-derived) when canonicalized, else the
+  // legacy frameName slug. Keyed on frameId so canonical + legacy agree (audit A.3).
+  const canonRoute = canonicalRouteResolver(canonical);
+  const routeFor = (frameId: string, frameName: string): string =>
+    canonRoute ? canonRoute(frameId) : routeNameFor(frameName);
   const out: string[] = [
     `APP PLAN — the COMPLETE, FIXED set of screens in this app. Wire navigation ONLY to these screens; NEVER create, invent, rename, or stub a screen that is not in this list. If a navigation target is not built yet, route to its route name below — a later step fills it in.`,
   ];
@@ -205,10 +231,10 @@ function buildAppPlan(run: import('./build-run-store').BuildRun): string {
   }
   if (run.flow?.entryFrameId) {
     const en = nameById.get(run.flow.entryFrameId) || run.flow.entryFrameId;
-    out.push(`Entry / start screen: "${en}" (route ${routeNameFor(en)}).`);
+    out.push(`Entry / start screen: "${en}" (route ${routeFor(run.flow.entryFrameId, en)}).`);
   }
   out.push(`Screens (name → route):`);
-  for (const s of run.screens) out.push(`- "${s.frameName}" → ${routeNameFor(s.frameName)}`);
+  for (const s of run.screens) out.push(`- "${s.frameName}" → ${routeFor(s.frameId, s.frameName)}`);
   if (run.flow?.connections?.length) {
     out.push(`Navigation graph (build these transitions, no dead ends):`);
     for (const c of run.flow.connections) {
@@ -256,11 +282,19 @@ async function readContextSlice(projectRoot: string): Promise<string> {
  * + the screens index from context.md. Kept as its own block so each screen builds
  * against a SHARED contract instead of re-inventing names per session.
  */
-function buildComponentApiSurface(run: import('./build-run-store').BuildRun): string {
+function buildComponentApiSurface(run: import('./build-run-store').BuildRun, canonical?: Canonical): string {
   const out: string[] = [
     `CANONICAL API SURFACE — the shared route/screen names every screen MUST build against (do NOT invent variants of these names; reuse them verbatim so cross-screen navigation resolves):`,
   ];
-  for (const s of run.screens) out.push(`- route ${routeNameFor(s.frameName)}  ⟶  screen "${s.frameName}"`);
+  // ONE route scheme — canonical routes when canonicalized (audit A.3), else legacy.
+  if (canonical) {
+    for (const cs of canonical.screens) out.push(`- route ${cs.route}  ⟶  screen "${cs.name}" (canonicalId ${cs.canonicalId})`);
+    if (canonical.components.length) {
+      for (const c of canonical.components) out.push(`- component ${c.name} (import from lib/components/)`);
+    }
+  } else {
+    for (const s of run.screens) out.push(`- route ${routeNameFor(s.frameName)}  ⟶  screen "${s.frameName}"`);
+  }
   // TODO(P2/P3): once canonicalization emits shared-component stubs with real
   // constructor signatures (RFC §4.2 deterministic skeleton), append each
   // component's API here (name + props) so screens import the exact signature
@@ -278,8 +312,9 @@ function buildComponentApiSurface(run: import('./build-run-store').BuildRun): st
  */
 function buildWrittenContract(
   run: import('./build-run-store').BuildRun, appPlan: string, contextSlice: string, freshSession: boolean,
+  canonical?: Canonical,
 ): string {
-  const parts: string[] = [appPlan, buildComponentApiSurface(run)];
+  const parts: string[] = [appPlan, buildComponentApiSurface(run, canonical)];
   if (contextSlice) {
     parts.push(
       [
@@ -532,10 +567,31 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
   let prevScore: number | null = null;
   let lastCandRel: string | null = null;   // newest candidate screenshot (for review)
 
+  // P2/P3 (audit A.2): PER-SCREEN previewEntry isolation. Parallel workers share one
+  // .uix/last-gen.json; the build mutex serialized the build+screenshot but a sibling
+  // worker could overwrite previewEntry between THIS screen's implement and its verify
+  // build → worker A would screenshot worker B's screen. We snapshot THIS screen's
+  // previewEntry/framework right after its OWN agent call returns (when last-gen still
+  // reflects this screen) and pass that snapshot into the build — never re-reading the
+  // shared file inside the lock. So parallel>1 verifies the right screen.
+  let screenPreviewEntry: string | undefined;
+  let screenFramework = framework;
+  const snapshotLastGen = async (): Promise<void> => {
+    const lastGen = await readLastGen(projectRoot);
+    // Only adopt a previewEntry that exists on disk for THIS screen (a stale/sibling
+    // entry is rejected so we don't capture the wrong screen). Falls back to the
+    // previous snapshot (or main.dart in renderPreview) when absent.
+    if (lastGen.previewEntry && fsSync.existsSync(path.join(projectRoot, lastGen.previewEntry))) {
+      screenPreviewEntry = lastGen.previewEntry;
+    }
+    if (lastGen.framework) screenFramework = lastGen.framework;
+  };
+
   // 1. IMPLEMENT
   appendJobLog(jobId, `[loop] implement: "${frameName}"`);
   const impl = await runModel(model, implementPrompt, env, projectRoot, { agent: true, modelId, jobId, projectId: req.projectId });
   if (impl.sessionId) session = impl.sessionId;
+  await snapshotLastGen();   // capture this screen's previewEntry before any sibling can clobber it
 
   // verify:false (or no reference render to compare against) → implement-only.
   // Write a result and mark the screen done so the run still completes.
@@ -557,13 +613,14 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
   for (let iter = 1; iter <= maxIterations; iter++) {
     iterationsRun = iter;
     appendJobLog(jobId, `[loop] verify ${iter}/${maxIterations}: building & screenshotting`);
-    // Read last-gen + build + screenshot under the per-project build lock so a
-    // sibling parallel worker can't clobber build/web or last-gen.json mid-build.
-    // (No-op for serial runs — the lock is uncontended.)
-    const shot = await withBuildLock(projectRoot, async () => {
-      const lastGen = await readLastGen(projectRoot);
-      return renderPreview(projectRoot, lastGen.framework || framework, lastGen.previewEntry, width, height, env, CAPTURE_SHOT_OPTS);
-    });
+    // Build + screenshot under the per-project build lock so a sibling parallel
+    // worker can't clobber build/web mid-build. (No-op for serial runs.) Audit A.2:
+    // use THIS screen's snapshotted previewEntry/framework (captured right after its
+    // own agent call) — NOT a fresh read of the shared last-gen.json, which a sibling
+    // worker may have overwritten with a different screen between our agent + build.
+    const shot = await withBuildLock(projectRoot, () =>
+      renderPreview(projectRoot, screenFramework, screenPreviewEntry, width, height, env, CAPTURE_SHOT_OPTS),
+    );
 
     let verdict: Verdict;
     let candRel: string | null = null;
@@ -602,6 +659,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     appendJobLog(jobId, `[loop] fix ${iter}: applying ${verdict.discrepancies.length} change(s)`);
     const fix = await runModel(model, fixPrompt(frameName, referenceImagePath, candRel ?? '(build failed — no screenshot)', verdict, req.userNotes), env, projectRoot, { agent: true, modelId, sessionId: session, jobId, projectId: req.projectId });
     if (fix.sessionId) session = fix.sessionId;
+    await snapshotLastGen();   // re-capture in case the fix moved/renamed the previewEntry (audit A.2)
   }
 
   const result = {
@@ -664,11 +722,18 @@ async function buildRunScreen(
   projectRoot: string, appPlan: string, sharedSession: string | undefined,
   canonicalCtx?: { canonical: Canonical; screen: CanonicalScreen },
 ): Promise<string | undefined> {
+  // ONE route scheme: when canonicalized, the API surface in the written contract
+  // derives from canonical.screens (audit A.3) — same as the appPlan caller built.
+  const canonical = canonicalCtx?.canonical;
   const { projectId, id: runId } = run;
   const fresh = run.freshSessions === true;
   if (!screen.spec) {
     await appendRunLog(projectId, runId, `[run] skip "${screen.frameName}" — no build spec`);
-    await updateRunScreen(projectId, runId, screen.frameId, { status: 'failed' });
+    // A failed screen must NOT let the run report 'done' (audit A.1). Attach a
+    // review payload so it surfaces in the needs-review queue (Accept / restart).
+    await updateRunScreen(projectId, runId, screen.frameId, {
+      status: 'failed', review: { reason: 'no build spec — screen was not built' },
+    });
     return sharedSession;
   }
   const jobId = `${runId}:${screen.frameId}`;
@@ -676,7 +741,7 @@ async function buildRunScreen(
   // Read the written contract FRESH per screen — earlier screens append to
   // .uix/context.md, so each screen sees the latest established tokens/components.
   const contextSlice = await readContextSlice(projectRoot);
-  let contract = buildWrittenContract(run, appPlan, contextSlice, fresh);
+  let contract = buildWrittenContract(run, appPlan, contextSlice, fresh, canonical);
   // P3: when this is a canonical lead frame, prepend its states/modals/template +
   // route-slot context so the agent builds ONE widget instead of per-variant pages.
   if (canonicalCtx) contract = `${buildCanonicalContext(canonicalCtx.canonical, canonicalCtx.screen)}\n\n— — —\n${contract}`;
@@ -696,7 +761,11 @@ async function buildRunScreen(
   } catch (e: any) {
     appendJobLog(jobId, `[loop] error: ${e?.message || 'unknown'}`);
     finishJobLog(jobId, '[loop] failed');
-    await updateRunScreen(projectId, runId, screen.frameId, { status: 'failed' });
+    // Surface the failure in the needs-review queue so the run can't report 'done'
+    // around an errored screen (audit A.1) and a human can Corrected-retry / restart.
+    await updateRunScreen(projectId, runId, screen.frameId, {
+      status: 'failed', review: { reason: `build error: ${e?.message || 'unknown'}` },
+    });
     return sharedSession;
   }
 }
@@ -715,10 +784,14 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
   if (isRunActive(runId)) return;          // already orchestrating in this process
   markRunActive(runId);
   clearRunCancelled(runId);
-  // P5 (RFC §4.9): while a run is actively orchestrating it is NOT resumable — only
-  // a graceful pause (checkpoint / stop) flips resumable back on. A crash mid-run
-  // therefore leaves resumable:false → no auto-resurrect on the next boot.
-  void setRunResumable(projectId, runId, false);
+  // Audit A.4 (RFC §4.9): an ACTIVELY-orchestrating run must survive a redeploy —
+  // a container restart mid-build (the common interruption) leaves the run 'running',
+  // and resumeInterruptedRuns picks it back up at boot. So mark it resumable WHILE it
+  // orchestrates (a live build is, by definition, resumable). It is flipped back to
+  // NOT-resumable only on terminal completion, and a user Stop moves it to 'stopped'
+  // (which the boot scan excludes), so the only thing auto-resumed is a build that was
+  // genuinely interrupted while running — never a user-stopped or completed run.
+  void setRunResumable(projectId, runId, true);
   const projectRoot = resolveProjectRoot(projectId);
   if (!projectRoot || !fsSync.existsSync(projectRoot)) { clearRunActive(runId); return; }
 
@@ -733,8 +806,10 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
     if (!run) return;
     // The global app plan (screen inventory + routes + nav graph + "never invent
     // screens" rule) — prepended to every screen's prompt so the flow shapes the
-    // whole build, not just per-screen nav lines.
-    const appPlan = buildAppPlan(run);
+    // whole build, not just per-screen nav lines. In canonical mode the route scheme
+    // derives from canonical.screens (audit A.3), so the plan is rebuilt below once
+    // the pre-pass has produced `canonical` — one route scheme, never two.
+    let appPlan = buildAppPlan(run);
 
     // ── P3: canonicalization pre-pass (RFC §4.1/§4.2) ────────────────────────
     // Cluster frames → canonical screens, rewrite the flow, write canonical.json,
@@ -789,6 +864,12 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
         await appendRunLog(projectId, runId, `[canon] canonicalization failed (falling back to per-frame build): ${e?.message || 'unknown'}`);
       }
     }
+    // Audit A.3: once canonicalized, rebuild the app plan so its route scheme derives
+    // from canonical.screens / canonicalId — matching the generated skeleton + the
+    // injected API surface. Without this the agent sees frameName routes in the plan
+    // but canonical routes in the skeleton (two divergent schemes).
+    if (canonical) appPlan = buildAppPlan(run, canonical);
+
     // When canonicalized, only the lead frames are buildable targets.
     const isBuildTarget = (frameId: string): boolean => !canonical || leadFrameIds.has(frameId);
     const canonCtxFor = (frameId: string) => {
@@ -890,18 +971,26 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
     const total = done?.screens.length ?? 0;
     const built = done?.screens.filter(s => s.status === 'done').length ?? 0;
     const needsReview = done?.screens.filter(s => s.status === 'needs-review').length ?? 0;
+    // Audit A.1: a 'failed' screen ALSO blocks completion (never silently ship a run
+    // with an errored screen). Both needs-review and failed hold the run open.
+    const failed = done?.screens.filter(s => s.status === 'failed').length ?? 0;
+    const blocking = needsReview + failed;
     // ── HITL Checkpoint 4 (RFC §5): before global wiring / full build / deploy ────
-    // Only gate here when the queue is clear (needs-review > 0 already parks the run
-    // for review below — the pre-global gate is the human sign-off once it's clean).
-    if (needsReview === 0 && done) {
+    // Only gate here when the queue is clear (a blocking screen parks the run for
+    // review below — the pre-global gate is the human sign-off once it's clean).
+    if (blocking === 0 && done) {
       if (await gate(done, 'pre-global', `pre-global sign-off — ${built}/${total} built, needs-review 0`)) return;
     }
-    // RFC §4.7: a run does NOT report complete while needs-review > 0 — it parks in
-    // 'needs-review' until a human Accepts / Corrected-retries every queued screen.
-    if (needsReview > 0) {
+    // RFC §4.7 + audit A.1: a run does NOT report complete while any screen is
+    // needs-review OR failed — it parks in 'needs-review' until a human Accepts /
+    // Corrected-retries / restarts every queued or errored screen.
+    if (blocking > 0) {
       await setRunStatus(projectId, runId, 'needs-review');
-      await appendRunLog(projectId, runId, `[run] paused for review — ${built}/${total} matched, ${needsReview} need review`);
+      await appendRunLog(projectId, runId, `[run] paused for review — ${built}/${total} matched, ${needsReview} need review${failed ? `, ${failed} failed` : ''}`);
     } else {
+      // Terminal completion: clear the resumable flag so a finished run is never
+      // re-launched on a later boot (audit A.4).
+      await setRunResumable(projectId, runId, false);
       await setRunStatus(projectId, runId, 'done');
       await appendRunLog(projectId, runId, `[run] complete — ${built}/${total} built`);
     }
@@ -936,11 +1025,14 @@ async function retryScreenLoop(projectId: string, runId: string, frameId: string
       return;
     }
     await updateRunScreen(projectId, runId, frameId, { status: 'building' });
-    const appPlan = buildAppPlan(run);
+    // Audit A.3: reuse the canonical route scheme on a corrected-retry too (one
+    // scheme), reading the persisted canonical.json when the run was canonicalized.
+    const canonical = run.canonical ? (await readCanonical(projectRoot, runId)) ?? undefined : undefined;
+    const appPlan = buildAppPlan(run, canonical);
     // P2: inject the same written contract (app plan + API surface + context.md) so a
     // corrected-retry builds against the established design system, not in a vacuum.
     const contextSlice = await readContextSlice(projectRoot);
-    const contract = buildWrittenContract(run, appPlan, contextSlice, run.freshSessions === true);
+    const contract = buildWrittenContract(run, appPlan, contextSlice, run.freshSessions === true, canonical);
     // The human correction is authoritative and injected up-front so the fresh pass
     // acts on it (the previous automated discrepancies didn't converge).
     const correction = `HUMAN CORRECTION (authoritative — the automated loop did NOT converge; apply this specific guidance):\n${note}`;
@@ -990,11 +1082,16 @@ export async function resumeInterruptedRuns(): Promise<void> {
     for (const projectId of projectIds) {
       const runs = await listRuns(projectId, 50);
       for (const r of runs) {
-        // Only resume an explicitly resumable (gracefully-paused) run, and never one
-        // parked at a checkpoint (a human must approve that gate first).
-        const resumable = r.resumable === true && r.status !== 'awaiting-approval' && r.status !== 'stopped';
+        // Audit A.4 (RFC §4.9): auto-resume ONLY a run that was actively orchestrating
+        // (status 'running') and is flagged resumable — i.e. a build interrupted by a
+        // redeploy/restart. This restores the "survives redeploy" guarantee for the
+        // common case. A 'stopped' run (user-stopped or stopped after a crash) and an
+        // 'awaiting-approval' run (parked at a HITL gate) are NOT auto-resurrected — a
+        // human restarts / approves those from the Runs UI. 'done'/'needs-review' runs
+        // are terminal-for-orchestration and likewise left alone.
+        const resumable = r.resumable === true && r.status === 'running';
         if (resumable && !isRunActive(r.id)) {
-          void appendRunLog(projectId, r.id, '[run] resuming gracefully-paused run after server restart');
+          void appendRunLog(projectId, r.id, '[run] resuming interrupted run after server restart (redeploy)');
           void runAppLoop(projectId, r.id);
         }
       }
@@ -1238,7 +1335,9 @@ export function registerScreenLoopRoutes(app: Express): void {
     if (!run) { res.status(404).json({ error: 'run not found' }); return; }
     const screen = run.screens.find(s => s.frameId === frameId);
     if (!screen) { res.status(404).json({ error: 'screen not found in run' }); return; }
-    if (screen.status !== 'needs-review') { res.status(409).json({ error: `screen is not needs-review (status: ${screen.status})` }); return; }
+    // Audit A.1: a 'failed' screen is also surfaced in the review queue (with a
+    // review payload) and may be human-accepted as-is, so the run can clear it.
+    if (screen.status !== 'needs-review' && screen.status !== 'failed') { res.status(409).json({ error: `screen is not reviewable (status: ${screen.status})` }); return; }
     const updated = await updateRunScreen(projectId, runId, frameId, { status: 'done', review: undefined });
     await appendRunLog(projectId, runId, `[review] accepted "${screen.frameName}" as-is (human)`);
     res.json({ run: updated });
