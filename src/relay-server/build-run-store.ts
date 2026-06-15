@@ -83,6 +83,15 @@ export interface BuildRun {
   //   effect with freshSessions (a shared --resume session can't be used by two
   //   workers at once). Clamped to a small cap. Default 1 (serial) = old behavior.
   parallel?: number;
+  // ── P3: canonicalization (RFC §4.1/§4.2) ─────────────────────────────────────
+  // canonical: run the deterministic canonicalization pre-pass before building —
+  //   cluster frames → canonical screens/states/modals/components, rewrite the
+  //   flow onto canonical ids, and generate a write-locked skeleton (router +
+  //   theme + component stubs). The build then iterates CANONICAL screens (one
+  //   build per canonicalId, all its states/modals in view) instead of one build
+  //   per raw frame. Default off → existing one-frame-per-screen behavior is
+  //   unchanged. The pre-pass result is persisted to .uix/runs/<id>.canonical.json.
+  canonical?: boolean;
   screens: RunScreen[];
   status: RunStatus;
   createdAt: string;
@@ -146,7 +155,7 @@ export async function createRun(
     kind: BuildRun['kind']; framework?: string; figStorageKey?: string;
     model: string; modelId?: string; maxIterations?: number; verify?: boolean; userNotes?: string;
     flow?: RunFlow;
-    freshSessions?: boolean; parallel?: number;
+    freshSessions?: boolean; parallel?: number; canonical?: boolean;
     screens: Array<{ frameId: string; frameName: string; spec?: ScreenSpec }>;
   },
 ): Promise<BuildRun | null> {
@@ -162,6 +171,7 @@ export async function createRun(
     flow: data.flow,
     freshSessions: data.freshSessions === true ? true : undefined,
     parallel: data.parallel != null ? clampParallel(data.parallel) : undefined,
+    canonical: data.canonical === true ? true : undefined,
     screens: orderedScreens.map(s => ({ frameId: s.frameId, frameName: s.frameName, status: 'pending' as const, spec: s.spec })),
     status: 'running', createdAt: now, updatedAt: now,
   };

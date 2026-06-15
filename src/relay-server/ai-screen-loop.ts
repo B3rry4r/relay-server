@@ -39,6 +39,10 @@ import {
   type ScreenSpec,
 } from './build-run-store';
 import { getProjectsRoot } from './runtime';
+import {
+  canonicalizeRun, writeCanonical, generateFlutterSkeleton,
+  type Canonical, type CanonicalScreen,
+} from './canonicalize';
 
 const execFile = promisify(execFileCb);
 
@@ -225,6 +229,35 @@ function buildWrittenContract(
     );
   }
   return parts.join('\n\n— — —\n');
+}
+
+/**
+ * P3 (RFC §4.1/§4.2): the CANONICAL context the server injects when a run is built
+ * canonically. For the lead frame of a canonical screen it spells out the screen's
+ * states, modals (rendered as overlays over THIS reused base, not standalone
+ * pages), template siblings, and its write-locked route slot — so the agent builds
+ * one widget with a state param instead of N near-duplicate routes/files.
+ */
+function buildCanonicalContext(canonical: Canonical, cs: CanonicalScreen): string {
+  const out: string[] = [
+    `CANONICAL SCREEN — this is ONE screen (canonicalId ${cs.canonicalId}, route ${cs.route}); build a SINGLE widget, not one page per variant. Its write-locked route slot already exists in lib/app_router.dart; fill the widget body, keep the route.`,
+  ];
+  if (cs.states.length > 1) {
+    out.push(`States (one widget + a state param — NOT separate routes; each state is verified individually against its own reference):`);
+    for (const s of cs.states) out.push(`- state "${s.id}" (frame ${s.frameId})`);
+  }
+  if (cs.modals.length) {
+    out.push(`Modals/sheets to present OVER this (reused) base screen via showModalBottomSheet / a dialog — do NOT rebuild the base or make these full standalone pages:`);
+    for (const m of cs.modals) out.push(`- modal "${m.id}" (frame ${m.frameId})`);
+  }
+  if (cs.templateRef) {
+    const sibs = canonical.templates.find(t => t.id === cs.templateRef)?.memberCanonicalIds.filter(id => id !== cs.canonicalId) ?? [];
+    out.push(`This screen shares template "${cs.templateRef}" with ${sibs.length} sibling screen(s) — extract the shared layout into a reusable widget + thin per-screen config.`);
+  }
+  if (canonical.components.length) {
+    out.push(`Shared components available (import from lib/components/ — reuse, don't re-invent): ${canonical.components.map(c => c.name).join(', ')}.`);
+  }
+  return out.join('\n');
 }
 
 async function readLastGen(projectRoot: string): Promise<LastGen> {
@@ -518,6 +551,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
 async function buildRunScreen(
   run: import('./build-run-store').BuildRun, screen: import('./build-run-store').RunScreen,
   projectRoot: string, appPlan: string, sharedSession: string | undefined,
+  canonicalCtx?: { canonical: Canonical; screen: CanonicalScreen },
 ): Promise<string | undefined> {
   const { projectId, id: runId } = run;
   const fresh = run.freshSessions === true;
@@ -531,7 +565,10 @@ async function buildRunScreen(
   // Read the written contract FRESH per screen — earlier screens append to
   // .uix/context.md, so each screen sees the latest established tokens/components.
   const contextSlice = await readContextSlice(projectRoot);
-  const contract = buildWrittenContract(run, appPlan, contextSlice, fresh);
+  let contract = buildWrittenContract(run, appPlan, contextSlice, fresh);
+  // P3: when this is a canonical lead frame, prepend its states/modals/template +
+  // route-slot context so the agent builds ONE widget instead of per-variant pages.
+  if (canonicalCtx) contract = `${buildCanonicalContext(canonicalCtx.canonical, canonicalCtx.screen)}\n\n— — —\n${contract}`;
   const sreq: BuildScreenReq = {
     projectId, model: run.model as AIModel, modelId: run.modelId, sessionId: sharedSession,
     framework: run.framework || 'flutter', frameId: screen.frameId, frameName: screen.frameName,
@@ -571,10 +608,68 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
     // screens" rule) — prepended to every screen's prompt so the flow shapes the
     // whole build, not just per-screen nav lines.
     const appPlan = buildAppPlan(run);
+
+    // ── P3: canonicalization pre-pass (RFC §4.1/§4.2) ────────────────────────
+    // Cluster frames → canonical screens, rewrite the flow, write canonical.json,
+    // and generate the write-locked skeleton. The build then iterates ONLY the
+    // canonical LEAD frames (states/modals fold into their lead screen); the
+    // non-lead frames are marked done so the run can complete. Behind run.canonical
+    // → existing one-frame-per-screen behavior is untouched when the flag is off.
+    let canonical: Canonical | undefined;
+    const canonByLeadFrame = new Map<string, CanonicalScreen>();   // leadFrameId → canonical screen
+    const leadFrameIds = new Set<string>();
+    if (run.canonical) {
+      try {
+        canonical = canonicalizeRun(run.screens, run.flow);
+        await writeCanonical(projectRoot, runId, canonical);
+        // Generate the deterministic skeleton (Flutter only for now; other
+        // frameworks still get canonical.json + the manifest, no router file).
+        if ((run.framework || 'flutter').toLowerCase() === 'flutter') {
+          try {
+            const sk = await generateFlutterSkeleton(projectRoot, canonical);
+            await appendRunLog(projectId, runId, `[canon] skeleton: ${sk.files.length} file(s), ${sk.routes.length} route(s)`);
+          } catch (e: any) {
+            await appendRunLog(projectId, runId, `[canon] skeleton generation failed (continuing): ${e?.message || 'unknown'}`);
+          }
+        }
+        // A canonical screen's LEAD frame = its first state's frame. Only leads are
+        // built; their states/modals are handled within that single build.
+        const memberToLead = new Map<string, string>();   // any member frameId → lead frameId
+        for (const cs of canonical.screens) {
+          const lead = cs.states[0]?.frameId ?? cs.frameIds[0];
+          if (!lead) continue;
+          leadFrameIds.add(lead);
+          canonByLeadFrame.set(lead, cs);
+          for (const fid of cs.frameIds) memberToLead.set(fid, lead);
+          for (const m of cs.modals) memberToLead.set(m.frameId, lead);
+        }
+        // Mark every NON-lead member (extra states, bound modals, components) done
+        // up-front so the run completes — they're built inside their lead screen.
+        let folded = 0;
+        for (const s of run.screens) {
+          if (memberToLead.has(s.frameId) && !leadFrameIds.has(s.frameId) && s.status !== 'done') {
+            await updateRunScreen(projectId, runId, s.frameId, { status: 'done', matched: true });
+            folded++;
+          }
+        }
+        await appendRunLog(projectId, runId, `[canon] ${run.screens.length} frame(s) → ${canonical.screens.length} canonical screen(s), ${canonical.components.length} component(s)${folded ? `, ${folded} folded state/modal frame(s)` : ''}${canonical.warnings.length ? ` — ${canonical.warnings.length} warning(s)` : ''}`);
+        for (const w of canonical.warnings) await appendRunLog(projectId, runId, `[canon] WARNING: ${w}`);
+      } catch (e: any) {
+        canonical = undefined;
+        await appendRunLog(projectId, runId, `[canon] canonicalization failed (falling back to per-frame build): ${e?.message || 'unknown'}`);
+      }
+    }
+    // When canonicalized, only the lead frames are buildable targets.
+    const isBuildTarget = (frameId: string): boolean => !canonical || leadFrameIds.has(frameId);
+    const canonCtxFor = (frameId: string) => {
+      const cs = canonByLeadFrame.get(frameId);
+      return canonical && cs ? { canonical, screen: cs } : undefined;
+    };
+
     // P2: a parallel pool only makes sense with fresh sessions (a shared --resume
     // session can't be used by two workers at once), so it forces freshSessions.
     const workers = run.freshSessions ? clampParallel(run.parallel ?? 1) : 1;
-    await appendRunLog(projectId, runId, `[run] start — ${run.screens.length} screen(s), model=${run.model}, verify=${run.verify !== false}, flow=${run.flow?.connections?.length ?? 0} link(s), sessions=${run.freshSessions ? 'fresh-per-screen' : 'shared'}, workers=${workers}`);
+    await appendRunLog(projectId, runId, `[run] start — ${run.screens.length} screen(s)${canonical ? ` (${leadFrameIds.size} canonical)` : ''}, model=${run.model}, verify=${run.verify !== false}, flow=${run.flow?.connections?.length ?? 0} link(s), sessions=${run.freshSessions ? 'fresh-per-screen' : 'shared'}, workers=${workers}`);
 
     const stillNeeded = async (frameId: string): Promise<boolean> => {
       const live = await getRun(projectId, runId);
@@ -587,7 +682,7 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
       // A shared work queue drained by `workers` concurrent builders. No session
       // threading (each screen is cold against the written contract), so order
       // only affects which screens see the most-extended context.md, not output.
-      const queue = [...run.screens];
+      const queue = run.screens.filter(s => isBuildTarget(s.frameId));   // P3: leads only when canonical
       let cancelled = false;
       const worker = async (): Promise<void> => {
         for (;;) {
@@ -595,7 +690,7 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
           const screen = queue.shift();
           if (!screen) return;
           if (!(await stillNeeded(screen.frameId))) continue;
-          await buildRunScreen(run, screen, projectRoot, appPlan, undefined);
+          await buildRunScreen(run, screen, projectRoot, appPlan, undefined, canonCtxFor(screen.frameId));
         }
       };
       await Promise.all(Array.from({ length: workers }, () => worker()));
@@ -613,11 +708,12 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
           await setRunStatus(projectId, runId, 'stopped');
           return;
         }
+        if (!isBuildTarget(screen.frameId)) continue;   // P3: non-lead frame folded into its canonical lead
         // Skip screens already built (resume): re-read live status each time.
         const live = await getRun(projectId, runId);
         const cur = live?.screens.find(s => s.frameId === screen.frameId);
         if (cur?.status === 'done') { session = run.freshSessions ? undefined : (cur.sessionId || session); continue; }
-        const sess = await buildRunScreen(run, screen, projectRoot, appPlan, session);
+        const sess = await buildRunScreen(run, screen, projectRoot, appPlan, session, canonCtxFor(screen.frameId));
         // In fresh-session mode there is no cross-screen thread to carry forward.
         if (sess && !run.freshSessions) { session = sess; await setRunSession(projectId, runId, session); }
       }
@@ -779,6 +875,8 @@ export function registerScreenLoopRoutes(app: Express): void {
       // and an optional bounded parallel worker pool. parallel>1 implies fresh.
       freshSessions: b.freshSessions === true || (typeof b.parallel === 'number' && b.parallel > 1),
       parallel: typeof b.parallel === 'number' ? b.parallel : undefined,
+      // P3: opt into the canonicalization pre-pass + write-locked skeleton.
+      canonical: b.canonical === true,
       flow: b.flow && (Array.isArray(b.flow.connections) || b.flow.entryFrameId !== undefined) ? {
         entryFrameId: b.flow.entryFrameId ?? null,
         connections: Array.isArray(b.flow.connections) ? b.flow.connections.map((c: any) => ({
