@@ -71,10 +71,32 @@ export interface BuildRun {
   userNotes?: string;
   flow?: RunFlow;
   sessionId?: string;          // shared CLI session threaded across screens
+  // ── P2: written-contract-driven builds (RFC §4.5) ────────────────────────────
+  // freshSessions: build each screen in a NEW/stateless CLI session that reads the
+  //   server-injected written contract (.uix/context.md + app plan + component API
+  //   surface) instead of relying on the threaded --resume session. Model-independent
+  //   (codex/gemini are already resume:false, so this just makes claude behave the
+  //   same), bounds context growth, and is what ENABLES parallel workers. Default
+  //   off → existing shared-session behavior is unchanged.
+  freshSessions?: boolean;
+  // parallel: max screens to build CONCURRENTLY (bounded worker pool). Only takes
+  //   effect with freshSessions (a shared --resume session can't be used by two
+  //   workers at once). Clamped to a small cap. Default 1 (serial) = old behavior.
+  parallel?: number;
   screens: RunScreen[];
   status: RunStatus;
   createdAt: string;
   updatedAt: string;
+}
+
+// P2: hard ceiling on concurrent screen workers, regardless of what the caller
+// asks for. Each worker spawns a coding-agent CLI + a Flutter/web release build,
+// so a small cap keeps CPU/memory/rate-limits sane on the relay box.
+export const MAX_PARALLEL_WORKERS = 3;
+/** Normalize a requested parallel worker count into [1, MAX_PARALLEL_WORKERS]. */
+export function clampParallel(n: unknown): number {
+  const v = typeof n === 'number' && Number.isFinite(n) ? Math.floor(n) : 1;
+  return Math.min(Math.max(v, 1), MAX_PARALLEL_WORKERS);
 }
 
 const runsDir = (root: string) => path.join(root, '.uix', 'runs');
@@ -124,6 +146,7 @@ export async function createRun(
     kind: BuildRun['kind']; framework?: string; figStorageKey?: string;
     model: string; modelId?: string; maxIterations?: number; verify?: boolean; userNotes?: string;
     flow?: RunFlow;
+    freshSessions?: boolean; parallel?: number;
     screens: Array<{ frameId: string; frameName: string; spec?: ScreenSpec }>;
   },
 ): Promise<BuildRun | null> {
@@ -137,6 +160,8 @@ export async function createRun(
     id, projectId, kind: data.kind, framework: data.framework, figStorageKey: data.figStorageKey,
     model: data.model, modelId: data.modelId, maxIterations: data.maxIterations, verify: data.verify, userNotes: data.userNotes,
     flow: data.flow,
+    freshSessions: data.freshSessions === true ? true : undefined,
+    parallel: data.parallel != null ? clampParallel(data.parallel) : undefined,
     screens: orderedScreens.map(s => ({ frameId: s.frameId, frameName: s.frameName, status: 'pending' as const, spec: s.spec })),
     status: 'running', createdAt: now, updatedAt: now,
   };

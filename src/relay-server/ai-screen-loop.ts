@@ -35,6 +35,7 @@ import {
   saveRun, restartRun, appendRunLog, readRunLog,
   markRunCancelled, isRunCancelled, clearRunCancelled,
   isRunActive, markRunActive, clearRunActive,
+  clampParallel,
   type ScreenSpec,
 } from './build-run-store';
 import { getProjectsRoot } from './runtime';
@@ -59,6 +60,12 @@ interface BuildScreenReq {
   runId?: string;             // durable multi-screen run this screen belongs to
   userNotes?: string;         // the human's design rules — shared with verify/fix
   verify?: boolean;           // when false, implement only (no verify↔fix loop)
+  // P2 (RFC §4.5): build this screen in a FRESH/stateless session — do NOT seed the
+  // implement call with a cross-screen --resume sessionId. Coherence then rides on
+  // the server-injected written contract (already baked into implementPrompt), not
+  // the shared CLI session. The within-screen fix loop still resumes the session
+  // started by THIS screen's implement call (full local context for the fixes).
+  freshSession?: boolean;
 }
 
 interface Discrepancy { area?: string; issue: string; severity?: string }
@@ -78,6 +85,34 @@ interface LastGen {
 }
 
 const sanitizeId = (id: string) => id.replace(/[^a-zA-Z0-9._-]+/g, '_');
+
+// P2: per-project BUILD mutex. With parallel workers the expensive LLM agent calls
+// (implement/verify/fix) run concurrently, but the build+screenshot step writes to
+// SHARED, per-project locations (build/web, dist/, .uix/last-gen.json), so two
+// builds at once would clobber each other. We serialize ONLY that step per project:
+// agents think in parallel, the bundle builds one at a time. (RFC §4.6's build-once/
+// hot-swap would remove even this serialization; deferred — see renderPreview TODO.)
+// TODO(P2/P3): per-screen last-gen isolation. Today the implement agent writes a
+// single shared .uix/last-gen.json; the build mutex makes the build itself safe but
+// a sibling worker can still overwrite previewEntry between this screen's implement
+// and its verify. The robust fix is P3's write-locked deterministic skeleton (each
+// screen owns its file + route slot) — until then prefer parallel ≤ 2 and expect
+// the mutex to dominate wall-time on build-heavy frameworks.
+const buildLocks = new Map<string, Promise<void>>();
+async function withBuildLock<T>(projectRoot: string, fn: () => Promise<T>): Promise<T> {
+  const prev = buildLocks.get(projectRoot) ?? Promise.resolve();
+  // The tail every later caller will chain on: prev finishing AND fn finishing.
+  let release!: () => void;
+  const done = new Promise<void>(r => { release = r; });
+  const tail = prev.then(() => done);
+  buildLocks.set(projectRoot, tail);
+  await prev;
+  try { return await fn(); }
+  finally {
+    release();
+    if (buildLocks.get(projectRoot) === tail) buildLocks.delete(projectRoot);
+  }
+}
 
 // References are exported @2× by the renderer (a 393px frame → 786px PNG). To make
 // "match" verdicts trustworthy (RFC §4.6) the candidate MUST be captured at the
@@ -115,6 +150,81 @@ function buildAppPlan(run: import('./build-run-store').BuildRun): string {
   }
   out.push(`Register ALL these routes in the central router by name (a placeholder/empty screen is fine for ones not built yet). Build ONLY the current screen below; do not implement, overwrite, or duplicate the others.`);
   return out.join('\n');
+}
+
+/**
+ * P2 (RFC §4.5 — the coherence vehicle): the SERVER reads the agent's written
+ * contract (.uix/context.md) and INJECTS it into every screen's prompt. Today the
+ * packet only *tells* the agent to read context.md; that breaks the moment the CLI
+ * is a cold/fresh session (codex & gemini ALWAYS are, claude is when freshSessions
+ * is on) because the file may not be opened, and even when opened it competes with
+ * the rest of the prompt for attention. Injecting it server-side guarantees the
+ * established design system / routing / screens index is in-context for EVERY
+ * screen, model-independently — which is what lets us drop the shared --resume
+ * session and still keep visual coherence.
+ *
+ * Bounded so a runaway context.md can't blow the window (later screens append to it).
+ */
+const CONTEXT_SLICE_MAX = 12000;
+async function readContextSlice(projectRoot: string): Promise<string> {
+  try {
+    const raw = await fs.readFile(path.join(projectRoot, '.uix', 'context.md'), 'utf8');
+    const trimmed = raw.trim();
+    if (!trimmed) return '';
+    // Keep the HEAD (design-system + routing live up top, written first) when the
+    // file outgrows the budget; the tail is the per-screen index which the app plan
+    // already covers.
+    return trimmed.length > CONTEXT_SLICE_MAX
+      ? trimmed.slice(0, CONTEXT_SLICE_MAX) + '\n…(context.md truncated — open .uix/context.md for the full contract)'
+      : trimmed;
+  } catch { return ''; }
+}
+
+/**
+ * P2 (RFC §4.5): a canonical COMPONENT / ROUTE API surface derived deterministically
+ * from the run — the signatures each screen must build against. Today this is the
+ * route table (canonical names every screen wires to). Until canonicalization (P3)
+ * produces real shared-component signatures, the surface is the stable route slugs
+ * + the screens index from context.md. Kept as its own block so each screen builds
+ * against a SHARED contract instead of re-inventing names per session.
+ */
+function buildComponentApiSurface(run: import('./build-run-store').BuildRun): string {
+  const out: string[] = [
+    `CANONICAL API SURFACE — the shared route/screen names every screen MUST build against (do NOT invent variants of these names; reuse them verbatim so cross-screen navigation resolves):`,
+  ];
+  for (const s of run.screens) out.push(`- route ${routeNameFor(s.frameName)}  ⟶  screen "${s.frameName}"`);
+  // TODO(P2/P3): once canonicalization emits shared-component stubs with real
+  // constructor signatures (RFC §4.2 deterministic skeleton), append each
+  // component's API here (name + props) so screens import the exact signature
+  // instead of re-deriving shared widgets per session.
+  return out.join('\n');
+}
+
+/**
+ * P2: assemble the full WRITTEN CONTRACT block the server injects ahead of a
+ * screen's packet — app plan + canonical API surface + the injected context.md
+ * slice. This is the model-independent coherence carrier (replaces leaning on the
+ * CLI --resume session). `freshSessions` only changes a header note; the contract
+ * body is identical so serial-shared-session and fresh-session builds converge on
+ * the same design language.
+ */
+function buildWrittenContract(
+  run: import('./build-run-store').BuildRun, appPlan: string, contextSlice: string, freshSession: boolean,
+): string {
+  const parts: string[] = [appPlan, buildComponentApiSurface(run)];
+  if (contextSlice) {
+    parts.push(
+      [
+        `ESTABLISHED PROJECT CONTRACT (.uix/context.md — written by earlier screens; AUTHORITATIVE for the design system, theme tokens, routing and shared components). REUSE what's here; do NOT redefine tokens/components that already exist, and EXTEND this file as you build:`,
+        contextSlice,
+      ].join('\n'),
+    );
+  } else if (freshSession) {
+    parts.push(
+      `No .uix/context.md exists yet — you are establishing the project contract. Create .uix/context.md (design system, routing, screens index) so every later screen builds against it.`,
+    );
+  }
+  return parts.join('\n\n— — —\n');
 }
 
 async function readLastGen(projectRoot: string): Promise<LastGen> {
@@ -266,7 +376,10 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
   if (req.tree) { try { await fs.writeFile(path.join(screenDir, 'ir.txt'), req.tree); } catch { /* non-fatal */ } }
   if (req.runId) { try { await updateRunScreen(req.projectId, req.runId, frameId, { status: 'building' }); } catch { /* non-fatal */ } }
 
-  let session = req.sessionId;
+  // In freshSession mode the implement call starts COLD (no cross-screen resume);
+  // the contract injected into the prompt carries coherence. The fix loop below
+  // still resumes whatever session THIS implement call returns.
+  let session = req.freshSession ? undefined : req.sessionId;
   let finalVerdict: Verdict | null = null;
   let matched = false;
   let accepted = false;
@@ -299,9 +412,14 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
   // when to stop; maxIterations is only a runaway backstop.
   for (let iter = 1; iter <= maxIterations; iter++) {
     iterationsRun = iter;
-    const lastGen = await readLastGen(projectRoot);
     appendJobLog(jobId, `[loop] verify ${iter}/${maxIterations}: building & screenshotting`);
-    const shot = await renderPreview(projectRoot, lastGen.framework || framework, lastGen.previewEntry, width, height, env, CAPTURE_SHOT_OPTS);
+    // Read last-gen + build + screenshot under the per-project build lock so a
+    // sibling parallel worker can't clobber build/web or last-gen.json mid-build.
+    // (No-op for serial runs — the lock is uncontended.)
+    const shot = await withBuildLock(projectRoot, async () => {
+      const lastGen = await readLastGen(projectRoot);
+      return renderPreview(projectRoot, lastGen.framework || framework, lastGen.previewEntry, width, height, env, CAPTURE_SHOT_OPTS);
+    });
 
     let verdict: Verdict;
     let candRel: string | null = null;
@@ -379,11 +497,60 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
 }
 
 // ── server-orchestrated full-app build ─────────────────────────────────────────
-// Builds every screen in a durable run SERVER-SIDE, one after another, threading
-// the CLI session for cross-screen context. Survives the browser tab closing;
-// resumable after Stop / rate-limit / redeploy (already-done screens are skipped).
-// Every job-log line for the run's screens is teed to the durable run log so the
-// client can replay the full history on reconnect.
+// Builds every screen in a durable run SERVER-SIDE. Survives the browser tab
+// closing; resumable after Stop / rate-limit / redeploy (already-done screens are
+// skipped). Every job-log line for the run's screens is teed to the durable run
+// log so the client can replay the full history on reconnect.
+//
+// Two coherence vehicles (RFC §4.5):
+//   • DEFAULT — one shared CLI --resume session threaded screen→screen (serial).
+//   • freshSessions — each screen builds COLD against the server-injected WRITTEN
+//     CONTRACT (app plan + canonical API surface + .uix/context.md slice). No
+//     shared session → identical on claude/codex/gemini, bounded context, and
+//     parallelizable: with `parallel>1` a bounded worker pool builds N screens at
+//     once. (A shared --resume session can't be parallelized, so parallel implies
+//     fresh sessions.)
+
+/** Build ONE screen of a run server-side, injecting the written contract. Shared
+ *  by the serial and parallel paths. `sharedSession` is the threaded session for
+ *  serial/non-fresh runs (undefined in fresh-session mode). Returns the session
+ *  the screen ended on (so serial mode can thread it forward). */
+async function buildRunScreen(
+  run: import('./build-run-store').BuildRun, screen: import('./build-run-store').RunScreen,
+  projectRoot: string, appPlan: string, sharedSession: string | undefined,
+): Promise<string | undefined> {
+  const { projectId, id: runId } = run;
+  const fresh = run.freshSessions === true;
+  if (!screen.spec) {
+    await appendRunLog(projectId, runId, `[run] skip "${screen.frameName}" — no build spec`);
+    await updateRunScreen(projectId, runId, screen.frameId, { status: 'failed' });
+    return sharedSession;
+  }
+  const jobId = `${runId}:${screen.frameId}`;
+  startJobLog(jobId, { projectId, firstLine: `[loop] queued "${screen.frameName}"` });
+  // Read the written contract FRESH per screen — earlier screens append to
+  // .uix/context.md, so each screen sees the latest established tokens/components.
+  const contextSlice = await readContextSlice(projectRoot);
+  const contract = buildWrittenContract(run, appPlan, contextSlice, fresh);
+  const sreq: BuildScreenReq = {
+    projectId, model: run.model as AIModel, modelId: run.modelId, sessionId: sharedSession,
+    framework: run.framework || 'flutter', frameId: screen.frameId, frameName: screen.frameName,
+    width: screen.spec.width, height: screen.spec.height,
+    referenceImagePath: screen.spec.referenceImagePath,
+    implementPrompt: `${contract}\n\n— — —\nNOW BUILD THIS SCREEN:\n${screen.spec.packet}`,
+    tree: screen.spec.tree, maxIterations: run.maxIterations, jobId, runId,
+    userNotes: run.userNotes, verify: run.verify, freshSession: fresh,
+  };
+  try {
+    return await runScreenLoop(sreq, projectRoot, jobId);
+  } catch (e: any) {
+    appendJobLog(jobId, `[loop] error: ${e?.message || 'unknown'}`);
+    finishJobLog(jobId, '[loop] failed');
+    await updateRunScreen(projectId, runId, screen.frameId, { status: 'failed' });
+    return sharedSession;
+  }
+}
+
 async function runAppLoop(projectId: string, runId: string): Promise<void> {
   if (isRunActive(runId)) return;          // already orchestrating in this process
   markRunActive(runId);
@@ -404,42 +571,55 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
     // screens" rule) — prepended to every screen's prompt so the flow shapes the
     // whole build, not just per-screen nav lines.
     const appPlan = buildAppPlan(run);
-    await appendRunLog(projectId, runId, `[run] start — ${run.screens.length} screen(s), model=${run.model}, verify=${run.verify !== false}, flow=${run.flow?.connections?.length ?? 0} link(s)`);
-    let session = run.sessionId;
+    // P2: a parallel pool only makes sense with fresh sessions (a shared --resume
+    // session can't be used by two workers at once), so it forces freshSessions.
+    const workers = run.freshSessions ? clampParallel(run.parallel ?? 1) : 1;
+    await appendRunLog(projectId, runId, `[run] start — ${run.screens.length} screen(s), model=${run.model}, verify=${run.verify !== false}, flow=${run.flow?.connections?.length ?? 0} link(s), sessions=${run.freshSessions ? 'fresh-per-screen' : 'shared'}, workers=${workers}`);
 
-    for (const screen of run.screens) {
-      if (isRunCancelled(runId)) {
+    const stillNeeded = async (frameId: string): Promise<boolean> => {
+      const live = await getRun(projectId, runId);
+      const cur = live?.screens.find(s => s.frameId === frameId);
+      return cur?.status !== 'done';   // skip already-built (resume)
+    };
+
+    if (workers > 1) {
+      // ── Bounded parallel worker pool (fresh sessions only) ──────────────────
+      // A shared work queue drained by `workers` concurrent builders. No session
+      // threading (each screen is cold against the written contract), so order
+      // only affects which screens see the most-extended context.md, not output.
+      const queue = [...run.screens];
+      let cancelled = false;
+      const worker = async (): Promise<void> => {
+        for (;;) {
+          if (isRunCancelled(runId)) { cancelled = true; return; }
+          const screen = queue.shift();
+          if (!screen) return;
+          if (!(await stillNeeded(screen.frameId))) continue;
+          await buildRunScreen(run, screen, projectRoot, appPlan, undefined);
+        }
+      };
+      await Promise.all(Array.from({ length: workers }, () => worker()));
+      if (cancelled || isRunCancelled(runId)) {
         await appendRunLog(projectId, runId, '[run] stopped by user');
         await setRunStatus(projectId, runId, 'stopped');
         return;
       }
-      // Skip screens already built (resume): re-read live status each time.
-      const fresh = await getRun(projectId, runId);
-      const cur = fresh?.screens.find(s => s.frameId === screen.frameId);
-      if (cur?.status === 'done') { session = cur.sessionId || session; continue; }
-      if (!screen.spec) {
-        await appendRunLog(projectId, runId, `[run] skip "${screen.frameName}" — no build spec`);
-        await updateRunScreen(projectId, runId, screen.frameId, { status: 'failed' });
-        continue;
-      }
-      const jobId = `${runId}:${screen.frameId}`;
-      startJobLog(jobId, { projectId, firstLine: `[loop] queued "${screen.frameName}"` });
-      const sreq: BuildScreenReq = {
-        projectId, model: run.model as AIModel, modelId: run.modelId, sessionId: session,
-        framework: run.framework || 'flutter', frameId: screen.frameId, frameName: screen.frameName,
-        width: screen.spec.width, height: screen.spec.height,
-        referenceImagePath: screen.spec.referenceImagePath,
-        implementPrompt: `${appPlan}\n\n— — —\nNOW BUILD THIS SCREEN:\n${screen.spec.packet}`,
-        tree: screen.spec.tree, maxIterations: run.maxIterations, jobId, runId,
-        userNotes: run.userNotes, verify: run.verify,
-      };
-      try {
-        const sess = await runScreenLoop(sreq, projectRoot, jobId);
-        if (sess) { session = sess; await setRunSession(projectId, runId, session); }
-      } catch (e: any) {
-        appendJobLog(jobId, `[loop] error: ${e?.message || 'unknown'}`);
-        finishJobLog(jobId, '[loop] failed');
-        await updateRunScreen(projectId, runId, screen.frameId, { status: 'failed' });
+    } else {
+      // ── Serial (shared session by default, or fresh-serial) ─────────────────
+      let session = run.freshSessions ? undefined : run.sessionId;
+      for (const screen of run.screens) {
+        if (isRunCancelled(runId)) {
+          await appendRunLog(projectId, runId, '[run] stopped by user');
+          await setRunStatus(projectId, runId, 'stopped');
+          return;
+        }
+        // Skip screens already built (resume): re-read live status each time.
+        const live = await getRun(projectId, runId);
+        const cur = live?.screens.find(s => s.frameId === screen.frameId);
+        if (cur?.status === 'done') { session = run.freshSessions ? undefined : (cur.sessionId || session); continue; }
+        const sess = await buildRunScreen(run, screen, projectRoot, appPlan, session);
+        // In fresh-session mode there is no cross-screen thread to carry forward.
+        if (sess && !run.freshSessions) { session = sess; await setRunSession(projectId, runId, session); }
       }
     }
 
@@ -493,6 +673,10 @@ async function retryScreenLoop(projectId: string, runId: string, frameId: string
     }
     await updateRunScreen(projectId, runId, frameId, { status: 'building' });
     const appPlan = buildAppPlan(run);
+    // P2: inject the same written contract (app plan + API surface + context.md) so a
+    // corrected-retry builds against the established design system, not in a vacuum.
+    const contextSlice = await readContextSlice(projectRoot);
+    const contract = buildWrittenContract(run, appPlan, contextSlice, run.freshSessions === true);
     // The human correction is authoritative and injected up-front so the fresh pass
     // acts on it (the previous automated discrepancies didn't converge).
     const correction = `HUMAN CORRECTION (authoritative — the automated loop did NOT converge; apply this specific guidance):\n${note}`;
@@ -504,7 +688,7 @@ async function retryScreenLoop(projectId: string, runId: string, frameId: string
       framework: run.framework || 'flutter', frameId, frameName: screen.frameName,
       width: screen.spec.width, height: screen.spec.height,
       referenceImagePath: screen.spec.referenceImagePath,
-      implementPrompt: `${appPlan}\n\n— — —\n${correction}\n\n— — —\nNOW REVISE THIS SCREEN:\n${screen.spec.packet}`,
+      implementPrompt: `${contract}\n\n— — —\n${correction}\n\n— — —\nNOW REVISE THIS SCREEN:\n${screen.spec.packet}`,
       tree: screen.spec.tree, maxIterations: run.maxIterations, jobId: startJobId, runId,
       userNotes: [run.userNotes?.trim(), note.trim()].filter(Boolean).join('\n\n'), verify: run.verify,
     };
@@ -591,6 +775,10 @@ export function registerScreenLoopRoutes(app: Express): void {
       maxIterations: typeof b.maxIterations === 'number' ? b.maxIterations : undefined,
       verify: b.verify !== false,
       userNotes: typeof b.userNotes === 'string' ? b.userNotes : undefined,
+      // P2: opt into fresh-per-screen sessions (model-independent written contract)
+      // and an optional bounded parallel worker pool. parallel>1 implies fresh.
+      freshSessions: b.freshSessions === true || (typeof b.parallel === 'number' && b.parallel > 1),
+      parallel: typeof b.parallel === 'number' ? b.parallel : undefined,
       flow: b.flow && (Array.isArray(b.flow.connections) || b.flow.entryFrameId !== undefined) ? {
         entryFrameId: b.flow.entryFrameId ?? null,
         connections: Array.isArray(b.flow.connections) ? b.flow.connections.map((c: any) => ({
