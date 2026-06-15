@@ -48,7 +48,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 RUN apt-get update && apt-get install -y \
     tini \
-    gosu \
+    sudo \
     git \
     curl \
     build-essential \
@@ -93,17 +93,23 @@ COPY package.json package-lock.json .
 RUN npm ci --omit=dev --ignore-scripts
 COPY setup-workspace.sh .
 
-# Non-root user. Claude Code and Flutter refuse to run as root, and Chrome is
-# happier non-root too. The volume (/workspace) and /app are handed to dev.
+# Non-root user. Claude Code and Flutter refuse to run as root, and the root
+# check is only skipped when Claude itself runs as a non-root user. Setting
+# USER dev makes EVERY process — the app AND any shell you exec into the
+# container — run as dev. dev gets passwordless sudo so the entrypoint can
+# still fix the volume's ownership at boot (volumes mount root-owned).
 RUN useradd --create-home --shell /bin/bash dev \
+    && echo "dev ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/dev \
+    && chmod 0440 /etc/sudoers.d/dev \
     && mkdir -p $WORKSPACE/.relay \
     && chown -R dev:dev $WORKSPACE /app
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# tini reaps orphaned grandchildren (headless Chrome from the screenshot
-# endpoints double-forks); without an init, zombies exhaust the pid cgroup.
-# entrypoint.sh fixes volume ownership as root, then drops to dev via gosu.
+USER dev
+
+# tini reaps orphaned grandchildren (headless Chrome double-forks). entrypoint.sh
+# fixes the volume ownership (via sudo) then runs the app — all as dev.
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
 CMD ["node", "dist/src/index.js"]
