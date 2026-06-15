@@ -56,6 +56,27 @@ const PROVIDER_DEFAULT_MODEL: Record<string, string> = {
   claude: 'claude-opus-4-8',
 };
 
+// CLI aliases → concrete catalog ids. The Claude CLI (and our CodegenPanel) pass
+// short aliases like "sonnet"/"opus"/"haiku"/"fable" as the modelId — NOT full
+// ids like "claude-sonnet-4-6". Without this map an alias falls through to the
+// generic 200K-window profile, which then FALSELY hard-blocks a multi-screen run
+// on a phantom context overflow (and reports "cost unknown"). Resolve aliases
+// (and bare version aliases) to the current concrete model first.
+const MODEL_ALIASES: Record<string, string> = {
+  opus: 'claude-opus-4-8',
+  'opus-4-8': 'claude-opus-4-8',
+  'opus-4-7': 'claude-opus-4-7',
+  'opus-4-6': 'claude-opus-4-6',
+  'opus-4-5': 'claude-opus-4-5',
+  sonnet: 'claude-sonnet-4-6',
+  'sonnet-4-6': 'claude-sonnet-4-6',
+  'sonnet-4-5': 'claude-sonnet-4-5',
+  haiku: 'claude-haiku-4-5',
+  'haiku-4-5': 'claude-haiku-4-5',
+  fable: 'claude-fable-5',
+  'fable-5': 'claude-fable-5',
+};
+
 // Generic fallback for non-Anthropic providers (or an unknown Anthropic id). A
 // large-but-finite window so the gate still does SOMETHING; price 0 → cost shown
 // as "unknown" rather than a fake number.
@@ -65,7 +86,10 @@ const GENERIC_PROFILE: Omit<ModelProfile, 'resolvedModelId'> = {
 
 /** Resolve a run's (provider, modelId) to a concrete ModelProfile. */
 export function resolveModelProfile(provider?: string, modelId?: string): ModelProfile {
-  const id = (modelId || '').trim() || PROVIDER_DEFAULT_MODEL[provider || ''] || '';
+  const raw = (modelId || '').trim().toLowerCase();
+  // alias → concrete id → otherwise the raw string → otherwise the provider default
+  const id = MODEL_ALIASES[raw] || (raw && ANTHROPIC_MODELS[raw] ? raw : '') ||
+    PROVIDER_DEFAULT_MODEL[provider || ''] || raw;
   const m = id && ANTHROPIC_MODELS[id];
   if (m) return { resolvedModelId: id, ...m };
   // Unknown concrete id → generic profile, but keep the id we guessed for display.
@@ -183,13 +207,17 @@ export function computePreflight(run: BuildRun): PreflightReport {
   // ── Verdict ────────────────────────────────────────────────────────────────
   let verdict: PreflightReport['verdict'] = 'ok';
   if (model.contextWindow > 0) {
+    // Only HARD-BLOCK on a window we actually know (exact profile). For a guessed
+    // window (generic/non-Anthropic), a would-be overflow is a WARNING, never a
+    // block — we will not stop a build on a phantom limit we're unsure of.
+    const overflowVerdict: PreflightReport['verdict'] = model.exact ? 'block' : 'warn';
     if (peakWindowFraction > BLOCK_PEAK_FRACTION) {
-      verdict = 'block';
-      notes.push(`A single screen's prompt (~${fmt(peakScreenTokens)} tok) exceeds ${pct(BLOCK_PEAK_FRACTION)} of the ${fmt(model.contextWindow)}-tok window — it will not fit. Trim the IR (size-gate / section build) before starting.`);
+      verdict = overflowVerdict;
+      notes.push(`A single screen's prompt (~${fmt(peakScreenTokens)} tok) exceeds ${pct(BLOCK_PEAK_FRACTION)} of the ${model.exact ? '' : 'estimated '}${fmt(model.contextWindow)}-tok window — it ${model.exact ? 'will not fit' : 'may not fit'}. Trim the IR (size-gate / section build) before starting.`);
     }
     if (sessionWindowFraction > 1) {
-      verdict = 'block';
-      notes.push(`The projected ${run.freshSessions ? 'peak' : 'cumulative shared-session'} transcript (~${fmt(projectedSessionTokens)} tok) overflows the ${fmt(model.contextWindow)}-tok window. ${run.freshSessions ? 'Reduce per-screen IR.' : 'Enable fresh-per-screen sessions, or split the run.'}`);
+      verdict = verdict === 'block' ? 'block' : overflowVerdict;
+      notes.push(`The projected ${run.freshSessions ? 'peak' : 'cumulative shared-session'} transcript (~${fmt(projectedSessionTokens)} tok) ${model.exact ? 'overflows' : 'may overflow'} the ${model.exact ? '' : 'estimated '}${fmt(model.contextWindow)}-tok window. ${run.freshSessions ? 'Reduce per-screen IR.' : 'Enable fresh-per-screen sessions, or split the run.'}`);
     } else if (verdict !== 'block' && (sessionWindowFraction > WARN_PEAK_FRACTION || peakWindowFraction > WARN_PEAK_FRACTION)) {
       verdict = 'warn';
       notes.push(`Projected usage is over ${pct(WARN_PEAK_FRACTION)} of the context window — quality degrades well before the hard limit. Consider fresh-per-screen sessions or a smaller batch.`);
