@@ -11,3 +11,4 @@ acli
 .config/
 .local/
 .relay/
+.claude/
