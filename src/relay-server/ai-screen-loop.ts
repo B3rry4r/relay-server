@@ -36,13 +36,16 @@ import {
   markRunCancelled, isRunCancelled, clearRunCancelled,
   isRunActive, markRunActive, clearRunActive,
   clampParallel,
-  type ScreenSpec,
+  gateIsActive, pauseAtCheckpoint, approveCheckpoint, setRunResumable,
+  addAmendment, resolveAmendment, writeFrameMap,
+  type ScreenSpec, type CheckpointGate, type BuildRun, type AmendmentKind,
 } from './build-run-store';
 import { getProjectsRoot } from './runtime';
 import {
-  canonicalizeRun, writeCanonical, generateFlutterSkeleton,
+  canonicalizeRun, writeCanonical, readCanonical, generateFlutterSkeleton,
   type Canonical, type CanonicalScreen,
 } from './canonicalize';
+import { computePreflight } from './preflight';
 
 const execFile = promisify(execFileCb);
 
@@ -134,11 +137,72 @@ const routeNameFor = (name: string): string =>
  * fix for "the AI builds its own screens" — each screen is built with the whole
  * app in view, so it registers routes to known screens instead of improvising.
  */
+// ── P4 (RFC §4.4): DIGEST PLANNER ────────────────────────────────────────────
+// Instead of feeding the planner full IR (≈150K tok for Ping), derive a COMPACT
+// structural digest from each screen's already-on-disk IR/packet text — dominant
+// colors, fonts, and which shared components recur — and fold that into the app
+// plan as a DESIGN-SYSTEM SUMMARY + SHARED-COMPONENT INVENTORY. This is the
+// planning signal that was missing (the agent had routes but no shared visual
+// vocabulary), produced deterministically (no LLM pass) from cheap digests.
+const HEX = /#[0-9a-fA-F]{6}\b/g;
+// font hints appear as `font: Inter`, `fontFamily: SF Pro`, `"Inter"` etc.
+const FONT_HINT = /(?:font(?:-?family|Family)?\s*[:=]\s*|typeface\s*[:=]\s*)["']?([A-Za-z][A-Za-z0-9 _-]{1,30})/g;
+// component-ish node names: capitalized PascalCase tokens / `[component: X]` / Card/Button/etc.
+const COMPONENT_HINT = /\b(?:component\s*[:=]\s*)?([A-Z][a-zA-Z]{2,}(?:Button|Card|Bar|Item|Tile|Field|Input|Header|Footer|Nav|List|Row|Avatar|Chip|Badge|Modal|Sheet|Tab|Cell|Icon))\b/g;
+
+function topN<T>(counts: Map<T, number>, n: number): T[] {
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, n).map(e => e[0]);
+}
+function tally(re: RegExp, text: string, into: Map<string, number>, group = 0): void {
+  re.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text))) {
+    const key = (group ? m[group] : m[0])?.trim();
+    if (key) into.set(key, (into.get(key) ?? 0) + 1);
+  }
+}
+
+interface DesignDigest { colors: string[]; fonts: string[]; components: Array<{ name: string; screens: number }> }
+function buildDesignDigest(run: import('./build-run-store').BuildRun): DesignDigest {
+  const colorCounts = new Map<string, number>();
+  const fontCounts = new Map<string, number>();
+  // Component recurrence: count DISTINCT screens a component name shows up in (a
+  // name in many screens = a real shared component, not a one-off).
+  const compScreenCounts = new Map<string, number>();
+  for (const s of run.screens) {
+    const text = `${s.spec?.tree ?? ''}\n${s.spec?.packet ?? ''}`;
+    if (!text.trim()) continue;
+    tally(HEX, text, colorCounts);
+    tally(FONT_HINT, text, fontCounts, 1);
+    const seenHere = new Set<string>();
+    COMPONENT_HINT.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    while ((m = COMPONENT_HINT.exec(text))) { const k = m[1]; if (k) seenHere.add(k); }
+    for (const k of seenHere) compScreenCounts.set(k, (compScreenCounts.get(k) ?? 0) + 1);
+  }
+  const components = [...compScreenCounts.entries()]
+    .filter(([, n]) => n >= 2)                  // shared = recurs across ≥2 screens
+    .sort((a, b) => b[1] - a[1]).slice(0, 12)
+    .map(([name, screens]) => ({ name, screens }));
+  return { colors: topN(colorCounts, 8), fonts: topN(fontCounts, 4), components };
+}
+
 function buildAppPlan(run: import('./build-run-store').BuildRun): string {
   const nameById = new Map(run.screens.map(s => [s.frameId, s.frameName]));
   const out: string[] = [
     `APP PLAN — the COMPLETE, FIXED set of screens in this app. Wire navigation ONLY to these screens; NEVER create, invent, rename, or stub a screen that is not in this list. If a navigation target is not built yet, route to its route name below — a later step fills it in.`,
   ];
+  // P4: design-system summary + shared-component inventory (from compact digests).
+  const digest = buildDesignDigest(run);
+  if (digest.colors.length || digest.fonts.length) {
+    out.push(`DESIGN SYSTEM (derived from the design — REUSE these across every screen; define them ONCE in the theme/token file and import, do not hardcode per screen):`);
+    if (digest.colors.length) out.push(`- Palette (most-used colors): ${digest.colors.join(', ')}`);
+    if (digest.fonts.length) out.push(`- Typeface(s): ${digest.fonts.join(', ')}`);
+  }
+  if (digest.components.length) {
+    out.push(`SHARED COMPONENT INVENTORY (these recur across multiple screens — build each ONCE as a reusable widget and reuse it; do NOT re-implement per screen):`);
+    for (const c of digest.components) out.push(`- ${c.name} (used in ${c.screens} screens)`);
+  }
   if (run.flow?.entryFrameId) {
     const en = nameById.get(run.flow.entryFrameId) || run.flow.entryFrameId;
     out.push(`Entry / start screen: "${en}" (route ${routeNameFor(en)}).`);
@@ -258,6 +322,53 @@ function buildCanonicalContext(canonical: Canonical, cs: CanonicalScreen): strin
     out.push(`Shared components available (import from lib/components/ — reuse, don't re-invent): ${canonical.components.map(c => c.name).join(', ')}.`);
   }
   return out.join('\n');
+}
+
+// ── P4 (RFC §4.5): IR HYGIENE ────────────────────────────────────────────────
+// The agent-facing IR carries dead weight: every asset line has a `[preview:<url>]`
+// annotation (a CSS-renderer hint the coding agent never needs — measured as pure
+// context cost in the failed Ping run), and lists/grids repeat near-identical
+// sibling lines dozens of times. We (1) STRIP the preview annotations and (2)
+// RUN-LENGTH-ENCODE consecutive identical sibling lines into `<line>  ×N`. This is
+// applied to the IR `tree` and to the IR portion of the packet on the way INTO the
+// agent prompt — the on-disk notation is untouched (renderer/UI still use it).
+const PREVIEW_ANNOTATION = /\s*\[preview:[^\]]*\]/g;
+
+/** Strip `[preview:<url>]` asset annotations from agent-facing IR text. */
+export function stripPreviewAnnotations(ir: string): string {
+  return ir ? ir.replace(PREVIEW_ANNOTATION, '') : ir;
+}
+
+// The tree uses box-drawing/indent prefixes (│ ├ └ etc.) before the node content.
+// Two siblings are "the same" when the content AFTER the leading tree glyphs and
+// whitespace is identical — RLE collapses a run of them so a 40-item list isn't 40
+// lines. We keep the FIRST occurrence verbatim and append `  ×N`.
+const TREE_PREFIX = /^[\s│├└─┬┴┼╰╯╭╮|`+\-]*/;
+const stripTreePrefix = (line: string): string => line.replace(TREE_PREFIX, '').trim();
+
+/** Collapse runs of consecutive identical sibling lines into `<line>  ×N`. */
+export function rleRepeatedSiblings(ir: string): string {
+  if (!ir) return ir;
+  const lines = ir.split('\n');
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const key = stripTreePrefix(lines[i]);
+    let n = 1;
+    // Only collapse non-trivial content lines (skip blanks / 1-char glyphs).
+    if (key.length > 2) {
+      while (i + n < lines.length && stripTreePrefix(lines[i + n]) === key) n++;
+    }
+    out.push(n > 1 ? `${lines[i]}  ×${n}` : lines[i]);
+    i += n;
+  }
+  return out.join('\n');
+}
+
+/** Full IR-hygiene pass for agent-facing IR: strip previews + RLE siblings. */
+export function hygieneIR(ir: string | undefined): string | undefined {
+  if (!ir) return ir;
+  return rleRepeatedSiblings(stripPreviewAnnotations(ir));
 }
 
 async function readLastGen(projectRoot: string): Promise<LastGen> {
@@ -569,13 +680,15 @@ async function buildRunScreen(
   // P3: when this is a canonical lead frame, prepend its states/modals/template +
   // route-slot context so the agent builds ONE widget instead of per-variant pages.
   if (canonicalCtx) contract = `${buildCanonicalContext(canonicalCtx.canonical, canonicalCtx.screen)}\n\n— — —\n${contract}`;
+  // P4: strip [preview:…] + RLE repeated siblings from the agent-facing IR.
+  const cleanPacket = hygieneIR(screen.spec.packet) ?? screen.spec.packet;
   const sreq: BuildScreenReq = {
     projectId, model: run.model as AIModel, modelId: run.modelId, sessionId: sharedSession,
     framework: run.framework || 'flutter', frameId: screen.frameId, frameName: screen.frameName,
     width: screen.spec.width, height: screen.spec.height,
     referenceImagePath: screen.spec.referenceImagePath,
-    implementPrompt: `${contract}\n\n— — —\nNOW BUILD THIS SCREEN:\n${screen.spec.packet}`,
-    tree: screen.spec.tree, maxIterations: run.maxIterations, jobId, runId,
+    implementPrompt: `${contract}\n\n— — —\nNOW BUILD THIS SCREEN:\n${cleanPacket}`,
+    tree: hygieneIR(screen.spec.tree), maxIterations: run.maxIterations, jobId, runId,
     userNotes: run.userNotes, verify: run.verify, freshSession: fresh,
   };
   try {
@@ -588,10 +701,24 @@ async function buildRunScreen(
   }
 }
 
+// P5 (RFC §5): pause the run at a HITL gate if it's enabled + not yet cleared.
+// Returns true when the orchestrator should STOP (the run is now parked awaiting a
+// human approval); false to proceed. No-op (returns false) when the gate is off.
+async function gate(run: BuildRun, gateName: CheckpointGate, message: string): Promise<boolean> {
+  if (!gateIsActive(run, gateName)) return false;
+  await appendRunLog(run.projectId, run.id, `[hitl] checkpoint "${gateName}" — paused for approval: ${message}`);
+  await pauseAtCheckpoint(run.projectId, run.id, gateName, message);
+  return true;
+}
+
 async function runAppLoop(projectId: string, runId: string): Promise<void> {
   if (isRunActive(runId)) return;          // already orchestrating in this process
   markRunActive(runId);
   clearRunCancelled(runId);
+  // P5 (RFC §4.9): while a run is actively orchestrating it is NOT resumable — only
+  // a graceful pause (checkpoint / stop) flips resumable back on. A crash mid-run
+  // therefore leaves resumable:false → no auto-resurrect on the next boot.
+  void setRunResumable(projectId, runId, false);
   const projectRoot = resolveProjectRoot(projectId);
   if (!projectRoot || !fsSync.existsSync(projectRoot)) { clearRunActive(runId); return; }
 
@@ -622,6 +749,9 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
       try {
         canonical = canonicalizeRun(run.screens, run.flow);
         await writeCanonical(projectRoot, runId, canonical);
+        // P5 (RFC §4.2/§4.9): persist frame-map.json — the SINGLE identity axis
+        // (frameId → canonicalId). All durability + route derivation key on this.
+        await writeFrameMap(projectId, runId, canonical.frameMap);
         // Generate the deterministic skeleton (Flutter only for now; other
         // frameworks still get canonical.json + the manifest, no router file).
         if ((run.framework || 'flutter').toLowerCase() === 'flutter') {
@@ -666,6 +796,20 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
       return canonical && cs ? { canonical, screen: cs } : undefined;
     };
 
+    // ── HITL Checkpoint 0 (RFC §5): after canonicalization/flow ──────────────────
+    // Re-read the run so the gate sees the latest approvedGates (set by an approve
+    // that resumed this loop). If a gate fires the loop returns; approve resumes it.
+    {
+      const live = await getRun(projectId, runId) ?? run;
+      const flowMsg = `${canonical ? `${canonical.screens.length} canonical screen(s)` : `${run.screens.length} frame(s)`}, ${run.flow?.connections?.length ?? 0} nav link(s)${run.flow?.connections?.length ? '' : ' — NO navigation graph; set entry + nav'}`;
+      if (await gate(live, 'flow', flowMsg)) return;
+    }
+    // ── HITL Checkpoint 1 (RFC §5): after plan + pre-flight ──────────────────────
+    {
+      const live = await getRun(projectId, runId) ?? run;
+      if (await gate(live, 'plan', `approve ${run.screens.length} route(s)/screen(s) + token/cost pre-flight`)) return;
+    }
+
     // P2: a parallel pool only makes sense with fresh sessions (a shared --resume
     // session can't be used by two workers at once), so it forces freshSessions.
     const workers = run.freshSessions ? clampParallel(run.parallel ?? 1) : 1;
@@ -702,6 +846,10 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
     } else {
       // ── Serial (shared session by default, or fresh-serial) ─────────────────
       let session = run.freshSessions ? undefined : run.sessionId;
+      // P5: rolling-review cadence (RFC §5 Checkpoint 3) — pause every N built screens.
+      const ROLLING_EVERY = 5;
+      let builtSinceGate = 0;
+      let screensBuilt = 0;
       for (const screen of run.screens) {
         if (isRunCancelled(runId)) {
           await appendRunLog(projectId, runId, '[run] stopped by user');
@@ -716,6 +864,20 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
         const sess = await buildRunScreen(run, screen, projectRoot, appPlan, session, canonCtxFor(screen.frameId));
         // In fresh-session mode there is no cross-screen thread to carry forward.
         if (sess && !run.freshSessions) { session = sess; await setRunSession(projectId, runId, session); }
+        screensBuilt++; builtSinceGate++;
+
+        // ── HITL Checkpoint 2 (RFC §5): after the FIRST screen — freeze the visual
+        // language (design system + screen-1 reference build) before scaling.
+        if (screensBuilt === 1) {
+          const l2 = await getRun(projectId, runId) ?? run;
+          if (await gate(l2, 'design-system', 'review the design system + screen-1 reference build before scaling')) return;
+        }
+        // ── HITL Checkpoint 3 (RFC §5): rolling review every N screens. ──────────
+        if (builtSinceGate >= ROLLING_EVERY) {
+          builtSinceGate = 0;
+          const l3 = await getRun(projectId, runId) ?? run;
+          if (await gate(l3, 'rolling', `rolling review — ${screensBuilt} screen(s) built so far`)) return;
+        }
       }
     }
 
@@ -728,6 +890,12 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
     const total = done?.screens.length ?? 0;
     const built = done?.screens.filter(s => s.status === 'done').length ?? 0;
     const needsReview = done?.screens.filter(s => s.status === 'needs-review').length ?? 0;
+    // ── HITL Checkpoint 4 (RFC §5): before global wiring / full build / deploy ────
+    // Only gate here when the queue is clear (needs-review > 0 already parks the run
+    // for review below — the pre-global gate is the human sign-off once it's clean).
+    if (needsReview === 0 && done) {
+      if (await gate(done, 'pre-global', `pre-global sign-off — ${built}/${total} built, needs-review 0`)) return;
+    }
     // RFC §4.7: a run does NOT report complete while needs-review > 0 — it parks in
     // 'needs-review' until a human Accepts / Corrected-retries every queued screen.
     if (needsReview > 0) {
@@ -784,8 +952,8 @@ async function retryScreenLoop(projectId: string, runId: string, frameId: string
       framework: run.framework || 'flutter', frameId, frameName: screen.frameName,
       width: screen.spec.width, height: screen.spec.height,
       referenceImagePath: screen.spec.referenceImagePath,
-      implementPrompt: `${contract}\n\n— — —\n${correction}\n\n— — —\nNOW REVISE THIS SCREEN:\n${screen.spec.packet}`,
-      tree: screen.spec.tree, maxIterations: run.maxIterations, jobId: startJobId, runId,
+      implementPrompt: `${contract}\n\n— — —\n${correction}\n\n— — —\nNOW REVISE THIS SCREEN:\n${hygieneIR(screen.spec.packet) ?? screen.spec.packet}`,
+      tree: hygieneIR(screen.spec.tree), maxIterations: run.maxIterations, jobId: startJobId, runId,
       userNotes: [run.userNotes?.trim(), note.trim()].filter(Boolean).join('\n\n'), verify: run.verify,
     };
     try {
@@ -805,8 +973,14 @@ async function retryScreenLoop(projectId: string, runId: string, frameId: string
 }
 
 /**
- * Re-start any run that was 'running' when the process died (e.g. a redeploy).
+ * Re-start runs that were GRACEFULLY PAUSED when the process died (e.g. a redeploy).
  * Called once on server boot so a full-app build survives a container restart.
+ *
+ * P5 (RFC §4.9): no auto-resurrect of crashed / stopped runs. Only a run with the
+ * explicit `resumable:true` graceful-pause flag is restarted — a run that was
+ * 'running' (mid-screen) when the box died is left alone (its in-flight state is
+ * untrustworthy) and a human restarts it from the Runs UI. This kills the old
+ * behavior where any 'running' run was blindly re-launched on every redeploy.
  */
 export async function resumeInterruptedRuns(): Promise<void> {
   try {
@@ -816,13 +990,36 @@ export async function resumeInterruptedRuns(): Promise<void> {
     for (const projectId of projectIds) {
       const runs = await listRuns(projectId, 50);
       for (const r of runs) {
-        if (r.status === 'running' && !isRunActive(r.id)) {
-          void appendRunLog(projectId, r.id, '[run] resuming after server restart');
+        // Only resume an explicitly resumable (gracefully-paused) run, and never one
+        // parked at a checkpoint (a human must approve that gate first).
+        const resumable = r.resumable === true && r.status !== 'awaiting-approval' && r.status !== 'stopped';
+        if (resumable && !isRunActive(r.id)) {
+          void appendRunLog(projectId, r.id, '[run] resuming gracefully-paused run after server restart');
           void runAppLoop(projectId, r.id);
         }
       }
     }
   } catch { /* boot resume is best-effort */ }
+}
+
+/**
+ * P5 (RFC §4.8): regenerate the write-locked skeleton after an approved amendment
+ * bumps the plan version. Reuses the persisted canonical.json (the skeleton
+ * generator is additive — it never clobbers a built screen file, only fills in the
+ * router/route-table + missing stubs), so downstream screens see plan v+1. Flutter
+ * only for now (matches generateFlutterSkeleton's scope). Best-effort + logged.
+ */
+async function regenSkeletonForRun(projectId: string, run: BuildRun): Promise<void> {
+  if (!run.canonical || (run.framework || 'flutter').toLowerCase() !== 'flutter') return;
+  const projectRoot = resolveProjectRoot(projectId);
+  if (!projectRoot || !fsSync.existsSync(projectRoot)) return;
+  try {
+    const canonical = (await readCanonical(projectRoot, run.id)) ?? canonicalizeRun(run.screens, run.flow);
+    const sk = await generateFlutterSkeleton(projectRoot, canonical);
+    await appendRunLog(projectId, run.id, `[amend] skeleton regenerated for plan v${run.planVersion ?? 1}: ${sk.files.length} file(s), ${sk.routes.length} route(s)`);
+  } catch (e: any) {
+    await appendRunLog(projectId, run.id, `[amend] skeleton regen failed (continuing): ${e?.message || 'unknown'}`);
+  }
 }
 
 export function registerScreenLoopRoutes(app: Express): void {
@@ -877,6 +1074,10 @@ export function registerScreenLoopRoutes(app: Express): void {
       parallel: typeof b.parallel === 'number' ? b.parallel : undefined,
       // P3: opt into the canonicalization pre-pass + write-locked skeleton.
       canonical: b.canonical === true,
+      // P5: enable HITL checkpoint gates (RFC §5). Pass a subset of gate names
+      // ('flow','plan','design-system','rolling','pre-global') to pause the run for
+      // human approval at those milestones. Omitted/empty → no gating (old behavior).
+      checkpoints: Array.isArray(b.checkpoints) ? b.checkpoints.map((g: any) => String(g)) as CheckpointGate[] : undefined,
       flow: b.flow && (Array.isArray(b.flow.connections) || b.flow.entryFrameId !== undefined) ? {
         entryFrameId: b.flow.entryFrameId ?? null,
         connections: Array.isArray(b.flow.connections) ? b.flow.connections.map((c: any) => ({
@@ -892,6 +1093,10 @@ export function registerScreenLoopRoutes(app: Express): void {
           tree: typeof s.spec.tree === 'string' ? s.spec.tree : undefined,
           width: typeof s.spec.width === 'number' ? s.spec.width : undefined,
           height: typeof s.spec.height === 'number' ? s.spec.height : undefined,
+          // P4: actual reference-render pixel size (refs are @2×) — drives the
+          // pre-flight vision-token estimate. Stored at creation per RFC §4.3.
+          refWidthPx: typeof s.spec.refWidthPx === 'number' ? s.spec.refWidthPx : undefined,
+          refHeightPx: typeof s.spec.refHeightPx === 'number' ? s.spec.refHeightPx : undefined,
         } : undefined,
       })),
     });
@@ -932,8 +1137,91 @@ export function registerScreenLoopRoutes(app: Express): void {
     const runId = req.params.runId;
     markRunCancelled(runId);
     await appendRunLog(projectId, runId, '[run] stop requested');
+    // P5 (RFC §4.9): a user Stop is a GRACEFUL pause → mark resumable so a later
+    // /start (or, if the user opts in, boot-resume) can pick it back up. (A crash
+    // leaves resumable:false, so only intentional stops are resumable.)
+    await setRunResumable(projectId, runId, true);
     if (!isRunActive(runId)) await setRunStatus(projectId, runId, 'stopped');
     res.json({ stopped: true });
+  });
+
+  // ── P5: HITL checkpoint gates (RFC §5) ───────────────────────────────────────
+  // POST /api/ai/runs/:runId/checkpoint { projectId, action: 'approve'|'edit',
+  //   gate?, edits? } — clear the parked checkpoint and resume the build. 'edit'
+  //   applies optional edits to the run (entryFrameId / steerNotes) before resuming
+  //   — the minimal "edit" affordance the RFC's checkpoint UI needs.
+  app.post('/api/ai/runs/:runId/checkpoint', async (req, res) => {
+    const b = req.body ?? {};
+    const projectId = b.projectId as string;
+    if (!projectId) { res.status(400).json({ error: 'projectId is required' }); return; }
+    const runId = req.params.runId;
+    let run = await getRun(projectId, runId);
+    if (!run) { res.status(404).json({ error: 'run not found' }); return; }
+    if (run.status !== 'awaiting-approval' || !run.checkpoint) {
+      res.status(409).json({ error: `run is not awaiting approval (status: ${run.status})` }); return;
+    }
+    const gateName = (b.gate as CheckpointGate) ?? run.checkpoint.gate;
+    // Optional edits applied at the gate (RFC §5: edit clustering/entry/nav, steer).
+    const edits = b.edits ?? {};
+    if (run.flow && typeof edits.entryFrameId === 'string') { run.flow.entryFrameId = edits.entryFrameId; await saveRun(projectId, run); }
+    if (typeof edits.steerNotes === 'string' && edits.steerNotes.trim()) {
+      run.userNotes = [run.userNotes?.trim(), edits.steerNotes.trim()].filter(Boolean).join('\n\n');
+      await saveRun(projectId, run);
+      await appendRunLog(projectId, runId, `[hitl] checkpoint "${gateName}" steered: ${edits.steerNotes.trim().replace(/\s+/g, ' ')}`);
+    }
+    run = (await approveCheckpoint(projectId, runId, gateName)) ?? run;
+    await appendRunLog(projectId, runId, `[hitl] checkpoint "${gateName}" approved — resuming`);
+    if (b.action === 'reject') {
+      // Reject = stop the run here (resumable so it can be restarted later).
+      await setRunResumable(projectId, runId, true);
+      await setRunStatus(projectId, runId, 'stopped');
+      res.json({ run: await getRun(projectId, runId), resumed: false }); return;
+    }
+    res.json({ run, resumed: true });
+    // Resume orchestration: the cleared gate is recorded in approvedGates so it
+    // won't re-fire; the loop continues from where it parked (already-done screens
+    // are skipped). Fire-and-forget — survives the request returning.
+    void runAppLoop(projectId, runId).catch(() => {});
+  });
+
+  // ── P5: plan amendment protocol (RFC §4.8) ───────────────────────────────────
+  // POST /api/ai/runs/:runId/amendments { projectId, kind, rationale, proposedApi,
+  //   fromFrameId? } — a screen requests a missing route/component. Whitelisted
+  //   classes auto-approve (planVersion++ + skeleton regen); else it's queued for
+  //   approval at the rolling gate. Returns the created amendment.
+  app.post('/api/ai/runs/:runId/amendments', async (req, res) => {
+    const b = req.body ?? {};
+    const projectId = b.projectId as string;
+    const kind = b.kind as AmendmentKind;
+    const rationale = typeof b.rationale === 'string' ? b.rationale.trim() : '';
+    const proposedApi = typeof b.proposedApi === 'string' ? b.proposedApi.trim() : '';
+    if (!projectId || (kind !== 'add-route' && kind !== 'add-component') || !proposedApi) {
+      res.status(400).json({ error: "projectId, kind ('add-route'|'add-component') and proposedApi are required" }); return;
+    }
+    const runId = req.params.runId;
+    const result = await addAmendment(projectId, runId, { kind, rationale, proposedApi, fromFrameId: b.fromFrameId });
+    if (!result) { res.status(404).json({ error: 'run not found' }); return; }
+    const { run, amendment } = result;
+    await appendRunLog(projectId, runId, `[amend] ${amendment.kind} "${amendment.proposedApi}" — ${amendment.status}${amendment.auto ? ' (auto, whitelisted)' : ' (queued for rolling-gate approval)'}`);
+    if (amendment.status === 'approved') await regenSkeletonForRun(projectId, run);
+    res.json({ amendment, planVersion: run.planVersion });
+  });
+
+  // POST /api/ai/runs/:runId/amendments/:amendmentId { projectId, decision } —
+  //   human resolves a pending amendment at the rolling gate. approved → planVersion++
+  //   + skeleton regen.
+  app.post('/api/ai/runs/:runId/amendments/:amendmentId', async (req, res) => {
+    const b = req.body ?? {};
+    const projectId = b.projectId as string;
+    const decision = b.decision === 'approved' ? 'approved' : b.decision === 'rejected' ? 'rejected' : null;
+    if (!projectId || !decision) { res.status(400).json({ error: "projectId and decision ('approved'|'rejected') are required" }); return; }
+    const runId = req.params.runId;
+    const result = await resolveAmendment(projectId, runId, req.params.amendmentId, decision);
+    if (!result) { res.status(404).json({ error: 'run or amendment not found' }); return; }
+    const { run, amendment } = result;
+    await appendRunLog(projectId, runId, `[amend] ${amendment.kind} "${amendment.proposedApi}" — ${decision} (human)`);
+    if (decision === 'approved') await regenSkeletonForRun(projectId, run);
+    res.json({ amendment, planVersion: run.planVersion });
   });
 
   // ── Needs-review workflow (RFC §4.7) ─────────────────────────────────────────
@@ -1012,6 +1300,23 @@ export function registerScreenLoopRoutes(app: Express): void {
     const projectId = req.query.projectId as string;
     if (!projectId) { res.status(400).json({ error: 'projectId is required' }); return; }
     res.json({ runs: await listRuns(projectId) });
+  });
+
+  // GET /api/ai/runs/:runId/preflight?projectId= — P4 (RFC §4.3): the deterministic
+  // token/cost pre-flight gate (NO LLM). Resolve the concrete model + real window,
+  // estimate text+vision tokens per screen, project the cumulative shared-session
+  // transcript, best/expected/worst cost, and a block/warn/ok verdict. Shown at
+  // HITL Checkpoint 1 BEFORE the run is started.
+  app.get('/api/ai/runs/:runId/preflight', async (req, res) => {
+    const projectId = req.query.projectId as string;
+    if (!projectId) { res.status(400).json({ error: 'projectId is required' }); return; }
+    const run = await getRun(projectId, req.params.runId);
+    if (!run) { res.status(404).json({ error: 'run not found' }); return; }
+    try {
+      res.json({ preflight: computePreflight(run) });
+    } catch (e: any) {
+      res.status(500).json({ error: `preflight failed: ${e?.message || 'unknown'}` });
+    }
   });
 
   // GET /api/ai/runs/:runId?projectId= — one run.
