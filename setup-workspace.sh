@@ -117,9 +117,13 @@ ensure_relay_identity() {
   RELAY_MACHINE_ID="$(tr -d '\n\r' < "$RELAY_MACHINE_ID_PATH")"
   RELAY_HOSTNAME="$(tr -d '\n\r' < "$RELAY_HOSTNAME_PATH")"
 
-  printf '%s\n' "$RELAY_MACHINE_ID" > /etc/machine-id
-  mkdir -p /var/lib/dbus
-  printf '%s\n' "$RELAY_MACHINE_ID" > /var/lib/dbus/machine-id
+  # /etc/machine-id and the dbus machine-id are root-owned system files; the
+  # app runs as the non-root 'dev' user, so write them via passwordless sudo.
+  # The relay's own identity is already persisted on the volume above, so these
+  # OS-level writes are best-effort — never let them crash bootstrap.
+  printf '%s\n' "$RELAY_MACHINE_ID" | sudo tee /etc/machine-id >/dev/null 2>&1 || true
+  sudo mkdir -p /var/lib/dbus 2>/dev/null || true
+  printf '%s\n' "$RELAY_MACHINE_ID" | sudo tee /var/lib/dbus/machine-id >/dev/null 2>&1 || true
   hostname "$RELAY_HOSTNAME" >/dev/null 2>&1 || true
 
   export RELAY_MACHINE_ID
