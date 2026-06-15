@@ -3,6 +3,15 @@
 set -euo pipefail
 
 WORKSPACE="${WORKSPACE:-/workspace}"
+
+# The Railway volume mounts root-owned on first attach, but the container now
+# runs as the non-root 'dev' user (see Dockerfile: USER dev). Before writing
+# anything into the volume, take ownership of it. 'dev' has passwordless sudo
+# for exactly this. Guarded by an ownership check so reboots stay fast.
+if [ "$(stat -c '%U' "$WORKSPACE" 2>/dev/null || echo unknown)" != "dev" ]; then
+  sudo chown -R dev:dev "$WORKSPACE"
+fi
+
 BOOTSTRAP_FLAG="$WORKSPACE/.bootstrapped"
 BOOTSTRAP_STATUS_PATH="$WORKSPACE/.bootstrap-status"
 RELAY_ROOT="$WORKSPACE/.relay"
