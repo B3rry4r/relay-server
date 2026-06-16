@@ -278,14 +278,25 @@ export async function getRun(projectId: string, id: string): Promise<BuildRun | 
   catch { return null; }
 }
 
+// A real run file is EXACTLY `<runId>.json` where runId = `run_<ts>_<rand>`. The
+// sidecars `<runId>.canonical.json` and `<runId>.frame-map.json` are also *.json
+// but are NOT runs — frame-map has no `screens` (so `r.screens.map` threw and the
+// outer catch wiped the WHOLE list → "No build runs yet" while a run was live),
+// and canonical's `screens` are a different shape. Match the run-id pattern only.
+const RUN_FILE_RE = /^run_\d+_[a-z0-9]+\.json$/i;
+
 /** List runs — WITHOUT the heavy per-screen specs (keeps the list payload small). */
 export async function listRuns(projectId: string, limit = 30): Promise<BuildRun[]> {
   const root = rootFor(projectId);
   if (!root) return [];
   try {
-    const files = (await fs.readdir(runsDir(root))).filter(f => f.endsWith('.json'));
+    const files = (await fs.readdir(runsDir(root))).filter(f => RUN_FILE_RE.test(f));
     const runs = await Promise.all(files.map(async f => {
-      try { return JSON.parse(await fs.readFile(path.join(runsDir(root), f), 'utf-8')) as BuildRun; } catch { return null; }
+      try {
+        const r = JSON.parse(await fs.readFile(path.join(runsDir(root), f), 'utf-8')) as BuildRun;
+        // Defensive: never let one malformed file throw and empty the whole list.
+        return Array.isArray(r?.screens) ? r : null;
+      } catch { return null; }
     }));
     return runs.filter((r): r is BuildRun => !!r)
       .map(r => ({ ...r, screens: r.screens.map(s => ({ ...s, spec: undefined })) }))

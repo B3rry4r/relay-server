@@ -985,47 +985,68 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
     const canonByLeadFrame = new Map<string, CanonicalScreen>();   // leadFrameId → canonical screen
     const leadFrameIds = new Set<string>();
     if (run.canonical) {
-      try {
-        canonical = canonicalizeRun(run.screens, run.flow);
-        await writeCanonical(projectRoot, runId, canonical);
-        // P5 (RFC §4.2/§4.9): persist frame-map.json — the SINGLE identity axis
-        // (frameId → canonicalId). All durability + route derivation key on this.
-        await writeFrameMap(projectId, runId, canonical.frameMap);
-        // Generate the deterministic skeleton (Flutter only for now; other
-        // frameworks still get canonical.json + the manifest, no router file).
-        if ((run.framework || 'flutter').toLowerCase() === 'flutter') {
-          try {
-            const sk = await generateFlutterSkeleton(projectRoot, canonical);
-            await appendRunLog(projectId, runId, `[canon] skeleton: ${sk.files.length} file(s), ${sk.routes.length} route(s)`);
-          } catch (e: any) {
-            await appendRunLog(projectId, runId, `[canon] skeleton generation failed (continuing): ${e?.message || 'unknown'}`);
+      // Resume-cheap: the canonicalization pre-pass is deterministic from the run's
+      // frames+flow and is persisted to canonical.json on the FIRST start. On every
+      // later (re)start — resume after redeploy, a restart, a checkpoint approve —
+      // REUSE the persisted result instead of re-clustering, re-writing the
+      // skeleton, and re-folding from scratch. This is the "why does the preparing
+      // phase always repeat" fix: prep runs ONCE, then we pick up where we left off.
+      const persisted = await readCanonical(projectRoot, runId);
+      if (persisted) {
+        canonical = persisted;
+        await appendRunLog(projectId, runId, `[canon] reusing persisted canonicalization (${canonical.screens.length} screen(s), ${canonical.components.length} component(s)) — prep already done, skipping re-canonicalize + skeleton + fold`);
+      } else {
+        try {
+          canonical = canonicalizeRun(run.screens, run.flow);
+          await writeCanonical(projectRoot, runId, canonical);
+          // P5 (RFC §4.2/§4.9): persist frame-map.json — the SINGLE identity axis
+          // (frameId → canonicalId). All durability + route derivation key on this.
+          await writeFrameMap(projectId, runId, canonical.frameMap);
+          // Generate the deterministic skeleton (Flutter only for now; other
+          // frameworks still get canonical.json + the manifest, no router file).
+          // (Skeleton writes are additive — a built screen file is never clobbered.)
+          if ((run.framework || 'flutter').toLowerCase() === 'flutter') {
+            try {
+              const sk = await generateFlutterSkeleton(projectRoot, canonical);
+              await appendRunLog(projectId, runId, `[canon] skeleton: ${sk.files.length} file(s), ${sk.routes.length} route(s)`);
+            } catch (e: any) {
+              await appendRunLog(projectId, runId, `[canon] skeleton generation failed (continuing): ${e?.message || 'unknown'}`);
+            }
           }
+          // Mark every NON-lead member (extra states, bound modals, components) done
+          // up-front so the run completes — they're built inside their lead screen.
+          // Only on the FIRST canonicalization; on resume these are already 'done'.
+          const memberToLead = new Map<string, string>();   // any member frameId → lead frameId
+          for (const cs of canonical.screens) {
+            const lead = cs.states[0]?.frameId ?? cs.frameIds[0];
+            if (!lead) continue;
+            for (const fid of cs.frameIds) memberToLead.set(fid, lead);
+            for (const m of cs.modals) memberToLead.set(m.frameId, lead);
+          }
+          const leadSet = new Set([...canonical.screens].map(cs => cs.states[0]?.frameId ?? cs.frameIds[0]).filter(Boolean) as string[]);
+          let folded = 0;
+          for (const s of run.screens) {
+            if (memberToLead.has(s.frameId) && !leadSet.has(s.frameId) && s.status !== 'done') {
+              await updateRunScreen(projectId, runId, s.frameId, { status: 'done', matched: true });
+              folded++;
+            }
+          }
+          await appendRunLog(projectId, runId, `[canon] ${run.screens.length} frame(s) → ${canonical.screens.length} canonical screen(s), ${canonical.components.length} component(s)${folded ? `, ${folded} folded state/modal frame(s)` : ''}${canonical.warnings.length ? ` — ${canonical.warnings.length} warning(s)` : ''}`);
+          for (const w of canonical.warnings) await appendRunLog(projectId, runId, `[canon] WARNING: ${w}`);
+        } catch (e: any) {
+          canonical = undefined;
+          await appendRunLog(projectId, runId, `[canon] canonicalization failed (falling back to per-frame build): ${e?.message || 'unknown'}`);
         }
-        // A canonical screen's LEAD frame = its first state's frame. Only leads are
-        // built; their states/modals are handled within that single build.
-        const memberToLead = new Map<string, string>();   // any member frameId → lead frameId
+      }
+      // Build the lead maps from the canonical (fresh OR reused) — these drive which
+      // frames are buildable targets and carry each screen's canonical context.
+      if (canonical) {
         for (const cs of canonical.screens) {
           const lead = cs.states[0]?.frameId ?? cs.frameIds[0];
           if (!lead) continue;
           leadFrameIds.add(lead);
           canonByLeadFrame.set(lead, cs);
-          for (const fid of cs.frameIds) memberToLead.set(fid, lead);
-          for (const m of cs.modals) memberToLead.set(m.frameId, lead);
         }
-        // Mark every NON-lead member (extra states, bound modals, components) done
-        // up-front so the run completes — they're built inside their lead screen.
-        let folded = 0;
-        for (const s of run.screens) {
-          if (memberToLead.has(s.frameId) && !leadFrameIds.has(s.frameId) && s.status !== 'done') {
-            await updateRunScreen(projectId, runId, s.frameId, { status: 'done', matched: true });
-            folded++;
-          }
-        }
-        await appendRunLog(projectId, runId, `[canon] ${run.screens.length} frame(s) → ${canonical.screens.length} canonical screen(s), ${canonical.components.length} component(s)${folded ? `, ${folded} folded state/modal frame(s)` : ''}${canonical.warnings.length ? ` — ${canonical.warnings.length} warning(s)` : ''}`);
-        for (const w of canonical.warnings) await appendRunLog(projectId, runId, `[canon] WARNING: ${w}`);
-      } catch (e: any) {
-        canonical = undefined;
-        await appendRunLog(projectId, runId, `[canon] canonicalization failed (falling back to per-frame build): ${e?.message || 'unknown'}`);
       }
     }
     // Audit A.3: once canonicalized, rebuild the app plan so its route scheme derives
