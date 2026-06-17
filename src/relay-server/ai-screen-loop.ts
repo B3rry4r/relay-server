@@ -46,6 +46,7 @@ import {
   canonicalizeRun, writeCanonical, readCanonical, generateFlutterSkeleton,
   type Canonical, type CanonicalScreen,
 } from './canonicalize';
+import { generateDesignSystem, seedContextWithThemeApi, hasGeneratedTheme } from './design-system';
 import { computePreflight } from './preflight';
 import { reconcileScreen, reconcileSummary, type ReconcileResult } from './reconcile';
 
@@ -232,8 +233,8 @@ function buildAppPlan(run: import('./build-run-store').BuildRun, canonical?: Can
   // P4: design-system summary + shared-component inventory (from compact digests).
   const digest = buildDesignDigest(run);
   if (digest.colors.length || digest.fonts.length) {
-    out.push(`DESIGN SYSTEM (derived from the design — REUSE these across every screen; define them ONCE in the theme/token file and import, do not hardcode per screen):`);
-    if (digest.colors.length) out.push(`- Palette (most-used colors): ${digest.colors.join(', ')}`);
+    out.push(`DESIGN SYSTEM — a real theme file (lib/theme/app_theme.dart, class \`AppTheme\`) is GENERATED before screens build. IMPORT \`AppTheme.<token>\` for colors/spacing/radius/typeface; a raw Color(0x..)/fontSize/EdgeInsets literal that duplicates a token is a DEFECT the review flags. The exact symbol list is in .uix/context.md ("Design system (importable)").`);
+    if (digest.colors.length) out.push(`- Palette behind the tokens (most-used): ${digest.colors.join(', ')}`);
     if (digest.fonts.length) out.push(`- Typeface(s): ${digest.fonts.join(', ')}`);
   }
   if (digest.components.length) {
@@ -1054,6 +1055,23 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
     // injected API surface. Without this the agent sees frameName routes in the plan
     // but canonical routes in the skeleton (two divergent schemes).
     if (canonical) appPlan = buildAppPlan(run, canonical);
+
+    // ── EXTRACT-FIRST design system (RFC §4.4) ───────────────────────────────────
+    // BEFORE any screen builds, turn the deterministic digest (dominant colors +
+    // fonts) into a REAL importable theme file (lib/theme/app_theme.dart → AppTheme)
+    // and seed .uix/context.md with the importable symbol list. This fixes the root
+    // cause of per-screen hardcoding: there was no named token to import, so screens
+    // inlined raw hex. Idempotent — skipped on resume if AppTheme already exists.
+    try {
+      if (!hasGeneratedTheme(projectRoot)) {
+        const digest = buildDesignDigest(run);
+        const ds = await generateDesignSystem(projectRoot, run.framework || 'flutter', { colors: digest.colors, fonts: digest.fonts });
+        await seedContextWithThemeApi(projectRoot, ds.api);
+        await appendRunLog(projectId, runId, `[design-system] ${ds.wrote ? 'generated' : 'reused'} ${ds.themeFile} with ${ds.tokenCount} color token(s)${digest.fonts[0] ? ` + ${digest.fonts[0]}` : ''} — screens import AppTheme.* (no per-screen hardcoding)`);
+      }
+    } catch (e: any) {
+      await appendRunLog(projectId, runId, `[design-system] generation skipped (non-fatal): ${e?.message || 'unknown'}`);
+    }
 
     // When canonicalized, only the lead frames are buildable targets.
     const isBuildTarget = (frameId: string): boolean => !canonical || leadFrameIds.has(frameId);
