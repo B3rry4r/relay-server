@@ -376,6 +376,9 @@ export function buildCanonical(frames: FrameInput[], flow?: RunFlow): Canonical 
   // 4. bind each modal to its base screen: incoming `modal` flow edge → else flag.
   const screenByFrame = new Map<string, string>();
   for (const s of canonicalScreens) for (const fid of s.frameIds) screenByFrame.set(fid, s.canonicalId);
+  // Name-token overlap (lowercased words ≥3 chars), for the no-flow-edge fallback.
+  const nameTokens = (s: string): Set<string> =>
+    new Set((s.toLowerCase().match(/[a-z]{3,}/g) ?? []).filter(w => !/iphone|pro|android|frame|screen|default|copy/.test(w)));
   for (const i of modalIdx) {
     const modalFrameId = frames[i].frameId;
     const modalId = 'modal_' + modalFrameId.replace(/[^a-zA-Z0-9]+/g, '_');
@@ -384,7 +387,23 @@ export function buildCanonical(frames: FrameInput[], flow?: RunFlow): Canonical 
     const incoming = (flow?.connections ?? []).filter(c => c.to === modalFrameId);
     const modalEdge = incoming.find(c => /modal|sheet|overlay/i.test(c.type)) ?? incoming[0];
     if (modalEdge) baseCanonicalId = screenByFrame.get(modalEdge.from) ?? null;
-    if (!baseCanonicalId) warnings.push(`modal "${frames[i].frameName}" (${modalFrameId}) has no base screen — bind it manually (HITL Checkpoint 0)`);
+    // Fallback (no flow edge): bind to the screen whose NAME shares the most
+    // meaningful tokens (e.g. "Notification settings sheet" → "Settings"). Needs ≥1
+    // shared token, so generic/identical device-frame names (Ping) never mis-bind.
+    if (!baseCanonicalId) {
+      const mt = nameTokens(frames[i].frameName);
+      if (mt.size) {
+        let best: { id: string; overlap: number } | null = null;
+        for (const s of canonicalScreens) {
+          if (s.role !== 'screen') continue;
+          let overlap = 0; const st = nameTokens(s.name);
+          for (const w of mt) if (st.has(w)) overlap++;
+          if (overlap > (best?.overlap ?? 0)) best = { id: s.canonicalId, overlap };
+        }
+        if (best && best.overlap > 0) baseCanonicalId = best.id;
+      }
+    }
+    if (!baseCanonicalId) warnings.push(`modal "${frames[i].frameName}" (${modalFrameId}) has no base screen — built as a standalone reachable route; bind it via the flow checkpoint to present it as an overlay`);
     const base = baseCanonicalId ? canonicalScreens.find(s => s.canonicalId === baseCanonicalId) : undefined;
     const modal: CanonicalModal = { id: modalId, frameId: modalFrameId, baseCanonicalId };
     if (base) base.modals.push(modal);

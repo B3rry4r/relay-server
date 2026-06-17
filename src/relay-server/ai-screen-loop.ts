@@ -46,7 +46,7 @@ import {
   canonicalizeRun, writeCanonical, readCanonical, generateFlutterSkeleton,
   type Canonical, type CanonicalScreen,
 } from './canonicalize';
-import { generateDesignSystem, seedContextWithThemeApi, hasGeneratedTheme } from './design-system';
+import { generateDesignSystem, seedContextWithThemeApi, ensureMainWired, consolidateDesignTokens, type ThemeTokens } from './design-system';
 import { computePreflight } from './preflight';
 import { reconcileScreen, reconcileSummary, type ReconcileResult } from './reconcile';
 
@@ -307,10 +307,15 @@ function buildComponentApiSurface(run: import('./build-run-store').BuildRun, can
   } else {
     for (const s of run.screens) out.push(`- route ${routeNameFor(s.frameName)}  ⟶  screen "${s.frameName}"`);
   }
-  // TODO(P2/P3): once canonicalization emits shared-component stubs with real
-  // constructor signatures (RFC §4.2 deterministic skeleton), append each
-  // component's API here (name + props) so screens import the exact signature
-  // instead of re-deriving shared widgets per session.
+  // Component OWNERSHIP (option 3, Fix #1): recurring UI (from the digest) must be
+  // extracted ONCE into lib/components/ and imported — not re-implemented per screen.
+  // We can't author the widget bodies deterministically (that's the per-screen
+  // agent's job), so we assign ownership + name them, and the review flags re-impl.
+  const digest = buildDesignDigest(run);
+  if (digest.components.length) {
+    out.push(`SHARED WIDGETS — these recur across multiple screens; the FIRST screen that renders one CREATES it as a public widget in lib/components/<name>.dart and EXPORTS it, and every other screen IMPORTS it. Re-implementing one of these inline (a private _Foo widget duplicated across screens) is a DEFECT the review flags:`);
+    for (const c of digest.components) out.push(`- ${c.name} (seen in ${c.screens} screens → lib/components/${c.name.replace(/[^A-Za-z0-9]/g, '')}.dart)`);
+  }
   return out.join('\n');
 }
 
@@ -1056,21 +1061,29 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
     // but canonical routes in the skeleton (two divergent schemes).
     if (canonical) appPlan = buildAppPlan(run, canonical);
 
-    // ── EXTRACT-FIRST design system (RFC §4.4) ───────────────────────────────────
-    // BEFORE any screen builds, turn the deterministic digest (dominant colors +
+    // ── EXTRACT-FIRST design system + app wiring (RFC §4.4) ──────────────────────
+    // BEFORE any screen builds: (1) turn the deterministic digest (dominant colors +
     // fonts) into a REAL importable theme file (lib/theme/app_theme.dart → AppTheme)
-    // and seed .uix/context.md with the importable symbol list. This fixes the root
-    // cause of per-screen hardcoding: there was no named token to import, so screens
-    // inlined raw hex. Idempotent — skipped on resume if AppTheme already exists.
+    // and seed .uix/context.md with the importable symbol list — fixes the root cause
+    // of per-screen hardcoding (there was no named token to import). (2) WIRE main.dart
+    // to the generated router — the canonical skeleton built AppRouter but never made
+    // the app run it, so the whole app was dead code behind a counter-demo main.dart.
+    // Both are idempotent (skip when already done / never clobber a real main.dart).
+    let themeTokens: ThemeTokens | undefined;
     try {
-      if (!hasGeneratedTheme(projectRoot)) {
-        const digest = buildDesignDigest(run);
-        const ds = await generateDesignSystem(projectRoot, run.framework || 'flutter', { colors: digest.colors, fonts: digest.fonts });
-        await seedContextWithThemeApi(projectRoot, ds.api);
-        await appendRunLog(projectId, runId, `[design-system] ${ds.wrote ? 'generated' : 'reused'} ${ds.themeFile} with ${ds.tokenCount} color token(s)${digest.fonts[0] ? ` + ${digest.fonts[0]}` : ''} — screens import AppTheme.* (no per-screen hardcoding)`);
-      }
+      const digest = buildDesignDigest(run);
+      const ds = await generateDesignSystem(projectRoot, run.framework || 'flutter', { colors: digest.colors, fonts: digest.fonts });
+      themeTokens = ds.tokens;
+      if (ds.wrote) await seedContextWithThemeApi(projectRoot, ds.api);
+      await appendRunLog(projectId, runId, `[design-system] ${ds.wrote ? 'generated' : 'reused'} ${ds.themeFile} with ${ds.tokenCount} color token(s)${digest.fonts[0] ? ` + ${digest.fonts[0]}` : ''} — screens import AppTheme.* (no per-screen hardcoding)`);
     } catch (e: any) {
       await appendRunLog(projectId, runId, `[design-system] generation skipped (non-fatal): ${e?.message || 'unknown'}`);
+    }
+    try {
+      const wired = await ensureMainWired(projectRoot, run.framework || 'flutter');
+      if (wired.wrote) await appendRunLog(projectId, runId, `[app-wiring] main.dart → runApp(AppRouter) (${wired.reason}) — the app now actually runs the generated router + screens`);
+    } catch (e: any) {
+      await appendRunLog(projectId, runId, `[app-wiring] main.dart wiring skipped (non-fatal): ${e?.message || 'unknown'}`);
     }
 
     // When canonicalized, only the lead frames are buildable targets.
@@ -1178,6 +1191,21 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
     // with an errored screen). Both needs-review and failed hold the run open.
     const failed = done?.screens.filter(s => s.status === 'failed').length ?? 0;
     const blocking = needsReview + failed;
+
+    // ── CONSOLIDATION PASS (option 3): de-duplicate token literals ───────────────
+    // Every screen is built; sweep the generated screens/components and replace raw
+    // color literals that EXACTLY match a design token with AppTheme.<token> (+ add
+    // the theme import). Pure, reversible textual substitution — opaque-only, so a
+    // translucent overlay is never altered. This retro-fixes screens that hardcoded
+    // before/around the theme being generated, and keeps a single source of truth.
+    if (themeTokens && (run.framework || 'flutter').toLowerCase() === 'flutter') {
+      try {
+        const c = await consolidateDesignTokens(projectRoot, themeTokens);
+        if (c.replacements > 0) await appendRunLog(projectId, runId, `[consolidate] ${c.replacements} hardcoded color literal(s) → AppTheme tokens across ${c.filesChanged} file(s)`);
+      } catch (e: any) {
+        await appendRunLog(projectId, runId, `[consolidate] skipped (non-fatal): ${e?.message || 'unknown'}`);
+      }
+    }
     // ── HITL Checkpoint 4 (RFC §5): before global wiring / full build / deploy ────
     // Only gate here when the queue is clear (a blocking screen parks the run for
     // review below — the pre-global gate is the human sign-off once it's clean).
