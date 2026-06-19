@@ -1551,7 +1551,13 @@ export function registerScreenLoopRoutes(app: Express): void {
     // /start (or, if the user opts in, boot-resume) can pick it back up. (A crash
     // leaves resumable:false, so only intentional stops are resumable.)
     await setRunResumable(projectId, runId, true);
-    if (!isRunActive(runId)) await setRunStatus(projectId, runId, 'stopped');
+    // Reflect the stop IMMEDIATELY: 'stopped' is a STICKY status (STICKY_RUN_STATUS),
+    // so the orchestrator's per-screen deriveStatus won't flip it back to 'running',
+    // and the cancel flag halts the loop after the in-flight screen. Previously this
+    // only set 'stopped' when the run was NOT active — so during a build (active) the
+    // run kept showing 'running' for minutes until the loop next checked, and the
+    // Stop button looked like it did nothing.
+    await setRunStatus(projectId, runId, 'stopped');
     res.json({ stopped: true });
   });
 
