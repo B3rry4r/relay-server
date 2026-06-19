@@ -46,7 +46,7 @@ import {
   canonicalizeRun, writeCanonical, readCanonical, generateFlutterSkeleton,
   type Canonical, type CanonicalScreen,
 } from './canonicalize';
-import { generateDesignSystem, seedContextWithThemeApi, ensureMainWired, consolidateDesignTokens, type ThemeTokens } from './design-system';
+import { generateDesignSystem, seedContextWithThemeApi, ensureMainWired, consolidateDesignTokens, ensureScreenPreviewEntry, type ThemeTokens } from './design-system';
 import { computePreflight } from './preflight';
 import { reconcileScreen, reconcileSummary, type ReconcileResult } from './reconcile';
 
@@ -711,6 +711,12 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
   const impl = await runModel(model, implementPrompt, env, projectRoot, { agent: true, modelId, jobId, projectId: req.projectId });
   if (impl.sessionId) session = impl.sessionId;
   await snapshotLastGen();   // capture this screen's previewEntry before any sibling can clobber it
+  // Deterministic per-screen preview entry: render the screen we JUST built (at the
+  // screenshot's device viewport) for verify — NEVER fall back to main.dart, which
+  // renders the app entry (a different/stub screen) and produces false "broken"
+  // verdicts on good screens. Overrides the agent's last-gen entry (more reliable).
+  try { const pe = await ensureScreenPreviewEntry(projectRoot, screenFramework, frameId); if (pe) screenPreviewEntry = pe; }
+  catch { /* non-fatal — falls back to last-gen/main.dart */ }
 
   // verify:false (or no reference render to compare against) → implement-only.
   // Write a result and mark the screen done so the run still completes.
@@ -798,6 +804,10 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     const fix = await runModel(model, fixPrompt(frameName, referenceImagePath, candRel ?? '(build failed — no screenshot)', verdict, req.userNotes), env, projectRoot, { agent: true, modelId, sessionId: session, jobId, projectId: req.projectId });
     if (fix.sessionId) session = fix.sessionId;
     await snapshotLastGen();   // re-capture in case the fix moved/renamed the previewEntry (audit A.2)
+    // Re-assert the deterministic per-screen entry (the screen file the agent just
+    // edited still exists; keep verify pointed at THIS screen, not the app entry).
+    try { const pe = await ensureScreenPreviewEntry(projectRoot, screenFramework, frameId); if (pe) screenPreviewEntry = pe; }
+    catch { /* non-fatal */ }
   }
 
   // P3 (RFC §4.5): DETERMINISTIC RECONCILIATION GATE (no LLM). The visual loop only

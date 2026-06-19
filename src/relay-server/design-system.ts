@@ -190,6 +190,44 @@ export function hasGeneratedTheme(projectRoot: string, themeFile = path.join('li
   catch { return false; }
 }
 
+// ── Per-screen preview entry (verify renders the RIGHT screen) ────────────────
+// The verify loop screenshots a runnable entrypoint. With no per-screen entry it
+// fell back to lib/main.dart → AppRouter(initialRoute: entry) → it rendered the
+// app's ENTRY screen (a different, still-stub screen) at an unbounded blank canvas,
+// so the verify agent compared the WRONG screen to the reference and dumped good
+// screens to needs-review with score ~2. This deterministically writes
+// lib/_preview/<screen>_preview.dart that renders ONLY the just-built screen, so
+// the screenshot is the target screen at the screenshot viewport's device size.
+// Returns the project-relative entry path (or undefined for non-flutter / no file).
+export async function ensureScreenPreviewEntry(
+  projectRoot: string, framework: string, frameId: string,
+): Promise<string | undefined> {
+  if ((framework || 'flutter').toLowerCase() !== 'flutter') return undefined;
+  const base = `screen_${frameId.replace(/[^a-zA-Z0-9]+/g, '_')}`.toLowerCase();
+  const screenAbs = path.join(projectRoot, 'lib', 'screens', `${base}.dart`);
+  let src: string;
+  try { src = await fs.readFile(screenAbs, 'utf8'); } catch { return undefined; }
+  // First PUBLIC widget class = the screen widget (skip private _Helper widgets).
+  const m = src.match(/class\s+([A-Z]\w*)\s+extends\s+(?:StatelessWidget|StatefulWidget)/);
+  if (!m) return undefined;
+  const cls = m[1];
+  const previewRel = path.join('lib', '_preview', `${base}_preview.dart`);
+  const previewAbs = path.join(projectRoot, previewRel);
+  const code = `// GENERATED — device-framed preview entry: renders ONLY this screen for verify
+// (instead of falling back to main.dart, which renders the app entry → wrong screen).
+import 'package:flutter/material.dart';
+import '../screens/${base}.dart';
+
+void main() => runApp(MaterialApp(
+      debugShowCheckedModeBanner: false,
+      home: ${cls}(),
+    ));
+`;
+  await fs.mkdir(path.dirname(previewAbs), { recursive: true });
+  await fs.writeFile(previewAbs, code, 'utf8');
+  return previewRel.split(path.sep).join('/');
+}
+
 // ── App wiring: connect main.dart to the generated router ─────────────────────
 // THE disconnection fix. The canonical skeleton builds AppRouter (a MaterialApp
 // with every route) but never rewires main.dart, and per-screen agents are barred
