@@ -131,10 +131,16 @@ async function withBuildLock<T>(projectRoot: string, fn: () => Promise<T>): Prom
 }
 
 // References are exported @2× by the renderer (a 393px frame → 786px PNG). To make
-// "match" verdicts trustworthy (RFC §4.6) the candidate MUST be captured at the
-// SAME scale and at FULL height (not clipped to the device viewport).
+// "match" verdicts trustworthy (RFC §4.6) the candidate MUST be captured at the SAME
+// SCALE and the SAME framing as the reference — i.e. the FRAME's own height, NOT a
+// forced-tall window. Flutter web fills whatever window height it's given, so the old
+// fullPage path (which forces a ≥4000px window) rendered an 852px screen at the top
+// of an 8000px canvas with a huge blank void below → every candidate scored low for
+// "blank area below" vs the tight 1704px reference. Capture at the frame height
+// (fullPage:false → window = width×height = the reference framing). Frames taller than
+// TALL_FRAME_THRESHOLD use the separate viewport-tile path, so nothing is clipped.
 const REF_DEVICE_SCALE = 2;
-const CAPTURE_SHOT_OPTS = { deviceScale: REF_DEVICE_SCALE, fullPage: true } as const;
+const CAPTURE_SHOT_OPTS = { deviceScale: REF_DEVICE_SCALE, fullPage: false } as const;
 // P1 (RFC §4.6): a reference taller than this (logical px) is downsampled below the
 // model's vision long-edge cap when judged as ONE image. Above it, capture the
 // candidate as vertical viewport-tall tiles (full resolution) and verify per band.
@@ -409,6 +415,33 @@ export function stripPreviewAnnotations(ir: string): string {
 const TREE_PREFIX = /^[\s│├└─┬┴┼╰╯╭╮|`+\-]*/;
 const stripTreePrefix = (line: string): string => line.replace(TREE_PREFIX, '').trim();
 
+// OS chrome — an OS status bar, the software keyboard, and the home indicator are
+// rendered by the real device, NOT the app. Figma iOS templates include them as
+// layers ("Status Bar", "Keyboard", "Home Indicator") purely for prototyping, and
+// the user's standing rule is to never build them. Strip such a node AND its whole
+// subtree from the agent-facing IR so the agent doesn't waste effort reproducing OS
+// chrome (and the screen's real content isn't pushed down by a fake 94px bar). The
+// verify prompt already carries the matching "do not add a status bar/keyboard" rule.
+const CHROME_NODE = /"[^"]*\b(?:status\s*bar|keyboard|home\s*indicator)\b[^"]*"/i;
+const depthOf = (line: string): number => Math.round((line.match(TREE_PREFIX)?.[0].length ?? 0) / 4);
+/** Remove OS status-bar / keyboard / home-indicator nodes (and their children). */
+export function stripChromeNodes(ir: string): string {
+  if (!ir) return ir;
+  const lines = ir.split('\n');
+  const out: string[] = [];
+  let skipDepth = -1;
+  for (const line of lines) {
+    const d = depthOf(line);
+    if (skipDepth >= 0) {
+      if (line.trim() && d > skipDepth) continue;   // still inside the stripped subtree
+      skipDepth = -1;                                 // back out to a sibling/ancestor
+    }
+    if (CHROME_NODE.test(stripTreePrefix(line))) { skipDepth = d; continue; }
+    out.push(line);
+  }
+  return out.join('\n');
+}
+
 /** Collapse runs of consecutive identical sibling lines into `<line>  ×N`. */
 export function rleRepeatedSiblings(ir: string): string {
   if (!ir) return ir;
@@ -431,7 +464,7 @@ export function rleRepeatedSiblings(ir: string): string {
 /** Full IR-hygiene pass for agent-facing IR: strip previews + RLE siblings. */
 export function hygieneIR(ir: string | undefined): string | undefined {
   if (!ir) return ir;
-  return rleRepeatedSiblings(stripPreviewAnnotations(ir));
+  return rleRepeatedSiblings(stripChromeNodes(stripPreviewAnnotations(ir)));
 }
 
 async function readLastGen(projectRoot: string): Promise<LastGen> {
