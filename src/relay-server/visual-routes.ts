@@ -91,7 +91,7 @@ export async function captureUrlScreenshot(
   width: number,
   height: number,
   timeoutMs = 30000,
-  opts: { deviceScale?: number; fullPage?: boolean } = {},
+  opts: { deviceScale?: number; fullPage?: boolean; disableWebSecurity?: boolean } = {},
 ): Promise<Buffer | null> {
   const out = path.join(os.tmpdir(), `relay-shot-${Date.now()}-${Math.random().toString(36).slice(2)}.png`);
   const scale = opts.deviceScale && opts.deviceScale > 0 ? opts.deviceScale : 1;
@@ -105,6 +105,15 @@ export async function captureUrlScreenshot(
     `--force-device-scale-factor=${scale}`,
     `--window-size=${Math.round(width)},${winH}`,
     '--virtual-time-budget=8000',
+    // The render harness fetches resolved IR + assets from the UIX origin (cross-
+    // origin to the localhost harness), so harness renders need CORS disabled. Safe
+    // on a headless render box (we only ever load our own harness/app). Requires a
+    // throwaway --user-data-dir to take effect.
+    ...(opts.disableWebSecurity ? [
+      '--disable-web-security',
+      '--disable-features=IsolateOrigins,site-per-process',
+      `--user-data-dir=${path.join(os.tmpdir(), `relay-cdt-${Date.now()}-${Math.random().toString(36).slice(2)}`)}`,
+    ] : []),
     `--screenshot=${out}`,
     url,
   ];

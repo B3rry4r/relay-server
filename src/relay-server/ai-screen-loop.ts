@@ -47,6 +47,8 @@ import {
   type Canonical, type CanonicalScreen,
 } from './canonicalize';
 import { generateDesignSystem, seedContextWithThemeApi, ensureMainWired, consolidateDesignTokens, ensureScreenPreviewEntry, type ThemeTokens } from './design-system';
+import { prepScreen, ensureIrComplete, getIrData, type PrepConfig } from './reference-render';
+import type { FigFrame, FlowGraph } from './agent-packet';
 import { computePreflight } from './preflight';
 import { reconcileScreen, reconcileSummary, type ReconcileResult } from './reconcile';
 
@@ -1512,6 +1514,143 @@ export function registerScreenLoopRoutes(app: Express): void {
     });
     if (!run) { res.status(404).json({ error: `project not found: ${b.projectId}` }); return; }
     res.json({ run });
+  });
+
+  // ── SERVER-SIDE PREP + RUN (the client no longer prepares specs) ─────────────
+  // POST /api/ai/prepare-and-run — prepare every screen's build spec ON THE SERVER
+  // (render the reference via the headless harness, build the agent packet, localize
+  // the frame's assets — cached per-frame), then create the durable run with the
+  // prepped screens and kick off the server-side orchestration. Returns { run }
+  // immediately; prep streams into the run's durable log. ONE path for both the
+  // whole-app build (many frameIds) and a single-frame build (one frameId).
+  //
+  // Body: {
+  //   projectId, figStorageKey, figmaUrl?, frameIds[], frameNames?{id:name},
+  //   framework, model, modelId?, flow, userNotes?, verify?, freshSessions?,
+  //   parallel?, canonical?, checkpoints?, scale?
+  // }
+  app.post('/api/ai/prepare-and-run', async (req, res) => {
+    const b = req.body ?? {};
+    const projectId = b.projectId as string;
+    const figStorageKey = b.figStorageKey as string;
+    const frameIds: string[] = Array.isArray(b.frameIds) ? b.frameIds.map((x: any) => String(x)) : [];
+    if (!projectId || !figStorageKey || frameIds.length === 0) {
+      res.status(400).json({ error: 'projectId, figStorageKey and a non-empty frameIds[] are required' }); return;
+    }
+    if (!isAIModel(b.model)) { res.status(400).json({ error: 'a valid model is required' }); return; }
+    const projectRoot = resolveProjectRoot(projectId);
+    if (!projectRoot || !fsSync.existsSync(projectRoot)) { res.status(404).json({ error: `project not found: ${projectId}` }); return; }
+
+    const framework = typeof b.framework === 'string' && b.framework ? b.framework : 'flutter';
+    const frameNames: Record<string, string> = (b.frameNames && typeof b.frameNames === 'object') ? b.frameNames : {};
+    const userNotes = typeof b.userNotes === 'string' ? b.userNotes : undefined;
+    const scale = typeof b.scale === 'number' && b.scale > 0 ? b.scale : 2;
+    const figmaUrl = typeof b.figmaUrl === 'string' ? b.figmaUrl.trim() : '';
+    const flow: FlowGraph = b.flow && (Array.isArray(b.flow.connections) || b.flow.entryFrameId !== undefined)
+      ? {
+          entryFrameId: b.flow.entryFrameId ?? null,
+          connections: Array.isArray(b.flow.connections) ? b.flow.connections.map((c: any) => ({
+            from: String(c.from), to: String(c.to), type: String(c.type ?? 'push') as FlowGraph['connections'][number]['type'],
+            label: c.label ? String(c.label) : undefined, tabIndex: typeof c.tabIndex === 'number' ? c.tabIndex : undefined,
+          })) : [],
+        }
+      : { entryFrameId: null, connections: [] };
+    // The run-store RunFlow shape (no tabIndex) — what createRun + orderScreensByFlow want.
+    const runFlow = { entryFrameId: flow.entryFrameId, connections: flow.connections.map(c => ({ from: c.from, to: c.to, type: c.type, label: c.label })) };
+
+    // Create the run FIRST (empty screens) so its durable log + Runs-table row exist
+    // immediately and prep progress attaches to a real run. We fill its screens once
+    // each is prepped, then start the orchestration.
+    const single = frameIds.length === 1;
+    const run = await createRun(projectId, {
+      kind: single ? 'single' : 'whole-app',
+      framework, figStorageKey,
+      model: b.model, modelId: b.modelId,
+      maxIterations: typeof b.maxIterations === 'number' ? b.maxIterations : undefined,
+      verify: b.verify !== false,
+      userNotes,
+      freshSessions: b.freshSessions === true || (typeof b.parallel === 'number' && b.parallel > 1),
+      parallel: typeof b.parallel === 'number' ? b.parallel : undefined,
+      canonical: b.canonical === true,
+      checkpoints: Array.isArray(b.checkpoints) ? b.checkpoints.map((g: any) => String(g)) as CheckpointGate[] : undefined,
+      flow: runFlow,
+      // Seed the screens as pending now (name only); prep populates each spec below.
+      screens: frameIds.map(id => ({ frameId: id, frameName: frameNames[id] ?? id })),
+    });
+    if (!run) { res.status(404).json({ error: `project not found: ${projectId}` }); return; }
+    res.json({ run });
+
+    // ── Prep + start in the background (survives the request returning) ───────────
+    void (async () => {
+      try {
+        await appendRunLog(projectId, run.id, `[prep] preparing ${frameIds.length} screen(s) server-side (framework ${framework}, scale ${scale}×)`);
+        // (a) Hybrid completion from the design URL (fill external/library gaps) — log progress.
+        if (figmaUrl) {
+          await appendRunLog(projectId, run.id, `[prep] completing IR from design URL…`);
+          await ensureIrComplete(figStorageKey, figmaUrl, (s) => { void appendRunLog(projectId, run.id, `[prep] ir-complete: ${s}`); });
+        }
+
+        // Resolve the frame geometry from the IR (the client used to pass it; the
+        // server reads it from UIX so the packet/cache get real dimensions).
+        const irData = await getIrData(figStorageKey);
+        const frameById = new Map<string, FigFrame>();
+        for (const f of (irData?.frames ?? [])) frameById.set(f.id, f);
+        const allFrames: FigFrame[] = frameIds.map(id => frameById.get(id) ?? {
+          id, name: frameNames[id] ?? id, x: 0, y: 0, width: 393, height: 852, pageId: '', pageName: '',
+        });
+
+        // (b) Prep each frame with bounded concurrency. Screen 1 bootstraps the
+        // project; every later screen is forced bootstrapped (shared scaffold).
+        // A shared `seen` set dedupes asset writes across the batch.
+        const seen = new Set<string>();
+        const POOL = 3;
+        let prepared = 0;
+        let firstDone = false;
+        const order = [...frameIds];
+        let idx = 0;
+        // Serialize the run's read-modify-write so concurrent prep workers don't
+        // clobber each other's spec writes (each saves the WHOLE run object).
+        let saveChain: Promise<void> = Promise.resolve();
+        const persistSpec = (frameId: string, spec: ScreenSpec): Promise<void> => {
+          saveChain = saveChain.then(async () => {
+            const cur = await getRun(projectId, run.id);
+            const sc = cur?.screens.find(s => s.frameId === frameId);
+            if (sc && cur) { sc.spec = spec; await saveRun(projectId, cur); }
+          });
+          return saveChain;
+        };
+        const prepOne = async (frameId: string, bootstrapped: boolean): Promise<void> => {
+          const frame = allFrames.find(f => f.id === frameId)!;
+          const cfg: PrepConfig = {
+            figStorageKey, framework, flow, frames: allFrames,
+            bootstrapped, userNotes, scale,
+          };
+          try {
+            const r = await prepScreen(projectId, frame, cfg, seen);
+            if (!r) { await appendRunLog(projectId, run.id, `[prep] frame "${frame.name}" — prep failed (no project root)`); return; }
+            await persistSpec(frameId, r.spec);
+            const how = r.cacheHit ? 'cache HIT' : (r.rendered ? 'rendered' : 'rendered (no harness — packet only)');
+            await appendRunLog(projectId, run.id, `[prep] frame "${frame.name}" ${how}, localized ${r.assetCount} asset(s)`);
+            prepared++;
+          } catch (e: any) {
+            await appendRunLog(projectId, run.id, `[prep] frame "${frame.name}" — prep error: ${e?.message || 'unknown'}`);
+          }
+        };
+        // Prep the FIRST frame alone (it bootstraps the project / establishes the
+        // cache for shared assets), then the rest with bounded concurrency.
+        if (order.length) { await prepOne(order[0], false); firstDone = true; idx = 1; }
+        const worker = async (): Promise<void> => {
+          while (idx < order.length) { const fid = order[idx++]; await prepOne(fid, firstDone); }
+        };
+        await Promise.all(Array.from({ length: Math.min(POOL, Math.max(0, order.length - 1)) }, worker));
+        await appendRunLog(projectId, run.id, `[prep] done — ${prepared}/${frameIds.length} screen(s) prepared; starting build`);
+
+        // (c) Kick off the server-side orchestration.
+        void runAppLoop(projectId, run.id).catch(() => {});
+      } catch (e: any) {
+        await appendRunLog(projectId, run.id, `[prep] fatal: ${e?.message || 'unknown'} — run not started`);
+      }
+    })();
   });
 
   // POST /api/ai/runs/:runId/start { projectId, steerNotes?, restart? } — kick off
