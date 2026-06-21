@@ -164,6 +164,12 @@ export interface BuildRun {
   //   that crashed or was stopped. Set true on graceful stop / checkpoint pause;
   //   cleared while a run is actively orchestrating.
   resumable?: boolean;
+  // ── P7: finalize phase ───────────────────────────────────────────────────────
+  // After the screen loop reaches terminal success, runAppLoop runs the six P7
+  // production-readiness passes (finalizeApp) as a best-effort, build-safe final
+  // phase. Default (undefined/true) = run finalize on whole-app builds; set false
+  // to skip it. A finalize failure NEVER flips a successful build to failed.
+  finalize?: boolean;
   screens: RunScreen[];
   status: RunStatus;
   createdAt: string;

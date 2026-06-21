@@ -51,6 +51,7 @@ import { prepScreen, ensureIrComplete, getIrData, runAssetPass, type PrepConfig,
 import type { FigFrame, FlowGraph } from './agent-packet';
 import { computePreflight } from './preflight';
 import { reconcileScreen, reconcileSummary, type ReconcileResult } from './reconcile';
+import { finalizeApp } from './passes/finalize';
 
 const execFile = promisify(execFileCb);
 
@@ -1264,6 +1265,46 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
       await setRunStatus(projectId, runId, 'needs-review');
       await appendRunLog(projectId, runId, `[run] paused for review — ${built}/${total} matched, ${needsReview} need review${failed ? `, ${failed} failed` : ''}`);
     } else {
+      // ── P7 FINALIZE PHASE (best-effort, build-safe) ──────────────────────────
+      // The screen loop is finished and every screen matched (blocking === 0), so
+      // the run reached terminal success. Run the six production-readiness passes
+      // (finalizeApp) over the built app as a final phase, streaming its log into
+      // the run's durable log. This runs ONLY here — AFTER the screen loop, never
+      // while it is still going. It is gated to whole-app builds + a run flag, and
+      // wrapped in try/catch so a finalize failure NEVER flips this successful build
+      // to failed: we log and move on, leaving the run 'done'. Idempotence: skip if
+      // .uix/finalize-report.json already exists (matches the canonicalization
+      // "reuse persisted, don't redo" pattern), so a resume after redeploy that
+      // re-enters this branch does not re-run finalize.
+      const finalizeEnabled = run.kind === 'whole-app' && run.finalize !== false;
+      const finalizeReportPath = path.join(projectRoot, '.uix', 'finalize-report.json');
+      const finalizeAlreadyRan = fsSync.existsSync(finalizeReportPath);
+      if (finalizeEnabled && !finalizeAlreadyRan) {
+        try {
+          const finalizeModel = isAIModel(run.model) ? (run.model as AIModel) : undefined;
+          const env = createTerminalEnv(resolveWorkspace());
+          await appendRunLog(projectId, runId, `[finalize] starting P7 production passes (model=${finalizeModel ?? 'none'})`);
+          const report = await finalizeApp(projectId, {
+            projectRoot,
+            model: finalizeModel,
+            env,
+            log: (msg) => { void appendRunLog(projectId, runId, msg); },
+            runModel: async (m, prompt, e, cwd, opts) => {
+              const { text } = await runModel(m, prompt, e, cwd, { format: opts?.format, projectId });
+              return { text };
+            },
+          });
+          const applied = report.passes.filter(p => p.status === 'applied').length;
+          const reverted = report.passes.filter(p => p.status === 'reverted').length;
+          await appendRunLog(projectId, runId, `[finalize] complete — ${applied} applied, ${reverted} reverted (analyze ${report.baselineAnalyze ?? 'n/a'} → ${report.finalAnalyze ?? 'n/a'})`);
+        } catch (e: any) {
+          // Never let a finalize failure change the run's terminal status.
+          await appendRunLog(projectId, runId, `[finalize] skipped (non-fatal — build stays complete): ${e?.message || 'unknown'}`);
+        }
+      } else if (finalizeAlreadyRan) {
+        await appendRunLog(projectId, runId, `[finalize] already ran for this run (finalize-report.json present) — skipping`);
+      }
+
       // Terminal completion: clear the resumable flag so a finished run is never
       // re-launched on a later boot (audit A.4).
       await setRunResumable(projectId, runId, false);

@@ -15,6 +15,8 @@ import { repointAssetUsage } from './passes/asset-usage';
 import { verifyFlowWiring } from './passes/flow-wiring';
 import { renameSemantic } from './passes/semantic-rename';
 import { deepenTokensAndCleanup } from './passes/token-cleanup';
+import { finalizeApp } from './passes/finalize';
+import { resolveCanonicalFromCode } from './passes/resolve-canonical';
 
 const execFileAsync = promisify(execFile);
 
@@ -646,6 +648,115 @@ export function registerAIRoutes(app: Express): void {
       res.json(result);
     } catch (err: any) {
       res.status(500).json({ error: `deepen-tokens failed: ${err?.message ?? err}` });
+    }
+  });
+
+  /**
+   * POST /api/ai/finalize-app — Phase 7 FINALIZE (all six passes, build-safe).
+   * Runs extractComponents → applyModalOverlays → repointAssetUsage →
+   * verifyFlowWiring → renameSemantic → deepenTokensAndCleanup IN ORDER over an
+   * ALREADY-BUILT app, framework-agnostic. Build-safe: it snapshots lib/ (+ test/)
+   * before the sequence and, after each pass, re-checks `flutter analyze` ≤ baseline
+   * AND `flutter build web` — a pass that breaks the build (or throws) is rolled
+   * back from the pre-pass snapshot and recorded `reverted`; the sequence never
+   * aborts and never leaves the app broken. This is how an existing built app (e.g.
+   * Ping) gets finalized WITHOUT a rebuild. Injects the real `runModel` for the
+   * passes' AI seams, exactly like the six standalone pass-routes.
+   * Body: { projectId, model?, dryRun?, onlyPasses? }. Returns the FinalizeReport.
+   */
+  app.post('/api/ai/finalize-app', async (req, res) => {
+    const projectId = (req.body?.projectId ?? '') as string;
+    const projectRoot = resolveProjectRoot(projectId);
+    if (!projectRoot) { res.status(400).json({ error: `Invalid projectId: ${projectId}` }); return; }
+    const model = isAIModel(req.body?.model) ? (req.body.model as AIModel) : undefined;
+    const env = createTerminalEnv(resolveWorkspace());
+    try {
+      const report = await finalizeApp(projectId, {
+        projectRoot,
+        model,
+        dryRun: req.body?.dryRun === true,
+        onlyPasses: Array.isArray(req.body?.onlyPasses) ? req.body.onlyPasses : undefined,
+        env,
+        // Adapt relay's runModel (returns {text, sessionId}) to the passes' seam.
+        runModel: async (m, prompt, e, cwd, opts) => {
+          const { text } = await runModel(m, prompt, e, cwd, { format: opts?.format, projectId });
+          return { text };
+        },
+      });
+      res.json(report);
+    } catch (err: any) {
+      res.status(500).json({ error: `finalize-app failed: ${err?.message ?? err}` });
+    }
+  });
+
+  // TEMPORARY (removable): code-based resolve for already-generated apps (e.g. Ping).
+  // The generation path canonicalizes from frames; this resolves from emitted code
+  // to avoid drift.
+  /**
+   * POST /api/ai/resolve-app — derive .uix/canonical.json from the EMITTED CODE of
+   * an already-generated app, then (by default) run the six Phase-7 passes against
+   * the now-matching canonical. For an existing built app, re-canonicalizing from
+   * frames drifts from the build (different frame set → screens/modals don't map);
+   * resolving from code matches by construction (every canonical screen IS a real
+   * screen file). Backs up any existing (possibly drifted, frame-derived) canonical
+   * to .uix/canonical.frames.json.bak first. Framework-agnostic; flutter ships.
+   * Body: { projectId, model?, dryRun?, finalize? }. Returns
+   * { canonical: <summary>, finalizeReport? }.
+   */
+  app.post('/api/ai/resolve-app', async (req, res) => {
+    const projectId = (req.body?.projectId ?? '') as string;
+    const projectRoot = resolveProjectRoot(projectId);
+    if (!projectRoot) { res.status(400).json({ error: `Invalid projectId: ${projectId}` }); return; }
+    const model = isAIModel(req.body?.model) ? (req.body.model as AIModel) : undefined;
+    const dryRun = req.body?.dryRun === true;
+    const env = createTerminalEnv(resolveWorkspace());
+    // Adapt relay's runModel (returns {text, sessionId}) to the pass/resolve seam.
+    const runModelSeam = async (m: AIModel, prompt: string, e: NodeJS.ProcessEnv, cwd: string, opts?: { format?: AIFormat }) => {
+      const { text } = await runModel(m, prompt, e, cwd, { format: opts?.format, projectId });
+      return { text };
+    };
+    try {
+      const canonical = await resolveCanonicalFromCode(projectId, {
+        projectRoot,
+        model,
+        noAi: req.body?.noAi === true || !model,
+        dryRun,
+        env,
+        runModel: runModelSeam,
+      });
+      const mappedScreens = canonical.screens.length;
+      const mappedModals = canonical.modals.filter((m) => m.baseCanonicalId).length;
+      const totalIds = canonical.screens.length + canonical.modals.length;
+      const mappedIds = mappedScreens + mappedModals;
+      const summary = {
+        contentHash: canonical.contentHash,
+        screens: canonical.screens.length,
+        modals: canonical.modals.length,
+        modalsWithBase: mappedModals,
+        components: canonical.components.length,
+        templates: canonical.templates.length,
+        edges: canonical.flow.edges.length,
+        entryCanonicalId: canonical.flow.entryCanonicalId,
+        mappingRate: totalIds ? Number((mappedIds / totalIds).toFixed(3)) : 1,
+        warnings: canonical.warnings,
+      };
+
+      // Run the six passes against the now-matching canonical (unless opted out or
+      // dry-run for resolve itself — finalize's own dryRun is honoured separately).
+      let finalizeReport: unknown = undefined;
+      if (req.body?.finalize !== false) {
+        finalizeReport = await finalizeApp(projectId, {
+          projectRoot,
+          model,
+          dryRun: req.body?.finalizeDryRun === true || dryRun,
+          env,
+          runModel: runModelSeam,
+        });
+      }
+
+      res.json({ canonical: summary, ...(finalizeReport !== undefined ? { finalizeReport } : {}) });
+    } catch (err: any) {
+      res.status(500).json({ error: `resolve-app failed: ${err?.message ?? err}` });
     }
   });
 }
