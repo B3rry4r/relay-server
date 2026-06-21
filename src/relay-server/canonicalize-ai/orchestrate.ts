@@ -22,8 +22,13 @@ import { reconcileLexicon } from './reconcile';
 import { reduceToCanonical, type ReduceFlow, type CanonicalModel } from './reduce';
 import { adjudicateCanonical, type AdjudicationChange } from './adjudicate';
 import type { FrameDescriptor } from './descriptor-schema';
+import type { AIModel } from '../ai-adapters';
 
 export interface CanonicalizeOptions {
+  /** AI provider (claude/codex/gemini) for every 1a–1d stage — respects the run's
+   *  selected model so a codex/gemini run doesn't silently hard-depend on claude
+   *  (RFC §0.1). Default 'claude' when unset. */
+  provider?: AIModel;
   modelId?: string;
   /** durable build-run id — threaded into every stage's AI log ctx so the
    *  `[ai:canon.*] status=ok` firing proof lands in .uix/runs/<runId>.log. */
@@ -73,23 +78,24 @@ export async function canonicalize(
   // bounded concurrency on the CLI; callers wanting parallelism can pre-describe and
   // pass descriptors to the lower stages directly. A frame that fails to describe is
   // skipped (logged via throw) rather than aborting the whole app.
+  const provider: AIModel = opts.provider ?? 'claude';
   const descriptors: FrameDescriptor[] = [];
   for (const f of frames) {
     const { descriptor } = await describeFrame(projectId, figStorageKey, f, {
-      modelId: opts.modelId, harnessBaseUrl: opts.harnessBaseUrl, scale: opts.scale, runId: opts.runId,
+      provider, modelId: opts.modelId, harnessBaseUrl: opts.harnessBaseUrl, scale: opts.scale, runId: opts.runId,
     });
     descriptors.push(descriptor);
   }
 
   // ── 1b RECONCILE — freeze the lexicon + proposalMap.
   const { lexicon, proposalMap, aiMerged } = await reconcileLexicon(projectId, descriptors, {
-    modelId: opts.modelId, skipAi: opts.skipAi, persist, forceRemerge: opts.force, runId: opts.runId,
+    provider, modelId: opts.modelId, skipAi: opts.skipAi, persist, forceRemerge: opts.force, runId: opts.runId,
   });
 
   // ── 1c REDUCE — the canonical model from descriptors + lexicon + flow.
   const { canonical: reduced, aiRefined } = await reduceToCanonical(
     projectId, figStorageKey, descriptors, lexicon, proposalMap, flow, {
-      modelId: opts.modelId, skipAi: opts.skipAi, persist, forceRefine: opts.force, runId: opts.runId,
+      provider, modelId: opts.modelId, skipAi: opts.skipAi, persist, forceRefine: opts.force, runId: opts.runId,
     });
 
   // ── 1d ADJUDICATE — vision-grounded review of the residue + finalize.
@@ -97,7 +103,7 @@ export async function canonicalize(
   const frameDims: Record<string, { width: number; height: number }> = {};
   for (const f of frames) if (f.width && f.height) frameDims[f.frameId] = { width: f.width, height: f.height };
   const adj = await adjudicateCanonical(projectId, figStorageKey, reduced, descriptors, {
-    modelId: opts.modelId, skipAi: opts.skipAi, persist, forceAdjudicate: opts.force,
+    provider, modelId: opts.modelId, skipAi: opts.skipAi, persist, forceAdjudicate: opts.force,
     harnessBaseUrl: opts.harnessBaseUrl, scale: opts.scale, frameDims, runId: opts.runId,
   });
 

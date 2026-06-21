@@ -492,6 +492,51 @@ export async function readCanonical(projectRoot: string, runId: string): Promise
   catch { return null; }
 }
 
+// ── header re-stamp (RFC v2 §3 Phase 8 — header preservation) ────────────────
+// The per-screen build REWRITES each screen file and can DROP the
+// `// canonicalId: c_<frame>  route: <route>` header that the skeleton stamped —
+// the marker 8b (modal→overlay), 8d (flow-wiring) and 8e (semantic-rename) rely on
+// to map a file back to its canonical screen. After the screens are built/accepted
+// (just before finalize), RE-STAMP the header from the canonical model onto any
+// screen file that is missing it, deterministically. Idempotent: a file that
+// already carries a canonicalId header is left untouched.
+//
+// The screen→file mapping is the SAME deterministic convention the skeleton uses
+// (`lib/screens/screen_<canonicalId-without-c_>.dart`), so this needs no on-disk
+// header to FIND the file — it can recover the header even when the agent dropped it.
+export interface RestampResult {
+  /** files that were missing the header and got it re-stamped. */
+  stamped: string[];
+  /** canonical screens whose expected file did not exist on disk. */
+  missingFiles: string[];
+}
+export async function restampCanonicalHeaders(
+  projectRoot: string,
+  canonical: Canonical,
+): Promise<RestampResult> {
+  const stamped: string[] = [];
+  const missingFiles: string[] = [];
+  const slugFile = (canonicalId: string) => `screen_${canonicalId.replace(/^c_/, '')}`.toLowerCase();
+  const headerRe = /^\/\/\s*canonicalId:\s*\S+/m;
+  for (const c of canonical.screens) {
+    const rel = path.join('lib', 'screens', `${slugFile(c.canonicalId)}.dart`);
+    const abs = path.join(projectRoot, rel);
+    let src: string;
+    try { src = await fs.readFile(abs, 'utf-8'); }
+    catch { missingFiles.push(c.canonicalId); continue; }
+    if (headerRe.test(src)) continue;            // already present → idempotent no-op
+    const route = c.route || routeForCanonical(c);
+    const header =
+      `// canonicalId: ${c.canonicalId}  route: ${route}\n` +
+      `// states: ${c.states.map(s => s.id).join(', ') || 'default'}` +
+      (c.modals.length ? `\n// modals: ${c.modals.map(m => m.id).join(', ')}` : '') +
+      '\n';
+    await fs.writeFile(abs, header + src, 'utf-8');
+    stamped.push(rel);
+  }
+  return { stamped, missingFiles };
+}
+
 // ── deterministic write-locked skeleton (RFC §4.2) ───────────────────────────
 // The server generates and WRITE-LOCKS: the router (every canonical route, real
 // builder or explicit stub), the theme/token file, and empty shared-component

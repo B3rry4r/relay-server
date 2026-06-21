@@ -160,25 +160,54 @@ function checkCanonical(ctx) {
         'canonical.json lacks resolvedFromCode=true — not a resolve-derived model'));
   } else {
     const log = ctx.runLog;
+    // T14.4: a generation run MUST prove canon AI fired in ITS OWN log. No log, or
+    // only an UNTIED newest-log guess (not the run that produced this canonical),
+    // is unprovable → FAIL, never a free SKIP/PASS.
     if (!log) {
-      out.push(check(P, 'AI-fired proof (generation: [ai:canon.*] status=ok)', SKIP,
-        'no run log found — cannot prove canon AI fired (pass --runId)'));
+      out.push(check(P, 'AI-fired proof (generation: [ai:canon.*] status=ok)', FAIL,
+        'no run log tied to this canonical — cannot prove canon AI fired (pass --runId)'));
+    } else if (!log.tied) {
+      out.push(check(P, 'AI-fired proof (generation: [ai:canon.*] status=ok)', FAIL,
+        `log ${path.basename(log.path)} is not tied to this canonical (contentHash mismatch / no per-run canonical) — pass the correct --runId`));
     } else {
       const re = /\[ai:canon[^\]]*\][^\n]*status=ok/;
       out.push(re.test(log.text)
-        ? check(P, 'AI-fired proof (generation: [ai:canon.*] status=ok)', PASS, path.basename(log.path))
+        ? check(P, 'AI-fired proof (generation: [ai:canon.*] status=ok)', PASS, `${path.basename(log.path)} (tied)`)
         : check(P, 'AI-fired proof (generation: [ai:canon.*] status=ok)', FAIL,
-          `no '[ai:canon.* status=ok]' in ${path.basename(log.path)}`));
+          `no '[ai:canon.* status=ok]' in tied log ${path.basename(log.path)}`));
     }
   }
 
   return { checks: out, canon };
 }
 
+// ── do assets exist that the pipeline SHOULD have processed? ───────────────────
+// Returns the count of source asset files (SVG/PNG/JPG/WEBP/GIF) found under the
+// project's `assets/` dir(s). A generation/resolve run over a design WITH assets
+// MUST produce a resources file + map — a missing one is a regression, not a SKIP.
+function countSourceAssets(root) {
+  const dirs = [path.join(root, 'assets'), path.join(root, 'lib', 'assets'), path.join(root, 'public', 'assets')];
+  const exts = new Set(['.svg', '.png', '.jpg', '.jpeg', '.webp', '.gif']);
+  let n = 0;
+  const walk = (d) => {
+    let ents;
+    try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of ents) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (exts.has(path.extname(e.name).toLowerCase())) n++;
+    }
+  };
+  for (const d of dirs) walk(d);
+  return n;
+}
+
 // ── PHASE 5 — Assets ──────────────────────────────────────────────────────────
-// SKIPPED (with reason) when the asset phase wasn't run for this project — a
-// missing app_assets.dart AND a missing asset-map.json means "not run", not FAIL.
-// Once either artifact exists, the phase WAS attempted and is held to its criteria.
+// HONEST GATE (T14.3/T14.7): a missing resources file is only a SKIP when there
+// were GENUINELY ZERO source assets to process. If the project has an `assets/`
+// dir with real assets (i.e. the phase SHOULD have produced a resources file +
+// map), a missing artifact is a FAIL, not a SKIP — that is the silent regression
+// this harness exists to catch.
 function checkAssets(ctx) {
   const out = [];
   const P = 'Assets (5)';
@@ -188,10 +217,18 @@ function checkAssets(ctx) {
   const mapPath = path.join(ctx.uix, 'asset-map.json');
   const hasResources = fs.existsSync(resourcesAbs);
   const hasMap = fs.existsSync(mapPath);
+  const sourceAssetCount = countSourceAssets(ctx.root);
 
   if (!hasResources && !hasMap) {
+    if (sourceAssetCount > 0) {
+      // Assets exist on disk but the phase produced NEITHER a resources file NOR a
+      // map → the asset pipeline did not run (or failed silently). FAIL.
+      out.push(check(P, 'asset phase ran (assets exist on disk)', FAIL,
+        `${sourceAssetCount} source asset(s) under assets/ but no ${resourcesRel} and no .uix/asset-map.json — asset pipeline did NOT run`));
+      return { checks: out };
+    }
     out.push(check(P, 'asset phase ran', SKIP,
-      `no ${resourcesRel} and no .uix/asset-map.json — asset phase not run for this project`));
+      `genuinely 0 source assets — no ${resourcesRel}/asset-map.json expected`));
     return { checks: out };
   }
 
@@ -236,17 +273,39 @@ function checkAssets(ctx) {
         `${broken.length}/${entries.length} missing on disk`));
   }
 
-  // AI-fired proof: run log has `[ai:asset-rename] status=ok` (or the observed
-  // step name the rename uses).
-  const log = ctx.runLog;
-  if (!log) {
-    out.push(check(P, 'AI-fired proof ([ai:asset-rename] status=ok)', SKIP, 'no run log to grep'));
+  // AI-fired proof — T14.7: the semantic rename is AI ONLY when there were OPAQUE /
+  // node-id source names to de-opaque. If every source asset was already
+  // semantically named (0 opaque), the rename legitimately fired NO model call →
+  // mark the AI check N/A (SKIP w/ reason), NOT FAIL. Otherwise the proof MUST be
+  // in THIS run's log (T14.4).
+  let opaqueSourceCount = 0;
+  if (hasMap) {
+    const map = readJson(mapPath);
+    const entries = (map && Array.isArray(map.assets)) ? map.assets : [];
+    opaqueSourceCount = entries.filter((e) => {
+      const old = e.oldPath || e.oldName || '';
+      const base = String(old).replace(/^.*[\\/]/, '').replace(/\.[^.]+$/, '');
+      return hasNodeIdResidue(base);
+    }).length;
+  }
+  if (opaqueSourceCount === 0) {
+    out.push(check(P, 'AI-fired proof (asset-rename)', SKIP,
+      'N/A — 0 opaque/node-id source names, semantic rename had nothing to AI-name'));
   } else {
+    const log = ctx.runLog;
     const re = /\[ai:asset[.\-]?rename[^\]]*\][^\n]*status=ok/;
-    out.push(re.test(log.text)
-      ? check(P, 'AI-fired proof ([ai:asset-rename] status=ok)', PASS, path.basename(log.path))
-      : check(P, 'AI-fired proof ([ai:asset-rename] status=ok)', FAIL,
-        `no asset-rename AI-ok line in ${path.basename(log.path)}`));
+    if (!log || !log.tied) {
+      // There WERE opaque assets to name → a proof is mandatory + must come from
+      // THIS run's log. No log, or only an untied newest-log guess = unprovable =
+      // FAIL (T14.4 — don't SKIP/PASS a run that should prove it).
+      out.push(check(P, 'AI-fired proof ([ai:asset-rename] status=ok)', FAIL,
+        `${opaqueSourceCount} opaque source name(s) needed AI rename but no run log is tied to this run (pass --runId)`));
+    } else {
+      out.push(re.test(log.text)
+        ? check(P, 'AI-fired proof ([ai:asset-rename] status=ok)', PASS, `${path.basename(log.path)} (${opaqueSourceCount} opaque named, tied)`)
+        : check(P, 'AI-fired proof ([ai:asset-rename] status=ok)', FAIL,
+          `no asset-rename AI-ok line in tied log ${path.basename(log.path)} (${opaqueSourceCount} opaque source name(s) needed it)`));
+    }
   }
 
   return { checks: out };
@@ -276,18 +335,20 @@ function checkBuild(ctx) {
   });
   const anOut = `${an.stdout || ''}${an.stderr || ''}`;
   const errors = (anOut.match(/^\s*error\s+•/gm) || []).length;
-  // baseline error count: prefer the finalize report's baseline if it tracked
-  // errors; else allow the known pre-existing MyApp-test error (=1) so a clean app
-  // with only that legacy error still passes. We assert "no NEW errors".
+  // T14.5 — assert 0 NEW errors vs the REAL recorded baseline. finalize now persists
+  // `baselineErrors` (the analyzer ERROR count it measured BEFORE the passes ran), so
+  // the gate is "≤ the errors that pre-existed the production passes", not a hardwired
+  // ≤1 from a dead field that nothing ever wrote. When no finalize report exists
+  // (e.g. a pure generation run that didn't finalize), the budget is 0 NEW errors:
+  // a freshly-built app must analyze clean.
   const finalizeRep = readJson(path.join(ctx.uix, 'finalize-report.json'));
-  // finalize records ISSUE totals, not error counts; the error budget is the
-  // pre-existing legacy error. We assert errors <= that budget.
-  const baselineErrors = (finalizeRep && typeof finalizeRep.__baselineErrors === 'number')
-    ? finalizeRep.__baselineErrors : 1;
+  const haveRecordedBaseline = finalizeRep && typeof finalizeRep.baselineErrors === 'number';
+  const baselineErrors = haveRecordedBaseline ? finalizeRep.baselineErrors : 0;
+  const src = haveRecordedBaseline ? 'finalize baselineErrors' : 'no finalize report → 0 new errors';
   out.push(errors <= baselineErrors
-    ? check(P, `flutter analyze errors ≤ baseline (${baselineErrors})`, PASS, `${errors} error(s)`)
-    : check(P, `flutter analyze errors ≤ baseline (${baselineErrors})`, FAIL,
-      `${errors} error(s) > baseline ${baselineErrors}`));
+    ? check(P, `flutter analyze errors ≤ baseline (${baselineErrors}, ${src})`, PASS, `${errors} error(s)`)
+    : check(P, `flutter analyze errors ≤ baseline (${baselineErrors}, ${src})`, FAIL,
+      `${errors} error(s) > baseline ${baselineErrors} — NEW errors introduced`));
 
   // build web.
   if (ctx.noBuild) {
@@ -349,6 +410,23 @@ function checkFinalize(ctx) {
     ? check(P, 'every pass has a legitimate status', PASS, 'applied/skipped only')
     : check(P, 'every pass has a legitimate status', FAIL,
       `bad: ${weird.map((p) => `${p.name}=${p.status}`).join(', ')}`));
+
+  // T14.6 — a `skipped` pass that SHOULD have applied = FAIL. RFC §5 expects 8a–8f
+  // `applied`. The only LEGITIMATE skip is a deliberate subset restriction
+  // (`onlyPasses` set → others recorded skipped with reason 'not in onlyPasses').
+  // Any OTHER skip is a regression masquerading as a clean result → FAIL.
+  const ALLOWLISTED_SKIP = /not in onlyPasses/i;
+  const skipped = passes.filter((p) => p.status === 'skipped');
+  const regressionSkips = skipped.filter((p) => !(p.warnings || []).some((w) => ALLOWLISTED_SKIP.test(String(w))));
+  if (skipped.length === 0) {
+    out.push(check(P, 'no pass skipped-when-should-apply', PASS, 'all 8a–8f applied (none skipped)'));
+  } else if (regressionSkips.length === 0) {
+    out.push(check(P, 'no pass skipped-when-should-apply', PASS,
+      `${skipped.length} skipped — all allowlisted (onlyPasses subset)`));
+  } else {
+    out.push(check(P, 'no pass skipped-when-should-apply', FAIL,
+      `${regressionSkips.length} pass(es) skipped without an allowlisted reason: ${regressionSkips.map((p) => `${p.name} [${(p.warnings || []).join('; ') || 'no reason'}]`).join(', ')}`));
+  }
 
   // AI proof present where a pass fired AI: any pass that fired must carry an
   // aiProof with firstCall proof (callId). A pass that didn't fire is fine.
@@ -412,16 +490,42 @@ function checkIdempotence(ctx, canon) {
   return { checks: out };
 }
 
-// ── run log discovery ──────────────────────────────────────────────────────────
+// ── run log discovery (T14.4: TIE the proof log to THIS run) ──────────────────
+// The AI-fired proof for a generation run must come from THE run that produced the
+// current canonical — NOT the newest unrelated run_*.log. Resolution order:
+//   1. explicit --runId            → `tied:true`  (the human named the run)
+//   2. derive: find the per-run    → `tied:true`  (the run whose
+//      `<runId>.canonical.json` whose         output IS the current canonical)
+//      contentHash === .uix/canonical.json
+//   3. newest run_*.log (fallback) → `tied:false` (a GUESS; a generation AI-fired
+//                                                   check must NOT trust this → FAIL)
+// `tied` lets the canon/asset proof distinguish "proven for this run" from
+// "found some log lying around".
 function findRunLog(uix, runId) {
   const runsDir = path.join(uix, 'runs');
   if (!fs.existsSync(runsDir)) return null;
+  // 1) explicit runId.
   if (runId) {
     const p = path.join(runsDir, `${runId}.log`);
-    if (fs.existsSync(p)) return { path: p, text: fs.readFileSync(p, 'utf8') };
-    return null;
+    if (fs.existsSync(p)) return { path: p, text: fs.readFileSync(p, 'utf8'), tied: true, runId };
+    return null;   // a named-but-missing log is honestly "not found" (→ FAIL downstream)
   }
-  // newest *.log (prefer real run_* logs over ad-hoc test logs).
+  // 2) derive the run that produced the current canonical, by contentHash match.
+  const curCanon = (() => { try { return JSON.parse(fs.readFileSync(path.join(uix, 'canonical.json'), 'utf8')); } catch { return null; } })();
+  const curHash = curCanon && curCanon.contentHash;
+  if (curHash) {
+    let perRun = [];
+    try { perRun = fs.readdirSync(runsDir).filter((f) => f.endsWith('.canonical.json')); } catch { /* none */ }
+    for (const f of perRun) {
+      const rc = (() => { try { return JSON.parse(fs.readFileSync(path.join(runsDir, f), 'utf8')); } catch { return null; } })();
+      if (rc && rc.contentHash && rc.contentHash === curHash) {
+        const rid = f.replace(/\.canonical\.json$/, '');
+        const lp = path.join(runsDir, `${rid}.log`);
+        if (fs.existsSync(lp)) return { path: lp, text: fs.readFileSync(lp, 'utf8'), tied: true, runId: rid };
+      }
+    }
+  }
+  // 3) newest *.log — an UNTIED guess (prefer real run_* logs over ad-hoc test logs).
   const logs = fs.readdirSync(runsDir).filter((f) => f.endsWith('.log'));
   if (!logs.length) return null;
   const ranked = logs
@@ -433,7 +537,7 @@ function findRunLog(uix, runId) {
       return y.st.mtimeMs - x.st.mtimeMs;       // then newest
     });
   const top = ranked[0];
-  return { path: top.p, text: fs.readFileSync(top.p, 'utf8') };
+  return { path: top.p, text: fs.readFileSync(top.p, 'utf8'), tied: false, runId: top.f.replace(/\.log$/, '') };
 }
 
 function detectFramework(root) {

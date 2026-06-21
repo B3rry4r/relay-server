@@ -48,7 +48,7 @@ export type RunModelLike = (
   env: NodeJS.ProcessEnv,
   cwd: string,
   opts?: { sessionId?: string; format?: AIFormat; agent?: boolean; jobId?: string; projectId?: string; modelId?: string },
-) => Promise<{ text: string; sessionId?: string }>;
+) => Promise<{ text: string; sessionId?: string; tokens?: number }>;
 
 // ── Typed result + errors ────────────────────────────────────────────────────
 
@@ -196,7 +196,7 @@ export async function runModelObserved(
   }
 
   try {
-    const { text, sessionId } = await runner(model, prompt, env, cwd, {
+    const { text, sessionId, tokens: usageTokens } = await runner(model, prompt, env, cwd, {
       sessionId: opts.sessionId,
       format: opts.format,
       agent: opts.agent,
@@ -206,7 +206,10 @@ export async function runModelObserved(
     });
     const durMs = Date.now() - t0;
     const out = (text ?? '').trim();
-    const tokens = estTokens(out);
+    // RFC v2 §0.2 — prefer the model's REAL reported usage (input+output tokens
+    // from the stream-json result) over the chars/4 estimate; fall back to the
+    // estimate only when the CLI didn't expose usage.
+    const tokens = (typeof usageTokens === 'number' && usageTokens > 0) ? usageTokens : estTokens(out);
     if (!out) {
       logAiLine(ctx, `model=${model} call=${callId} tokens≈0 status=empty dur=${durMs}ms`);
       return { ok: false, reason: 'empty', callId, durMs, model, tokens: 0 };

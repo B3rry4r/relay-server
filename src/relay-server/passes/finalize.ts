@@ -134,6 +134,11 @@ export interface FinalizeReport {
   baselineAnalyze: number | null;
   /** Analyzer issue count after the sequence (null when not flutter / skipped). */
   finalAnalyze: number | null;
+  /** Analyzer ERROR count before the sequence — the verify harness's real error
+   *  budget (assert finalErrors ≤ baselineErrors = 0 NEW errors). Null = not flutter. */
+  baselineErrors: number | null;
+  /** Analyzer ERROR count after the sequence (null when not flutter / skipped). */
+  finalErrors: number | null;
   /** Path the report was written to (null when noReport / write failed). */
   reportPath: string | null;
 }
@@ -378,7 +383,29 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
   if (!opts.dryRun && sourceDirs.length) {
     await ensureProjectGit(projectRoot, vc);
     gitReady = fsSync.existsSync(path.join(projectRoot, '.git'));
-    if (!gitReady) log(`[finalize] WARNING: git unavailable — passes run WITHOUT rollback (data safety degraded)`);
+    if (!gitReady) log(`[finalize] WARNING: git unavailable — destructive passes will be REFUSED (no rollback point)`);
+  }
+
+  // T11 fix #4 — REFUSE destructive passes with no rollback. Every finalize pass
+  // mutates real source IRREVERSIBLY (extract/move/rename/cleanup). When this is a
+  // real (non-dry) run over a project WITH source dirs but git is unavailable, there
+  // is no snapshot to roll back to — so, matching asset-phase, we do NOT mutate.
+  // Each pass is recorded `reverted` with a loud reason instead of running. (Dry-run
+  // never writes, and a no-source project has nothing to protect, so both still run.)
+  const passReports: PassReport[] = [];
+  const refuseNoGit = !opts.dryRun && sourceDirs.length > 0 && !gitReady;
+  if (refuseNoGit) {
+    const reason = 'git unavailable — REFUSING destructive finalize passes without a rollback snapshot (RFC §9; never mutate source irreversibly without a recovery point)';
+    log(`[finalize] ABORT passes — ${reason}`);
+    for (const def of PASSES) {
+      passReports.push({
+        name: def.name,
+        status: 'reverted',
+        counts: {},
+        warnings: [],
+        error: reason,
+      });
+    }
   }
 
   // The analyze ERROR count we measure against AFTER a pass — it tracks the LAST
@@ -391,9 +418,8 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
   // real ERROR (undefined name, invalid constant, broken build) still does.
   let lastGoodErrors = baselineErrors;
 
-  const passReports: PassReport[] = [];
-
   for (const def of PASSES) {
+    if (refuseNoGit) break;   // T11 #4 — refused above; do not mutate without rollback.
     if (!want(def.name)) {
       passReports.push({ name: def.name, status: 'skipped', counts: {}, warnings: ['not in onlyPasses'] });
       log(`[finalize] ${def.name}: skipped (not in onlyPasses)`);
@@ -502,9 +528,12 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
 
   // Final analyze (best-effort; reflects the net of applied+reverted passes).
   let finalAnalyze: number | null = null;
+  let finalErrors: number | null = null;
   if (buildCheckable) {
-    finalAnalyze = await flutterAnalyzeCount(projectRoot, opts.env);
-    log(`[finalize] final analyze: ${finalAnalyze ?? 'n/a'} issue(s) (baseline ${baselineAnalyze ?? 'n/a'})`);
+    const fa = await flutterAnalyze(projectRoot, opts.env);
+    finalAnalyze = fa?.total ?? null;
+    finalErrors = fa?.errors ?? null;
+    log(`[finalize] final analyze: ${finalAnalyze ?? 'n/a'} issue(s), ${finalErrors ?? 'n/a'} error(s) (baseline ${baselineAnalyze ?? 'n/a'} issue(s), ${baselineErrors ?? 'n/a'} error(s))`);
   }
 
   const applied = passReports.filter((p) => p.status === 'applied').length;
@@ -521,6 +550,8 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
     passes: passReports,
     baselineAnalyze,
     finalAnalyze,
+    baselineErrors,
+    finalErrors,
     reportPath: null,
   };
 

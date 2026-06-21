@@ -31,8 +31,44 @@ import * as fs from 'node:fs/promises';
 import * as fsSync from 'node:fs';
 import * as path from 'node:path';
 import { promisify } from 'node:util';
+import { assertSafeProjectRoot } from './runtime';
 
 const execFile = promisify(execFileCb);
+
+// ── per-repo async mutex (T11 fix #3) ────────────────────────────────────────────
+// Parallel screen workers call commitCheckpoint / snapshotBeforeMutation / rollbackTo
+// concurrently on the SAME repo. Each does `git add -A` + commit, which take the
+// repo's index.lock — concurrent writers collide and most commits are DROPPED
+// ("Another git process seems to be running"). Serialize all git WRITE ops per repo
+// so concurrent checkpoints QUEUE instead of failing. Keyed by resolved projectRoot.
+const repoLocks = new Map<string, Promise<unknown>>();
+function withRepoLock<T>(projectRoot: string, fn: () => Promise<T>): Promise<T> {
+  const key = path.resolve(projectRoot);
+  const prev = repoLocks.get(key) ?? Promise.resolve();
+  // Chain fn after whatever is currently queued; swallow the predecessor's result so
+  // one failing op never rejects a later queued op's gate.
+  const next = prev.then(() => fn(), () => fn());
+  // Keep the chain alive even if `next` rejects (callers handle their own errors).
+  repoLocks.set(key, next.catch(() => undefined));
+  return next;
+}
+
+/**
+ * HARD SCOPE GUARD (T11 fix #1). Returns true when it is SAFE to operate on
+ * `projectRoot` (a managed project strictly under the projects root, not relay-server
+ * itself / the projects root / a parent). On an unsafe root it logs a LOUD refusal
+ * and returns false — the harness then no-ops there, NEVER running git. `..`, `.`,
+ * and `relay-server` are all refused here even if a caller bypassed resolveProjectRoot.
+ */
+function isSafeProjectRoot(projectRoot: string, log: Logger): boolean {
+  try {
+    assertSafeProjectRoot(projectRoot);
+    return true;
+  } catch (e) {
+    log(`[vc] REFUSED: ${(e as Error).message}`);
+    return false;
+  }
+}
 
 // Local-only git identity for harness commits. Applied per-command with `-c` (and
 // committed to .git/config as a local-only value by ensureProjectGit) so the GLOBAL
@@ -166,6 +202,9 @@ async function ensureGitignore(projectRoot: string, log: Logger): Promise<void> 
 export async function ensureProjectGit(projectRoot: string, opts: VcOptions = {}): Promise<void> {
   const log = opts.log ?? noopLog;
   const env = opts.env;
+  // HARD SCOPE GUARD (T11 #1): never init/operate git on relay-server itself, the
+  // projects root, /workspace, or a parent. A loud refusal — not a silent return.
+  if (!isSafeProjectRoot(projectRoot, log)) return;
   if (!fsSync.existsSync(projectRoot)) {
     log(`[vc] WARNING: project root does not exist, cannot init git: ${projectRoot} — DATA SAFETY OFF`);
     return;
@@ -175,43 +214,90 @@ export async function ensureProjectGit(projectRoot: string, opts: VcOptions = {}
     return;
   }
 
-  try {
-    if (hasGitDir(projectRoot)) {
-      // Already a repo. Make sure the LOCAL identity is set so harness commits work
-      // even on a repo created elsewhere (idempotent; never touches global).
+  // Serialize the whole init under the per-repo lock so a parallel caller can't race
+  // `git init` / the baseline commit (T11 #3).
+  await withRepoLock(projectRoot, async () => {
+    try {
+      if (hasGitDir(projectRoot)) {
+        // Already a repo. Make sure the LOCAL identity is set so harness commits work
+        // even on a repo created elsewhere (idempotent; never touches global).
+        try {
+          await git(projectRoot, ['config', '--local', 'user.name', HARNESS_USER_NAME], env);
+          await git(projectRoot, ['config', '--local', 'user.email', HARNESS_USER_EMAIL], env);
+        } catch { /* identity is also injected per-command via -c; this is belt+braces */ }
+        await warnIfSourceDirsIgnored(projectRoot, log, env);
+        return; // no-op
+      }
+
+      log(`[vc] initializing git repo for managed project: ${projectRoot}`);
       try {
-        await git(projectRoot, ['config', '--local', 'user.name', HARNESS_USER_NAME], env);
-        await git(projectRoot, ['config', '--local', 'user.email', HARNESS_USER_EMAIL], env);
-      } catch { /* identity is also injected per-command via -c; this is belt+braces */ }
-      return; // no-op
-    }
+        await git(projectRoot, ['init', '-b', 'main'], env);
+      } catch {
+        // Older git without `-b`: init then rename the branch best-effort.
+        await git(projectRoot, ['init'], env);
+        try { await git(projectRoot, ['checkout', '-b', 'main'], env); } catch { /* ignore */ }
+      }
+      // LOCAL identity only (RFC §9 — don't touch global).
+      await git(projectRoot, ['config', '--local', 'user.name', HARNESS_USER_NAME], env);
+      await git(projectRoot, ['config', '--local', 'user.email', HARNESS_USER_EMAIL], env);
 
-    log(`[vc] initializing git repo for managed project: ${projectRoot}`);
-    try {
-      await git(projectRoot, ['init', '-b', 'main'], env);
-    } catch {
-      // Older git without `-b`: init then rename the branch best-effort.
-      await git(projectRoot, ['init'], env);
-      try { await git(projectRoot, ['checkout', '-b', 'main'], env); } catch { /* ignore */ }
-    }
-    // LOCAL identity only (RFC §9 — don't touch global).
-    await git(projectRoot, ['config', '--local', 'user.name', HARNESS_USER_NAME], env);
-    await git(projectRoot, ['config', '--local', 'user.email', HARNESS_USER_EMAIL], env);
+      await ensureGitignore(projectRoot, log);
 
-    await ensureGitignore(projectRoot, log);
+      // Initial baseline commit so there is always a sha to roll back to. If the tree
+      // is empty this is an empty commit (still a valid rollback target).
+      try {
+        await git(projectRoot, ['add', '-A'], env);
+        await git(projectRoot, ['commit', '--allow-empty', '-m', '[ckpt] init — version-control harness baseline'], env);
+        log('[vc] initial baseline commit created');
+      } catch (e) {
+        log(`[vc] WARNING: initial commit failed (continuing): ${(e as Error).message}`);
+      }
 
-    // Initial baseline commit so there is always a sha to roll back to. If the tree
-    // is empty this is an empty commit (still a valid rollback target).
-    try {
-      await git(projectRoot, ['add', '-A'], env);
-      await git(projectRoot, ['commit', '--allow-empty', '-m', '[ckpt] init — version-control harness baseline'], env);
-      log('[vc] initial baseline commit created');
+      // ROLLBACK-SAFETY CHECK (T11 #5): rollbackTo (reset --hard + clean -fd) can only
+      // restore a dir git TRACKS. If a wired source dir (lib/test/src) is covered by
+      // .gitignore, a pass that deletes files there could NOT be rolled back — the
+      // guarantee would silently depend on ignore contents. Warn LOUDLY.
+      await warnIfSourceDirsIgnored(projectRoot, log, env);
     } catch (e) {
-      log(`[vc] WARNING: initial commit failed (continuing): ${(e as Error).message}`);
+      log(`[vc] WARNING: ensureProjectGit failed (DATA SAFETY OFF for this project): ${(e as Error).message}`);
     }
-  } catch (e) {
-    log(`[vc] WARNING: ensureProjectGit failed (DATA SAFETY OFF for this project): ${(e as Error).message}`);
+  });
+}
+
+// ── source-dir ignore safety (T11 #5) ────────────────────────────────────────────
+
+/** Candidate source dirs a mutating pass may delete from; rollback depends on these
+ *  being TRACKED (not gitignored). */
+const WIRED_SOURCE_DIRS = ['lib', 'test', 'src'];
+
+/**
+ * Warn loudly when a wired source dir exists but is IGNORED by .gitignore. A
+ * gitignored source dir means `reset --hard` + `clean -fd` cannot restore files a
+ * pass deletes there — so the data-safety guarantee would silently depend on ignore
+ * contents. Best-effort (git failure / missing dir → no warning). Returns the list of
+ * offending dirs (for tests).
+ */
+async function warnIfSourceDirsIgnored(
+  projectRoot: string, log: Logger, env?: NodeJS.ProcessEnv,
+): Promise<string[]> {
+  const offending: string[] = [];
+  for (const d of WIRED_SOURCE_DIRS) {
+    const abs = path.join(projectRoot, d);
+    if (!fsSync.existsSync(abs)) continue;
+    try {
+      // `git check-ignore -q <dir>` exits 0 when the path IS ignored.
+      await git(projectRoot, ['check-ignore', '-q', d], env);
+      offending.push(d);
+    } catch {
+      // non-zero exit = NOT ignored (the safe case) — or git failed; either way no warn.
+    }
   }
+  if (offending.length) {
+    log(`[vc] CRITICAL: wired source dir(s) [${offending.join(', ')}] are covered by .gitignore — ` +
+        `rollback CANNOT restore deletions there. Remove these from .gitignore before any destructive pass; ` +
+        `rollback-dependent mutation is UNSAFE here.`);
+  }
+  return offending;
 }
 
 // ── helpers: working-tree state ──────────────────────────────────────────────────
@@ -253,27 +339,32 @@ export async function commitCheckpoint(
 ): Promise<string | null> {
   const log = opts.log ?? noopLog;
   const env = opts.env;
+  if (!isSafeProjectRoot(projectRoot, log)) return null;
   if (!hasGitDir(projectRoot)) {
     // Not initialized — don't silently swallow: the caller expected a repo.
     log(`[vc] WARNING: commitCheckpoint('${label}') skipped — no .git at ${projectRoot} (call ensureProjectGit first)`);
     return null;
   }
-  try {
-    if (!(await isDirty(projectRoot, env))) {
-      log(`[vc] checkpoint '${label}': nothing to commit (no-op)`);
+  // Serialize the add+commit per repo so parallel checkpoints queue instead of
+  // colliding on index.lock (T11 #3).
+  return withRepoLock(projectRoot, async () => {
+    try {
+      if (!(await isDirty(projectRoot, env))) {
+        log(`[vc] checkpoint '${label}': nothing to commit (no-op)`);
+        return null;
+      }
+      await git(projectRoot, ['add', '-A'], env);
+      const args = ['commit', '-m', `[ckpt] ${label}`];
+      if (detail && detail.trim()) args.push('-m', detail.trim());
+      await git(projectRoot, args, env);
+      const sha = await headSha(projectRoot, env);
+      log(`[vc] checkpoint '${label}' committed${sha ? ` (${sha.slice(0, 8)})` : ''}`);
+      return sha;
+    } catch (e) {
+      log(`[vc] WARNING: commitCheckpoint('${label}') failed (non-fatal): ${(e as Error).message}`);
       return null;
     }
-    await git(projectRoot, ['add', '-A'], env);
-    const args = ['commit', '-m', `[ckpt] ${label}`];
-    if (detail && detail.trim()) args.push('-m', detail.trim());
-    await git(projectRoot, args, env);
-    const sha = await headSha(projectRoot, env);
-    log(`[vc] checkpoint '${label}' committed${sha ? ` (${sha.slice(0, 8)})` : ''}`);
-    return sha;
-  } catch (e) {
-    log(`[vc] WARNING: commitCheckpoint('${label}') failed (non-fatal): ${(e as Error).message}`);
-    return null;
-  }
+  });
 }
 
 // ── 3. snapshotBeforeMutation ────────────────────────────────────────────────────
@@ -298,31 +389,36 @@ export async function snapshotBeforeMutation(
 ): Promise<string> {
   const log = opts.log ?? noopLog;
   const env = opts.env;
+  if (!isSafeProjectRoot(projectRoot, log)) return '';
   if (!hasGitDir(projectRoot)) {
     log(`[vc] WARNING: snapshotBeforeMutation('${label}') — no .git at ${projectRoot}; rollback UNAVAILABLE (call ensureProjectGit first)`);
     return '';
   }
-  try {
-    if (await isDirty(projectRoot, env)) {
-      await git(projectRoot, ['add', '-A'], env);
-      await git(projectRoot, ['commit', '-m', `[ckpt] pre ${label}`], env);
-      log(`[vc] snapshot baseline committed: pre ${label}`);
+  // Serialize per repo so a concurrent checkpoint can't interleave with the baseline
+  // commit and drop it (T11 #3).
+  return withRepoLock(projectRoot, async () => {
+    try {
+      if (await isDirty(projectRoot, env)) {
+        await git(projectRoot, ['add', '-A'], env);
+        await git(projectRoot, ['commit', '-m', `[ckpt] pre ${label}`], env);
+        log(`[vc] snapshot baseline committed: pre ${label}`);
+      }
+      const sha = await headSha(projectRoot, env);
+      if (!sha) {
+        // No commits yet (e.g. empty repo, commit failed) — make an empty baseline so
+        // there is always a concrete rollback target.
+        try {
+          await git(projectRoot, ['commit', '--allow-empty', '-m', `[ckpt] pre ${label} (empty baseline)`], env);
+        } catch { /* ignore */ }
+        const sha2 = await headSha(projectRoot, env);
+        return sha2 ?? '';
+      }
+      return sha;
+    } catch (e) {
+      log(`[vc] WARNING: snapshotBeforeMutation('${label}') failed (rollback UNAVAILABLE): ${(e as Error).message}`);
+      return '';
     }
-    const sha = await headSha(projectRoot, env);
-    if (!sha) {
-      // No commits yet (e.g. empty repo, commit failed) — make an empty baseline so
-      // there is always a concrete rollback target.
-      try {
-        await git(projectRoot, ['commit', '--allow-empty', '-m', `[ckpt] pre ${label} (empty baseline)`], env);
-      } catch { /* ignore */ }
-      const sha2 = await headSha(projectRoot, env);
-      return sha2 ?? '';
-    }
-    return sha;
-  } catch (e) {
-    log(`[vc] WARNING: snapshotBeforeMutation('${label}') failed (rollback UNAVAILABLE): ${(e as Error).message}`);
-    return '';
-  }
+  });
 }
 
 // ── 4. rollbackTo ────────────────────────────────────────────────────────────────
@@ -347,6 +443,7 @@ export async function rollbackTo(
 ): Promise<void> {
   const log = opts.log ?? noopLog;
   const env = opts.env;
+  if (!isSafeProjectRoot(projectRoot, log)) return;
   if (!sha || !sha.trim()) {
     log(`[vc] WARNING: rollbackTo called with no sha — NOTHING RESTORED (no snapshot was taken)`);
     return;
@@ -355,20 +452,25 @@ export async function rollbackTo(
     log(`[vc] CRITICAL: rollbackTo('${sha.slice(0, 8)}') — no .git at ${projectRoot}; CANNOT RESTORE`);
     return;
   }
-  try {
-    await git(projectRoot, ['reset', '--hard', sha], env);
-    // Remove untracked files/dirs the failed pass created. -d for directories; we do
-    // NOT pass -x so .gitignore'd build artifacts (e.g. build/) are preserved (they
-    // are not pass output and re-deleting them just forces a slow rebuild).
-    await git(projectRoot, ['clean', '-fd'], env);
-    log(`[vc] rolled back to ${sha.slice(0, 8)} (reset --hard + clean -fd) — deleted/moved files restored, pass-created files removed`);
-  } catch (e) {
-    log(`[vc] CRITICAL: rollbackTo('${sha.slice(0, 8)}') FAILED — working tree may be inconsistent: ${(e as Error).message}`);
-  }
+  // Serialize per repo so a rollback never collides with a concurrent commit (T11 #3).
+  await withRepoLock(projectRoot, async () => {
+    try {
+      await git(projectRoot, ['reset', '--hard', sha], env);
+      // Remove untracked files/dirs the failed pass created. -d for directories; we do
+      // NOT pass -x so .gitignore'd build artifacts (e.g. build/) are preserved (they
+      // are not pass output and re-deleting them just forces a slow rebuild).
+      await git(projectRoot, ['clean', '-fd'], env);
+      log(`[vc] rolled back to ${sha.slice(0, 8)} (reset --hard + clean -fd) — deleted/moved files restored, pass-created files removed`);
+    } catch (e) {
+      log(`[vc] CRITICAL: rollbackTo('${sha.slice(0, 8)}') FAILED — working tree may be inconsistent: ${(e as Error).message}`);
+    }
+  });
 }
 
 // Test-only surface: reset the cached git-availability probe between unit tests.
 export const __test = {
   resetGitAvailableCache(): void { gitAvailable = null; },
   detectIgnoreFlavors,
+  warnIfSourceDirsIgnored,
+  isSafeProjectRoot,
 };

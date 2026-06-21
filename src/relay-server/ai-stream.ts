@@ -12,6 +12,23 @@ export interface ClaudeStreamResult {
   text?: string;
   /** Resumable session id from the stream (init or result event). */
   sessionId?: string;
+  /**
+   * RFC v2 §0.1 — the terminal `result` event's `is_error` flag (and/or an error
+   * subtype like `error_max_turns` / `error_during_execution`). A claude result
+   * can carry NON-EMPTY text and still be an error (rate-limit, API failure,
+   * max-turns); that text must NOT be treated as a clean success. `runModel`
+   * reads this and signals failure for the turn so the observability layer logs
+   * `status=error` and `requireModel` throws instead of accepting the error text.
+   */
+  isError?: boolean;
+  /** The result subtype when present (e.g. 'success', 'error_max_turns'). */
+  resultSubtype?: string;
+  /**
+   * RFC v2 §0.2 — real token usage from the result event when the CLI reports it
+   * (`usage.input_tokens` + `usage.output_tokens`). Used for the `[ai:…] tokens≈N`
+   * line instead of the chars/4 estimate; undefined when the CLI omits usage.
+   */
+  tokens?: number;
 }
 
 export interface ClaudeStreamParser {
@@ -51,8 +68,18 @@ type StreamEvent = {
   session_id?: string;
   result?: unknown;
   is_error?: boolean;
+  usage?: { input_tokens?: number; output_tokens?: number };
   message?: { content?: Array<{ type?: string; text?: string; name?: string; input?: unknown }> };
 };
+
+/** Sum input+output tokens from a result event's usage block, if present. */
+function usageTokens(usage: StreamEvent['usage']): number | undefined {
+  if (!usage || typeof usage !== 'object') return undefined;
+  const inTok = typeof usage.input_tokens === 'number' ? usage.input_tokens : 0;
+  const outTok = typeof usage.output_tokens === 'number' ? usage.output_tokens : 0;
+  const total = inTok + outTok;
+  return total > 0 ? total : undefined;
+}
 
 export function createClaudeStreamParser(onLine: (line: string) => void): ClaudeStreamParser {
   const result: ClaudeStreamResult = {};
@@ -78,7 +105,15 @@ export function createClaudeStreamParser(onLine: (line: string) => void): Claude
       case 'result': {
         result.text = typeof event.result === 'string' ? event.result : String(event.result ?? '');
         if (event.session_id) result.sessionId = event.session_id;
-        onLine(event.is_error ? '[claude] finished with an error' : '[claude] result received');
+        // RFC v2 §0.1: capture the error signal. `is_error:true` OR an error-flavoured
+        // subtype (claude emits `error_max_turns`, `error_during_execution`) means the
+        // turn FAILED even when `result` text is non-empty. Surface it so runModel can
+        // reject it rather than returning the error string as a clean success.
+        result.resultSubtype = event.subtype;
+        result.isError = event.is_error === true || (typeof event.subtype === 'string' && event.subtype.startsWith('error'));
+        const tk = usageTokens(event.usage);
+        if (tk !== undefined) result.tokens = tk;
+        onLine(result.isError ? '[claude] finished with an error' : '[claude] result received');
         break;
       }
       default:

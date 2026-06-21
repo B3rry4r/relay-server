@@ -143,4 +143,42 @@ describe('aiModelToCanonical adapter', () => {
     expect(overlay.fromCanonicalId).toBe('c_settings');
     expect(overlay.toCanonicalId).toBe('m_alert');
   });
+
+  // T14.9 — an unbound modal becomes a standalone screen with a NEW c_ id; flow
+  // edges that referenced its OLD m_ id must be REMAPPED to the new id, never left
+  // dangling (pointing at an id no screen/modal carries).
+  it('remaps flow edges that referenced an unbound modal to its new standalone id', () => {
+    const model = sampleModel();
+    // Add a flow edge that targets the UNBOUND modal m_orphan by its old m_ id.
+    model.flow.edges.push({ from: 'c_login', to: 'm_orphan', kind: 'push', label: 'see orphan' });
+    const c = aiModelToCanonical(model);
+
+    const standalone = c.screens.find(s => s.frameIds.includes('999:0001'))!;
+    expect(standalone.canonicalId).not.toBe('m_orphan');   // got a fresh c_ id
+
+    // The edge that pointed at m_orphan is now wired to the new standalone id.
+    const edge = c.flow.edges.find(e => e.label === 'see orphan')!;
+    expect(edge).toBeDefined();
+    expect(edge.toCanonicalId).toBe(standalone.canonicalId);
+
+    // NO edge dangles: every endpoint resolves to a real screen or a folded modal.
+    const valid = new Set<string>(c.screens.map(s => s.canonicalId));
+    for (const s of c.screens) for (const m of s.modals) valid.add(m.id);
+    for (const e of c.flow.edges) {
+      expect(valid.has(e.fromCanonicalId)).toBe(true);
+      expect(valid.has(e.toCanonicalId)).toBe(true);
+    }
+    // Specifically: the old m_orphan id appears on NO edge anymore.
+    expect(c.flow.edges.some(e => e.fromCanonicalId === 'm_orphan' || e.toCanonicalId === 'm_orphan')).toBe(false);
+  });
+
+  // A flow edge to a genuinely non-existent endpoint (typo / stale id) is DROPPED
+  // with a warning rather than left as a dead wire.
+  it('drops a flow edge whose endpoint resolves to nothing, with a warning', () => {
+    const model = sampleModel();
+    model.flow.edges.push({ from: 'c_login', to: 'c_does_not_exist', kind: 'push' });
+    const c = aiModelToCanonical(model);
+    expect(c.flow.edges.some(e => e.toCanonicalId === 'c_does_not_exist')).toBe(false);
+    expect(c.warnings.some(w => /c_does_not_exist/.test(w) && /drops|dangling/i.test(w))).toBe(true);
+  });
 });

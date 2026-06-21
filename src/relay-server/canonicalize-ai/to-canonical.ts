@@ -69,6 +69,11 @@ export function aiModelToCanonical(model: CanonicalModel): Canonical {
   // their base screen. An unbound modal (empty/unresolved base) cannot be presented
   // as an overlay, so — mirroring the deterministic pre-pass — it is surfaced as a
   // warning AND kept as a standalone built screen so it is still reachable + built.
+  // When an unbound modal is converted to a standalone screen it gets a BRAND-NEW
+  // `c_` canonicalId (canonicalIdFor(frameId)) ≠ its old `m_` modal id. Flow edges
+  // still reference the old id, so we record old→new here and REMAP edge endpoints
+  // below — otherwise those edges dangle (point at an id no screen/modal carries).
+  const modalIdRemap = new Map<string, string>();
   for (const m of model.modals ?? []) {
     const base = m.baseCanonicalId ? screenById.get(m.baseCanonicalId) : undefined;
     if (base) {
@@ -90,6 +95,7 @@ export function aiModelToCanonical(model: CanonicalModel): Canonical {
       screens.push(standalone);
       screenById.set(canonicalId, standalone);
       frameMap[m.frameId] = canonicalId;
+      if (m.canonicalId && m.canonicalId !== canonicalId) modalIdRemap.set(m.canonicalId, canonicalId);
     }
   }
 
@@ -108,14 +114,32 @@ export function aiModelToCanonical(model: CanonicalModel): Canonical {
   }));
 
   // ── flow: AI edges use {from,to,kind}; build edges use {fromCanonicalId,toCanonicalId,kind} ─
-  const edges: BuildFlowEdge[] = (model.flow?.edges ?? []).map((e): BuildFlowEdge => ({
-    fromCanonicalId: e.from,
-    toCanonicalId: e.to,
-    kind: e.kind,
-    ...(e.label ? { label: e.label } : {}),
-  }));
+  // Remap any endpoint that pointed at an unbound modal's OLD id to its new
+  // standalone screen id; an edge that still references a non-existent endpoint
+  // after remap is DEAD (dangling) → drop it with a warning rather than leave a
+  // wire to nowhere (RFC §0.1 — no silent dangling state).
+  const remap = (id: string): string => modalIdRemap.get(id) ?? id;
+  // Valid endpoints = every screen (incl. folded-in standalone modals) + every
+  // modal id still presented as an overlay under its base screen.
+  const validEndpoints = new Set<string>(screens.map(s => s.canonicalId));
+  for (const s of screens) for (const md of s.modals) validEndpoints.add(md.id);
+  const edges: BuildFlowEdge[] = [];
+  for (const e of model.flow?.edges ?? []) {
+    const from = remap(e.from);
+    const to = remap(e.to);
+    if (!validEndpoints.has(from) || !validEndpoints.has(to)) {
+      warnings.push(`flow edge ${e.from}→${e.to} (${e.kind}) drops: endpoint not a known screen/modal after remap — removed to avoid a dangling wire`);
+      continue;
+    }
+    edges.push({
+      fromCanonicalId: from,
+      toCanonicalId: to,
+      kind: e.kind,
+      ...(e.label ? { label: e.label } : {}),
+    });
+  }
   const flow: BuildFlow = {
-    entryCanonicalId: model.flow?.entryCanonicalId ?? null,
+    entryCanonicalId: model.flow?.entryCanonicalId ? remap(model.flow.entryCanonicalId) : null,
     edges,
   };
 

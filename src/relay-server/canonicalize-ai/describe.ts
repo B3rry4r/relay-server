@@ -24,6 +24,7 @@ import path from 'node:path';
 import { Validator } from '@cfworker/json-schema';
 import { resolveProjectRoot, createTerminalEnv, resolveWorkspace } from '../runtime';
 import { requireModel } from '../ai-observability';
+import type { AIModel } from '../ai-adapters';
 import { getNodeTree, renderFrameReference } from '../reference-render';
 import { isWidgetKind, lexiconForPrompt } from './lexicon';
 import {
@@ -177,7 +178,7 @@ export async function describeFrame(
   projectId: string,
   figStorageKey: string,
   frame: DescribeFrameInput,
-  opts: { modelId?: string; harnessBaseUrl?: string; scale?: number; runId?: string } = {},
+  opts: { provider?: AIModel; modelId?: string; harnessBaseUrl?: string; scale?: number; runId?: string } = {},
 ): Promise<DescribeResult> {
   const root = resolveProjectRoot(projectId);
   if (!root || !fsSync.existsSync(root)) throw new Error(`describeFrame: project not found: ${projectId}`);
@@ -218,7 +219,10 @@ export async function describeFrame(
   // that fails to describe aborts loud rather than emitting a stub descriptor.
   const env = createTerminalEnv(resolveWorkspace());
   const prompt = buildPrompt(frame, tree, refRelPath);
-  const { text } = await requireModel('claude', prompt, env, root, {
+  // Provider respects the RUN's selected model (claude/codex/gemini) — a codex/gemini
+  // run must NOT silently hard-depend on claude (RFC §0.1). Default 'claude' when
+  // unset so existing callers are unchanged.
+  const { text } = await requireModel(opts.provider ?? 'claude', prompt, env, root, {
     agent: true, modelId: opts.modelId ?? 'sonnet',
     log: { projectId, runId: opts.runId, step: 'canon.describe' },
   });

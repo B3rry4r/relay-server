@@ -863,10 +863,83 @@ const reactStrategy: AssetUsageStrategy = {
   },
 };
 
+// =============================================================================
+// AppAssets symbol inventory (T12 — Phase 5/6 packet injection)
+// =============================================================================
+//
+// The per-screen build agent must reference real assets through the generated
+// resources file (`AppAssets.<symbol>`), NOT raw `'assets/...'` path literals
+// (the OLD opaque names the asset pass renames/deletes on disk). This builds the
+// compact inventory injected into a screen's written contract so the agent emits
+// `AppAssets.x` from the start. It mirrors buildAssetIndex's symbol-key
+// computation EXACTLY (same source of truth as resources-emit + the re-point
+// pass), so a hint here resolves to the same symbol the resources file declares.
+//
+// Returns null when the asset pass did NOT produce a usable resources file/map
+// (no map, no resources file on disk, or no symbols) — the caller then injects
+// NOTHING (guard for absence), so a project without assets is unaffected.
+
+export interface AssetInventory {
+  /** Resources class, e.g. `AppAssets`. */
+  className: string;
+  /** Resources file path relative to project root, e.g. `lib/resources/app_assets.dart`. */
+  resourcesRel: string;
+  /** Distinct symbols declared (symbolKey → asset meta). */
+  symbols: IndexedAsset[];
+}
+
+/**
+ * Read `.uix/asset-map.json` + the resources file and build the inventory of
+ * AppAssets symbols available to a screen. Only symbols ACTUALLY DECLARED in the
+ * resources file are included (so a stale map can never advertise a symbol the
+ * agent would reference and break the build). Flutter-only for now (matches the
+ * shipped re-point strategy); other frameworks return null.
+ */
+export async function buildAssetInventory(projectRoot: string): Promise<AssetInventory | null> {
+  const framework = await detectFramework(projectRoot);
+  if (framework !== 'flutter') return null;
+  const map = await readAssetMap(projectRoot);
+  if (!map || !Array.isArray(map.assets) || map.assets.length === 0) return null;
+  const resourcesSrc = await readFileOrNull(path.join(projectRoot, FLUTTER_RESOURCES_REL));
+  if (!resourcesSrc) return null;
+  const declared = parseDeclaredSymbols(resourcesSrc);
+  if (declared.size === 0) return null;
+  const index = buildAssetIndex(map);
+  const symbols = index.assets.filter((a) => declared.has(a.symbolKey));
+  if (symbols.length === 0) return null;
+  return { className: FLUTTER_RESOURCES_CLASS, resourcesRel: FLUTTER_RESOURCES_REL, symbols };
+}
+
+/**
+ * Render the inventory as a contract block: the import path + the "use AppAssets,
+ * never raw asset path literals" instruction + a compact symbol list (icons then
+ * images) with each symbol's depicted name. Bounded so a 300-asset app does not
+ * blow the prompt: lists up to `cap` symbols, then notes the remainder.
+ */
+export function renderAssetInventory(inv: AssetInventory, cap = 120): string {
+  const icons = inv.symbols.filter((a) => a.kind === 'icon');
+  const images = inv.symbols.filter((a) => a.kind === 'image');
+  const fmt = (a: IndexedAsset) =>
+    `${inv.className}.${a.symbolKey} (${a.name}, ${a.format})`;
+  const ordered = [...icons, ...images];
+  const shown = ordered.slice(0, cap);
+  const lines: string[] = [
+    `AVAILABLE DESIGN ASSETS (${inv.symbols.length}) — the asset pipeline exported the design's real icons/images into ${inv.resourcesRel} as the \`${inv.className}\` class.`,
+    `USE \`${inv.className}.<symbol>\` for every icon/image — NEVER a raw 'assets/...' path string literal and NEVER a substitute Material icon. The raw 'assets/...' paths in the IR tree are OPAQUE pre-rename names; the files have been renamed/deduped, so a raw path literal will FAIL at runtime. Reference the symbol instead.`,
+    `Import it with a relative path to ${inv.resourcesRel}. SVG symbols → \`SvgPicture.asset(${inv.className}.x, width:.., height:.., colorFilter: ColorFilter.mode(color, BlendMode.srcIn))\` (needs \`flutter_svg\`); raster symbols → \`Image.asset(${inv.className}.x)\`.`,
+  ];
+  if (icons.length) lines.push(`Icons: ${shown.filter(a => a.kind === 'icon').map(fmt).join('; ')}`);
+  if (images.length) lines.push(`Images: ${shown.filter(a => a.kind === 'image').map(fmt).join('; ')}`);
+  if (ordered.length > cap) lines.push(`…and ${ordered.length - cap} more symbols declared in ${inv.resourcesRel} — open that file for the full list.`);
+  return lines.join('\n');
+}
+
 // ── test seam ────────────────────────────────────────────────────────────────
 /** Internal helpers exposed for unit tests (const-context rewrite safety). */
 export const __test = {
   rewriteIconWidget,
   stripEnclosingConst,
   findMaterialIconUses,
+  buildAssetInventory,
+  renderAssetInventory,
 };

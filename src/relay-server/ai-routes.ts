@@ -8,6 +8,7 @@ import { createTerminalEnv, resolveWorkspace, resolveProjectRoot } from './runti
 import { AI_ADAPTERS, getAdapter, isAIModel, type AIModel, type AIFormat } from './ai-adapters';
 import { appendJobLog, finishJobLog, findJobLogByProject, getJobLog, startJobLog } from './ai-job-log';
 import { createClaudeStreamParser } from './ai-stream';
+import { runModelObserved } from './ai-observability';
 import { appendTurn, getConversation, listConversations } from './conversation-store';
 import { extractComponents } from './passes/component-extraction';
 import { applyModalOverlays } from './passes/modal-overlay';
@@ -143,7 +144,7 @@ export async function runModel(
   env: NodeJS.ProcessEnv,
   cwd: string,
   opts: { sessionId?: string; format?: AIFormat; agent?: boolean; jobId?: string; projectId?: string; modelId?: string } = {},
-): Promise<{ text: string; sessionId?: string }> {
+): Promise<{ text: string; sessionId?: string; tokens?: number }> {
   const adapter = getAdapter(model);
   // In agent mode for claude (resume + json capable), use stream-json output:
   // it emits NDJSON events DURING the run (assistant text, tool uses) so the
@@ -220,15 +221,35 @@ export async function runModel(
   if (streamParser) {
     streamParser.flush();
     if (streamParser.result.text !== undefined) {
-      return { text: streamParser.result.text, sessionId: streamParser.result.sessionId };
+      // RFC v2 §0.1 — an `is_error` result (rate-limit / API error / max-turns)
+      // can carry NON-EMPTY text. It must NOT pass as a clean success: throw so
+      // runModelObserved records status=error and requireModel raises
+      // AiNotFiredError instead of accepting the error text as a canonical/answer.
+      if (streamParser.result.isError) {
+        const sub = streamParser.result.resultSubtype ? ` subtype=${streamParser.result.resultSubtype}` : '';
+        const detail = (streamParser.result.text || '').replace(/\s+/g, ' ').slice(0, 300);
+        throw new Error(`${model} result error${sub}: ${detail || '(no detail)'}`);
+      }
+      return { text: streamParser.result.text, sessionId: streamParser.result.sessionId, tokens: streamParser.result.tokens };
     }
     // Fallback: scan the buffered NDJSON for a result event the live parser
     // missed (shouldn't happen, but the buffered copy is authoritative).
     for (const line of out.split('\n').reverse()) {
       try {
         const j = JSON.parse(line);
-        if (j?.type === 'result') return { text: String(j.result ?? ''), sessionId: j.session_id };
-      } catch { /* not a JSON line */ }
+        if (j?.type === 'result') {
+          if (j.is_error === true || (typeof j.subtype === 'string' && String(j.subtype).startsWith('error'))) {
+            const detail = String(j.result ?? '').replace(/\s+/g, ' ').slice(0, 300);
+            throw new Error(`${model} result error${j.subtype ? ` subtype=${j.subtype}` : ''}: ${detail || '(no detail)'}`);
+          }
+          const u = j.usage && (Number(j.usage.input_tokens) || 0) + (Number(j.usage.output_tokens) || 0);
+          return { text: String(j.result ?? ''), sessionId: j.session_id, tokens: u || undefined };
+        }
+      } catch (e) {
+        // Re-throw a deliberate is_error rejection; swallow only JSON parse noise.
+        if (e instanceof Error && e.message.includes('result error')) throw e;
+        /* not a JSON line */
+      }
     }
     // Last resort: a single buffered JSON envelope (older CLI behaviour).
   }
@@ -237,8 +258,16 @@ export async function runModel(
   if (format === 'json' || streamParser) {
     try {
       const j = JSON.parse(out);
+      // RFC v2 §0.1 — reject an is_error envelope even if it carries result text.
+      if (j?.is_error === true || (typeof j?.subtype === 'string' && String(j.subtype).startsWith('error'))) {
+        const detail = String(j.result ?? j.text ?? '').replace(/\s+/g, ' ').slice(0, 300);
+        throw new Error(`${model} result error${j.subtype ? ` subtype=${j.subtype}` : ''}: ${detail || '(no detail)'}`);
+      }
       return { text: String(j.result ?? j.text ?? out), sessionId: j.session_id ?? j.sessionId };
-    } catch { /* not JSON — fall through */ }
+    } catch (e) {
+      if (e instanceof Error && e.message.includes('result error')) throw e;
+      /* not JSON — fall through */
+    }
   }
   return { text: out };
 }
@@ -727,11 +756,6 @@ export function registerAIRoutes(app: Express): void {
     const model = isAIModel(req.body?.model) ? (req.body.model as AIModel) : undefined;
     const dryRun = req.body?.dryRun === true;
     const env = createTerminalEnv(resolveWorkspace());
-    // Adapt relay's runModel (returns {text, sessionId}) to the pass/resolve seam.
-    const runModelSeam = async (m: AIModel, prompt: string, e: NodeJS.ProcessEnv, cwd: string, opts?: { format?: AIFormat }) => {
-      const { text } = await runModel(m, prompt, e, cwd, { format: opts?.format, projectId });
-      return { text };
-    };
     // RFC §9.1 — auto-init git the moment resolve touches the managed project, so the
     // asset phase + finalize below mutate a tracked tree (rollback available).
     await ensureProjectGit(projectRoot, {}).catch(() => { /* non-fatal */ });
@@ -747,6 +771,20 @@ export function registerAIRoutes(app: Express): void {
     });
     const runId = resolveRun?.id;
     const rlog = (msg: string): void => { if (runId) void appendRunLog(projectId, runId, msg); };
+    // T13 (RFC v2 §0.1/§0.2/§8.4): route resolve's AI calls through the OBSERVED path
+    // WITH the run's runId so each canon/asset/finalize model call bumps the run's
+    // ai{ok,failed} tally and writes an `[ai:resolve] …` proof line tied to THIS run
+    // (previously the seam passed projectId only → resolve runs showed AI 0/0). Behavior
+    // is preserved: these are AI-purpose calls, so a model failure still throws (the
+    // observed result is rejected) exactly as the old direct-runModel seam did.
+    const runModelSeam = async (m: AIModel, prompt: string, e: NodeJS.ProcessEnv, cwd: string, opts?: { format?: AIFormat }) => {
+      const r = await runModelObserved(m, prompt, e, cwd, {
+        format: opts?.format,
+        log: { projectId, runId, step: 'resolve' },
+      });
+      if (!r.ok) throw new Error(`${m} resolve AI call failed: ${r.reason}${r.error ? ` — ${r.error}` : ''}`);
+      return { text: r.text };
+    };
     if (runId) {
       rlog(`[resolve] resolve-app started — deriving canonical from emitted code${model ? ` (model ${model})` : ' (no AI)'}`);
     }

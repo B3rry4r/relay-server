@@ -49,6 +49,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { resolveProjectRoot, createTerminalEnv, resolveWorkspace } from '../runtime';
 import { requireModel } from '../ai-observability';
+import type { AIModel } from '../ai-adapters';
 import { renderFrameReference } from '../reference-render';
 import { LEXICON_VERSION } from './lexicon';
 import type { FrameDescriptor } from './descriptor-schema';
@@ -82,6 +83,8 @@ export interface AdjudicateResult {
 }
 
 export interface AdjudicateOptions {
+  /** AI provider (claude/codex/gemini) — respects the run's selected model; default claude. */
+  provider?: AIModel;
   modelId?: string;
   /** durable run id — threaded into the AI log ctx so firing proof lands in the run log. */
   runId?: string;
@@ -329,7 +332,7 @@ function buildAdjudicatePrompt(
  *  real model anchors (so a hallucinated id can never corrupt the model). */
 async function runVision(
   canonical: CanonicalModel, r: Residue, refs: Map<string, string>,
-  projectId: string, root: string, modelId: string, runId?: string,
+  projectId: string, root: string, modelId: string, runId?: string, provider: AIModel = 'claude',
 ): Promise<VisionVerdict | null> {
   // AI-PURPOSE (Phase 1d vision adjudication). The model is REQUIRED to fire — a
   // no-fire / error must SURFACE (RFC §0.1), not be swallowed into a null that
@@ -339,7 +342,7 @@ async function runVision(
   const prompt = buildAdjudicatePrompt(canonical, r, refs);
   {
     // agent:true so the CLI can OPEN the reference image files (vision grounding).
-    const { text } = await requireModel('claude', prompt, env, root, {
+    const { text } = await requireModel(provider, prompt, env, root, {
       agent: true, modelId,
       log: { projectId, runId, step: 'canon.adjudicate' },
     });
@@ -555,7 +558,7 @@ export async function adjudicateCanonical(
         ...residue.coarseTemplateIds.flatMap(tid => (canonical.templates.find(t => t.id === tid)?.memberCanonicalIds ?? []).map(id => canonical.screens.find(s => s.canonicalId === id)?.frameIds[0]).filter(Boolean) as string[]),
       ].filter(Boolean) as string[];
       const refs = await renderRefs(figStorageKey, frameIds, root, opts);
-      const v = await runVision(canonical, residue, refs, projectId, root, opts.modelId ?? 'sonnet', opts.runId);
+      const v = await runVision(canonical, residue, refs, projectId, root, opts.modelId ?? 'sonnet', opts.runId, opts.provider ?? 'claude');
       if (v) {
         verdict = v;
         visionRan = true;

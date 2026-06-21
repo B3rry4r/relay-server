@@ -2,9 +2,13 @@ import { describe, it, expect } from 'vitest';
 import {
   parseFrame, multisetJaccard, clusterFrames, classifyRole,
   isSameScreenState, buildCanonical, rewriteFlow, canonicalIdFor,
-  type FrameInput,
+  restampCanonicalHeaders,
+  type FrameInput, type Canonical,
 } from '../src/relay-server/canonicalize';
 import type { RunFlow } from '../src/relay-server/build-run-store';
+import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
+import * as path from 'node:path';
 
 // A small login screen, two states (default + "code sent"), a structural twin
 // (Change PIN vs Change Password = semantic split = template), a bottom-sheet
@@ -171,5 +175,73 @@ describe('canonicalIdFor / rewriteFlow guards', () => {
     const f = rewriteFlow(undefined, {}, [], []);
     expect(f.edges).toEqual([]);
     expect(f.entryCanonicalId).toBeNull();
+  });
+});
+
+// T14.8 — header preservation: re-stamp the `// canonicalId: … route: …` marker
+// onto screen files the per-screen agent rewrote without it, so 8b/8d/8e can still
+// map a file back to its canonical screen. Deterministic (file→id is the skeleton's
+// slug convention) and idempotent (a file that already has the header is untouched).
+describe('restampCanonicalHeaders (T14.8 header preservation)', () => {
+  function canonOf(): Canonical {
+    return {
+      version: 1,
+      screens: [
+        { canonicalId: 'c_283_1967', frameIds: ['283:1967'], name: 'Login', role: 'screen',
+          route: '/login', states: [{ id: 'default', frameId: '283:1967' }], modals: [] },
+        { canonicalId: 'c_294_3343', frameIds: ['294:3343'], name: 'Settings', role: 'screen',
+          route: '/settings', states: [{ id: 'default', frameId: '294:3343' }],
+          modals: [{ id: 'm_315_3794', frameId: '315:3794', baseCanonicalId: 'c_294_3343' }] },
+      ],
+      components: [], templates: [],
+      flow: { entryCanonicalId: 'c_283_1967', edges: [] },
+      frameMap: {}, warnings: [],
+    };
+  }
+
+  it('re-stamps a header the agent dropped, and is idempotent', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'restamp-'));
+    try {
+      const screensDir = path.join(dir, 'lib', 'screens');
+      await fs.mkdir(screensDir, { recursive: true });
+      // Agent REWROTE the login file WITHOUT the canonicalId header.
+      const loginFile = path.join(screensDir, 'screen_283_1967.dart');
+      await fs.writeFile(loginFile, 'import "package:flutter/material.dart";\nclass LoginScreen extends StatelessWidget {}\n');
+      // Settings file STILL carries the header → must be left untouched.
+      const settingsFile = path.join(screensDir, 'screen_294_3343.dart');
+      const settingsSrc = '// canonicalId: c_294_3343  route: /settings\nclass SettingsScreen extends StatelessWidget {}\n';
+      await fs.writeFile(settingsFile, settingsSrc);
+
+      const r = await restampCanonicalHeaders(dir, canonOf());
+
+      // login got re-stamped; settings untouched.
+      expect(r.stamped).toContain(path.join('lib', 'screens', 'screen_283_1967.dart'));
+      expect(r.stamped).not.toContain(path.join('lib', 'screens', 'screen_294_3343.dart'));
+
+      const loginAfter = await fs.readFile(loginFile, 'utf8');
+      // 8b/8d/8e header-resolve regex: `^// canonicalId: <id>  route: <route>`
+      const hm = /^\/\/\s*canonicalId:\s*(\S+)(?:\s+route:\s*(\S+))?/m.exec(loginAfter);
+      expect(hm?.[1]).toBe('c_283_1967');
+      expect(hm?.[2]).toBe('/login');
+      // modals comment carries through for the screen that has one (settings stayed as-is).
+      expect((await fs.readFile(settingsFile, 'utf8'))).toBe(settingsSrc);
+
+      // idempotent: a second run stamps nothing.
+      const r2 = await restampCanonicalHeaders(dir, canonOf());
+      expect(r2.stamped).toHaveLength(0);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('reports canonical screens whose file is absent on disk', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'restamp-'));
+    try {
+      await fs.mkdir(path.join(dir, 'lib', 'screens'), { recursive: true });
+      const r = await restampCanonicalHeaders(dir, canonOf());
+      expect(r.missingFiles.sort()).toEqual(['c_283_1967', 'c_294_3343']);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -56,6 +56,56 @@ export function getProjectsRoot(): string {
   return path.join(resolveWorkspace(), 'projects');
 }
 
+/**
+ * Absolute path to the relay-server repo's OWN root — the one directory the
+ * version-control harness must NEVER touch. Resolved by walking UP from this module
+ * until a directory holding the repo's `package.json` is found (robust to both
+ * `src/relay-server/…` under ts-node and the compiled `dist/src/relay-server/…`
+ * layout, where the depth differs). Falls back to two-levels-up if no marker is
+ * found. Resolved (no symlinks/`..`) so comparisons are exact.
+ */
+let relayServerRepoRootCache: string | null = null;
+export function getRelayServerRepoRoot(): string {
+  if (relayServerRepoRootCache) return relayServerRepoRootCache;
+  let dir = __dirname;
+  for (let i = 0; i < 8; i++) {
+    if (fsSync.existsSync(path.join(dir, 'package.json'))) {
+      relayServerRepoRootCache = path.resolve(dir);
+      return relayServerRepoRootCache;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  relayServerRepoRootCache = path.resolve(__dirname, '..', '..');
+  return relayServerRepoRootCache;
+}
+
+/**
+ * HARD SAFETY GATE (RFC §9 / T11): throws unless `projectRoot` is a legitimate
+ * MANAGED-PROJECT root — i.e. it lives STRICTLY under the projects root AND is not
+ * the projects root, the workspace, a parent dir, or the relay-server repo itself.
+ * Any harness operation that mutates files / runs git MUST call this first so the
+ * pipeline can never `git add -A`/commit/reset the relay-server repo or /workspace.
+ */
+export function assertSafeProjectRoot(projectRoot: string): void {
+  const resolved = path.resolve(projectRoot);
+  const projects = getProjectsRoot();
+  const repo = getRelayServerRepoRoot();
+  if (resolved === projects || !resolved.startsWith(`${projects}${path.sep}`)) {
+    throw new Error(
+      `[vc] REFUSING to operate on '${resolved}': not strictly under the projects root (${projects}). ` +
+      `The version-control harness only ever touches managed projects under ${projects}.`,
+    );
+  }
+  if (resolved === repo) {
+    throw new Error(
+      `[vc] REFUSING to operate on the relay-server repo itself (${repo}). ` +
+      `The version-control harness must NEVER touch relay-server.`,
+    );
+  }
+}
+
 export function getFlutterRoot(workspace = resolveWorkspace()): string {
   return path.join(getRelayToolsRoot(workspace), 'flutter');
 }
@@ -248,12 +298,25 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
 
 export function validateProjectName(name: string): string | null {
   const trimmed = name.trim();
+  // PROJECT_NAME_PATTERN (/^[A-Za-z0-9._-]+$/) admits the path-traversal segments
+  // "." and ".." (both are valid char sets), which path.join would resolve to the
+  // projects root itself / its parent. Reject any name that is purely traversal
+  // segments so resolveProjectRoot can never escape the projects dir.
+  if (trimmed === '.' || trimmed === '..') return null;
   return PROJECT_NAME_PATTERN.test(trimmed) ? trimmed : null;
 }
 
 export function resolveProjectRoot(projectId: string): string | null {
   const validName = validateProjectName(projectId);
-  return validName ? path.join(getProjectsRoot(), validName) : null;
+  if (!validName) return null;
+  const root = getProjectsRoot();
+  const resolved = path.resolve(root, validName);
+  // HARD SCOPE GUARD (RFC §9 / T11): a managed project root must live STRICTLY
+  // UNDER the projects root. Reject anything that resolves to the projects root
+  // itself or above it (defense-in-depth on top of the name check) so the pipeline
+  // can never operate on /workspace, /workspace/projects, or a parent dir.
+  if (resolved === root || !resolved.startsWith(`${root}${path.sep}`)) return null;
+  return resolved;
 }
 
 export function resolveProjectRelativePath(projectRoot: string, relativePath: string): string | null {

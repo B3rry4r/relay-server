@@ -53,6 +53,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { resolveProjectRoot, createTerminalEnv, resolveWorkspace } from '../runtime';
 import { requireModel } from '../ai-observability';
+import type { AIModel } from '../ai-adapters';
 import { LEXICON_VERSION, WIDGET_KIND_SET } from './lexicon';
 import type { FrameDescriptor, DescriptorWidget } from './descriptor-schema';
 import type { FrozenLexicon } from './reconcile';
@@ -371,7 +372,7 @@ function buildRefinePrompt(
 
 async function aiRefine(
   norm: NormalizedDescriptor[], flow: ReduceFlow, ambiguousFrames: string[], unboundModals: string[],
-  projectId: string, root: string, modelId: string, runId?: string,
+  projectId: string, root: string, modelId: string, runId?: string, provider: AIModel = 'claude',
 ): Promise<AiRefinement | null> {
   if (!ambiguousFrames.length && !unboundModals.length) return null;   // nothing to adjudicate
   // AI-PURPOSE (Phase 1c refine). The model is REQUIRED to fire here — a no-fire /
@@ -382,7 +383,7 @@ async function aiRefine(
   const env = createTerminalEnv(resolveWorkspace());
   const prompt = buildRefinePrompt(norm, flow, ambiguousFrames, unboundModals);
   {
-    const { text } = await requireModel('claude', prompt, env, root, {
+    const { text } = await requireModel(provider, prompt, env, root, {
       agent: false, modelId,
       log: { projectId, runId, step: 'canon.reduce' },
       validate: (t) => { const j = extractJson(t); return j && typeof j === 'object' ? j : undefined; },
@@ -411,6 +412,8 @@ async function aiRefine(
 // ── main entry ───────────────────────────────────────────────────────────────
 
 export interface ReduceOptions {
+  /** AI provider (claude/codex/gemini) — respects the run's selected model; default claude. */
+  provider?: AIModel;
   modelId?: string;
   /** durable run id — threaded into the AI log ctx so firing proof lands in the run log. */
   runId?: string;
@@ -512,7 +515,7 @@ export async function reduceToCanonical(
     if (refinement) {
       aiRefined = true;
     } else {
-      const ai = await aiRefine(norm, safeFlow, ambiguousFrames, unboundModals, projectId, root, opts.modelId ?? 'sonnet', opts.runId);
+      const ai = await aiRefine(norm, safeFlow, ambiguousFrames, unboundModals, projectId, root, opts.modelId ?? 'sonnet', opts.runId, opts.provider ?? 'claude');
       if (ai) {
         refinement = ai;
         aiRefined = true;

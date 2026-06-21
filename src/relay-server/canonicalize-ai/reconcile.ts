@@ -46,6 +46,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { resolveProjectRoot, createTerminalEnv, resolveWorkspace } from '../runtime';
 import { requireModel } from '../ai-observability';
+import type { AIModel } from '../ai-adapters';
 import { LEXICON_VERSION, WIDGET_KINDS, WIDGET_KIND_SET } from './lexicon';
 import type { FrameDescriptor, DescriptorProposal } from './descriptor-schema';
 
@@ -307,7 +308,7 @@ function extractJson(text: string): any | null {
 /** Run the bounded synonym-merge. Returns merge groups over cluster INDICES, or null
  *  on any failure (caller falls back to one-group-per-cluster). */
 async function aiSynonymMerge(
-  clusters: PreCluster[], projectId: string, root: string, modelId: string, runId?: string,
+  clusters: PreCluster[], projectId: string, root: string, modelId: string, runId?: string, provider: AIModel = 'claude',
 ): Promise<AiMergeGroup[] | null> {
   if (clusters.length < 2) return null;       // nothing to merge across
   // AI-PURPOSE (Phase 1b synonym merge). The model is REQUIRED to fire — a
@@ -317,7 +318,7 @@ async function aiSynonymMerge(
   const env = createTerminalEnv(resolveWorkspace());
   const prompt = buildMergePrompt(clusters);
   {
-    const { text } = await requireModel('claude', prompt, env, root, {
+    const { text } = await requireModel(provider, prompt, env, root, {
       agent: false, modelId,
       log: { projectId, runId, step: 'canon.reconcile' },
       validate: (t) => { const j = extractJson(t); return j && typeof j === 'object' ? j : undefined; },
@@ -413,6 +414,8 @@ async function writeGroupingCache(root: string, signature: string, groups: strin
 // ── main entry ──────────────────────────────────────────────────────────────────
 
 export interface ReconcileOptions {
+  /** AI provider (claude/codex/gemini) — respects the run's selected model; default claude. */
+  provider?: AIModel;
   /** override the merge model (default 'sonnet'). */
   modelId?: string;
   /** durable run id — threaded into the AI log ctx so firing proof lands in the run log. */
@@ -471,7 +474,7 @@ export async function reconcileLexicon(
       if (!covered) groups = null;
     }
     if (!groups) {
-      const ai = await aiSynonymMerge(clusters, projectId, root, opts.modelId ?? 'sonnet', opts.runId);
+      const ai = await aiSynonymMerge(clusters, projectId, root, opts.modelId ?? 'sonnet', opts.runId, opts.provider ?? 'claude');
       if (ai && ai.length) {
         aiMerged = true;
         // The AI groups over cluster members. Rebuild groups, then fold in any cluster

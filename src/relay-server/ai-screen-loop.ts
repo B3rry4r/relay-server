@@ -45,20 +45,22 @@ import {
 import { getProjectsRoot } from './runtime';
 import {
   canonicalizeRun, writeCanonical, readCanonical, generateFlutterSkeleton,
+  restampCanonicalHeaders,
   type Canonical, type CanonicalScreen,
 } from './canonicalize';
 import { canonicalize as aiCanonicalize, type CanonicalizeOptions } from './canonicalize-ai/orchestrate';
 import { aiModelToCanonical } from './canonicalize-ai/to-canonical';
 import type { DescribeFrameInput } from './canonicalize-ai/describe';
 import type { ReduceFlow } from './canonicalize-ai/reduce';
-import { AiStepError } from './ai-observability';
+import { AiStepError, runModelObserved } from './ai-observability';
 import { generateDesignSystem, seedContextWithThemeApi, ensureMainWired, consolidateDesignTokens, ensureScreenPreviewEntry, type ThemeTokens } from './design-system';
 import { prepScreen, ensureIrComplete, getIrData, runAssetPass, type PrepConfig, type LocalizedAsset } from './reference-render';
 import type { FigFrame, FlowGraph } from './agent-packet';
 import { computePreflight } from './preflight';
 import { reconcileScreen, reconcileSummary, type ReconcileResult } from './reconcile';
 import { finalizeApp } from './passes/finalize';
-import { ensureProjectGit, commitCheckpoint } from './version-control';
+import { repointAssetUsage, buildAssetInventory, renderAssetInventory } from './passes/asset-usage';
+import { ensureProjectGit, commitCheckpoint, snapshotBeforeMutation, rollbackTo } from './version-control';
 
 const execFile = promisify(execFileCb);
 
@@ -67,11 +69,17 @@ const execFile = promisify(execFileCb);
 // BOTH the prep route (prepare-and-run: prep + assets) and runAppLoop (canonicalize
 // → skeleton → design-system → build → verify → finalize), so the index is stable
 // end-to-end. Best-effort emission via phase(): a phase write never breaks a run.
+// IMPORTANT: this list MUST be in CHRONOLOGICAL EXECUTION order so the displayed
+// "Phase X/N" is monotonic (index derived via indexOf). The generation entrypoint
+// (prepare-and-run) runs the prep route FIRST — which localizes + semantically
+// renames assets — and ONLY THEN calls runAppLoop (canonicalize → skeleton →
+// pre-flight → build → verify → finalize). So `Assets` is phase 1, not phase 4:
+// emitting it after Canonicalize made the UI pill jump 4→1→2→3. (RFC v2 §8.1.)
 const GEN_PHASES = [
-  'Canonicalize',       // 1 — heavy-AI canonicalization (or degraded clusterer)
-  'Skeleton',           // 2 — write-locked router/theme/component stubs
-  'Pre-flight',         // 3 — token/cost gate + design-system extract
-  'Assets',             // 4 — semantic rename + resources file (prep route)
+  'Assets',             // 1 — localize + semantic rename + resources file (prep route, runs first)
+  'Canonicalize',       // 2 — heavy-AI canonicalization (or degraded clusterer)
+  'Skeleton',           // 3 — write-locked router/theme/component stubs
+  'Pre-flight',         // 4 — token/cost gate + design-system extract
   'Build screens',      // 5 — per-screen implement→verify→fix loop
   'Verify',             // 6 — needs-review rollup / queue
   'Finalize',           // 7 — production-readiness passes + global wire
@@ -97,6 +105,125 @@ async function runCheckpoint(projectId: string, runId: string, projectRoot: stri
       log: (msg) => { void appendRunLog(projectId, runId, msg); },
     });
   } catch { /* never break a run on a checkpoint */ }
+}
+
+/**
+ * T12 (RFC v2 §3 Phase 5/6): the AppAssets symbol inventory injected at the TOP of
+ * every per-screen contract, so the build agent emits `AppAssets.<x>` rather than
+ * the raw `'assets/...'` literals carried in the IR tree (those literals point at
+ * pre-rename/deduped files the asset pass renamed/deleted → runtime failures).
+ * Returns a block terminated by the contract separator, or '' when the asset pass
+ * produced no resources file/map (guard for absence — a no-asset project is
+ * unaffected). Never throws.
+ */
+async function assetInventoryBlock(projectRoot: string): Promise<string> {
+  try {
+    const inv = await buildAssetInventory(projectRoot);
+    if (!inv) return '';
+    return `${renderAssetInventory(inv)}\n\n— — —\n`;
+  } catch { return ''; }
+}
+
+/**
+ * T12 SAFETY NET: re-point any raw `'assets/...'` literals (and Material-icon
+ * substitutions) the build agent still emitted to the generated `AppAssets`
+ * symbols — UNCONDITIONALLY, regardless of needs-review/failed screens. The old
+ * code only re-pointed inside finalizeApp, which is gated on `blocking === 0` (all
+ * screens accepted) — so a real run with ≥1 needs-review screen NEVER repointed and
+ * shipped screens referencing renamed/deleted files. This always runs over the
+ * built screens before the run parks or finishes.
+ *
+ * BUILD-SAFE via the T10 git snapshot/rollback: snapshot before the mutation, run
+ * the deterministic+AI re-point, then on a flutter project gate on the analyze
+ * ERROR count — if it regresses, roll back EXACTLY (so a bad re-point can never
+ * break the app). On a non-buildable shape it still runs (a path-literal → symbol
+ * swap is a same-value rename) and only a throw rolls back. Idempotent: a second
+ * run is a no-op (already-`AppAssets.x` usages are recognized + skipped).
+ */
+async function runAssetRepoint(projectId: string, runId: string, projectRoot: string): Promise<void> {
+  const log = (msg: string) => { void appendRunLog(projectId, runId, msg); };
+  // Guard: nothing to do without a resources file/map (asset pass didn't produce one).
+  const inv = await buildAssetInventory(projectRoot).catch(() => null);
+  if (!inv) { log('[assets] re-point skipped — no AppAssets resources file/map (asset pass produced none)'); return; }
+
+  const env = createTerminalEnv(resolveWorkspace());
+  const vc = { log, env };
+  try {
+    await ensureProjectGit(projectRoot, vc);
+  } catch { /* non-fatal — handled below */ }
+  const gitReady = fsSync.existsSync(path.join(projectRoot, '.git'));
+
+  // Baseline analyze (flutter only) so a regression can be detected + rolled back.
+  const isFlutter = fsSync.existsSync(path.join(projectRoot, 'pubspec.yaml'))
+    && fsSync.existsSync(path.join(projectRoot, 'lib'));
+  let baselineErrors: number | null = null;
+  if (isFlutter) {
+    const a = await flutterAnalyzeErrors(projectRoot, env);
+    baselineErrors = a;
+  }
+
+  // This runs in the Verify stage (after build, before the finalize/needs-review
+  // branch). Emit 'Verify' — NOT 'Finalize' — so the phase index stays monotonic
+  // (the needs-review path re-emits Verify right after; finalize emits 7 only in the
+  // blocking===0 branch). Emitting 'Finalize' here caused a 6→7→6 pill jump.
+  setGenPhase(projectId, runId, 'Verify', 're-pointing asset usages');
+  // Snapshot BEFORE mutating (the rollback target). When git is unavailable there is
+  // no rollback point — we still run (a path→symbol swap is conservative + same-value),
+  // but log loudly, matching the finalize discipline (never silently /tmp-back-up).
+  let preSha = '';
+  if (gitReady) preSha = await snapshotBeforeMutation(projectRoot, 'T12 always-run asset re-point', vc);
+  else log('[assets] WARNING: git unavailable — re-point runs with NO rollback point');
+
+  let result;
+  try {
+    const finalizeModel = undefined; // deterministic path-literal rewrites need no AI; the
+    // AI icon-match is a finalize-pass concern. The safety net's JOB is the raw-path
+    // literals the agent emitted, which are 100% deterministic.
+    void finalizeModel;
+    result = await repointAssetUsage(projectId, {
+      projectRoot,
+      noAi: true,
+      env,
+    });
+  } catch (e: any) {
+    log(`[assets] re-point threw (${e?.message || 'unknown'}) — rolling back`);
+    if (gitReady && preSha) await rollbackTo(projectRoot, preSha, vc);
+    return;
+  }
+
+  const repointed = result.repointed.length;
+  if (repointed === 0) {
+    log(`[assets] re-point: 0 raw-path/icon usages to fix (already clean)${result.warnings.length ? ` — ${result.warnings.join('; ')}` : ''}`);
+    return;
+  }
+
+  // Regression gate (flutter): if analyze ERRORS got worse, roll back exactly.
+  if (isFlutter && baselineErrors != null) {
+    const afterErrors = await flutterAnalyzeErrors(projectRoot, env);
+    if (afterErrors != null && afterErrors > baselineErrors) {
+      log(`[assets] re-point REGRESSED analyze errors (${baselineErrors} → ${afterErrors}) — rolling back`);
+      if (gitReady && preSha) await rollbackTo(projectRoot, preSha, vc);
+      else log('[assets] CRITICAL: no rollback point — re-point left in place despite regression');
+      return;
+    }
+  }
+
+  log(`[assets] re-point: ${repointed} raw-path/icon usage(s) → AppAssets symbols (${result.skipped.length} left alone)`);
+  if (gitReady) await runCheckpoint(projectId, runId, projectRoot, 'phase asset re-point', `${repointed} repointed`);
+}
+
+/** Best-effort flutter analyze ERROR count (null if unavailable). Thin wrapper so
+ *  the safety net doesn't pull in the whole finalize analyze plumbing. */
+async function flutterAnalyzeErrors(projectRoot: string, env: NodeJS.ProcessEnv): Promise<number | null> {
+  try {
+    const { stdout, stderr } = await execFile('flutter', ['analyze', '--no-pub'], {
+      cwd: projectRoot, env, maxBuffer: 32 * 1024 * 1024, timeout: 300000,
+    }).catch((e: any) => ({ stdout: e?.stdout ?? '', stderr: e?.stderr ?? '' }));
+    const out = `${stdout}\n${stderr}`;
+    // `error •` lines are analyzer errors (vs `info •` / `warning •`).
+    const m = out.match(/^\s*error\s+•/gm);
+    return m ? m.length : 0;
+  } catch { return null; }
 }
 
 interface BuildScreenReq {
@@ -746,6 +873,31 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
   // login", and mis-rooted every tool path (Flutter/npm/mise). The project is
   // the cwd of each runModel/build call, passed separately.
   const env = createTerminalEnv(resolveWorkspace());
+
+  // T13 (RFC v2 §0.1/§0.2/§8.4): the per-screen build/verify/fix model calls are the
+  // longest, most AI-heavy phase, yet they bypassed the observed path — so the run's
+  // ai{ok,failed} tally and the `[ai:…]` proof lines were FROZEN during the whole
+  // build. Route them through `runModelObserved` WITH this run's runId + a `build:` /
+  // `verify:` / `fix:` step label so each call bumps the tally and emits a proof line.
+  // Behavior is preserved: these are BUILD calls (not requireModel) — a failed turn
+  // returns empty text (tallied as `failed`) and the existing build-fail / parseVerdict
+  // / retry / needs-review logic handles it, never a fatal abort. When there's no runId
+  // (per-frame jobs outside a durable run) it still observes through the job log.
+  const stepLabel = (kind: 'build' | 'verify' | 'fix'): string => `${kind}:${frameName}`;
+  const observedBuildCall = async (
+    kind: 'build' | 'verify' | 'fix',
+    prompt: string,
+    callOpts: { sessionId?: string } = {},
+  ): Promise<{ text: string; sessionId?: string }> => {
+    const r = await runModelObserved(model, prompt, env, projectRoot, {
+      agent: true, modelId, sessionId: callOpts.sessionId,
+      log: { projectId: req.projectId, runId: req.runId, jobId, step: stepLabel(kind) },
+    });
+    // Tolerant: a failed AI turn becomes empty text (already tallied `failed` by the
+    // observed path) so the loop's existing handling (build/verify failure → fix or
+    // needs-review) proceeds without a fatal throw.
+    return r.ok ? { text: r.text, sessionId: r.sessionId } : { text: '', sessionId: callOpts.sessionId };
+  };
   const screenDir = path.join(projectRoot, '.uix', 'screens', sanitizeId(frameId));
   await fs.mkdir(screenDir, { recursive: true });
   const relScreenDir = path.join('.uix', 'screens', sanitizeId(frameId));
@@ -788,7 +940,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
 
   // 1. IMPLEMENT
   appendJobLog(jobId, `[loop] implement: "${frameName}"`);
-  const impl = await runModel(model, implementPrompt, env, projectRoot, { agent: true, modelId, jobId, projectId: req.projectId });
+  const impl = await observedBuildCall('build', implementPrompt);
   if (impl.sessionId) session = impl.sessionId;
   await snapshotLastGen();   // capture this screen's previewEntry before any sibling can clobber it
   // Deterministic per-screen preview entry: render the screen we JUST built (at the
@@ -808,7 +960,13 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
       ir: req.tree ? path.join(relScreenDir, 'ir.txt') : undefined, at: new Date().toISOString(),
     };
     await fs.writeFile(path.join(screenDir, 'result.json'), JSON.stringify(result, null, 2));
-    if (req.runId) { try { await updateRunScreen(req.projectId, req.runId, frameId, { status: 'done', matched: false, sessionId: session }); } catch { /* non-fatal */ } }
+    if (req.runId) {
+      try { await updateRunScreen(req.projectId, req.runId, frameId, { status: 'done', matched: false, sessionId: session }); } catch { /* non-fatal */ }
+      // T9 (RFC v2 §8.2): emit the explicit terminal ACCEPTED line on the verify-off
+      // done path too, so the at-a-glance run log is complete (consistent with the
+      // verified/matched path). The "(verify off)" tag flags it was implement-only.
+      try { await appendRunLog(req.projectId, req.runId, `[screen ${frameName}] ACCEPTED (verify off)`); } catch { /* non-fatal */ }
+    }
     finishJobLog(jobId, `[loop] done: "${frameName}" implemented (verify off)`);
     return session;
   }
@@ -851,7 +1009,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
       candRel = tileRels[0];
       lastCandRel = tileRels[0];   // first band is the representative thumbnail for review
       appendJobLog(jobId, `[loop] verify ${iter}: comparing to reference (${tileRels.length} tiles)`);
-      const v = await runModel(model, tiledVerifyPrompt(referenceImagePath, tileRels, frameName, prevScore, req.userNotes), env, projectRoot, { agent: true, modelId, jobId, projectId: req.projectId });
+      const v = await observedBuildCall('verify', tiledVerifyPrompt(referenceImagePath, tileRels, frameName, prevScore, req.userNotes));
       verdict = parseVerdict(v.text);
     } else {
       const candAbs = path.join(screenDir, `cand-${iter}.png`);
@@ -859,7 +1017,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
       candRel = path.join(relScreenDir, `cand-${iter}.png`);
       lastCandRel = candRel;
       appendJobLog(jobId, `[loop] verify ${iter}: comparing to reference`);
-      const v = await runModel(model, verifyPrompt(referenceImagePath, candRel, frameName, prevScore, req.userNotes), env, projectRoot, { agent: true, modelId, jobId, projectId: req.projectId });
+      const v = await observedBuildCall('verify', verifyPrompt(referenceImagePath, candRel, frameName, prevScore, req.userNotes));
       verdict = parseVerdict(v.text);
     }
     finalVerdict = verdict;
@@ -881,7 +1039,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
 
     // FIX (resume the implementation session so the agent keeps full context).
     appendJobLog(jobId, `[loop] fix ${iter}: applying ${verdict.discrepancies.length} change(s)`);
-    const fix = await runModel(model, fixPrompt(frameName, referenceImagePath, candRel ?? '(build failed — no screenshot)', verdict, req.userNotes), env, projectRoot, { agent: true, modelId, sessionId: session, jobId, projectId: req.projectId });
+    const fix = await observedBuildCall('fix', fixPrompt(frameName, referenceImagePath, candRel ?? '(build failed — no screenshot)', verdict, req.userNotes), { sessionId: session });
     if (fix.sessionId) session = fix.sessionId;
     await snapshotLastGen();   // re-capture in case the fix moved/renamed the previewEntry (audit A.2)
     // Re-assert the deterministic per-screen entry (the screen file the agent just
@@ -1008,6 +1166,12 @@ async function buildRunScreen(
   // .uix/context.md, so each screen sees the latest established tokens/components.
   const contextSlice = await readContextSlice(projectRoot);
   let contract = buildWrittenContract(run, appPlan, contextSlice, fresh, canonical);
+  // T12 (RFC v2 §3 Phase 5/6): inject the AppAssets symbol inventory so the agent
+  // references real exported assets via `AppAssets.<x>` from the START — never the
+  // raw 'assets/...' literals in the IR (those point at pre-rename/deduped files
+  // that the asset pass renamed or deleted, so they FAIL at runtime). Guarded: only
+  // injected when the asset pass actually produced a resources file + map.
+  contract = `${await assetInventoryBlock(projectRoot)}${contract}`;
   // P3: when this is a canonical lead frame, prepend its states/modals/template +
   // route-slot context so the agent builds ONE widget instead of per-variant pages.
   if (canonicalCtx) contract = `${buildCanonicalContext(canonicalCtx.canonical, canonicalCtx.screen)}\n\n— — —\n${contract}`;
@@ -1137,7 +1301,14 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
             const aiFlow: ReduceFlow | undefined = run.flow
               ? { entryFrameId: run.flow.entryFrameId ?? null, connections: run.flow.connections ?? [] }
               : undefined;
-            const aiOpts: CanonicalizeOptions = { runId, ...(run.modelId ? { modelId: run.modelId } : {}) };
+            // Thread the run's selected provider (claude/codex/gemini) into the heavy-AI
+            // canon chain so a codex/gemini run doesn't silently hard-depend on claude
+            // (RFC §0.1 / T14.10). Guard with isAIModel; default 'claude' otherwise.
+            const aiOpts: CanonicalizeOptions = {
+              runId,
+              ...(isAIModel(run.model) ? { provider: run.model } : {}),
+              ...(run.modelId ? { modelId: run.modelId } : {}),
+            };
             await appendRunLog(projectId, runId, `[canon] heavy-AI canonicalization — 1a describe → 1b reconcile → 1c reduce → 1d adjudicate over ${aiFrames.length} frame(s)`);
             const result = await aiCanonicalize(projectId, figKey, aiFrames, aiFlow, aiOpts);
             await appendRunLog(projectId, runId, `[canon] AI chain done — described ${result.stages.describedFrames} frame(s), lexicon-AI-merged=${result.stages.lexiconAiMerged}, reduce-AI-refined=${result.stages.reduceAiRefined}, adjudicate-vision=${result.stages.adjudicateVisionRan}, ${result.drilled.length} drilled, ${result.changes.length} correction(s)`);
@@ -1390,6 +1561,20 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
         await appendRunLog(projectId, runId, `[consolidate] skipped (non-fatal): ${e?.message || 'unknown'}`);
       }
     }
+    // ── T12 (RFC v2 §3 Phase 5/6): ALWAYS-RUN ASSET RE-POINT SAFETY NET ──────────
+    // Convert any raw 'assets/...' literals the build agent still emitted → AppAssets
+    // symbols, REGARDLESS of needs-review/failed screens. This is the critical fix:
+    // re-point previously lived only inside finalizeApp (the `else` branch below),
+    // which is gated on blocking === 0, so a run with ≥1 needs-review screen NEVER
+    // repointed and shipped screens referencing renamed/deleted asset files. It runs
+    // here, unconditionally, over the built screens — build-safe via the T10 git
+    // snapshot/rollback (a regression rolls back exactly). Idempotent, so the finalize
+    // re-point below (when blocking === 0) is a no-op after this.
+    try {
+      await runAssetRepoint(projectId, runId, projectRoot);
+    } catch (e: any) {
+      await appendRunLog(projectId, runId, `[assets] re-point safety net skipped (non-fatal): ${e?.message || 'unknown'}`);
+    }
     // ── HITL Checkpoint 4 (RFC §5): before global wiring / full build / deploy ────
     // Only gate here when the queue is clear (a blocking screen parks the run for
     // review below — the pre-global gate is the human sign-off once it's clean).
@@ -1420,6 +1605,27 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
       const finalizeEnabled = run.kind === 'whole-app' && run.finalize !== false;
       const finalizeReportPath = path.join(projectRoot, '.uix', 'finalize-report.json');
       const finalizeAlreadyRan = fsSync.existsSync(finalizeReportPath);
+      // T14.8 HEADER PRESERVATION — RE-STAMP the `// canonicalId: … route: …`
+      // header onto any screen file the per-screen agent rewrote without it, BEFORE
+      // finalize: 8b (modal→overlay), 8d (flow-wiring) + 8e (semantic-rename) map a
+      // file back to its canonical screen via that marker. Deterministic + idempotent
+      // (file→canonicalId is the skeleton's slug convention; a file that already has
+      // the header is untouched). Best-effort: never fail the run on it.
+      if (finalizeEnabled && !finalizeAlreadyRan) {
+        try {
+          const canonForStamp = await readCanonical(projectRoot, runId);
+          if (canonForStamp) {
+            const r = await restampCanonicalHeaders(projectRoot, canonForStamp);
+            if (r.stamped.length || r.missingFiles.length) {
+              await appendRunLog(projectId, runId,
+                `[finalize] header re-stamp — restored canonicalId header on ${r.stamped.length} screen file(s)`
+                + (r.missingFiles.length ? `; ${r.missingFiles.length} canonical screen(s) had no file on disk` : ''));
+            }
+          }
+        } catch (e: any) {
+          await appendRunLog(projectId, runId, `[finalize] header re-stamp skipped (non-fatal): ${e?.message || 'unknown'}`);
+        }
+      }
       if (finalizeEnabled && !finalizeAlreadyRan) {
         try {
           setGenPhase(projectId, runId, 'Finalize', 'production passes');
@@ -1495,7 +1701,9 @@ async function retryScreenLoop(projectId: string, runId: string, frameId: string
     // P2: inject the same written contract (app plan + API surface + context.md) so a
     // corrected-retry builds against the established design system, not in a vacuum.
     const contextSlice = await readContextSlice(projectRoot);
-    const contract = buildWrittenContract(run, appPlan, contextSlice, run.freshSessions === true, canonical);
+    // T12: a corrected-retry must also see the AppAssets inventory (so a re-build
+    // emits symbols, not raw paths).
+    const contract = `${await assetInventoryBlock(projectRoot)}${buildWrittenContract(run, appPlan, contextSlice, run.freshSessions === true, canonical)}`;
     // The human correction is authoritative and injected up-front so the fresh pass
     // acts on it (the previous automated discrepancies didn't converge).
     const correction = `HUMAN CORRECTION (authoritative — the automated loop did NOT converge; apply this specific guidance):\n${note}`;
