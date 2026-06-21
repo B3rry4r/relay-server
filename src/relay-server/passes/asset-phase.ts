@@ -37,9 +37,7 @@ import { getFlutterRoot } from '../runtime';
 import { gatherExistingAssets, runAssetPass } from '../reference-render';
 import { repointAssetUsage } from './asset-usage';
 import { detectFramework, type Framework } from './token-cleanup';
-import { __test as finalizeTest } from './finalize';
-
-const { takeSnapshot, restoreSnapshot } = finalizeTest;
+import { ensureProjectGit, snapshotBeforeMutation, rollbackTo, commitCheckpoint } from '../version-control';
 
 // ── Public contract ──────────────────────────────────────────────────────────
 
@@ -136,7 +134,6 @@ export async function runAssetPhaseOnBuild(
   }
   log(`[asset-phase] gathered ${gathered.length} on-disk asset(s)`);
 
-  const pubspecAbs = path.join(projectRoot, 'pubspec.yaml');
   const resourcesAbs = path.join(projectRoot, FLUTTER_RESOURCES_REL);
   const assetMapAbs = path.join(projectRoot, ASSET_MAP_REL);
 
@@ -154,33 +151,39 @@ export async function runAssetPhaseOnBuild(
     return { ...base, status: 'skipped', reason: 'already applied (idempotent no-op)' };
   }
 
-  // Source dirs to snapshot: lib/ + assets/ (where the rename + re-point write). We
-  // snapshot pubspec.yaml separately (a single file outside those dirs).
-  const snapDirs = [path.join(projectRoot, 'lib'), path.join(projectRoot, 'assets')]
-    .filter((d) => fsSync.existsSync(d));
-
   // Build-safety: only flutter with a lib/ gets the analyze/build gate.
   const buildCheckable =
     !opts.skipBuildCheck &&
     framework === 'flutter' &&
     fsSync.existsSync(path.join(projectRoot, 'lib'));
 
-  // Snapshot lib/ + assets/ + pubspec.yaml BEFORE any mutation. Without a snapshot we
-  // cannot guarantee rollback, so refuse to mutate (the hazard is too sharp).
-  let snapshot: Awaited<ReturnType<typeof takeSnapshot>> | null = null;
-  let pubspecBefore: Buffer | null = null;
-  // The set of artifacts that did NOT exist before the run (so rollback deletes them).
-  const resourcesExistedBefore = fsSync.existsSync(resourcesAbs);
-  const assetMapExistedBefore = fsSync.existsSync(assetMapAbs);
-  try {
-    snapshot = await takeSnapshot(snapDirs);
-    if (fsSync.existsSync(pubspecAbs)) pubspecBefore = await fs.readFile(pubspecAbs);
-    log(`[asset-phase] snapshot: ${snapshot.fileCount} file(s) across ${snapDirs.map((d) => path.relative(projectRoot, d)).join(', ')}${pubspecBefore ? ' + pubspec.yaml' : ''}`);
-  } catch (e) {
-    const error = `could not snapshot lib/assets (refusing to mutate without rollback): ${(e as Error).message}`;
+  // VERSION-CONTROL SNAPSHOT (RFC §9.3/§9.4) — replaces the /tmp byte-snapshot.
+  // This pass is the SHARPEST hazard: runAssetPass DELETES dedup duplicates and
+  // MOVES files on semantic-rename, breaking every existing reference until repoint
+  // fixes it. The git snapshot-before + rollback (reset --hard + clean -fd) restores
+  // ALL deleted/moved files AND removes pass-created artifacts (the resources file +
+  // .uix/asset-map.json are untracked-then-created, so `clean -fd` removes them on
+  // revert — no special-casing needed). .git lives under the project (persistent),
+  // so this survives a redeploy; /tmp did not. Without a snapshot we cannot guarantee
+  // rollback, so we refuse to mutate (the hazard is too sharp).
+  const vc = { log, env };
+  await ensureProjectGit(projectRoot, vc);
+  const gitReady = fsSync.existsSync(path.join(projectRoot, '.git'));
+  if (!gitReady) {
+    const error = 'git unavailable — refusing to run the destructive asset pass without a rollback snapshot (RFC §9; /tmp is not an acceptable fallback)';
     log(`[asset-phase] ABORT — ${error}`);
     return { ...base, status: 'reverted', error };
   }
+  const preSha = await snapshotBeforeMutation(projectRoot, 'asset-phase (rename+dedup+repoint)', vc);
+  if (!preSha) {
+    const error = 'could not establish a git snapshot baseline (refusing to mutate without rollback)';
+    log(`[asset-phase] ABORT — ${error}`);
+    return { ...base, status: 'reverted', error };
+  }
+  log(`[asset-phase] git snapshot baseline ${preSha.slice(0, 8)} — rollback restores all deleted/moved/created files`);
+  // Track which artifacts existed before (for accurate reporting on revert).
+  const resourcesExistedBefore = fsSync.existsSync(resourcesAbs);
+  const assetMapExistedBefore = fsSync.existsSync(assetMapAbs);
 
   // Baseline analyze (best-effort). We track BOTH the total issue count (for the
   // report) and the ERROR count (the gate). See the gate below for why errors, not
@@ -195,18 +198,14 @@ export async function runAssetPhaseOnBuild(
   }
   base.baselineAnalyze = baselineAnalyze;
 
-  // Restore helper — returns the tree to EXACTLY the pre-run state: lib/ + assets/ +
-  // pubspec.yaml from the snapshot, AND remove the resources file / asset-map if they
-  // were created by this run (they live outside snapDirs so the snapshot won't).
+  // Restore helper — git rollback to the pre-mutation snapshot. `reset --hard` reverts
+  // every modified/deleted/moved tracked file (lib/, assets/, pubspec.yaml) to the
+  // baseline, and `clean -fd` removes everything the pass CREATED (the renamed asset
+  // files that are now duplicates of restored originals, the resources file, and
+  // .uix/asset-map.json when they didn't exist before). One primitive restores the
+  // whole atomic unit — no per-artifact bookkeeping.
   const rollback = async (): Promise<void> => {
-    if (snapshot) {
-      try { await restoreSnapshot(snapshot, snapDirs); } catch (e) { log(`[asset-phase] CRITICAL: lib/assets rollback FAILED: ${(e as Error).message}`); }
-    }
-    if (pubspecBefore != null) {
-      try { await fs.writeFile(pubspecAbs, pubspecBefore); } catch { /* best-effort */ }
-    }
-    if (!resourcesExistedBefore) { try { await fs.rm(resourcesAbs, { force: true }); } catch { /* best-effort */ } }
-    if (!assetMapExistedBefore) { try { await fs.rm(assetMapAbs, { force: true }); } catch { /* best-effort */ } }
+    await rollbackTo(projectRoot, preSha, vc);
   };
 
   // EXPLICIT no-AI when no model/runner is provided (allowed, surfaced as a
@@ -320,6 +319,9 @@ export async function runAssetPhaseOnBuild(
   }
 
   // ── success ─────────────────────────────────────────────────────────────────
+  // Commit the applied asset pass as a durable checkpoint (RFC §9.2) — the renamed
+  // files + resources + asset-map are now history, recoverable from any later pass.
+  await commitCheckpoint(projectRoot, 'phase assets applied', `renamed=${renamed}, deduped=${duplicatesDeleted}, repointed=${repointed}`, vc);
   log(`[asset-phase] applied — renamed=${renamed}, repointed=${repointed}, analyze ${baselineAnalyze ?? 'n/a'} → ${finalAnalyze ?? 'n/a'}`);
   return { ...base, status: 'applied', finalAnalyze };
 }

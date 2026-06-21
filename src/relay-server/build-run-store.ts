@@ -108,10 +108,26 @@ export interface AmendmentRequest {
 export interface RunFlowConn { from: string; to: string; type: string; label?: string }
 export interface RunFlow { entryFrameId: string | null; connections: RunFlowConn[] }
 
+// ── T9 (RFC v2 §8.1): structured phase progress ──────────────────────────────
+// The pipeline phase a run is CURRENTLY in, so the UI shows "Phase X of N: <name>"
+// (+ a live detail like "screen 7/24" or "naming 62/77") instead of an
+// undifferentiated "building". Best-effort: set as the orchestrator crosses phase
+// boundaries; never required for correctness. `total` is the canonical phase count
+// for this entrypoint (generation = §2 entry A; resolve = §2 entry B). `done` marks
+// the run reaching its terminal phase (so the UI can render a finished pill cleanly).
+export interface RunPhase {
+  index: number;       // 1-based phase position
+  total: number;       // total phases for this entrypoint
+  name: string;        // human label, e.g. "Assets", "Building screens"
+  detail?: string;     // live sub-progress, e.g. "screen 7/24", "naming 62/77"
+  done?: boolean;      // the run reached its terminal phase
+  at?: string;         // when this phase was set (ISO)
+}
+
 export interface BuildRun {
   id: string;
   projectId: string;
-  kind: 'whole-app' | 'selected' | 'single';
+  kind: 'whole-app' | 'selected' | 'single' | 'resolve';
   framework?: string;
   figStorageKey?: string;
   // Build config the server orchestrator needs:
@@ -181,6 +197,13 @@ export interface BuildRun {
   // phase. Default (undefined/true) = run finalize on whole-app builds; set false
   // to skip it. A finalize failure NEVER flips a successful build to failed.
   finalize?: boolean;
+  // ── T9 (RFC v2 §8.1): the pipeline phase this run is currently in. ──────────
+  phase?: RunPhase;
+  // ── T9 (RFC v2 §8.4): AI-firing tally (proof the model is actually working).
+  // Bumped from the AI-observability log seam ([ai:…] status=ok|error|empty) so the
+  // Runs UI can show "AI: N ok / M failed" + a loud error state without parsing the
+  // raw log. Best-effort; never required for correctness.
+  ai?: { ok: number; failed: number };
   screens: RunScreen[];
   status: RunStatus;
   createdAt: string;
@@ -354,6 +377,7 @@ export async function restartRun(projectId: string, runId: string): Promise<Buil
   run.checkpoint = undefined;
   run.approvedGates = undefined;
   run.resumable = false;
+  run.phase = undefined;       // T9: a restart re-runs every phase from the top
   run.status = 'running';
   await saveRun(projectId, run);
   return run;
@@ -367,6 +391,65 @@ export async function setRunStatus(projectId: string, runId: string, status: Run
   run.status = status;
   run.updatedAt = new Date().toISOString();
   await fs.writeFile(runFile(root, runId), JSON.stringify(run, null, 2), 'utf-8');
+}
+
+// ── T9 (RFC v2 §8.1): set the run's current pipeline phase ───────────────────
+// Best-effort: a phase write must NEVER break a run (the catch swallows + logs
+// nothing). Merges into the existing phase so a caller can update just `detail`
+// (e.g. per-screen "screen 7/24") without re-stating index/total/name. Pass
+// `null` to clear the phase entirely.
+export async function setRunPhase(
+  projectId: string, runId: string,
+  phase: { index?: number; total?: number; name?: string; detail?: string; done?: boolean } | null,
+): Promise<void> {
+  try {
+    const root = rootFor(projectId);
+    if (!root) return;
+    const run = await getRun(projectId, runId);
+    if (!run) return;
+    if (phase === null) {
+      run.phase = undefined;
+    } else {
+      const prev = run.phase;
+      run.phase = {
+        index: phase.index ?? prev?.index ?? 0,
+        total: phase.total ?? prev?.total ?? 0,
+        name: phase.name ?? prev?.name ?? '',
+        // detail is replaced each call (undefined clears it) so stale sub-progress
+        // (e.g. "naming 62/77") doesn't linger into the next phase.
+        detail: phase.detail,
+        done: phase.done ?? (phase.name ? false : prev?.done),
+        at: new Date().toISOString(),
+      };
+    }
+    run.updatedAt = new Date().toISOString();
+    await fs.writeFile(runFile(root, runId), JSON.stringify(run, null, 2), 'utf-8');
+  } catch { /* phase is observability — never break a run on it */ }
+}
+
+// ── T9 (RFC v2 §8.4): AI-firing tally ────────────────────────────────────────
+// Increment the run's ok/failed AI counters (called from the AI-observability log
+// seam). Serialized per-run so concurrent AI calls (parallel screen workers) don't
+// clobber each other's read-modify-write. Best-effort: a tally miss never breaks a
+// run, and a missing run id is a no-op.
+const aiTallyChain = new Map<string, Promise<void>>();
+export function bumpRunAi(projectId: string, runId: string, outcome: 'ok' | 'failed'): void {
+  const key = `${projectId}:${runId}`;
+  const prev = aiTallyChain.get(key) ?? Promise.resolve();
+  const next = prev.then(async () => {
+    try {
+      const root = rootFor(projectId);
+      if (!root) return;
+      const run = await getRun(projectId, runId);
+      if (!run) return;
+      const ai = run.ai ?? { ok: 0, failed: 0 };
+      ai[outcome] += 1;
+      run.ai = ai;
+      run.updatedAt = new Date().toISOString();
+      await fs.writeFile(runFile(root, runId), JSON.stringify(run, null, 2), 'utf-8');
+    } catch { /* tally is observability — never throw */ }
+  }).finally(() => { if (aiTallyChain.get(key) === next) aiTallyChain.delete(key); });
+  aiTallyChain.set(key, next);
 }
 
 export async function setRunSession(projectId: string, runId: string, sessionId: string): Promise<void> {

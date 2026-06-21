@@ -36,6 +36,7 @@ import {
   saveRun, restartRun, appendRunLog, readRunLog,
   markRunCancelled, isRunCancelled, clearRunCancelled,
   isRunActive, markRunActive, clearRunActive,
+  setRunPhase,
   clampParallel,
   gateIsActive, pauseAtCheckpoint, approveCheckpoint, setRunResumable,
   addAmendment, resolveAmendment, writeFrameMap,
@@ -57,8 +58,46 @@ import type { FigFrame, FlowGraph } from './agent-packet';
 import { computePreflight } from './preflight';
 import { reconcileScreen, reconcileSummary, type ReconcileResult } from './reconcile';
 import { finalizeApp } from './passes/finalize';
+import { ensureProjectGit, commitCheckpoint } from './version-control';
 
 const execFile = promisify(execFileCb);
+
+// ── T9 (RFC v2 §8.1): the canonical GENERATION phase sequence ────────────────
+// Drives the "Phase X of N: <name>" the Runs UI shows. One ordered list spanning
+// BOTH the prep route (prepare-and-run: prep + assets) and runAppLoop (canonicalize
+// → skeleton → design-system → build → verify → finalize), so the index is stable
+// end-to-end. Best-effort emission via phase(): a phase write never breaks a run.
+const GEN_PHASES = [
+  'Canonicalize',       // 1 — heavy-AI canonicalization (or degraded clusterer)
+  'Skeleton',           // 2 — write-locked router/theme/component stubs
+  'Pre-flight',         // 3 — token/cost gate + design-system extract
+  'Assets',             // 4 — semantic rename + resources file (prep route)
+  'Build screens',      // 5 — per-screen implement→verify→fix loop
+  'Verify',             // 6 — needs-review rollup / queue
+  'Finalize',           // 7 — production-readiness passes + global wire
+] as const;
+const GEN_TOTAL = GEN_PHASES.length;
+type GenPhaseName = typeof GEN_PHASES[number];
+/** Best-effort: set the run's generation phase by name (index derived from the
+ *  canonical sequence). `detail` carries live sub-progress ("screen 7/24"). */
+function setGenPhase(projectId: string, runId: string, name: GenPhaseName, detail?: string, done?: boolean): void {
+  const index = GEN_PHASES.indexOf(name) + 1;
+  void setRunPhase(projectId, runId, { index, total: GEN_TOTAL, name, detail, done });
+}
+
+/**
+ * Best-effort checkpoint commit for a run phase (RFC §9.2). NEVER fails the run: the
+ * version-control fns are already non-throwing, but we wrap defensively + tee the
+ * outcome into the run log so the history is observable. A git hiccup must never
+ * break a build.
+ */
+async function runCheckpoint(projectId: string, runId: string, projectRoot: string, label: string, detail?: string): Promise<void> {
+  try {
+    await commitCheckpoint(projectRoot, label, detail, {
+      log: (msg) => { void appendRunLog(projectId, runId, msg); },
+    });
+  } catch { /* never break a run on a checkpoint */ }
+}
 
 interface BuildScreenReq {
   projectId: string;
@@ -897,6 +936,11 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     try {
       if (matched) {
         await updateRunScreen(req.projectId, req.runId, frameId, { status: 'done', matched: true, sessionId: session, review: undefined });
+        // T9 (RFC v2 §8.2): explicit terminal outcome line — at a glance "ACCEPTED",
+        // not just "loop done", so the human doesn't have to parse the log to know it
+        // passed. Score (when the verify agent gave one) rides along.
+        await appendRunLog(req.projectId, req.runId,
+          `[screen ${frameName}] ACCEPTED${typeof finalVerdict?.score === 'number' ? ` (score ${finalVerdict.score})` : ''}`);
       } else {
         // Surface recon flags alongside the visual discrepancies in the review queue.
         const reconDiscs = (recon?.flags ?? []).map(f => ({ area: `recon:${f.code}`, issue: f.message, severity: f.severity }));
@@ -910,6 +954,8 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
             discrepancies: [...(finalVerdict?.discrepancies ?? []), ...reconDiscs],
           },
         });
+        // T9 (RFC v2 §8.2): explicit needs-review terminal line with the reason.
+        await appendRunLog(req.projectId, req.runId, `[screen ${frameName}] NEEDS REVIEW (${stopReason})`);
       }
     } catch { /* non-fatal */ }
   }
@@ -953,6 +999,7 @@ async function buildRunScreen(
     await updateRunScreen(projectId, runId, screen.frameId, {
       status: 'failed', review: { reason: 'no build spec — screen was not built' },
     });
+    await appendRunLog(projectId, runId, `[screen ${screen.frameName}] FAILED (no build spec)`);
     return sharedSession;
   }
   const jobId = `${runId}:${screen.frameId}`;
@@ -987,6 +1034,7 @@ async function buildRunScreen(
     await updateRunScreen(projectId, runId, screen.frameId, {
       status: 'failed', review: { reason: `build error: ${e?.message || 'unknown'}` },
     });
+    await appendRunLog(projectId, runId, `[screen ${screen.frameName}] FAILED (${e?.message || 'unknown'})`);
     return sharedSession;
   }
 }
@@ -1016,6 +1064,15 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
   const projectRoot = resolveProjectRoot(projectId);
   if (!projectRoot || !fsSync.existsSync(projectRoot)) { clearRunActive(runId); return; }
 
+  // RFC §9 — version-control harness. Ensure the managed project is a git repo
+  // (auto-init + .gitignore) and checkpoint at run start, so no run ever mutates an
+  // untracked project and every phase below has a baseline to roll back to. All git
+  // ops are best-effort + non-fatal (a git hiccup never breaks a build).
+  try {
+    await ensureProjectGit(projectRoot, { log: (msg) => { void appendRunLog(projectId, runId, msg); } });
+    await runCheckpoint(projectId, runId, projectRoot, 'run start', `run ${runId}`);
+  } catch { /* non-fatal */ }
+
   // Tee every screen job's log line to the run's durable, replayable log.
   const unsub = subscribeJobLog((e) => {
     if (e.kind !== 'line' || !e.line || !e.jobKey.startsWith(`${runId}:`)) return;
@@ -1042,6 +1099,8 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
     const canonByLeadFrame = new Map<string, CanonicalScreen>();   // leadFrameId → canonical screen
     const leadFrameIds = new Set<string>();
     if (run.canonical) {
+      setGenPhase(projectId, runId, 'Canonicalize',
+        run.canonMode === 'deterministic' ? 'degraded (deterministic)' : 'heavy-AI (1a→1d)');
       // Resume-cheap: the canonicalization pre-pass is deterministic from the run's
       // frames+flow and is persisted to canonical.json on the FIRST start. On every
       // later (re)start — resume after redeploy, a restart, a checkpoint approve —
@@ -1095,6 +1154,7 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
           // (Skeleton writes are additive — a built screen file is never clobbered.)
           if ((run.framework || 'flutter').toLowerCase() === 'flutter') {
             try {
+              setGenPhase(projectId, runId, 'Skeleton');
               const sk = await generateFlutterSkeleton(projectRoot, canonical);
               await appendRunLog(projectId, runId, `[canon] skeleton: ${sk.files.length} file(s), ${sk.routes.length} route(s)`);
             } catch (e: any) {
@@ -1121,6 +1181,8 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
           }
           await appendRunLog(projectId, runId, `[canon] ${run.screens.length} frame(s) → ${canonical.screens.length} canonical screen(s), ${canonical.components.length} component(s)${folded ? `, ${folded} folded state/modal frame(s)` : ''}${canonical.warnings.length ? ` — ${canonical.warnings.length} warning(s)` : ''}`);
           for (const w of canonical.warnings) await appendRunLog(projectId, runId, `[canon] WARNING: ${w}`);
+          // RFC §9.2 — checkpoint after canonicalization (canonical.json + skeleton).
+          await runCheckpoint(projectId, runId, projectRoot, 'phase canonicalize', `${canonical.screens.length} screen(s), ${canonical.components.length} component(s)`);
         } catch (e: any) {
           // RFC §0.1/§0.4 — NO SILENT FALLBACK. The heavy-AI canon is THE
           // canonicalization; if the AI did not fire (AiStepError) or the pass
@@ -1165,6 +1227,7 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
     // the app run it, so the whole app was dead code behind a counter-demo main.dart.
     // Both are idempotent (skip when already done / never clobber a real main.dart).
     let themeTokens: ThemeTokens | undefined;
+    setGenPhase(projectId, runId, 'Pre-flight', 'design system + token extract');
     try {
       const digest = buildDesignDigest(run);
       const ds = await generateDesignSystem(projectRoot, run.framework || 'flutter', { colors: digest.colors, fonts: digest.fonts });
@@ -1207,6 +1270,19 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
     const workers = run.freshSessions ? clampParallel(run.parallel ?? 1) : 1;
     await appendRunLog(projectId, runId, `[run] start — ${run.screens.length} screen(s)${canonical ? ` (${leadFrameIds.size} canonical)` : ''}, model=${run.model}, verify=${run.verify !== false}, flow=${run.flow?.connections?.length ?? 0} link(s), sessions=${run.freshSessions ? 'fresh-per-screen' : 'shared'}, workers=${workers}`);
 
+    // T9: enter the per-screen BUILD phase. The detail tracks "screen done/total"
+    // (built-or-resolved-so-far over the buildable target count), updated as each
+    // screen reaches a terminal state — so the UI shows "Building screen 7/24".
+    const buildTargets = run.screens.filter(s => isBuildTarget(s.frameId)).length;
+    const countBuilt = async (): Promise<number> => {
+      const live = await getRun(projectId, runId);
+      return live?.screens.filter(s => isBuildTarget(s.frameId) && (s.status === 'done' || s.status === 'needs-review' || s.status === 'failed')).length ?? 0;
+    };
+    const emitBuildProgress = async (): Promise<void> => {
+      setGenPhase(projectId, runId, 'Build screens', `screen ${await countBuilt()}/${buildTargets}`);
+    };
+    await emitBuildProgress();
+
     const stillNeeded = async (frameId: string): Promise<boolean> => {
       const live = await getRun(projectId, runId);
       const cur = live?.screens.find(s => s.frameId === frameId);
@@ -1227,6 +1303,11 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
           if (!screen) return;
           if (!(await stillNeeded(screen.frameId))) continue;
           await buildRunScreen(run, screen, projectRoot, appPlan, undefined, canonCtxFor(screen.frameId));
+          await emitBuildProgress();   // T9: bump "screen X/N" as each worker finishes one
+          // RFC §9.2 — checkpoint when a screen reaches a terminal accepted/done state.
+          if (!(await stillNeeded(screen.frameId))) {
+            await runCheckpoint(projectId, runId, projectRoot, `screen ${screen.frameId} accepted`, screen.frameName);
+          }
         }
       };
       await Promise.all(Array.from({ length: workers }, () => worker()));
@@ -1257,6 +1338,13 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
         // In fresh-session mode there is no cross-screen thread to carry forward.
         if (sess && !run.freshSessions) { session = sess; await setRunSession(projectId, runId, session); }
         screensBuilt++; builtSinceGate++;
+        await emitBuildProgress();   // T9: bump "screen X/N" after each serial screen
+        // RFC §9.2 — checkpoint when this screen reaches a terminal accepted/done state.
+        {
+          const after = await getRun(projectId, runId);
+          const st = after?.screens.find(s => s.frameId === screen.frameId);
+          if (st?.status === 'done') await runCheckpoint(projectId, runId, projectRoot, `screen ${screen.frameId} accepted`, screen.frameName);
+        }
 
         // ── HITL Checkpoint 2 (RFC §5): after the FIRST screen — freeze the visual
         // language (design system + screen-1 reference build) before scaling.
@@ -1278,6 +1366,7 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
       await setRunStatus(projectId, runId, 'stopped');
       return;
     }
+    setGenPhase(projectId, runId, 'Verify', 'rolling up screen verdicts');
     const done = await getRun(projectId, runId);
     const total = done?.screens.length ?? 0;
     const built = done?.screens.filter(s => s.status === 'done').length ?? 0;
@@ -1311,6 +1400,9 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
     // needs-review OR failed — it parks in 'needs-review' until a human Accepts /
     // Corrected-retries / restarts every queued or errored screen.
     if (blocking > 0) {
+      // T9: terminal-but-blocked — leave the phase on Verify with a queue detail so
+      // the UI reads "Phase 6/7: Verify — k need review" alongside the needs-review state.
+      setGenPhase(projectId, runId, 'Verify', `${needsReview} need review${failed ? `, ${failed} failed` : ''}`, true);
       await setRunStatus(projectId, runId, 'needs-review');
       await appendRunLog(projectId, runId, `[run] paused for review — ${built}/${total} matched, ${needsReview} need review${failed ? `, ${failed} failed` : ''}`);
     } else {
@@ -1330,6 +1422,7 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
       const finalizeAlreadyRan = fsSync.existsSync(finalizeReportPath);
       if (finalizeEnabled && !finalizeAlreadyRan) {
         try {
+          setGenPhase(projectId, runId, 'Finalize', 'production passes');
           const finalizeModel = isAIModel(run.model) ? (run.model as AIModel) : undefined;
           const env = createTerminalEnv(resolveWorkspace());
           await appendRunLog(projectId, runId, `[finalize] starting P7 production passes (model=${finalizeModel ?? 'none'})`);
@@ -1346,6 +1439,9 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
           const applied = report.passes.filter(p => p.status === 'applied').length;
           const reverted = report.passes.filter(p => p.status === 'reverted').length;
           await appendRunLog(projectId, runId, `[finalize] complete — ${applied} applied, ${reverted} reverted (analyze ${report.baselineAnalyze ?? 'n/a'} → ${report.finalAnalyze ?? 'n/a'})`);
+          // RFC §9.2 — checkpoint after finalize (the production passes are already
+          // per-pass committed inside finalizeApp; this captures any net residue).
+          await runCheckpoint(projectId, runId, projectRoot, 'phase finalize', `${applied} applied, ${reverted} reverted`);
         } catch (e: any) {
           // Never let a finalize failure change the run's terminal status.
           await appendRunLog(projectId, runId, `[finalize] skipped (non-fatal — build stays complete): ${e?.message || 'unknown'}`);
@@ -1357,6 +1453,7 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
       // Terminal completion: clear the resumable flag so a finished run is never
       // re-launched on a later boot (audit A.4).
       await setRunResumable(projectId, runId, false);
+      setGenPhase(projectId, runId, 'Finalize', `done — ${built}/${total} accepted`, true);
       await setRunStatus(projectId, runId, 'done');
       await appendRunLog(projectId, runId, `[run] complete — ${built}/${total} built`);
     }
@@ -1631,6 +1728,10 @@ export function registerScreenLoopRoutes(app: Express): void {
     const projectRoot = resolveProjectRoot(projectId);
     if (!projectRoot || !fsSync.existsSync(projectRoot)) { res.status(404).json({ error: `project not found: ${projectId}` }); return; }
 
+    // RFC §9.1 — auto-init git the moment the pipeline touches a managed project, so
+    // it is never untracked before prep starts mutating it. Best-effort, non-fatal.
+    await ensureProjectGit(projectRoot, {}).catch(() => { /* non-fatal */ });
+
     const framework = typeof b.framework === 'string' && b.framework ? b.framework : 'flutter';
     const frameNames: Record<string, string> = (b.frameNames && typeof b.frameNames === 'object') ? b.frameNames : {};
     const userNotes = typeof b.userNotes === 'string' ? b.userNotes : undefined;
@@ -1747,12 +1848,17 @@ export function registerScreenLoopRoutes(app: Express): void {
         // it PARKS at the design-system gate (HITL 2) so a human sees the failure.
         let assetAiFailed = false;
         try {
+          // T9: surface the asset phase (semantic rename count rides in `detail`).
+          setGenPhase(projectId, run.id, 'Assets', `naming ${allAssets.length} asset(s)`);
           const assetEnv = createTerminalEnv(resolveWorkspace());
           const pass = await runAssetPass(projectId, framework, allAssets, b.model, assetEnv, { runId: run.id });
           if (pass) {
+            setGenPhase(projectId, run.id, 'Assets', `${pass.renamed}/${pass.unique} named`);
             await appendRunLog(projectId, run.id,
               `[prep] asset pass: ${pass.gathered} gathered → ${pass.unique} unique-by-content, ${pass.renamed} named, ${pass.duplicatesDeleted} duplicate(s) deleted, ${pass.repaired} raster(s) repaired`
               + (pass.resourcesPath ? `, resources → ${pass.resourcesPath}` : ''));
+            // RFC §9.2 — checkpoint after the (generation) asset pass.
+            await runCheckpoint(projectId, run.id, projectRoot, 'phase assets', `${pass.renamed} named, ${pass.duplicatesDeleted} deduped`);
           }
         } catch (e: any) {
           // A loud AI failure (AiNotFiredError/AiUnusableError) is NOT a silent

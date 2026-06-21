@@ -617,8 +617,9 @@ export async function runAssetPass(
   // format+kind so an svg icon never merges with a png image), pick ONE
   // deterministic representative per group, AI-name ONLY the representatives,
   // map EVERY original path → the representative's symbol, and delete the
-  // redundant duplicate files. The deletes are reversible: asset-phase snapshots
-  // assets/ in full bytes and restoreSnapshot recreates pass-deleted files.
+  // redundant duplicate files. The deletes are reversible: asset-phase takes a git
+  // snapshot before this pass and a git rollback (reset --hard + clean -fd)
+  // recreates pass-deleted/renamed files (see version-control.ts / asset-phase.ts).
   const dedup = await dedupAssetsByContent(root, distinctPaths);
   const representatives = dedup.representatives;       // ~77 (one per content group)
   const repaired = representatives.filter(a => a.repaired).length;

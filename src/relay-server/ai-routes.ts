@@ -18,6 +18,17 @@ import { deepenTokensAndCleanup } from './passes/token-cleanup';
 import { finalizeApp } from './passes/finalize';
 import { resolveCanonicalFromCode } from './passes/resolve-canonical';
 import { runAssetPhaseOnBuild } from './passes/asset-phase';
+import { ensureProjectGit } from './version-control';
+import { createRun, setRunPhase, appendRunLog, setRunStatus, setRunResumable } from './build-run-store';
+
+// ── T9 (RFC v2 §8.3): the RESOLVE entrypoint phase sequence ──────────────────
+// resolve-app derives the canonical FROM CODE (no frames), so it runs only the
+// input-deriving + post-build phases. Three phases drive its "Phase X of N" pill.
+const RESOLVE_PHASES = ['Canonicalize-from-code', 'Assets', 'Finalize'] as const;
+const RESOLVE_TOTAL = RESOLVE_PHASES.length;
+function setResolvePhase(projectId: string, runId: string, name: typeof RESOLVE_PHASES[number], detail?: string, done?: boolean): void {
+  void setRunPhase(projectId, runId, { index: RESOLVE_PHASES.indexOf(name) + 1, total: RESOLVE_TOTAL, name, detail, done });
+}
 
 const execFileAsync = promisify(execFile);
 
@@ -721,7 +732,26 @@ export function registerAIRoutes(app: Express): void {
       const { text } = await runModel(m, prompt, e, cwd, { format: opts?.format, projectId });
       return { text };
     };
+    // RFC §9.1 — auto-init git the moment resolve touches the managed project, so the
+    // asset phase + finalize below mutate a tracked tree (rollback available).
+    await ensureProjectGit(projectRoot, {}).catch(() => { /* non-fatal */ });
+
+    // T9 (RFC v2 §8.3): resolve-app is a DURABLE RUN. Create a BuildRun (kind
+    // 'resolve', no buildable screens) up-front so it appears in the Runs panel with
+    // streamed phases + log exactly like a generation build. The synchronous JSON
+    // response below is unchanged for automation; the run is the watchable surface.
+    const resolveRun = await createRun(projectId, {
+      kind: 'resolve', framework: 'flutter',
+      model: model ?? 'none', verify: false,
+      screens: [],
+    });
+    const runId = resolveRun?.id;
+    const rlog = (msg: string): void => { if (runId) void appendRunLog(projectId, runId, msg); };
+    if (runId) {
+      rlog(`[resolve] resolve-app started — deriving canonical from emitted code${model ? ` (model ${model})` : ' (no AI)'}`);
+    }
     try {
+      if (runId) setResolvePhase(projectId, runId, 'Canonicalize-from-code', 'parsing router/screens');
       const canonical = await resolveCanonicalFromCode(projectId, {
         projectRoot,
         model,
@@ -746,6 +776,7 @@ export function registerAIRoutes(app: Express): void {
         mappingRate: totalIds ? Number((mappedIds / totalIds).toFixed(3)) : 1,
         warnings: canonical.warnings,
       };
+      rlog(`[resolve] canonical from code — ${summary.screens} screen(s), ${summary.modals} modal(s) (${summary.modalsWithBase} bound), ${summary.components} component(s), mapping ${Math.round(summary.mappingRate * 100)}%`);
 
       // PHASE 2 — asset phase. BETWEEN canonical-resolve and finalize: semantic-rename
       // the existing on-disk assets, emit the resources file + asset-map, and re-point
@@ -755,6 +786,8 @@ export function registerAIRoutes(app: Express): void {
       // (the refs already point at AppAssets, so it's a no-op).
       let assetPhase: unknown = undefined;
       if (req.body?.assets !== false) {
+        if (runId) setResolvePhase(projectId, runId, 'Assets', 'rename + re-point');
+        rlog(`[resolve] asset phase — semantic rename + emit resources + re-point usages`);
         assetPhase = await runAssetPhaseOnBuild(projectId, {
           projectRoot,
           model,
@@ -762,27 +795,46 @@ export function registerAIRoutes(app: Express): void {
           env,
           runModel: runModelSeam,
         });
+        rlog(`[resolve] asset phase complete`);
       }
 
       // Run the six passes against the now-matching canonical (unless opted out or
       // dry-run for resolve itself — finalize's own dryRun is honoured separately).
       let finalizeReport: unknown = undefined;
       if (req.body?.finalize !== false) {
+        if (runId) setResolvePhase(projectId, runId, 'Finalize', 'production passes (8a–8f)');
+        rlog(`[resolve] finalize — running production-readiness passes`);
         finalizeReport = await finalizeApp(projectId, {
           projectRoot,
           model,
           dryRun: req.body?.finalizeDryRun === true || dryRun,
           env,
           runModel: runModelSeam,
+          ...(runId ? { log: (msg: string) => rlog(msg) } : {}),
         });
       }
 
+      // T9: terminal — mark the run done so the Runs panel shows an unambiguous
+      // finished state (resolve has no per-screen needs-review queue).
+      if (runId) {
+        setResolvePhase(projectId, runId, 'Finalize', 'done', true);
+        rlog(`[resolve] complete — canonical + assets + finalize done`);
+        await setRunStatus(projectId, runId, 'done');
+        await setRunResumable(projectId, runId, false);
+      }
+
       res.json({
+        ...(runId ? { runId } : {}),
         canonical: summary,
         ...(assetPhase !== undefined ? { assetPhase } : {}),
         ...(finalizeReport !== undefined ? { finalizeReport } : {}),
       });
     } catch (err: any) {
+      // T9: surface the failure on the durable run too (loud, not a silent 500).
+      if (runId) {
+        rlog(`[resolve] ERROR — ${err?.message ?? err}`);
+        await setRunStatus(projectId, runId, 'stopped').catch(() => {});
+      }
       res.status(500).json({ error: `resolve-app failed: ${err?.message ?? err}` });
     }
   });

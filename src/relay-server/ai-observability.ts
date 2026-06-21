@@ -35,7 +35,7 @@
 import { randomUUID } from 'node:crypto';
 import type { AIModel, AIFormat } from './ai-adapters';
 import { appendJobLog } from './ai-job-log';
-import { appendRunLog } from './build-run-store';
+import { appendRunLog, bumpRunAi } from './build-run-store';
 
 // ── The underlying runner seam ───────────────────────────────────────────────
 // runModel lives in ai-routes.ts. To avoid an eval-time circular import
@@ -124,6 +124,10 @@ function logAiLine(ctx: LogCtx, line: string): void {
   // Durable run log (survives restart/redeploy) wins when we have a runId.
   if (ctx.projectId && ctx.runId) {
     void appendRunLog(ctx.projectId, ctx.runId, tagged);
+    // T9 (RFC v2 §8.4): bump the run's AI-firing tally from the structured line so
+    // the Runs UI can show "AI: N ok / M failed" without parsing the raw log. Only
+    // `status=ok` counts as success; empty/error/timeout count as failed.
+    bumpRunAi(ctx.projectId, ctx.runId, /\bstatus=ok\b/.test(line) ? 'ok' : 'failed');
     return;
   }
   // Otherwise the in-memory job log (live progress) if we have a key.

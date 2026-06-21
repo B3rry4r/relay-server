@@ -46,6 +46,7 @@ import { repointAssetUsage } from './asset-usage';
 import { verifyFlowWiring } from './flow-wiring';
 import { renameSemantic } from './semantic-rename';
 import { deepenTokensAndCleanup, detectFramework, type Framework } from './token-cleanup';
+import { ensureProjectGit, snapshotBeforeMutation, rollbackTo, commitCheckpoint } from '../version-control';
 
 // ── Public contract ──────────────────────────────────────────────────────────
 
@@ -362,17 +363,22 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
     log(`[finalize] build-check disabled (framework=${framework}, lib/=${fsSync.existsSync(path.join(projectRoot, 'lib'))}) — only a THROWING pass is rolled back`);
   }
 
-  // Pre-sequence snapshot. We snapshot once; after each successful pass we re-snapshot
-  // so a later pass's rollback restores only THAT pass's delta (not earlier passes').
-  let snapshot: Snapshot | null = null;
+  // VERSION-CONTROL SNAPSHOTS (RFC §9.3): replace the fragile /tmp byte-snapshots
+  // with git. .git lives UNDER the project in /workspace (persistent), so a snapshot
+  // survives a redeploy — unlike /tmp, which is wiped on container restart (the
+  // exact incident this guards against). We snapshot BEFORE each pass
+  // (`snapshotBeforeMutation` → a committed clean baseline + the sha to roll back
+  // to) and on regression/throw `rollbackTo(preSha)` restores the tree EXACTLY
+  // (reset --hard + clean -fd → un-deletes deleted/moved files, removes pass-created
+  // files). On success we `commitCheckpoint` so the applied pass is durable history.
+  // `gitReady` gates this: if git is unavailable, every pass still runs but with NO
+  // rollback (surfaced loudly by ensureProjectGit) — never a silent /tmp fallback.
+  const vc = { log, env: opts.env };
+  let gitReady = false;
   if (!opts.dryRun && sourceDirs.length) {
-    try {
-      snapshot = await takeSnapshot(sourceDirs);
-      log(`[finalize] snapshot: ${snapshot.fileCount} file(s) across ${sourceDirs.map((d) => path.relative(projectRoot, d) || '.').join(', ')}`);
-    } catch (e) {
-      log(`[finalize] WARNING: could not snapshot source (rollback disabled for this run): ${(e as Error).message}`);
-      snapshot = null;
-    }
+    await ensureProjectGit(projectRoot, vc);
+    gitReady = fsSync.existsSync(path.join(projectRoot, '.git'));
+    if (!gitReady) log(`[finalize] WARNING: git unavailable — passes run WITHOUT rollback (data safety degraded)`);
   }
 
   // The analyze ERROR count we measure against AFTER a pass — it tracks the LAST
@@ -392,6 +398,13 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
       passReports.push({ name: def.name, status: 'skipped', counts: {}, warnings: ['not in onlyPasses'] });
       log(`[finalize] ${def.name}: skipped (not in onlyPasses)`);
       continue;
+    }
+
+    // SNAPSHOT BEFORE this pass (git). preSha is the clean baseline to roll back to
+    // if the pass regresses/throws. Empty when git is unavailable → no rollback.
+    let preSha = '';
+    if (!opts.dryRun && gitReady) {
+      preSha = await snapshotBeforeMutation(projectRoot, `${def.name} (P8 pass)`, vc);
     }
 
     log(`[finalize] ${def.name}: running…`);
@@ -454,34 +467,36 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
     if (!failure) {
       passReports.push({ name: def.name, status: 'applied', counts, warnings, aiProof });
       log(`[finalize] ${def.name}: applied — ${summarizeCounts(counts)}`);
-      // Re-snapshot so the NEXT pass rolls back only its own delta.
-      if (snapshot && sourceDirs.length) {
-        try { snapshot = await takeSnapshot(sourceDirs); }
-        catch (e) { log(`[finalize] WARNING: re-snapshot after ${def.name} failed (rollback may be imprecise): ${(e as Error).message}`); }
+      // Commit the applied pass as a durable checkpoint (RFC §9.2). This both
+      // records history AND establishes the clean baseline the NEXT pass's
+      // snapshotBeforeMutation will return — so a later pass rolls back only its own
+      // delta, not earlier applied passes'.
+      if (gitReady) {
+        await commitCheckpoint(projectRoot, `${def.name} applied`, summarizeCounts(counts), vc);
       }
       continue;
     }
 
-    // FAILURE → restore this pass's delta from the pre-pass snapshot, then continue.
+    // FAILURE → restore the tree EXACTLY to the pre-pass snapshot via git
+    // (reset --hard + clean -fd): un-deletes files the pass deleted/moved, reverts
+    // modifications, removes files the pass created. Then continue with the next pass.
     let restored = false;
-    if (snapshot && sourceDirs.length) {
-      try {
-        await restoreSnapshot(snapshot, sourceDirs);
-        restored = true;
-      } catch (e) {
-        log(`[finalize] CRITICAL: rollback of ${def.name} FAILED: ${(e as Error).message}`);
-      }
+    if (gitReady && preSha) {
+      await rollbackTo(projectRoot, preSha, vc);
+      restored = true;
+    } else if (gitReady && !preSha) {
+      log(`[finalize] CRITICAL: no snapshot sha for ${def.name} — cannot roll back this pass`);
     }
     passReports.push({
       name: def.name,
       status: 'reverted',
       counts: {},
       warnings,
-      error: failure + (restored ? ' (reverted)' : snapshot ? ' (rollback FAILED)' : ' (no snapshot to revert)'),
+      error: failure + (restored ? ' (reverted via git)' : gitReady ? ' (rollback FAILED — no snapshot)' : ' (no git — could not revert)'),
       aiProof,
     });
-    log(`[finalize] ${def.name}: REVERTED — ${failure}${restored ? ' (rolled back)' : ''}`);
-    // lastGoodErrors is unchanged — the restore returns the tree to the last good
+    log(`[finalize] ${def.name}: REVERTED — ${failure}${restored ? ' (rolled back via git)' : ''}`);
+    // lastGoodErrors is unchanged — the rollback returns the tree to the last good
     // state, so the next pass is measured from the same bar.
   }
 
@@ -539,68 +554,6 @@ function sourceDirsFor(framework: Framework, projectRoot: string): string[] {
     if (fsSync.existsSync(abs)) dirs.push(abs);
   }
   return dirs;
-}
-
-// ── Snapshot / restore (precise rollback) ─────────────────────────────────────
-
-interface Snapshot {
-  /** absolute file path → file content (utf8). Only text files are tracked. */
-  files: Map<string, Buffer>;
-  /** the set of dirs the snapshot covers (so restore can delete created files). */
-  roots: string[];
-  fileCount: number;
-}
-
-async function listFilesRec(dir: string): Promise<string[]> {
-  const out: string[] = [];
-  async function walk(d: string): Promise<void> {
-    let entries: fsSync.Dirent[];
-    try { entries = await fs.readdir(d, { withFileTypes: true }); } catch { return; }
-    for (const e of entries) {
-      const abs = path.join(d, e.name);
-      if (e.isDirectory()) await walk(abs);
-      else if (e.isFile()) out.push(abs);
-    }
-  }
-  await walk(dir);
-  return out;
-}
-
-/** Capture the full byte content of every file under the given source dirs. */
-async function takeSnapshot(dirs: string[]): Promise<Snapshot> {
-  const files = new Map<string, Buffer>();
-  for (const dir of dirs) {
-    for (const f of await listFilesRec(dir)) {
-      files.set(f, await fs.readFile(f));
-    }
-  }
-  return { files, roots: [...dirs], fileCount: files.size };
-}
-
-/**
- * Restore the source dirs to EXACTLY the snapshot state:
- *  - files that changed are overwritten with the snapshot bytes,
- *  - files CREATED since the snapshot are deleted,
- *  - files DELETED since the snapshot (e.g. a renamed/moved screen) are recreated.
- * This makes rollback complete even when a pass partially wrote then threw, or
- * moved files (semantic-rename).
- */
-async function restoreSnapshot(snap: Snapshot, dirs: string[]): Promise<void> {
-  // 1) Delete files that exist now but were NOT in the snapshot (created by the pass).
-  const current = new Set<string>();
-  for (const dir of dirs) for (const f of await listFilesRec(dir)) current.add(f);
-  for (const f of current) {
-    if (!snap.files.has(f)) {
-      try { await fs.rm(f, { force: true }); } catch { /* best-effort */ }
-    }
-  }
-  // 2) Re-write / recreate every snapshot file with its original bytes.
-  for (const [f, buf] of snap.files) {
-    try {
-      await fs.mkdir(path.dirname(f), { recursive: true });
-      await fs.writeFile(f, buf);
-    } catch { /* best-effort; reported by caller via try/catch around restore */ }
-  }
 }
 
 // ── Build-safety checks (flutter) ─────────────────────────────────────────────
@@ -681,7 +634,7 @@ function summarizeCounts(counts: Record<string, number>): string {
   return parts.length ? parts.join(', ') : 'no changes';
 }
 
-// Test-only surface for the build-safe rollback primitives (snapshot/restore +
-// source-dir resolution). Exported so the precise-rollback contract can be unit-
-// tested without a live server / Flutter SDK. Not part of the runtime API.
-export const __test = { takeSnapshot, restoreSnapshot, sourceDirsFor };
+// Test-only surface for source-dir resolution. Exported so the resolution contract
+// can be unit-tested without a live server / Flutter SDK. The build-safe rollback is
+// now git-based (see ../version-control); not part of the runtime API.
+export const __test = { sourceDirsFor };
