@@ -585,19 +585,88 @@ function rewriteIconWidget(src: string, use: IconUse, asset: IndexedAsset): { sr
 
   const symbol = `${FLUTTER_RESOURCES_CLASS}.${asset.symbolKey}`;
   const parts: string[] = [symbol];
+  let replacement: string;
   if (asset.format === 'svg') {
     if (use.args.size) { parts.push(`width: ${use.args.size}`); parts.push(`height: ${use.args.size}`); }
     if (use.args.color) parts.push(`colorFilter: ColorFilter.mode(${use.args.color}, BlendMode.srcIn)`);
     if (use.args.semanticLabel) parts.push(`semanticsLabel: ${use.args.semanticLabel}`);
-    const replacement = `SvgPicture.asset(${parts.join(', ')})`;
-    return { src: src.slice(0, idx) + replacement + src.slice(idx + use.fullText.length), changed: true };
+    replacement = `SvgPicture.asset(${parts.join(', ')})`;
   } else {
     if (use.args.size) { parts.push(`width: ${use.args.size}`); parts.push(`height: ${use.args.size}`); }
     if (use.args.color) parts.push(`color: ${use.args.color}`);
     if (use.args.semanticLabel) parts.push(`semanticLabel: ${use.args.semanticLabel}`);
-    const replacement = `Image.asset(${parts.join(', ')})`;
-    return { src: src.slice(0, idx) + replacement + src.slice(idx + use.fullText.length), changed: true };
+    replacement = `Image.asset(${parts.join(', ')})`;
   }
+  let out = src.slice(0, idx) + replacement + src.slice(idx + use.fullText.length);
+  // `Icon(...)` IS a const constructor, so it can legally live inside a `const`
+  // widget subtree (`const SizedBox(child: Stack(children: [Icon(...)]))`).
+  // `SvgPicture.asset(...)` / `Image.asset(...)` are NOT const — leaving an
+  // enclosing `const` on an ANCESTOR constructor now yields `const_with_non_const`
+  // (the exact analyze regression that reverted the resolve path). Strip the
+  // `const` from every ancestor constructor invocation that encloses the freshly
+  // injected non-const widget. Removing a `const` only forgoes a compile-time
+  // optimization — it never changes behaviour — so this is always safe.
+  out = stripEnclosingConst(out, idx);
+  return { src: out, changed: true };
+}
+
+/**
+ * Remove the `const` keyword from every constructor invocation whose argument
+ * subtree ENCLOSES `pos` (the start of a just-injected non-const widget). Walks
+ * outward from `pos`: for each enclosing `(` … `)`, look just before the matching
+ * constructor name for a `const ` and delete it. Idempotent and conservative —
+ * only strips a `const` that directly precedes an `Identifier(` whose parens span
+ * `pos`. Returns the source unchanged when there is nothing to strip.
+ */
+function stripEnclosingConst(src: string, pos: number): string {
+  // Collect every enclosing opener — a constructor call `(` OR a list literal `[`
+  // — that contains `pos`, by scanning LEFT and tracking nesting per bracket kind.
+  // (A const context can be `const Foo(... Icon ...)` OR `const [ Icon, ... ]`.)
+  const enclosing: Array<{ idx: number; kind: '(' | '[' }> = [];
+  let pd = 0; // paren depth
+  let bd = 0; // bracket depth
+  let inStr: string | null = null;
+  for (let i = pos - 1; i >= 0; i--) {
+    const c = src[i];
+    if (inStr) { if (c === inStr && src[i - 1] !== '\\') inStr = null; continue; }
+    if (c === '\'' || c === '"') { inStr = c; continue; }
+    if (c === ')') pd++;
+    else if (c === '(') { if (pd === 0) enclosing.push({ idx: i, kind: '(' }); else pd--; }
+    else if (c === ']') bd++;
+    else if (c === '[') { if (bd === 0) enclosing.push({ idx: i, kind: '[' }); else bd--; }
+  }
+  // Strip the `const` token that makes each enclosing opener a const context. For
+  // `(`: the `const` precedes the constructor identifier. For `[`: it precedes the
+  // `[` (optionally with a type arg like `const <Widget>[`). `enclosing` is
+  // innermost→outermost (descending index); process in that order so a strip never
+  // shifts the offset of a not-yet-processed lower-index outer opener. Removing a
+  // `const` only forgoes an optimization — never changes behaviour.
+  let out = src;
+  for (const e of enclosing) {
+    // Find the position just before which a `const` keyword would sit.
+    let nameStart: number;
+    if (e.kind === '(') {
+      let j = e.idx - 1;
+      while (j >= 0 && /\s/.test(out[j])) j--;
+      const nameEnd = j + 1;
+      while (j >= 0 && /[A-Za-z0-9_.]/.test(out[j])) j--;
+      nameStart = j + 1;
+      if (nameStart >= nameEnd) continue; // not an identifier call (a grouping `(`)
+    } else {
+      // list literal: skip an optional `<...>` type arg immediately before `[`.
+      let j = e.idx - 1;
+      while (j >= 0 && /\s/.test(out[j])) j--;
+      if (out[j] === '>') { const lt = out.lastIndexOf('<', j); if (lt >= 0) j = lt - 1; }
+      while (j >= 0 && /\s/.test(out[j])) j--;
+      nameStart = j + 1;
+    }
+    let p = nameStart - 1;
+    while (p >= 0 && /\s/.test(out[p])) p--;
+    if (p >= 4 && out.slice(p - 4, p + 1) === 'const' && (p - 5 < 0 || !/[A-Za-z0-9_]/.test(out[p - 5]))) {
+      out = out.slice(0, p - 4) + out.slice(nameStart);
+    }
+  }
+  return out;
 }
 
 // ── icon → asset semantic matching ───────────────────────────────────────────
@@ -769,4 +838,12 @@ const reactStrategy: AssetUsageStrategy = {
   async repoint() {
     return { repointed: [], skipped: [], warnings: ['react strategy not implemented (7c ships flutter)'] };
   },
+};
+
+// ── test seam ────────────────────────────────────────────────────────────────
+/** Internal helpers exposed for unit tests (const-context rewrite safety). */
+export const __test = {
+  rewriteIconWidget,
+  stripEnclosingConst,
+  findMaterialIconUses,
 };

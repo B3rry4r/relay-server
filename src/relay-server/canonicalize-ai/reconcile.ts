@@ -45,7 +45,7 @@ import fsSync from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { resolveProjectRoot, createTerminalEnv, resolveWorkspace } from '../runtime';
-import { runModel } from '../ai-routes';
+import { requireModel } from '../ai-observability';
 import { LEXICON_VERSION, WIDGET_KINDS, WIDGET_KIND_SET } from './lexicon';
 import type { FrameDescriptor, DescriptorProposal } from './descriptor-schema';
 
@@ -307,14 +307,20 @@ function extractJson(text: string): any | null {
 /** Run the bounded synonym-merge. Returns merge groups over cluster INDICES, or null
  *  on any failure (caller falls back to one-group-per-cluster). */
 async function aiSynonymMerge(
-  clusters: PreCluster[], projectId: string, root: string, modelId: string,
+  clusters: PreCluster[], projectId: string, root: string, modelId: string, runId?: string,
 ): Promise<AiMergeGroup[] | null> {
   if (clusters.length < 2) return null;       // nothing to merge across
-  try {
-    const env = createTerminalEnv(resolveWorkspace());
-    const prompt = buildMergePrompt(clusters);
-    const { text } = await runModel('claude', prompt, env, root, {
-      agent: false, modelId, projectId,
+  // AI-PURPOSE (Phase 1b synonym merge). The model is REQUIRED to fire — a
+  // no-fire / error must SURFACE (RFC §0.1), not be swallowed into a null that
+  // looks like "AI ran, nothing to merge". A genuine fired-but-no-groups reply
+  // legitimately returns null (the deterministic one-group-per-cluster stands).
+  const env = createTerminalEnv(resolveWorkspace());
+  const prompt = buildMergePrompt(clusters);
+  {
+    const { text } = await requireModel('claude', prompt, env, root, {
+      agent: false, modelId,
+      log: { projectId, runId, step: 'canon.reconcile' },
+      validate: (t) => { const j = extractJson(t); return j && typeof j === 'object' ? j : undefined; },
     });
     const parsed = extractJson(text);
     const groupsRaw: any[] = Array.isArray(parsed?.groups) ? parsed.groups : [];
@@ -330,8 +336,6 @@ async function aiSynonymMerge(
       groups.push({ canonical, members });
     }
     return groups.length ? groups : null;
-  } catch {
-    return null;
   }
 }
 
@@ -411,6 +415,8 @@ async function writeGroupingCache(root: string, signature: string, groups: strin
 export interface ReconcileOptions {
   /** override the merge model (default 'sonnet'). */
   modelId?: string;
+  /** durable run id — threaded into the AI log ctx so firing proof lands in the run log. */
+  runId?: string;
   /** skip the AI call (deterministic-only) — for tests / offline. */
   skipAi?: boolean;
   /** write the lexicon to disk (default true). */
@@ -465,7 +471,7 @@ export async function reconcileLexicon(
       if (!covered) groups = null;
     }
     if (!groups) {
-      const ai = await aiSynonymMerge(clusters, projectId, root, opts.modelId ?? 'sonnet');
+      const ai = await aiSynonymMerge(clusters, projectId, root, opts.modelId ?? 'sonnet', opts.runId);
       if (ai && ai.length) {
         aiMerged = true;
         // The AI groups over cluster members. Rebuild groups, then fold in any cluster

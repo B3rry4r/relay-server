@@ -23,7 +23,7 @@ import fsSync from 'node:fs';
 import path from 'node:path';
 import { Validator } from '@cfworker/json-schema';
 import { resolveProjectRoot, createTerminalEnv, resolveWorkspace } from '../runtime';
-import { runModel } from '../ai-routes';
+import { requireModel } from '../ai-observability';
 import { getNodeTree, renderFrameReference } from '../reference-render';
 import { isWidgetKind, lexiconForPrompt } from './lexicon';
 import {
@@ -177,7 +177,7 @@ export async function describeFrame(
   projectId: string,
   figStorageKey: string,
   frame: DescribeFrameInput,
-  opts: { modelId?: string; harnessBaseUrl?: string; scale?: number } = {},
+  opts: { modelId?: string; harnessBaseUrl?: string; scale?: number; runId?: string } = {},
 ): Promise<DescribeResult> {
   const root = resolveProjectRoot(projectId);
   if (!root || !fsSync.existsSync(root)) throw new Error(`describeFrame: project not found: ${projectId}`);
@@ -213,10 +213,14 @@ export async function describeFrame(
   }
 
   // 2. ASK — one bounded agent call. agent:true so the CLI can open the image file.
+  // AI-PURPOSE (Phase 1a describe): the model IS the step. requireModel logs the
+  // call + THROWS AiNotFiredError on no-fire/empty (RFC §0.1/§0.2) so a frame
+  // that fails to describe aborts loud rather than emitting a stub descriptor.
   const env = createTerminalEnv(resolveWorkspace());
   const prompt = buildPrompt(frame, tree, refRelPath);
-  const { text } = await runModel('claude', prompt, env, root, {
-    agent: true, modelId: opts.modelId ?? 'sonnet', projectId,
+  const { text } = await requireModel('claude', prompt, env, root, {
+    agent: true, modelId: opts.modelId ?? 'sonnet',
+    log: { projectId, runId: opts.runId, step: 'canon.describe' },
   });
 
   // 3. NORMALIZE (server-fill fingerprints) + VALIDATE.

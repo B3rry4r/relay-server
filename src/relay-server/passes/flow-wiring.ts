@@ -811,13 +811,19 @@ async function aiLocateDeadTrigger(edge: CanonFlowEdge, baseSrc: string, opts: F
     `Reply with EXACTLY one JSON object, no prose:`,
     `{"snippet":"<verbatim empty-handler substring, or empty string>"}`,
   ].join('\n');
+  // AI is a FUZZY trigger LOCATOR over a deterministic primary (route-push
+  // detection). Not an AI-PURPOSE step. On failure: conservative no-op (leave
+  // the trigger unwired → reported as deadTrigger for the human), but LOGGED
+  // (RFC §0.1 — not silent).
   try {
     const { text } = await opts.runModel(opts.model, prompt, opts.env ?? process.env, opts.projectRoot, { format: 'text' });
     const m = text.match(/\{[\s\S]*\}/);
-    if (!m) return null;
+    if (!m) { console.log('[ai:flow-locate] status=empty — no JSON; trigger left unwired'); return null; } // eslint-disable-line no-console
     const s = (JSON.parse(m[0]) as { snippet?: string }).snippet;
     return s && s.trim() && baseSrc.includes(s) ? s : null;
-  } catch {
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.log(`[ai:flow-locate] status=error — ${(e as Error).message.slice(0, 80)}; trigger left unwired`);
     return null;
   }
 }

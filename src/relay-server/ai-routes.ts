@@ -17,6 +17,7 @@ import { renameSemantic } from './passes/semantic-rename';
 import { deepenTokensAndCleanup } from './passes/token-cleanup';
 import { finalizeApp } from './passes/finalize';
 import { resolveCanonicalFromCode } from './passes/resolve-canonical';
+import { runAssetPhaseOnBuild } from './passes/asset-phase';
 
 const execFileAsync = promisify(execFile);
 
@@ -230,6 +231,11 @@ export async function runModel(
   }
   return { text: out };
 }
+
+// Bind runModel into the AI observability layer so requireModel/runModelObserved
+// use this exact adapter path (job streaming, session resume, cancellation)
+// WITHOUT an eval-time circular import. Done once at module load.
+import('./ai-observability').then((m) => m.setRunModel(runModel)).catch(() => { /* observability binds lazily on first use */ });
 
 // ── Route registration ────────────────────────────────────────────────────────
 
@@ -741,6 +747,23 @@ export function registerAIRoutes(app: Express): void {
         warnings: canonical.warnings,
       };
 
+      // PHASE 2 — asset phase. BETWEEN canonical-resolve and finalize: semantic-rename
+      // the existing on-disk assets, emit the resources file + asset-map, and re-point
+      // code references to AppAssets — as ONE atomic, build-safe unit (rename + repoint
+      // share a single build check + rollback; see asset-phase.ts). Skipped when the
+      // caller passes `assets: false`. finalize's own repoint pass then runs idempotently
+      // (the refs already point at AppAssets, so it's a no-op).
+      let assetPhase: unknown = undefined;
+      if (req.body?.assets !== false) {
+        assetPhase = await runAssetPhaseOnBuild(projectId, {
+          projectRoot,
+          model,
+          dryRun: req.body?.assetsDryRun === true || dryRun,
+          env,
+          runModel: runModelSeam,
+        });
+      }
+
       // Run the six passes against the now-matching canonical (unless opted out or
       // dry-run for resolve itself — finalize's own dryRun is honoured separately).
       let finalizeReport: unknown = undefined;
@@ -754,7 +777,11 @@ export function registerAIRoutes(app: Express): void {
         });
       }
 
-      res.json({ canonical: summary, ...(finalizeReport !== undefined ? { finalizeReport } : {}) });
+      res.json({
+        canonical: summary,
+        ...(assetPhase !== undefined ? { assetPhase } : {}),
+        ...(finalizeReport !== undefined ? { finalizeReport } : {}),
+      });
     } catch (err: any) {
       res.status(500).json({ error: `resolve-app failed: ${err?.message ?? err}` });
     }

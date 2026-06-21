@@ -677,16 +677,25 @@ async function aiConfirmTextStyle(
     'Reply with EXACTLY one JSON object, no prose:',
     '{"equivalent": true|false, "helper": "<helper name or empty>", "reason": "<short>"}',
   ].join('\n');
+  // AI is a CONFIRMATION GATE over a deterministic literal→token candidate (not
+  // an AI-PURPOSE step). On failure: conservative SAFE no-op (don't substitute),
+  // but LOGGED + reason recorded (RFC §0.1 — not silent).
   try {
     const { text } = await opts.runModel(opts.model, prompt, opts.env ?? process.env, opts.projectRoot, { format: 'text' });
     const mm = text.match(/\{[\s\S]*\}/);
-    if (!mm) return { equivalent: false, reason: 'AI returned no JSON' };
+    if (!mm) {
+      // eslint-disable-next-line no-console
+      console.log('[ai:token-confirm] status=empty — AI returned no JSON; keeping literal');
+      return { equivalent: false, reason: 'AI returned no JSON' };
+    }
     const j = JSON.parse(mm[0]) as { equivalent?: boolean; helper?: string; reason?: string };
     if (!j.equivalent || !j.helper || !theme.textStyleHelpers.includes(j.helper)) {
       return { equivalent: false, reason: j.reason || 'AI: not a known helper' };
     }
     return { equivalent: true, helper: j.helper, reason: j.reason };
   } catch (e) {
+    // eslint-disable-next-line no-console
+    console.log(`[ai:token-confirm] status=error — ${(e as Error).message.slice(0, 80)}; keeping literal`);
     return { equivalent: false, reason: `AI confirm failed: ${(e as Error).message}` };
   }
 }

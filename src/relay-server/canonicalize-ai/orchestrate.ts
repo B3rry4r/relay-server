@@ -25,6 +25,9 @@ import type { FrameDescriptor } from './descriptor-schema';
 
 export interface CanonicalizeOptions {
   modelId?: string;
+  /** durable build-run id — threaded into every stage's AI log ctx so the
+   *  `[ai:canon.*] status=ok` firing proof lands in .uix/runs/<runId>.log. */
+  runId?: string;
   /** skip ALL AI calls (deterministic-only) across 1a–1d — for tests / offline. */
   skipAi?: boolean;
   /** persist each stage's artifact (lexicon.json / canonical.json). Default true. */
@@ -73,20 +76,20 @@ export async function canonicalize(
   const descriptors: FrameDescriptor[] = [];
   for (const f of frames) {
     const { descriptor } = await describeFrame(projectId, figStorageKey, f, {
-      modelId: opts.modelId, harnessBaseUrl: opts.harnessBaseUrl, scale: opts.scale,
+      modelId: opts.modelId, harnessBaseUrl: opts.harnessBaseUrl, scale: opts.scale, runId: opts.runId,
     });
     descriptors.push(descriptor);
   }
 
   // ── 1b RECONCILE — freeze the lexicon + proposalMap.
   const { lexicon, proposalMap, aiMerged } = await reconcileLexicon(projectId, descriptors, {
-    modelId: opts.modelId, skipAi: opts.skipAi, persist, forceRemerge: opts.force,
+    modelId: opts.modelId, skipAi: opts.skipAi, persist, forceRemerge: opts.force, runId: opts.runId,
   });
 
   // ── 1c REDUCE — the canonical model from descriptors + lexicon + flow.
   const { canonical: reduced, aiRefined } = await reduceToCanonical(
     projectId, figStorageKey, descriptors, lexicon, proposalMap, flow, {
-      modelId: opts.modelId, skipAi: opts.skipAi, persist, forceRefine: opts.force,
+      modelId: opts.modelId, skipAi: opts.skipAi, persist, forceRefine: opts.force, runId: opts.runId,
     });
 
   // ── 1d ADJUDICATE — vision-grounded review of the residue + finalize.
@@ -95,7 +98,7 @@ export async function canonicalize(
   for (const f of frames) if (f.width && f.height) frameDims[f.frameId] = { width: f.width, height: f.height };
   const adj = await adjudicateCanonical(projectId, figStorageKey, reduced, descriptors, {
     modelId: opts.modelId, skipAi: opts.skipAi, persist, forceAdjudicate: opts.force,
-    harnessBaseUrl: opts.harnessBaseUrl, scale: opts.scale, frameDims,
+    harnessBaseUrl: opts.harnessBaseUrl, scale: opts.scale, frameDims, runId: opts.runId,
   });
 
   return {

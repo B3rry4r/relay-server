@@ -38,6 +38,7 @@ import * as path from 'path';
 import { spawn } from 'child_process';
 import type { AIModel } from '../ai-adapters';
 import { getFlutterRoot } from '../runtime';
+import { runModelObserved } from '../ai-observability';
 
 import { extractComponents } from './component-extraction';
 import { applyModalOverlays } from './modal-overlay';
@@ -89,6 +90,25 @@ export interface FinalizeOptions {
 
 export type PassStatus = 'applied' | 'skipped' | 'reverted';
 
+/** Per-pass AI-firing proof (RFC §0.2: "AI firing is observable"). Records whether
+ *  the pass actually invoked the model, how many times, and the first call's proof
+ *  (id + token estimate). `fired:false` with `available:true` means the pass ran
+ *  but its AI seam wasn't needed (deterministic path covered everything) — a
+ *  legitimate, surfaced "no AI required". `available:false` means no model/runner
+ *  was injected (degraded mode). */
+export interface PassAiProof {
+  /** A model + runner were injected (the pass COULD fire AI). */
+  available: boolean;
+  /** The pass actually invoked the model at least once. */
+  fired: boolean;
+  /** Number of model invocations the pass made during this run. */
+  calls: number;
+  /** How many of those returned usable output (status=ok). */
+  okCalls: number;
+  /** First call's proof for the report (id + ≈tokens + ms), when any fired. */
+  firstCall?: { callId: string; tokens: number; durMs: number; status: 'ok' | 'empty' | 'error' };
+}
+
 export interface PassReport {
   name: PassName;
   status: PassStatus;
@@ -98,6 +118,8 @@ export interface PassReport {
   warnings: string[];
   /** Present when status === 'reverted'. */
   error?: string;
+  /** AI-firing proof for this pass (RFC §0.2). */
+  aiProof?: PassAiProof;
 }
 
 export interface FinalizeReport {
@@ -119,13 +141,51 @@ export interface FinalizeReport {
 
 interface PassDef {
   name: PassName;
-  /** Run the pass with the shared finalize opts; return counts + warnings. */
-  run: (projectId: string, opts: FinalizeOptions) => Promise<{ counts: Record<string, number>; warnings: string[] }>;
+  /** Run the pass with the shared finalize opts; return counts + warnings. The
+   *  `proof` collector is swapped in per pass to tally AI firing. */
+  run: (projectId: string, opts: FinalizeOptions, proof: AiProofCollector) => Promise<{ counts: Record<string, number>; warnings: string[] }>;
 }
 
-/** Adapt the shared finalize RunModelFn into each pass's identically-shaped seam. */
-function passRunModel(opts: FinalizeOptions): RunModelFn | undefined {
-  return opts.runModel;
+/** A mutable collector the orchestrator swaps in PER PASS so the wrapped runner
+ *  records AI-firing proof for exactly that pass. */
+interface AiProofCollector {
+  available: boolean;
+  calls: number;
+  okCalls: number;
+  firstCall?: PassAiProof['firstCall'];
+}
+
+/**
+ * Adapt the shared finalize RunModelFn into each pass's identically-shaped seam,
+ * routing every call through `runModelObserved` so (a) the standard `[ai:…]`
+ * structured line is logged (RFC §0.2 — provable firing) and (b) the per-pass
+ * collector tallies invocations + captures the first call's proof. The pass sees
+ * the same `{text}` contract; observability is transparent to it.
+ */
+function passRunModel(opts: FinalizeOptions, proof: AiProofCollector, passName: PassName): RunModelFn | undefined {
+  if (!opts.runModel || !opts.model) return undefined;
+  return async (model, prompt, env, cwd, o) => {
+    proof.calls++;
+    const res = await runModelObserved(model, prompt, env, cwd, {
+      format: o?.format,
+      runner: async (m, p, e, c, ro) => {
+        // Delegate to the injected adapter; map its richer shape to RunModelLike.
+        const out = await opts.runModel!(m, p, e, c, { format: ro?.format });
+        return { text: out.text };
+      },
+      log: { step: passName },
+    });
+    if (res.ok) {
+      proof.okCalls++;
+      if (!proof.firstCall) proof.firstCall = { callId: res.callId, tokens: res.tokens, durMs: res.durMs, status: 'ok' };
+      return { text: res.text };
+    }
+    if (!proof.firstCall) proof.firstCall = { callId: res.callId, tokens: res.tokens, durMs: res.durMs, status: res.reason === 'empty' ? 'empty' : 'error' };
+    // Preserve the pass's existing error-handling contract: a non-ok observed
+    // result throws so the pass's own try/catch degrades exactly as before (and
+    // the failure is already LOGGED by runModelObserved — never silent).
+    throw new Error(`[ai:${passName}] model ${model} did not fire (${res.reason})${res.error ? ': ' + res.error.slice(0, 120) : ''}`);
+  };
 }
 
 /** noAi for a pass: true when there is no model OR no runModel to drive it. */
@@ -136,7 +196,7 @@ function noAi(opts: FinalizeOptions): boolean {
 const PASSES: PassDef[] = [
   {
     name: 'extractComponents',
-    run: async (projectId, opts) => {
+    run: async (projectId, opts, proof) => {
       const r = await extractComponents(projectId, {
         projectRoot: opts.projectRoot,
         model: opts.model,
@@ -144,7 +204,7 @@ const PASSES: PassDef[] = [
         noAiConfirm: noAi(opts),
         dryRun: opts.dryRun,
         env: opts.env,
-        runModel: passRunModel(opts),
+        runModel: passRunModel(opts, proof, 'extractComponents'),
       });
       return {
         counts: { extracted: r.extracted.length, rejected: r.rejected.length },
@@ -154,14 +214,14 @@ const PASSES: PassDef[] = [
   },
   {
     name: 'applyModalOverlays',
-    run: async (projectId, opts) => {
+    run: async (projectId, opts, proof) => {
       const r = await applyModalOverlays(projectId, {
         projectRoot: opts.projectRoot,
         model: opts.model,
         noAi: noAi(opts),
         dryRun: opts.dryRun,
         env: opts.env,
-        runModel: passRunModel(opts),
+        runModel: passRunModel(opts, proof, 'applyModalOverlays'),
       });
       return {
         counts: { transformed: r.transformed.length, skipped: r.skipped.length },
@@ -171,14 +231,14 @@ const PASSES: PassDef[] = [
   },
   {
     name: 'repointAssetUsage',
-    run: async (projectId, opts) => {
+    run: async (projectId, opts, proof) => {
       const r = await repointAssetUsage(projectId, {
         projectRoot: opts.projectRoot,
         model: opts.model,
         noAi: noAi(opts),
         dryRun: opts.dryRun,
         env: opts.env,
-        runModel: passRunModel(opts),
+        runModel: passRunModel(opts, proof, 'repointAssetUsage'),
       });
       return {
         counts: { repointed: r.repointed.length, skipped: r.skipped.length },
@@ -188,14 +248,14 @@ const PASSES: PassDef[] = [
   },
   {
     name: 'verifyFlowWiring',
-    run: async (projectId, opts) => {
+    run: async (projectId, opts, proof) => {
       const r = await verifyFlowWiring(projectId, {
         projectRoot: opts.projectRoot,
         model: opts.model,
         noAi: noAi(opts),
         dryRun: opts.dryRun,
         env: opts.env,
-        runModel: passRunModel(opts),
+        runModel: passRunModel(opts, proof, 'verifyFlowWiring'),
       });
       const s = r.report.summary;
       return {
@@ -216,14 +276,14 @@ const PASSES: PassDef[] = [
   },
   {
     name: 'renameSemantic',
-    run: async (projectId, opts) => {
+    run: async (projectId, opts, proof) => {
       const r = await renameSemantic(projectId, {
         projectRoot: opts.projectRoot,
         model: opts.model,
         noAi: noAi(opts),
         dryRun: opts.dryRun,
         env: opts.env,
-        runModel: passRunModel(opts),
+        runModel: passRunModel(opts, proof, 'renameSemantic'),
       });
       const s = r.report.summary;
       return {
@@ -234,14 +294,14 @@ const PASSES: PassDef[] = [
   },
   {
     name: 'deepenTokensAndCleanup',
-    run: async (projectId, opts) => {
+    run: async (projectId, opts, proof) => {
       const r = await deepenTokensAndCleanup(projectId, {
         projectRoot: opts.projectRoot,
         model: opts.model,
         noAi: noAi(opts),
         dryRun: opts.dryRun,
         env: opts.env,
-        runModel: passRunModel(opts),
+        runModel: passRunModel(opts, proof, 'deepenTokensAndCleanup'),
       });
       const sub = r.report.substitutions;
       const rem = r.report.removals;
@@ -292,9 +352,12 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
   // Baseline analyze (best-effort). On a non-buildable project this is null and the
   // gate uses thrown-pass detection only.
   let baselineAnalyze: number | null = null;
+  let baselineErrors: number | null = null;
   if (buildCheckable) {
-    baselineAnalyze = await flutterAnalyzeCount(projectRoot, opts.env);
-    log(`[finalize] baseline analyze: ${baselineAnalyze ?? 'n/a'} issue(s)`);
+    const a = await flutterAnalyze(projectRoot, opts.env);
+    baselineAnalyze = a?.total ?? null;
+    baselineErrors = a?.errors ?? null;
+    log(`[finalize] baseline analyze: ${baselineAnalyze ?? 'n/a'} issue(s), ${baselineErrors ?? 'n/a'} error(s)`);
   } else if (!opts.dryRun) {
     log(`[finalize] build-check disabled (framework=${framework}, lib/=${fsSync.existsSync(path.join(projectRoot, 'lib'))}) — only a THROWING pass is rolled back`);
   }
@@ -312,11 +375,15 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
     }
   }
 
-  // The analyze count we measure against AFTER a pass — it tracks the LAST good
-  // state (baseline, then each successful pass's post-count). A pass is judged
-  // against this, not the original baseline, so a pass that improves analyze raises
-  // the bar for the next one only if it's actually better.
-  let lastGoodAnalyze = baselineAnalyze;
+  // The analyze ERROR count we measure against AFTER a pass — it tracks the LAST
+  // good state (baseline, then each successful pass's post-count). A pass is judged
+  // against this, not the original baseline, so a pass that fixes errors raises the
+  // bar for the next one only if it's actually better. We gate on ERRORS (not total
+  // issues) to match the asset phase: the production passes legitimately shuffle
+  // cosmetic lints (prefer_const_constructors infos shift line-to-line as code
+  // moves, unused-import warnings are pruned) — those must NOT force a revert, but a
+  // real ERROR (undefined name, invalid constant, broken build) still does.
+  let lastGoodErrors = baselineErrors;
 
   const passReports: PassReport[] = [];
 
@@ -331,21 +398,32 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
     let counts: Record<string, number> = {};
     let warnings: string[] = [];
     let threw: Error | null = null;
+    // Fresh AI-firing collector for THIS pass. `available` reflects whether a
+    // model + runner were injected (the pass could fire AI at all).
+    const proof: AiProofCollector = { available: !noAi(opts), calls: 0, okCalls: 0 };
     try {
-      const out = await def.run(projectId, opts);
+      const out = await def.run(projectId, opts, proof);
       counts = out.counts;
       warnings = out.warnings;
     } catch (e) {
       threw = e as Error;
     }
+    const aiProof: PassAiProof = {
+      available: proof.available,
+      fired: proof.calls > 0,
+      calls: proof.calls,
+      okCalls: proof.okCalls,
+      ...(proof.firstCall ? { firstCall: proof.firstCall } : {}),
+    };
+    log(`[finalize] ${def.name}: ai ${aiProof.available ? (aiProof.fired ? `fired ${aiProof.okCalls}/${aiProof.calls} ok${aiProof.firstCall ? ` (call=${aiProof.firstCall.callId} ≈${aiProof.firstCall.tokens}tok)` : ''}` : 'available but not needed (deterministic path)') : 'unavailable (degraded — no model/runner)'}`);
 
     // dry-run never writes → never needs a rollback; just record.
     if (opts.dryRun) {
       if (threw) {
-        passReports.push({ name: def.name, status: 'reverted', counts: {}, warnings, error: threw.message });
+        passReports.push({ name: def.name, status: 'reverted', counts: {}, warnings, error: threw.message, aiProof });
         log(`[finalize] ${def.name}: ERROR (dry-run, nothing written): ${threw.message}`);
       } else {
-        passReports.push({ name: def.name, status: 'applied', counts, warnings });
+        passReports.push({ name: def.name, status: 'applied', counts, warnings, aiProof });
         log(`[finalize] ${def.name}: ${summarizeCounts(counts)} (dry-run)`);
       }
       continue;
@@ -355,22 +433,26 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
     let failure: string | null = threw ? `threw: ${threw.message}` : null;
 
     // Build-safety gate (only when buildable & the pass didn't already throw).
+    // Gate on the analyze ERROR count (not total issues) AND a successful build —
+    // a pass that introduces a real error or breaks the build is reverted; a pass
+    // that only churns cosmetic info/warning lints is allowed (matches asset-phase).
     if (!failure && buildCheckable) {
-      const after = await flutterAnalyzeCount(projectRoot, opts.env);
-      if (after != null && lastGoodAnalyze != null && after > lastGoodAnalyze) {
-        failure = `flutter analyze regressed (${lastGoodAnalyze} → ${after} issues)`;
+      const a = await flutterAnalyze(projectRoot, opts.env);
+      const afterErrors = a?.errors ?? null;
+      if (afterErrors != null && lastGoodErrors != null && afterErrors > lastGoodErrors) {
+        failure = `flutter analyze errors regressed (${lastGoodErrors} → ${afterErrors} error(s))`;
       } else {
         const built = await flutterBuildWebOk(projectRoot, opts.env);
         if (!built.ok) failure = `flutter build web failed: ${built.error}`;
         else {
-          // Pass is good: advance the bar to this pass's analyze count.
-          lastGoodAnalyze = after ?? lastGoodAnalyze;
+          // Pass is good: advance the error bar to this pass's error count.
+          lastGoodErrors = afterErrors ?? lastGoodErrors;
         }
       }
     }
 
     if (!failure) {
-      passReports.push({ name: def.name, status: 'applied', counts, warnings });
+      passReports.push({ name: def.name, status: 'applied', counts, warnings, aiProof });
       log(`[finalize] ${def.name}: applied — ${summarizeCounts(counts)}`);
       // Re-snapshot so the NEXT pass rolls back only its own delta.
       if (snapshot && sourceDirs.length) {
@@ -396,9 +478,10 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
       counts: {},
       warnings,
       error: failure + (restored ? ' (reverted)' : snapshot ? ' (rollback FAILED)' : ' (no snapshot to revert)'),
+      aiProof,
     });
     log(`[finalize] ${def.name}: REVERTED — ${failure}${restored ? ' (rolled back)' : ''}`);
-    // lastGoodAnalyze is unchanged — the restore returns the tree to the last good
+    // lastGoodErrors is unchanged — the restore returns the tree to the last good
     // state, so the next pass is measured from the same bar.
   }
 
@@ -522,18 +605,26 @@ async function restoreSnapshot(snap: Snapshot, dirs: string[]): Promise<void> {
 
 // ── Build-safety checks (flutter) ─────────────────────────────────────────────
 
-/** Run `flutter analyze` and return the issue count (null if flutter unavailable). */
-async function flutterAnalyzeCount(projectRoot: string, env?: NodeJS.ProcessEnv): Promise<number | null> {
+/** Run `flutter analyze` and return BOTH the total issue count (for the report)
+ *  and the ERROR count (the gate keys on errors, not total — see the gate). Null
+ *  when flutter is unavailable. Mirrors asset-phase.flutterAnalyze. */
+async function flutterAnalyze(projectRoot: string, env?: NodeJS.ProcessEnv): Promise<{ total: number; errors: number } | null> {
   const flutter = flutterBin();
   if (!flutter) return null;
   const raw = await runCmd(flutter, ['analyze', '--no-pub'], projectRoot, env).catch(() => null);
   if (raw == null) return null;
+  const errors = (raw.match(/^\s*error\s+•/gm) || []).length;
+  if (/no issues found/i.test(raw)) return { total: 0, errors: 0 };
   const summ = /(\d+)\s+issues?\s+found/.exec(raw);
-  if (summ) return Number(summ[1]);
-  // "No issues found!" → 0. Otherwise count diagnostic lines.
-  if (/no issues found/i.test(raw)) return 0;
-  const diagRe = /^\s*(error|warning|info)\s+•/gm;
-  return (raw.match(diagRe) || []).length;
+  if (summ) return { total: Number(summ[1]), errors };
+  const total = (raw.match(/^\s*(error|warning|info)\s+•/gm) || []).length;
+  return { total, errors };
+}
+
+/** Back-compat total-only count (used for the report fields baseline/finalAnalyze). */
+async function flutterAnalyzeCount(projectRoot: string, env?: NodeJS.ProcessEnv): Promise<number | null> {
+  const a = await flutterAnalyze(projectRoot, env);
+  return a?.total ?? null;
 }
 
 /** Run `flutter build web` and report whether it succeeded. */

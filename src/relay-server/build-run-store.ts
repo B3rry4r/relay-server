@@ -143,6 +143,17 @@ export interface BuildRun {
   //   per raw frame. Default off → existing one-frame-per-screen behavior is
   //   unchanged. The pre-pass result is persisted to .uix/runs/<id>.canonical.json.
   canonical?: boolean;
+  // ── RFC v2 §0.1/§0.4 / §4.2: which canonicalization to run when `canonical` is on.
+  // Default (undefined) = the heavy-AI chain (canonicalize-ai/orchestrate.canonicalize):
+  //   1a describe → 1b reconcile → 1c reduce → 1d adjudicate, adapted to the build
+  //   Canonical shape. This is THE canonicalization. If the AI does not fire it FAILS
+  //   LOUD (parks at HITL Checkpoint 0 / errors the run) — never a silent deterministic
+  //   fallback.
+  //   'deterministic' = an EXPLICIT, human-opted, LOGGED degraded mode that uses the
+  //   deterministic clusterer (canonicalize.canonicalizeRun) instead. It is surfaced in
+  //   the run log as `[canon] DEGRADED: deterministic mode …` and is the ONLY permitted
+  //   non-AI path (RFC §0.1).
+  canonMode?: 'ai' | 'deterministic';
   // ── P5 (RFC §4.8): plan version + amendments ─────────────────────────────────
   // The plan is append-only/namespace-locked; an approved amendment bumps planVersion
   // and regenerates the skeleton. Starts at 1. Amendments are journaled here.

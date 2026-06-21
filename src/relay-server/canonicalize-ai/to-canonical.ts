@@ -1,0 +1,131 @@
+// =============================================================================
+// File: src/relay-server/canonicalize-ai/to-canonical.ts
+//
+// ADAPTER: CanonicalModel (the heavy-AI chain's output, RFC §4.1) → Canonical (the
+// build-flow's consumed shape, canonicalize.ts). RFC v2 §4.2 — the AI chain
+// (`canonicalize()` in orchestrate.ts) is THE canonicalization; runAppLoop consumes
+// the deterministic `Canonical` shape, so this PURE function folds one into the other
+// with zero IO:
+//
+//   - the AI model carries modals at the TOP LEVEL (`modals[]`, each with a
+//     `baseCanonicalId`); the build shape nests `modals[]` INSIDE each screen — so we
+//     FOLD every modal into its base screen by `baseCanonicalId` (an unbound modal —
+//     empty base — is surfaced as a warning + kept as a standalone built screen, the
+//     same contract the deterministic pre-pass uses);
+//   - `frameMap` (every frameId → canonicalId — the single identity axis) is rebuilt
+//     from the model: each screen's state frames → its canonicalId, each modal's frame
+//     → its modal id (or, when unbound, its standalone screen id), each component frame
+//     → its component id;
+//   - states / templates / components / flow are mapped field-for-field;
+//   - warnings carry through (1c/1d doubts → HITL Checkpoint 0).
+//
+// Deterministic + side-effect-free so it is trivially unit-testable; the caller
+// persists the result via writeCanonical / writeFrameMap.
+// =============================================================================
+
+import type {
+  Canonical,
+  CanonicalScreen as BuildScreen,
+  CanonicalState as BuildState,
+  CanonicalModal as BuildModal,
+  CanonicalComponent as BuildComponent,
+  CanonicalTemplate as BuildTemplate,
+  CanonicalFlow as BuildFlow,
+  CanonicalFlowEdge as BuildFlowEdge,
+} from '../canonicalize';
+import type { CanonicalModel, CanonicalScreen as AiScreen } from './reduce';
+import { canonicalIdFor, routeForCanonicalId } from './reduce';
+
+/**
+ * Fold the heavy-AI `CanonicalModel` into the build flow's `Canonical`. PURE — no IO,
+ * no model calls. The AI chain has already done the reasoning; this is a structural
+ * re-shape so `runAppLoop`'s existing writeCanonical / writeFrameMap / skeleton / fold
+ * code consumes it unchanged.
+ */
+export function aiModelToCanonical(model: CanonicalModel): Canonical {
+  const warnings: string[] = Array.isArray(model.warnings) ? [...model.warnings] : [];
+  const frameMap: Record<string, string> = {};
+
+  // ── screens (states map field-for-field; modals folded in below) ───────────
+  const screens: BuildScreen[] = (model.screens ?? []).map((s: AiScreen): BuildScreen => {
+    const states: BuildState[] = (s.states ?? []).map(st => ({ id: st.id, frameId: st.frameId }));
+    // Every state frame of this screen maps onto the screen's canonical id.
+    for (const fid of s.frameIds ?? []) frameMap[fid] = s.canonicalId;
+    return {
+      canonicalId: s.canonicalId,
+      frameIds: [...(s.frameIds ?? [])],
+      name: s.name,
+      states: states.length ? states : [{ id: 'default', frameId: (s.frameIds ?? [])[0] }],
+      modals: [],
+      role: 'screen',
+      route: s.route || routeForCanonicalId(s.canonicalId),
+      ...(s.templateRef ? { templateRef: s.templateRef } : {}),
+    };
+  });
+  const screenById = new Map<string, BuildScreen>(screens.map(s => [s.canonicalId, s]));
+
+  // ── FOLD modals into their base screen by baseCanonicalId ──────────────────
+  // The AI model lists modals at the top level; the build shape nests them under
+  // their base screen. An unbound modal (empty/unresolved base) cannot be presented
+  // as an overlay, so — mirroring the deterministic pre-pass — it is surfaced as a
+  // warning AND kept as a standalone built screen so it is still reachable + built.
+  for (const m of model.modals ?? []) {
+    const base = m.baseCanonicalId ? screenById.get(m.baseCanonicalId) : undefined;
+    if (base) {
+      const modal: BuildModal = { id: m.canonicalId, frameId: m.frameId, baseCanonicalId: m.baseCanonicalId };
+      base.modals.push(modal);
+      frameMap[m.frameId] = m.canonicalId;
+    } else {
+      warnings.push(`modal "${m.name}" (${m.frameId}) has no base screen — built as a standalone reachable route; bind it via the flow checkpoint to present it as an overlay`);
+      const canonicalId = canonicalIdFor(m.frameId);
+      const standalone: BuildScreen = {
+        canonicalId,
+        frameIds: [m.frameId],
+        name: m.name,
+        states: [{ id: 'default', frameId: m.frameId }],
+        modals: [],
+        role: 'screen',
+        route: routeForCanonicalId(canonicalId),
+      };
+      screens.push(standalone);
+      screenById.set(canonicalId, standalone);
+      frameMap[m.frameId] = canonicalId;
+    }
+  }
+
+  // ── components → build component entries (their own canonical ids, no route) ─
+  const components: BuildComponent[] = (model.components ?? []).map((c, i) => {
+    // The AI model's components are keyed by canonicalName (a recurring widget), not a
+    // frame — they have no frameId. Synthesize a stable id; they don't enter frameMap.
+    const id = 'cmp_' + String(c.canonicalName).replace(/[^a-zA-Z0-9]+/g, '_') + (i ? `_${i}` : '');
+    return { id, frameId: '', name: c.canonicalName };
+  });
+
+  // ── templates map field-for-field (members only; sharedSections is AI-only meta) ─
+  const templates: BuildTemplate[] = (model.templates ?? []).map((t): BuildTemplate => ({
+    id: t.id,
+    memberCanonicalIds: [...(t.memberCanonicalIds ?? [])],
+  }));
+
+  // ── flow: AI edges use {from,to,kind}; build edges use {fromCanonicalId,toCanonicalId,kind} ─
+  const edges: BuildFlowEdge[] = (model.flow?.edges ?? []).map((e): BuildFlowEdge => ({
+    fromCanonicalId: e.from,
+    toCanonicalId: e.to,
+    kind: e.kind,
+    ...(e.label ? { label: e.label } : {}),
+  }));
+  const flow: BuildFlow = {
+    entryCanonicalId: model.flow?.entryCanonicalId ?? null,
+    edges,
+  };
+
+  return {
+    version: 1,
+    screens,
+    components,
+    templates,
+    flow,
+    frameMap,
+    warnings,
+  };
+}

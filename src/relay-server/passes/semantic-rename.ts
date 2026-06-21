@@ -612,13 +612,19 @@ async function aiProposeName(
     `Reply with EXACTLY one JSON object, no prose:`,
     `{"name":"<short human name>"}`,
   ].join('\n');
+  // AI is a COLLISION DISAMBIGUATOR over a deterministic name (canonical name →
+  // identifier). Not an AI-PURPOSE step. On failure: conservative no-op (fall
+  // back to deterministic numeric disambiguation by the caller), but LOGGED
+  // (RFC §0.1 — not silent).
   try {
     const { text } = await opts.runModel(opts.model, prompt, opts.env ?? process.env, opts.projectRoot, { format: 'text' });
     const m = text.match(/\{[\s\S]*\}/);
-    if (!m) return null;
+    if (!m) { console.log('[ai:rename-disambig] status=empty — no JSON; using deterministic name'); return null; } // eslint-disable-line no-console
     const name = (JSON.parse(m[0]) as { name?: string }).name;
     return name && name.trim() ? name.trim() : null;
-  } catch {
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.log(`[ai:rename-disambig] status=error — ${(e as Error).message.slice(0, 80)}; using deterministic name`);
     return null;
   }
 }

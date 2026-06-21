@@ -587,6 +587,11 @@ export async function prepScreen(
  * (operates on the union of localized assets). Best-effort — never blocks a build.
  *
  * Returns a summary for logging, or null when there's nothing to do.
+ *
+ * The semantic rename is AI-REQUIRED and FAILS LOUD: if the model doesn't fire
+ * or returns no usable names for the opaque batch, renameAssetsSemantic THROWS
+ * and this propagates it (no garbage resources file is written). Pass
+ * `opts.noAi` to take the EXPLICIT, logged `degraded` (hint-only) path instead.
  */
 export async function runAssetPass(
   projectId: string,
@@ -594,6 +599,7 @@ export async function runAssetPass(
   assets: LocalizedAsset[],
   model: AIModel,
   env: NodeJS.ProcessEnv,
+  opts: { runId?: string; noAi?: boolean } = {},
 ): Promise<{ resourcesPath: string | null; renamed: number; repaired: number } | null> {
   const root = resolveProjectRoot(projectId);
   if (!root || assets.length === 0) return null;
@@ -604,8 +610,10 @@ export async function runAssetPass(
   const uniq = [...byPath.values()];
   const repaired = uniq.filter(a => a.repaired).length;
 
-  // 1. Semantic rename (bounded AI call; falls back to filename hints).
-  const renamed = await renameAssetsSemantic(root, uniq, model, env, { projectId });
+  // 1. Semantic rename — AI-REQUIRED, fails loud (propagated to the caller).
+  const renamed = await renameAssetsSemantic(root, uniq, model, env, {
+    projectId, runId: opts.runId, noAi: opts.noAi,
+  });
 
   // 2. Emit the framework-agnostic resources file from the renamed paths.
   let resourcesPath: string | null = null;
@@ -640,4 +648,83 @@ export async function runAssetPass(
   } catch { /* mapping is an optimization for the re-point pass */ }
 
   return { resourcesPath, renamed: renamed.length, repaired };
+}
+
+// ── gather EXISTING on-disk assets (for the resolve / already-built-app path) ────
+
+/** The on-disk asset root(s) a framework bundles its assets under. Flutter is the
+ *  one that must work; the others are reasonable defaults for the shared seam. */
+function assetDirsFor(framework: string): string[] {
+  switch ((framework || '').toLowerCase()) {
+    case 'flutter': return ['assets'];
+    case 'react': case 'vite': case 'ts': return ['src/assets', 'public'];
+    case 'next': case 'web': return ['public', 'src/assets'];
+    default: return ['assets'];
+  }
+}
+
+/** Parse a trailing Figma node id baked into an opaque asset filename. UIX names
+ *  assets like `visibility_off_313_10937.svg` / `vector_290_4399.svg` — the last
+ *  two underscore-separated numeric groups are the node id. Returns it in `:`-form
+ *  (`313:10937`), or undefined when no trailing id is present. */
+export function nodeIdFromAssetName(fileName: string): string | undefined {
+  const base = path.basename(fileName).replace(/\.[a-z0-9]+$/i, '');
+  const m = /(\d+)[_:](\d+)$/.exec(base);
+  return m ? `${m[1]}:${m[2]}` : undefined;
+}
+
+/** Classify an asset's kind from its containing dir then its format: a path under
+ *  `.../icons/...` is an icon, `.../images/...` an image; otherwise svg→icon,
+ *  png→image (matches localizeFrameAssets' icons/=svg, images/=raster layout). */
+function kindForAsset(relPosix: string, format: 'svg' | 'png'): 'icon' | 'image' {
+  const lower = relPosix.toLowerCase();
+  if (/(^|\/)icons?(\/|$)/.test(lower)) return 'icon';
+  if (/(^|\/)images?(\/|$)/.test(lower)) return 'image';
+  return format === 'svg' ? 'icon' : 'image';
+}
+
+/**
+ * Recursively scan an ALREADY-BUILT project's on-disk asset dir(s) and return a
+ * `LocalizedAsset[]` describing every `.svg`/`.png` found — the INPUT the Phase-2
+ * asset pass (runAssetPass) expects. Used by the resolve path for apps whose assets
+ * were localized at build time but never semantic-renamed / surfaced in a resources
+ * file. Framework-agnostic seam (flutter → `assets/**`). Returns [] when there is no
+ * asset dir or no asset files. relPath is project-relative POSIX.
+ */
+export async function gatherExistingAssets(
+  projectRoot: string,
+  framework: string,
+): Promise<LocalizedAsset[]> {
+  if (!projectRoot || !fsSync.existsSync(projectRoot)) return [];
+  const out: LocalizedAsset[] = [];
+  const seen = new Set<string>();
+
+  const walk = async (absDir: string): Promise<void> => {
+    let entries: fsSync.Dirent[];
+    try { entries = await fs.readdir(absDir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const abs = path.join(absDir, e.name);
+      if (e.isDirectory()) { await walk(abs); continue; }
+      if (!e.isFile()) continue;
+      const ext = path.extname(e.name).toLowerCase();
+      const format: 'svg' | 'png' | null = ext === '.svg' ? 'svg' : ext === '.png' ? 'png' : null;
+      if (!format) continue;
+      const relPath = path.relative(projectRoot, abs).split(path.sep).join('/');
+      if (seen.has(relPath)) continue;
+      seen.add(relPath);
+      out.push({
+        relPath,
+        nodeId: nodeIdFromAssetName(e.name),
+        format,
+        kind: kindForAsset(relPath, format),
+      });
+    }
+  };
+
+  for (const dir of assetDirsFor(framework)) {
+    const abs = path.join(projectRoot, dir);
+    if (fsSync.existsSync(abs)) await walk(abs);
+  }
+  out.sort((a, b) => a.relPath.localeCompare(b.relPath));
+  return out;
 }

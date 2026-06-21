@@ -920,24 +920,36 @@ async function aiClassifyModalBase(
     `Reply with EXACTLY one JSON object, no prose:`,
     `{"baseCanonicalId":"<one of the canonicalIds above, or empty string>"}`,
   ].join('\n');
+  // AI classifies an AMBIGUOUS modal→base binding over a deterministic primary
+  // (per RFC Phase 1′: AI only for genuinely ambiguous classification). On
+  // failure: conservative no-op (leave the modal unbound → surfaced, not
+  // guess-wired), but LOGGED (RFC §0.1 — not silent).
   try {
     const { text } = await opts.runModel(opts.model, prompt, opts.env ?? process.env, opts.projectRoot, { format: 'text' });
     const m = text.match(/\{[\s\S]*\}/);
-    if (!m) return null;
+    if (!m) { console.log('[ai:resolve-modal] status=empty — no JSON; modal left unbound'); return null; } // eslint-disable-line no-console
     const id = (JSON.parse(m[0]) as { baseCanonicalId?: string }).baseCanonicalId;
     return id && id.trim() ? id.trim() : null;
-  } catch {
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.log(`[ai:resolve-modal] status=error — ${(e as Error).message.slice(0, 80)}; modal left unbound`);
     return null;
   }
 }
 
 // ── shared low-level utils ────────────────────────────────────────────────────
 
+/** Balanced `{}` matcher that is STRING- AND COMMENT-aware. Skipping comments
+ *  matters: an apostrophe inside a `//` comment (`don't`) would otherwise corrupt
+ *  string tracking and make brace matching fail (the modal-shape mis-detection /
+ *  "unexpected shape" class of bug). */
 function matchBrace(s: string, open: number): number {
   let depth = 0; let inStr: string | null = null;
   for (let i = open; i < s.length; i++) {
     const c = s[i]; const prev = s[i - 1];
     if (inStr) { if (c === inStr && prev !== '\\') inStr = null; continue; }
+    if (c === '/' && s[i + 1] === '/') { while (i < s.length && s[i] !== '\n') i++; continue; }
+    if (c === '/' && s[i + 1] === '*') { i += 2; while (i < s.length && !(s[i] === '*' && s[i + 1] === '/')) i++; i++; continue; }
     if (c === "'" || c === '"') { inStr = c; continue; }
     if (c === '{') depth++;
     else if (c === '}') { depth--; if (depth === 0) return i; }

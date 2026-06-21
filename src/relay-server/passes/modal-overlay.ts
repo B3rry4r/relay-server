@@ -304,6 +304,7 @@ function inspectModalRoute(modalSrc: string, modalClass: string): ModalRouteShap
   let align: ModalRouteShape['align'] = 'unknown';
   if (/alignment:\s*Alignment\.bottomCenter|Alignment\.bottomLeft|Alignment\.bottomRight/.test(body)) align = 'bottom';
   else if (/alignment:\s*Alignment\.center\b/.test(body)) align = 'center';
+  else if (/\bCenter\s*\(\s*child\s*:/.test(body)) align = 'center'; // centered foreground (loaders) → dialog
   else if (/Positioned\.fill/.test(body) && !backdropClass) align = 'fill';
   // sheet class: a `_Foo(` that is NOT a Screen and appears after an Align/bottom.
   const sheetM = [...body.matchAll(/\b(_[A-Z][A-Za-z0-9_]*)\s*\(/g)]
@@ -358,53 +359,77 @@ async function convertFlutterModal(
     if (aiKind) presentation = { kind: aiKind, source: 'ai' };
   }
 
-  // Locate the trigger in the base screen. Deterministic: the base pushes the
-  // modal's route. Resolve the modal's route const from app_routes.dart, then
-  // find the push call on the base. Fuzzy fallback → AI.
+  // Locate the trigger. Deterministic: SOME screen/modal pushes the modal's route.
+  // The push is usually on the base screen, but in real apps it can live on a
+  // DIFFERENT screen (the modal's visual backdrop ≠ the screen carrying the
+  // button — Ping's loading modal sits over the result screen but is launched from
+  // the prior step) or inside a SIBLING modal that chains to it via
+  // pushReplacementNamed. So we scan ALL screen files for the route push, not just
+  // the base. Resolve the modal's route const from app_routes.dart first.
   const route = await resolveRouteConst(projectRoot, modal.canonicalId);
-  const baseSrc = await fs.readFile(resolvedBase.file, 'utf8');
   let triggerHow: ModalTransform['trigger']['how'] = 'none';
   let triggerWired: ModalTransform['trigger']['wired'] = 'none';
 
   // Build the presenter call we will inject at the trigger site.
   const presenterCall = `${resolvedModal.widgetClass}.present(context)`;
 
-  let newBaseSrc = baseSrc;
+  // The file we actually rewrite the trigger in (may be the base, or another
+  // screen/modal that pushes this route). Written separately from the modal file.
+  let triggerFile: string | null = null;
+  let triggerSrcNew: string | null = null;
+
   if (route) {
-    const rewritten = rewritePushToPresent(baseSrc, route.constName, presenterCall, resolvedModal.file, resolvedBase.file, presentation.kind);
-    if (rewritten.changed) {
-      newBaseSrc = rewritten.src;
+    // Find every file under lib/ whose source pushes this route const, and rewrite
+    // the push there. (Reads fresh from disk so earlier conversions in THIS pass
+    // — e.g. a sibling modal we already turned into a presenter — are respected.)
+    const hit = await findRoutePushAcrossLib(projectRoot, route.constName, presenterCall, resolvedModal.file, presentation.kind);
+    if (hit) {
+      triggerFile = hit.file;
+      triggerSrcNew = hit.src;
       triggerHow = 'deterministic';
       triggerWired = 'rewrote-push';
     }
   }
   if (triggerWired === 'none' && opts.model && opts.runModel && !opts.noAi) {
-    // Fuzzy trigger: ask the AI to locate the element/handler by label, then we
-    // still apply a deterministic rewrite around the returned snippet.
+    // Fuzzy trigger: ask the AI to locate the element/handler by label on the base
+    // screen, then apply a deterministic rewrite around the returned snippet.
+    const baseSrc = await fs.readFile(resolvedBase.file, 'utf8');
     const located = await aiLocateTrigger(modal, baseSrc, opts);
     if (located) {
       const rewritten = rewriteSnippetToPresent(baseSrc, located, presenterCall, resolvedModal.file, resolvedBase.file);
       if (rewritten.changed) {
-        newBaseSrc = rewritten.src;
+        triggerFile = resolvedBase.file;
+        triggerSrcNew = rewritten.src;
         triggerHow = 'ai';
         triggerWired = 'rewrote-push';
       }
     }
   }
-  if (triggerWired === 'none') {
-    return { skip: `could not locate trigger '${modal.trigger.element ?? '?'}' on base ${baseScreen.canonicalId} (no push to modal route, AI unavailable/failed) — left untouched` };
+  if (triggerWired === 'none' || !triggerFile || triggerSrcNew == null) {
+    return { skip: `could not locate trigger '${modal.trigger.element ?? '?'}' for modal ${modal.canonicalId} (no push to modal route '${route?.routeString ?? '?'}' anywhere in lib/, AI unavailable/failed) — left untouched` };
   }
 
   // Build the converted modal source: surface widget + present() presenter.
-  const newModalSrc = buildOverlayModalSource(modalSrc, resolvedModal.widgetClass, shape, presentation.kind);
+  // Re-read the modal file FRESH here: a SIBLING modal's conversion earlier in
+  // this same pass may have rewritten a chained push INSIDE this modal (e.g. a
+  // loader's initState `pushReplacementNamed` → `SuccessModal.present(context)`)
+  // AND added the corresponding import. Transforming the stale top-of-function
+  // read would clobber those edits (the undefined-name + missing-import class of
+  // regression). If the trigger file we just rewrote IS this modal file, fold its
+  // rewritten content in too so both edits compose.
+  let freshModalSrc = await fs.readFile(resolvedModal.file, 'utf8');
+  if (triggerFile === resolvedModal.file && triggerSrcNew != null) freshModalSrc = triggerSrcNew;
+  const newModalSrc = buildOverlayModalSource(freshModalSrc, resolvedModal.widgetClass, shape, presentation.kind);
   if (!newModalSrc) return { skip: `could not rewrite modal ${resolvedModal.widgetClass} into a presentable surface (unexpected shape)` };
 
   // Remove the dead route from the router + routes table.
   const removedRoute = route?.constName;
 
   if (!opts.dryRun) {
+    // Write the trigger file FIRST (unless it's the modal file — then the modal
+    // write below carries both edits), then the modal file.
+    if (triggerFile !== resolvedModal.file) await fs.writeFile(triggerFile, triggerSrcNew, 'utf8');
     await fs.writeFile(resolvedModal.file, newModalSrc, 'utf8');
-    await fs.writeFile(resolvedBase.file, newBaseSrc, 'utf8');
     if (route) await removeRouteFromRouter(projectRoot, route, resolvedModal);
   }
 
@@ -417,11 +442,65 @@ async function convertFlutterModal(
       presentation: presentation.kind,
       presentationSource: presentation.source,
       modalFile: path.relative(projectRoot, resolvedModal.file),
-      baseFile: path.relative(projectRoot, resolvedBase.file),
+      baseFile: path.relative(projectRoot, triggerFile),
       trigger: { element: modal.trigger.element, wired: triggerWired, how: triggerHow },
       ...(removedRoute ? { removedRoute } : {}),
     },
   };
+}
+
+/**
+ * Scan every lib/ Dart file for a push to `routeConstName` and rewrite the FIRST
+ * file that pushes it (push → presenter call). Returns the file + rewritten src,
+ * or null if no file pushes the route. Reads fresh from disk so conversions made
+ * earlier in the same pass are honoured. Screen files are scanned first (a real
+ * button trigger is preferred over a chained pushReplacement inside a sibling
+ * modal), then the rest of lib/.
+ */
+async function findRoutePushAcrossLib(
+  projectRoot: string,
+  routeConstName: string,
+  presenterCall: string,
+  modalFile: string,
+  kind: PresentationKind,
+): Promise<{ file: string; src: string } | null> {
+  const screensDir = path.join(projectRoot, 'lib', 'screens');
+  const constRe = new RegExp(`AppRoutes\\.${escapeRe(routeConstName)}\\b`);
+
+  // Gather candidate files: screens first, then any other lib/ dart file.
+  const candidates: string[] = [];
+  try {
+    for (const f of (await fs.readdir(screensDir)).filter((x) => x.endsWith('.dart')).sort()) {
+      candidates.push(path.join(screensDir, f));
+    }
+  } catch { /* no screens dir */ }
+
+  // Collect every file that references the route const, with its source.
+  const pushers: Array<{ abs: string; src: string }> = [];
+  for (const abs of candidates) {
+    let src: string;
+    try { src = await fs.readFile(abs, 'utf8'); } catch { continue; }
+    if (constRe.test(src)) pushers.push({ abs, src });
+  }
+  if (!pushers.length) return null;
+
+  // Rank: a real forward push (pushNamed / push) ranks above a chained
+  // pushReplacement, so a button trigger wins over an auto-advance; the modal's
+  // own file ranks last (a self-advancing loader).
+  const score = (abs: string, src: string): number => {
+    if (abs === modalFile) return -10;
+    let s = 0;
+    if (/\.pushNamed\s*\([^;]*?AppRoutes\.|Navigator\.pushNamed\s*\(\s*context\s*,\s*AppRoutes\.|\.push\s*\([^;]*?AppRoutes\./.test(src)) s += 2;
+    if (/pushReplacement/.test(src)) s += 1;
+    return s;
+  };
+  pushers.sort((a, b) => score(b.abs, b.src) - score(a.abs, a.src));
+
+  for (const { abs, src } of pushers) {
+    const rewritten = rewritePushToPresent(src, routeConstName, presenterCall, modalFile, abs, kind);
+    if (rewritten.changed) return { file: abs, src: rewritten.src };
+  }
+  return null;
 }
 
 // ── modal source rewrite (Scaffold route → surface + present()) ──────────────
@@ -455,10 +534,13 @@ function buildOverlayModalSource(
   // The sheet child expression as written inside the Stack (e.g.
   // `_SuccessSheet(onLogin: …, onAccountSetup: …)`). Pull the whole call.
   const sheetExpr = shape.sheetClass ? extractCallExpr(buildBody, shape.sheetClass) : null;
-  // Surface returned by build(): prefer the sheet expr; else the whole prior body
-  // minus the backdrop/scrim (fallback: keep body as-is — still valid, just not
-  // de-backdropped). We keep it simple + safe: if we found a sheet expr, return it.
-  const surface = sheetExpr ?? null;
+  // Surface returned by build(): prefer the named sheet expr; else the FOREGROUND
+  // Stack child (the non-backdrop, non-scrim widget — e.g. the loading modals'
+  // `Center(child: PingBadgeLoader(...))`), so the converted build() returns ONLY
+  // the modal content (the presenter supplies the barrier; embedding the backdrop
+  // again would double-render the base). Only if neither resolves do we keep the
+  // body as-is (still valid as an overlay surface).
+  const surface = sheetExpr ?? extractForegroundSurface(buildBody, shape.backdropClass);
 
   let newBuildBody: string;
   if (surface) {
@@ -466,7 +548,7 @@ function buildOverlayModalSource(
     // still pop the route the presenter pushes, which is correct for a sheet.
     newBuildBody = `\n    return ${surface};\n  `;
   } else {
-    // Couldn't isolate a sheet — leave the original body (returns the Stack). The
+    // Couldn't isolate a surface — leave the original body (returns the Stack). The
     // presenter still presents it as an overlay surface; visuals preserved.
     newBuildBody = buildBody;
   }
@@ -489,18 +571,32 @@ function buildOverlayModalSource(
   return out;
 }
 
-/** Remove a relative `'screen_*.dart'` import line iff `className` (the symbol the
- *  import provided, e.g. the backdrop screen) no longer appears anywhere in the
- *  file. A still-used import is left intact. */
+/** Remove the relative import line that provided `className` (the backdrop screen
+ *  class) iff that class no longer appears anywhere in the file after
+ *  de-backdropping. Reference-checked + idempotent; only the SPECIFIC import that
+ *  provides the dead backdrop class is dropped (resolved by the file's basename,
+ *  which the build names as the class's snake_case — `CreateAccountScreen` →
+ *  `create_account_screen.dart`, `IPhone…63Screen` → `screen_290_4323.dart`), so
+ *  other still-used screen imports (e.g. a chained present target) are preserved. */
 function pruneDeadImportFor(src: string, className: string): string {
   const refs = (src.match(new RegExp(`\\b${escapeRe(className)}\\b`, 'g')) || []).length;
   if (refs > 0) return src; // backdrop class still referenced → keep the import.
-  // Backdrop class fully gone. Drop the relative screen import that provided it.
-  // Only act when there is EXACTLY ONE relative screen import (the backdrop's) —
-  // if a modal happens to import several screens, leave them rather than guess.
+  // Backdrop class fully gone. Match the relative import whose basename matches
+  // this class. Two naming conventions: semantic (create_account_screen.dart) and
+  // machine (screen_<frame>.dart). We can resolve the semantic one from the class
+  // name; the machine one we fall back to single-screen-import heuristic.
+  const snakeName = className
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/[^A-Za-z0-9]+/g, '_')
+    .toLowerCase()
+    .replace(/^_+|_+$/g, '');
+  // a) semantic: an import ending in `<snake>.dart` (e.g. create_account_screen.dart).
+  const semRe = new RegExp(`^import\\s+'[^']*\\b${escapeRe(snakeName)}\\.dart';\\n`, 'm');
+  if (semRe.test(src)) return src.replace(semRe, '');
+  // b) machine: exactly one `screen_<frame>.dart` relative import → that's it.
   const screenImports = [...src.matchAll(/^import\s+'(?:\.\/)?screen_[A-Za-z0-9_]+\.dart';\n/gm)];
-  if (screenImports.length !== 1) return src;
-  return src.replace(screenImports[0][0], '');
+  if (screenImports.length === 1) return src.replace(screenImports[0][0], '');
+  return src;
 }
 
 /** Emit the static presenter for the chosen kind. */
@@ -733,14 +829,20 @@ async function aiPickPresentation(modal: CanonModal, modalSrc: string, opts: Mod
     'Reply with EXACTLY one JSON object, no prose:',
     '{"kind":"bottomSheet"|"dialog"|"fullOverlay"}',
   ].join('\n');
+  // AI picks the presentation kind ONLY when structure is ambiguous (the
+  // deterministic shape inspector is primary). Not an AI-PURPOSE step. On
+  // failure: conservative no-op (keep the structural default), but LOGGED
+  // (RFC §0.1 — not silent).
   try {
     const { text } = await opts.runModel(opts.model, prompt, opts.env ?? process.env, opts.projectRoot, { format: 'text' });
     const m = text.match(/\{[\s\S]*\}/);
-    if (!m) return null;
+    if (!m) { console.log('[ai:modal-present] status=empty — no JSON; keeping structural default'); return null; } // eslint-disable-line no-console
     const k = (JSON.parse(m[0]) as { kind?: string }).kind;
     if (k === 'bottomSheet' || k === 'dialog' || k === 'fullOverlay') return k;
     return null;
-  } catch {
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.log(`[ai:modal-present] status=error — ${(e as Error).message.slice(0, 80)}; keeping structural default`);
     return null;
   }
 }
@@ -760,13 +862,18 @@ async function aiLocateTrigger(modal: CanonModal, baseSrc: string, opts: ModalOv
     'Reply with EXACTLY one JSON object, no prose:',
     '{"snippet":"<verbatim contiguous source substring>"}',
   ].join('\n');
+  // AI fuzzily LOCATES the trigger when the deterministic route-push rewrite
+  // didn't find it. Not an AI-PURPOSE step. On failure: conservative no-op
+  // (trigger stays unwired → reported), but LOGGED (RFC §0.1 — not silent).
   try {
     const { text } = await opts.runModel(opts.model, prompt, opts.env ?? process.env, opts.projectRoot, { format: 'text' });
     const m = text.match(/\{[\s\S]*\}/);
-    if (!m) return null;
+    if (!m) { console.log('[ai:modal-locate] status=empty — no JSON; trigger left unwired'); return null; } // eslint-disable-line no-console
     const s = (JSON.parse(m[0]) as { snippet?: string }).snippet;
     return s && baseSrc.includes(s) ? s : null;
-  } catch {
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.log(`[ai:modal-locate] status=error — ${(e as Error).message.slice(0, 80)}; trigger left unwired`);
     return null;
   }
 }
@@ -858,6 +965,88 @@ function injectPresenter(src: string, name: string, method: string): string {
   return src.slice(0, insertAt) + `\n${method}\n` + src.slice(insertAt);
 }
 
+/**
+ * Extract the FOREGROUND surface widget from a modal-as-route build body: the
+ * single Stack child that is neither the embedded backdrop screen (a
+ * `Positioned.fill` wrapping an `XScreen()`) nor the scrim (a `Positioned.fill`
+ * wrapping a `ColoredBox`/scrim). For the loading modals this is the
+ * `Center(child: PingBadgeLoader(...))`; for a success modal without a *named*
+ * sheet it's whatever aligned content sits over the base. Returns the verbatim
+ * child expression, or null when the shape isn't a recognizable single-foreground
+ * Stack (then the caller keeps the body as-is — safe).
+ */
+function extractForegroundSurface(buildBody: string, backdropClass: string | null): string | null {
+  // Find the Stack(...) call and its children: [ ... ] list.
+  const stackM = /\bStack\s*\(/.exec(buildBody);
+  if (!stackM) return null;
+  const stackOpen = buildBody.indexOf('(', stackM.index);
+  const stackClose = matchParen(buildBody, stackOpen);
+  if (stackClose < 0) return null;
+  const stackArgs = buildBody.slice(stackOpen + 1, stackClose);
+  const childrenM = /\bchildren\s*:\s*(?:const\s*)?\[/.exec(stackArgs);
+  if (!childrenM) return null;
+  const listOpen = stackArgs.indexOf('[', childrenM.index);
+  const listClose = matchBracket(stackArgs, listOpen);
+  if (listClose < 0) return null;
+  const listInner = stackArgs.slice(listOpen + 1, listClose);
+
+  const children = splitTopLevelList(listInner).map((c) => c.trim()).filter(Boolean);
+  if (!children.length) return null;
+
+  const isBackdrop = (c: string): boolean => {
+    if (backdropClass && new RegExp(`\\b${escapeRe(backdropClass)}\\b`).test(c)) return true;
+    // a Positioned.fill wrapping any *Screen() is a backdrop.
+    return /Positioned\.fill/.test(c) && /\b[A-Z][A-Za-z0-9_]*Screen\s*\(/.test(c);
+  };
+  const isScrim = (c: string): boolean =>
+    /ColoredBox/.test(c) || /scrim/i.test(c) || /barrierColor/.test(c) ||
+    (/Positioned\.fill/.test(c) && /Color\(0x[0-9A-Fa-f]{2}0{6}\)|withOpacity|Opacity\b/.test(c));
+
+  const foreground = children.filter((c) => !isBackdrop(c) && !isScrim(c));
+  // Exactly one foreground child → that's the surface. Strip a leading `const`
+  // (the presenter's builder is a runtime closure context; const is preserved
+  // inside the expression where valid anyway).
+  if (foreground.length === 1) return foreground[0].replace(/^const\s+/, '');
+  // Multiple foreground children → wrap them back in a Stack so nothing is lost.
+  if (foreground.length > 1) return `Stack(children: [${foreground.join(', ')}])`;
+  return null;
+}
+
+/** Split a top-level comma-separated list, respecting nested brackets/strings/
+ *  comments. Used for Stack children. */
+function splitTopLevelList(s: string): string[] {
+  const out: string[] = [];
+  let depth = 0; let cur = ''; let inStr: string | null = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]; const prev = s[i - 1];
+    if (inStr) { cur += c; if (c === inStr && prev !== '\\') inStr = null; continue; }
+    if (c === '/' && s[i + 1] === '/') { while (i < s.length && s[i] !== '\n') i++; continue; }
+    if (c === '/' && s[i + 1] === '*') { i += 2; while (i < s.length && !(s[i] === '*' && s[i + 1] === '/')) i++; i++; continue; }
+    if (c === "'" || c === '"') { inStr = c; cur += c; continue; }
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') depth--;
+    if (c === ',' && depth === 0) { if (cur.trim()) out.push(cur); cur = ''; continue; }
+    cur += c;
+  }
+  if (cur.trim()) out.push(cur);
+  return out;
+}
+
+/** Balanced `[]` matcher (string/comment aware) for child lists. */
+function matchBracket(s: string, open: number): number {
+  let depth = 0; let inStr: string | null = null;
+  for (let i = open; i < s.length; i++) {
+    const c = s[i]; const prev = s[i - 1];
+    if (inStr) { if (c === inStr && prev !== '\\') inStr = null; continue; }
+    if (c === '/' && s[i + 1] === '/') { while (i < s.length && s[i] !== '\n') i++; continue; }
+    if (c === '/' && s[i + 1] === '*') { i += 2; while (i < s.length && !(s[i] === '*' && s[i + 1] === '/')) i++; i++; continue; }
+    if (c === "'" || c === '"') { inStr = c; continue; }
+    if (c === '[') depth++;
+    else if (c === ']') { depth--; if (depth === 0) return i; }
+  }
+  return -1;
+}
+
 /** Extract the full call expression `Name( … )` (balanced parens) from text. */
 function extractCallExpr(text: string, name: string): string | null {
   const re = new RegExp(`\\b${escapeRe(name)}\\s*\\(`);
@@ -870,25 +1059,33 @@ function extractCallExpr(text: string, name: string): string | null {
 }
 
 function matchBrace(s: string, open: number): number {
-  let depth = 0; let inStr: string | null = null;
-  for (let i = open; i < s.length; i++) {
-    const c = s[i]; const prev = s[i - 1];
-    if (inStr) { if (c === inStr && prev !== '\\') inStr = null; continue; }
-    if (c === "'" || c === '"') { inStr = c; continue; }
-    if (c === '{') depth++;
-    else if (c === '}') { depth--; if (depth === 0) return i; }
-  }
-  return -1;
+  return matchDelimiter(s, open, '{', '}');
 }
 
 function matchParen(s: string, open: number): number {
+  return matchDelimiter(s, open, '(', ')');
+}
+
+/**
+ * Balanced-delimiter matcher that is STRING- AND COMMENT-aware. A `//` line
+ * comment or `/* … *​/` block comment is skipped so an apostrophe inside a
+ * comment (`don't`, `it's`) does NOT corrupt string tracking — that was the
+ * "unexpected shape" bug: a State class build body whose comment contained
+ * `don't reach` made matchBrace mis-track and return -1, so classBuild() failed
+ * and the modal was rejected. Strings still toggle, escapes still honoured.
+ */
+function matchDelimiter(s: string, open: number, openCh: string, closeCh: string): number {
   let depth = 0; let inStr: string | null = null;
   for (let i = open; i < s.length; i++) {
     const c = s[i]; const prev = s[i - 1];
     if (inStr) { if (c === inStr && prev !== '\\') inStr = null; continue; }
+    // line comment — skip to end of line.
+    if (c === '/' && s[i + 1] === '/') { while (i < s.length && s[i] !== '\n') i++; continue; }
+    // block comment — skip to closing */.
+    if (c === '/' && s[i + 1] === '*') { i += 2; while (i < s.length && !(s[i] === '*' && s[i + 1] === '/')) i++; i++; continue; }
     if (c === "'" || c === '"') { inStr = c; continue; }
-    if (c === '(') depth++;
-    else if (c === ')') { depth--; if (depth === 0) return i; }
+    if (c === openCh) depth++;
+    else if (c === closeCh) { depth--; if (depth === 0) return i; }
   }
   return -1;
 }

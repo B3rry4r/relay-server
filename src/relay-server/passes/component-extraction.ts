@@ -296,14 +296,25 @@ async function confirmEquivalent(
     'Reply with EXACTLY one JSON object, no prose:',
     '{"equivalent": true|false, "reason": "<short>"}',
   ].join('\n');
+  // AI here is a CONFIRMATION GATE over a deterministic candidate (the pass's
+  // primary work is structural dedup). It is NOT an AI-PURPOSE step, so an AI
+  // failure does NOT throw — it falls back to the conservative SAFE no-op (do
+  // not merge). But per RFC §0.1 the failure must NOT be silent: it is LOGGED
+  // and recorded in the rejection `reason` (surfaced in the finalize report).
   try {
     const { text } = await opts.runModel(opts.model, prompt, opts.env ?? process.env, opts.projectRoot, { format: 'text' });
     const m = text.match(/\{[\s\S]*\}/);
-    if (!m) return { equivalent: false, reason: 'AI returned no JSON' };
+    if (!m) {
+      // eslint-disable-next-line no-console
+      console.log('[ai:extract-confirm] status=empty — AI returned no JSON; conservative no-merge');
+      return { equivalent: false, reason: 'AI returned no JSON' };
+    }
     const parsed = JSON.parse(m[0]) as { equivalent?: boolean; reason?: string };
     return { equivalent: !!parsed.equivalent, reason: parsed.reason };
   } catch (e) {
     // On AI failure, be conservative: do NOT merge ambiguous near-matches.
+    // eslint-disable-next-line no-console
+    console.log(`[ai:extract-confirm] status=error — ${(e as Error).message.slice(0, 80)}; conservative no-merge`);
     return { equivalent: false, reason: `AI confirm failed: ${(e as Error).message}` };
   }
 }
@@ -483,13 +494,23 @@ async function extractFlutterGroup(
   const componentPath = path.join('lib', 'components', `${snake(chosenName)}.dart`);
   const absComponent = path.join(projectRoot, componentPath);
 
+  // Resolve imports the lifted body needs for any PUBLIC symbol it references that
+  // is NOT core flutter — sibling components (Disc), shared widgets (PingButton),
+  // theme, etc. Without these the lifted file references undefined symbols (the
+  // `Disc` undefined_method + invalid_constant regression). We index every class
+  // DEFINED under lib/ and emit the relative import for each referenced one.
+  const symbolIndex = await buildSymbolIndex(projectRoot);
+  const componentSource = plan.componentSource(chosenName, (body) =>
+    resolveBodyImports(body, absComponent, projectRoot, symbolIndex),
+  );
+
   if (!dryRun) {
     await fs.mkdir(path.dirname(absComponent), { recursive: true });
-    await fs.writeFile(absComponent, plan.componentSource(chosenName), 'utf8');
+    await fs.writeFile(absComponent, componentSource, 'utf8');
     // Rewrite each occurrence: remove the private class, rewrite call sites,
     // ensure the import, and remove now-dead file-local consts that were lifted.
     for (const g of group) {
-      await rewriteOccurrenceFile(projectRoot, g, chosenName, componentPath, plan);
+      await rewriteOccurrenceFile(projectRoot, g, chosenName, componentPath, plan, symbolIndex);
     }
   }
 
@@ -504,9 +525,90 @@ async function extractFlutterGroup(
   };
 }
 
+// ── Symbol → defining-file index (for resolving lifted-body imports) ──────────
+
+/** Build an index of every PUBLIC top-level Dart class/enum/mixin/typedef defined
+ *  under lib/ → its absolute defining file. Used to import any symbol a lifted
+ *  component body references (sibling components, shared widgets, theme types).
+ *  Skips lib/screens (screen classes are never imported by a shared component). */
+async function buildSymbolIndex(projectRoot: string): Promise<Map<string, string>> {
+  const index = new Map<string, string>();
+  const libDir = path.join(projectRoot, 'lib');
+  const screensDir = path.join(projectRoot, 'lib', 'screens');
+  const walk = async (dir: string): Promise<void> => {
+    let entries: import('fs').Dirent[];
+    try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const abs = path.join(dir, e.name);
+      if (e.isDirectory()) { if (abs !== screensDir) await walk(abs); continue; }
+      if (!e.name.endsWith('.dart')) continue;
+      const src = await fs.readFile(abs, 'utf8');
+      const declRe = /^(?:abstract\s+|sealed\s+|base\s+|final\s+|interface\s+|mixin\s+)*(?:class|enum|mixin|extension|typedef)\s+([A-Z][A-Za-z0-9_]*)\b/gm;
+      let m: RegExpExecArray | null;
+      while ((m = declRe.exec(src)) !== null) {
+        // First definition wins (stable); a symbol defined twice is ambiguous —
+        // keep the first so the resolver is deterministic.
+        if (!index.has(m[1])) index.set(m[1], abs);
+      }
+    }
+  };
+  await walk(libDir);
+  return index;
+}
+
+/** Identifiers that are core Dart/Flutter (always available via material.dart) and
+ *  must NOT be import-resolved. A conservative allow-list of the common ones the
+ *  lifted bodies use; anything else Capitalized is looked up in the symbol index. */
+const CORE_FLUTTER_SYMBOLS = new Set<string>([
+  'SizedBox', 'Container', 'Stack', 'Positioned', 'Row', 'Column', 'Center', 'Align',
+  'Padding', 'Expanded', 'Flexible', 'Spacer', 'Text', 'Icon', 'Image', 'Color',
+  'Colors', 'Widget', 'BuildContext', 'EdgeInsets', 'BoxDecoration', 'BorderRadius',
+  'Border', 'BorderSide', 'BoxShape', 'BoxShadow', 'Offset', 'Alignment', 'Radius',
+  'TextStyle', 'FontWeight', 'TextAlign', 'TextOverflow', 'MainAxisAlignment',
+  'CrossAxisAlignment', 'MainAxisSize', 'Flex', 'Wrap', 'Opacity', 'ClipRRect',
+  'ClipOval', 'DecoratedBox', 'ColoredBox', 'FittedBox', 'AspectRatio', 'Transform',
+  'GestureDetector', 'InkWell', 'Material', 'IconData', 'Icons', 'LinearGradient',
+  'RadialGradient', 'Gradient', 'Theme', 'ThemeData', 'MediaQuery', 'Scaffold',
+  'AppBar', 'Card', 'Divider', 'CircleAvatar', 'ConstrainedBox', 'BoxConstraints',
+  'SingleChildScrollView', 'ListView', 'Flexible', 'IntrinsicHeight', 'IntrinsicWidth',
+  'Visibility', 'AnimatedContainer', 'Duration', 'Curves', 'TextSpan', 'RichText',
+  'Key', 'ValueKey', 'GlobalKey', 'Navigator', 'StatelessWidget', 'StatefulWidget',
+  'State', 'CircularProgressIndicator', 'TextDecoration', 'FontStyle', 'Matrix4',
+  'LayoutBuilder', 'Builder', 'SafeArea', 'Positioned', 'Shadow', 'StackFit',
+  'Clip', 'OverflowBox', 'Stack', 'TextDirection', 'VerticalDirection', 'Axis',
+]);
+
+/** Resolve the relative-import lines a lifted body needs for PUBLIC symbols it
+ *  references (constructor calls `Foo(` and static refs `Foo.`) that are defined
+ *  under lib/ but outside core flutter. Returns dedup'd `import '...';` lines. */
+function resolveBodyImports(
+  body: string,
+  componentAbsFile: string,
+  _projectRoot: string,
+  symbolIndex: Map<string, string>,
+): string[] {
+  const refs = new Set<string>();
+  const re = /\b([A-Z][A-Za-z0-9_]*)\s*[(.]/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(body)) !== null) refs.add(m[1]);
+  const lines = new Set<string>();
+  for (const sym of refs) {
+    if (CORE_FLUTTER_SYMBOLS.has(sym)) continue;
+    const def = symbolIndex.get(sym);
+    if (!def) continue;                         // unknown → can't resolve; leave it
+    if (def === componentAbsFile) continue;     // self
+    let rel = path.relative(path.dirname(componentAbsFile), def).split(path.sep).join('/');
+    if (!rel.startsWith('.')) rel = `./${rel}`;
+    lines.add(`import '${rel}';`);
+  }
+  return [...lines].sort();
+}
+
 interface ParamPlan {
   params: DartCtorParam[];
-  componentSource: (name: string) => string;
+  /** Build the component file. `extraImports(body)` resolves imports for any
+   *  PUBLIC symbol the lifted body references beyond core flutter. */
+  componentSource: (name: string, extraImports: (body: string) => string[]) => string;
   /** Map: for each occurrence file, the call-site arg expression per param. */
   callArgs: Map<string, Record<string, string>>;
   /** File-local const identifiers that were lifted into params (per file). */
@@ -628,7 +730,8 @@ function makePlan(
 
   const params: DartCtorParam[] = spanParams.map((s) => ({ name: s.name, type: s.type, required: true, positional: false }));
 
-  const componentSource = (name: string): string => buildFlutterComponentFromSpans(name, baseBody, existing, spanParams);
+  const componentSource = (name: string, extraImports: (body: string) => string[]): string =>
+    buildFlutterComponentFromSpans(name, baseBody, existing, spanParams, extraImports);
 
   return { params, componentSource, callArgs, liftedConsts };
 }
@@ -824,6 +927,7 @@ function buildFlutterComponentFromSpans(
   baseBody: string,
   existing: DartCtorParam[],
   spanParams: SpanParam[],
+  extraImports: (body: string) => string[],
 ): string {
   // Replace spans right-to-left so offsets stay valid.
   let body = baseBody;
@@ -869,10 +973,17 @@ function buildFlutterComponentFromSpans(
   // always needed (StatelessWidget/Widget/BuildContext).
   const usesSvg = /\bSvgPicture\b/.test(body);
   const usesTheme = /\bAppTheme\b/.test(body);
+  // Any OTHER public symbol the body references (sibling components like Disc,
+  // shared widgets like PingButton) is resolved to its lib/ defining file and
+  // imported — otherwise the lifted file references undefined symbols.
+  const resolved = extraImports(body).filter(
+    (imp) => !imp.includes('app_theme.dart') && !imp.includes('flutter_svg'),
+  );
   const imports = [
     "import 'package:flutter/material.dart';",
     ...(usesSvg ? ["import 'package:flutter_svg/flutter_svg.dart';"] : []),
     ...(usesTheme ? ["import '../theme/app_theme.dart';"] : []),
+    ...resolved,
   ];
 
   return [
@@ -902,6 +1013,7 @@ async function rewriteOccurrenceFile(
   componentName: string,
   componentPath: string,
   plan: ParamPlan,
+  symbolIndex: Map<string, string>,
 ): Promise<void> {
   let src = await fs.readFile(unit.file, 'utf8');
 
@@ -916,7 +1028,7 @@ async function rewriteOccurrenceFile(
 
   // 4) Prune declarations the lift left dead — but ONLY when they now have ZERO
   //    references in the file (provably safe; a still-used const is left alone).
-  src = pruneDeadDeclarations(src);
+  src = pruneDeadDeclarations(src, projectRoot, symbolIndex);
 
   await fs.writeFile(unit.file, src, 'utf8');
 }
@@ -925,7 +1037,7 @@ async function rewriteOccurrenceFile(
  *  file: top-level `const _x = …;`, private top-level getters/vars, and unused
  *  package imports (flutter_svg / theme). Each is removed only if its name has
  *  no other occurrence — so anything still in use is preserved. Idempotent. */
-function pruneDeadDeclarations(src: string): string {
+function pruneDeadDeclarations(src: string, projectRoot?: string, symbolIndex?: Map<string, string>): string {
   let out = src;
   // a) Unused file-local `const TYPE _name = …;`
   for (const [name] of collectFileConsts(out)) {
@@ -950,6 +1062,32 @@ function pruneDeadDeclarations(src: string): string {
   ];
   for (const [imp, used] of importChecks) {
     if (imp.test(out) && !used.test(out.replace(imp, ''))) out = out.replace(imp, '');
+  }
+  // d) Generalized: prune relative imports (`../components/x.dart`, `../widgets/x.
+  //    dart`, `./x.dart`) whose provided class(es) are no longer referenced after
+  //    the lift removed the only usage (the `disc.dart` unused_import regression).
+  //    Resolve each relative import to its file via the symbol index reverse map;
+  //    drop the import only when NONE of the classes that file defines appear in
+  //    the remaining source. Reference-checked + idempotent + safe (skipped when
+  //    we cannot resolve the file → never guesses).
+  if (projectRoot && symbolIndex) {
+    const fileToClasses = new Map<string, string[]>();
+    for (const [sym, file] of symbolIndex) {
+      const arr = fileToClasses.get(file) ?? [];
+      arr.push(sym);
+      fileToClasses.set(file, arr);
+    }
+    const relImportRe = /^import\s+'((?:\.{1,2}\/)[^']+\.dart)';\n/gm;
+    const lines = [...out.matchAll(relImportRe)].map((m) => ({ full: m[0], rel: m[1] }));
+    for (const { full, rel } of lines) {
+      // resolve the import path against lib/screens (occurrence files live there).
+      const abs = path.resolve(path.join(projectRoot, 'lib', 'screens'), rel);
+      const classes = fileToClasses.get(abs);
+      if (!classes || !classes.length) continue;        // unknown file → keep (safe)
+      const body = out.replace(full, '');
+      const stillUsed = classes.some((c) => new RegExp(`\\b${escapeRe(c)}\\b`).test(body));
+      if (!stillUsed) out = out.replace(full, '');
+    }
   }
   return out;
 }
@@ -996,13 +1134,34 @@ function rewriteCallSites(
     // Strip a trailing comma so we don't emit `...,, p0:` (a parse error).
     const inner = src.slice(openIdx + 1, close).trim().replace(/,\s*$/, '');
     const mergedInner = [inner, ...extra].filter(Boolean).join(', ');
-    // Drop `const` — new params may be runtime values (params/theme getters).
-    out += src.slice(last, m.index) + `${componentName}(${mergedInner})`;
+    // Preserve `const` when the original call was const AND we added no runtime
+    // params (params/theme getters are non-const) AND the existing args are all
+    // const-safe. Dropping const where it was valid regresses prefer_const_
+    // constructors (an analyze info bump); keeping it where it's now invalid
+    // would be an error. A param-free lift (e.g. const MastercardLogo()) stays
+    // const; a parameterized one drops it.
+    const wasConst = !!m[1];
+    const keepConst = wasConst && extra.length === 0 && constSafeArgs(mergedInner);
+    const prefix = keepConst ? 'const ' : '';
+    out += src.slice(last, m.index) + `${prefix}${componentName}(${mergedInner})`;
     last = close + 1;
     callRe.lastIndex = last;
   }
   out += src.slice(last);
   return out;
+}
+
+/** True when an arg list contains only const-evaluable expressions (no method
+ *  calls on lowercase receivers, no `context`, no lower-case identifiers that
+ *  would be runtime values). Conservative: any lowercase identifier followed by
+ *  `(` or `.` (a getter/method call) or a bare `context` makes it non-const. */
+function constSafeArgs(inner: string): boolean {
+  if (!inner.trim()) return true;
+  if (/\bcontext\b/.test(inner)) return false;
+  // A lowercase identifier used as a call/getter (theme.grotesk(), foo.bar) is
+  // runtime. Capitalized ctors and Type.staticConst are const-safe.
+  if (/\b[a-z][A-Za-z0-9_]*\s*[(.]/.test(inner)) return false;
+  return true;
 }
 
 function matchParen(s: string, open: number): number {

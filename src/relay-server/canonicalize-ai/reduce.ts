@@ -52,7 +52,7 @@ import fsSync from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { resolveProjectRoot, createTerminalEnv, resolveWorkspace } from '../runtime';
-import { runModel } from '../ai-routes';
+import { requireModel } from '../ai-observability';
 import { LEXICON_VERSION, WIDGET_KIND_SET } from './lexicon';
 import type { FrameDescriptor, DescriptorWidget } from './descriptor-schema';
 import type { FrozenLexicon } from './reconcile';
@@ -371,13 +371,22 @@ function buildRefinePrompt(
 
 async function aiRefine(
   norm: NormalizedDescriptor[], flow: ReduceFlow, ambiguousFrames: string[], unboundModals: string[],
-  projectId: string, root: string, modelId: string,
+  projectId: string, root: string, modelId: string, runId?: string,
 ): Promise<AiRefinement | null> {
   if (!ambiguousFrames.length && !unboundModals.length) return null;   // nothing to adjudicate
-  try {
-    const env = createTerminalEnv(resolveWorkspace());
-    const prompt = buildRefinePrompt(norm, flow, ambiguousFrames, unboundModals);
-    const { text } = await runModel('claude', prompt, env, root, { agent: false, modelId, projectId });
+  // AI-PURPOSE (Phase 1c refine). The model is REQUIRED to fire here — a no-fire /
+  // error must SURFACE (RFC §0.1), not be swallowed into a null that masquerades
+  // as "AI ran, no corrections". A genuine fired-but-no-actionable-output reply
+  // legitimately returns null (the deterministic anchor stands). We use
+  // requireModel so empty/error THROWS; the validator only rejects non-JSON.
+  const env = createTerminalEnv(resolveWorkspace());
+  const prompt = buildRefinePrompt(norm, flow, ambiguousFrames, unboundModals);
+  {
+    const { text } = await requireModel('claude', prompt, env, root, {
+      agent: false, modelId,
+      log: { projectId, runId, step: 'canon.reduce' },
+      validate: (t) => { const j = extractJson(t); return j && typeof j === 'object' ? j : undefined; },
+    });
     const parsed = extractJson(text);
     if (!parsed || typeof parsed !== 'object') return null;
     const knownFrames = new Set(norm.map(n => n.frameId));
@@ -396,8 +405,6 @@ async function aiRefine(
       }
     }
     return { splitOut, modalBase };
-  } catch {
-    return null;
   }
 }
 
@@ -405,6 +412,8 @@ async function aiRefine(
 
 export interface ReduceOptions {
   modelId?: string;
+  /** durable run id — threaded into the AI log ctx so firing proof lands in the run log. */
+  runId?: string;
   /** skip the AI confirm/refine (deterministic-only) — for tests / offline. */
   skipAi?: boolean;
   /** write canonical.json (default true). */
@@ -503,7 +512,7 @@ export async function reduceToCanonical(
     if (refinement) {
       aiRefined = true;
     } else {
-      const ai = await aiRefine(norm, safeFlow, ambiguousFrames, unboundModals, projectId, root, opts.modelId ?? 'sonnet');
+      const ai = await aiRefine(norm, safeFlow, ambiguousFrames, unboundModals, projectId, root, opts.modelId ?? 'sonnet', opts.runId);
       if (ai) {
         refinement = ai;
         aiRefined = true;

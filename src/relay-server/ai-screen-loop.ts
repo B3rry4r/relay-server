@@ -46,6 +46,11 @@ import {
   canonicalizeRun, writeCanonical, readCanonical, generateFlutterSkeleton,
   type Canonical, type CanonicalScreen,
 } from './canonicalize';
+import { canonicalize as aiCanonicalize, type CanonicalizeOptions } from './canonicalize-ai/orchestrate';
+import { aiModelToCanonical } from './canonicalize-ai/to-canonical';
+import type { DescribeFrameInput } from './canonicalize-ai/describe';
+import type { ReduceFlow } from './canonicalize-ai/reduce';
+import { AiStepError } from './ai-observability';
 import { generateDesignSystem, seedContextWithThemeApi, ensureMainWired, consolidateDesignTokens, ensureScreenPreviewEntry, type ThemeTokens } from './design-system';
 import { prepScreen, ensureIrComplete, getIrData, runAssetPass, type PrepConfig, type LocalizedAsset } from './reference-render';
 import type { FigFrame, FlowGraph } from './agent-packet';
@@ -1048,8 +1053,39 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
         canonical = persisted;
         await appendRunLog(projectId, runId, `[canon] reusing persisted canonicalization (${canonical.screens.length} screen(s), ${canonical.components.length} component(s)) — prep already done, skipping re-canonicalize + skeleton + fold`);
       } else {
+        // RFC v2 §4.2: the HEAVY-AI chain is THE canonicalization. The deterministic
+        // clusterer is ONLY reachable as an EXPLICIT, logged `degraded` mode
+        // (run.canonMode === 'deterministic'); default is AI. An AI no-fire FAILS LOUD
+        // — it parks at HITL Checkpoint 0, never silently falls back (RFC §0.1/§0.4).
+        const degraded = run.canonMode === 'deterministic';
+        let canonFailed = false;
         try {
-          canonical = canonicalizeRun(run.screens, run.flow);
+          if (degraded) {
+            await appendRunLog(projectId, runId, `[canon] DEGRADED: deterministic mode (AI canonicalization skipped by request)`);
+            canonical = canonicalizeRun(run.screens, run.flow);
+          } else {
+            // Heavy-AI chain (1a describe → 1b reconcile → 1c reduce → 1d adjudicate).
+            // describeFrame renders references + reads the IR tree itself off the
+            // figStorageKey, so we pass only frames (id/name/dims) + the flow + ids.
+            const figKey = run.figStorageKey;
+            if (!figKey) throw new Error('AI canonicalization requires run.figStorageKey (ingest must run first)');
+            const aiFrames: DescribeFrameInput[] = run.screens.map(s => ({
+              frameId: s.frameId,
+              frameName: s.frameName,
+              width: s.spec?.width,
+              height: s.spec?.height,
+            }));
+            const aiFlow: ReduceFlow | undefined = run.flow
+              ? { entryFrameId: run.flow.entryFrameId ?? null, connections: run.flow.connections ?? [] }
+              : undefined;
+            const aiOpts: CanonicalizeOptions = { runId, ...(run.modelId ? { modelId: run.modelId } : {}) };
+            await appendRunLog(projectId, runId, `[canon] heavy-AI canonicalization — 1a describe → 1b reconcile → 1c reduce → 1d adjudicate over ${aiFrames.length} frame(s)`);
+            const result = await aiCanonicalize(projectId, figKey, aiFrames, aiFlow, aiOpts);
+            await appendRunLog(projectId, runId, `[canon] AI chain done — described ${result.stages.describedFrames} frame(s), lexicon-AI-merged=${result.stages.lexiconAiMerged}, reduce-AI-refined=${result.stages.reduceAiRefined}, adjudicate-vision=${result.stages.adjudicateVisionRan}, ${result.drilled.length} drilled, ${result.changes.length} correction(s)`);
+            // Adapter: CanonicalModel → the build flow's Canonical (folds top-level
+            // modals into base screens, rebuilds frameMap, maps states/templates/flow).
+            canonical = aiModelToCanonical(result.canonical);
+          }
           await writeCanonical(projectRoot, runId, canonical);
           // P5 (RFC §4.2/§4.9): persist frame-map.json — the SINGLE identity axis
           // (frameId → canonicalId). All durability + route derivation key on this.
@@ -1086,9 +1122,22 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
           await appendRunLog(projectId, runId, `[canon] ${run.screens.length} frame(s) → ${canonical.screens.length} canonical screen(s), ${canonical.components.length} component(s)${folded ? `, ${folded} folded state/modal frame(s)` : ''}${canonical.warnings.length ? ` — ${canonical.warnings.length} warning(s)` : ''}`);
           for (const w of canonical.warnings) await appendRunLog(projectId, runId, `[canon] WARNING: ${w}`);
         } catch (e: any) {
+          // RFC §0.1/§0.4 — NO SILENT FALLBACK. The heavy-AI canon is THE
+          // canonicalization; if the AI did not fire (AiStepError) or the pass
+          // otherwise failed, we must NOT quietly drop to a deterministic guess or to
+          // per-frame builds. Park the run at HITL Checkpoint 0 (flow gate) so a human
+          // sees the failure + can fix the flow / re-run / opt into degraded mode.
           canonical = undefined;
-          await appendRunLog(projectId, runId, `[canon] canonicalization failed (falling back to per-frame build): ${e?.message || 'unknown'}`);
+          canonFailed = true;
+          const aiNoFire = e instanceof AiStepError;
+          const reason = aiNoFire
+            ? `AI canonicalization did not fire (${e.message})`
+            : `canonicalization failed: ${e?.message || 'unknown'}`;
+          await appendRunLog(projectId, runId, `[canon] ERROR — ${reason}`);
+          await appendRunLog(projectId, runId, `[canon] no silent fallback (RFC §0.1) — parking at HITL Checkpoint 0 (flow). ${degraded ? 'Deterministic (degraded) mode failed — fix the run inputs.' : 'Re-run, fix the flow, or set canonMode=\'deterministic\' to opt into the explicit degraded clusterer.'}`);
+          await pauseAtCheckpoint(projectId, runId, 'flow', `canonicalization failed — ${reason}`);
         }
+        if (canonFailed) return;          // STOP — the run is parked, awaiting a human.
       }
       // Build the lead maps from the canonical (fresh OR reused) — these drive which
       // frames are buildable targets and carry each screen's canonical context.
@@ -1691,17 +1740,42 @@ export function registerScreenLoopRoutes(app: Express): void {
         await appendRunLog(projectId, run.id, `[prep] done — ${prepared}/${frameIds.length} screen(s) prepared; starting build`);
 
         // (b.5) ASSET PASS: semantic-rename the union of localized assets + emit the
-        // framework's resources/constants file (best-effort — never blocks the build).
+        // framework's resources/constants file. The semantic rename is AI-REQUIRED
+        // (RFC §0.1 — "a fail is a fail"). If the model does not fire / returns
+        // unusable output it THROWS, and per the no-silent-fallback principle the
+        // run MUST NOT continue to the per-screen build as though assets succeeded —
+        // it PARKS at the design-system gate (HITL 2) so a human sees the failure.
+        let assetAiFailed = false;
         try {
           const assetEnv = createTerminalEnv(resolveWorkspace());
-          const pass = await runAssetPass(projectId, framework, allAssets, b.model, assetEnv);
+          const pass = await runAssetPass(projectId, framework, allAssets, b.model, assetEnv, { runId: run.id });
           if (pass) {
             await appendRunLog(projectId, run.id,
               `[prep] asset pass: ${pass.renamed} named, ${pass.repaired} raster(s) repaired`
               + (pass.resourcesPath ? `, resources → ${pass.resourcesPath}` : ''));
           }
         } catch (e: any) {
-          await appendRunLog(projectId, run.id, `[prep] asset pass skipped: ${e?.message || 'unknown'}`);
+          // A loud AI failure (AiNotFiredError/AiUnusableError) is NOT a silent
+          // "skipped": surface it AND halt the run. No garbage resources file was
+          // written (the throw came before emit).
+          const isAiFail = e?.name === 'AiNotFiredError' || e?.name === 'AiUnusableError';
+          assetAiFailed = isAiFail;
+          await appendRunLog(projectId, run.id,
+            isAiFail
+              ? `[prep] asset pass FAILED (AI did not fire — assets NOT renamed, no resources file written): ${e?.message || 'unknown'}`
+              : `[prep] asset pass error: ${e?.message || 'unknown'}`);
+        }
+
+        if (assetAiFailed) {
+          // PARK, do NOT proceed to the build. The run is held at the design-system
+          // gate (resumable): the asset pipeline is the contract the per-screen
+          // build consumes, so building on a failed asset pass would ship
+          // Material-icon substitutions / opaque paths and report "applied".
+          await appendRunLog(projectId, run.id,
+            `[prep] HALTED at design-system gate — asset pipeline (AI semantic rename) failed; run will not build until assets resolve (re-run prep or fix model access, then approve)`);
+          await pauseAtCheckpoint(projectId, run.id, 'design-system',
+            'Asset pipeline failed: the AI semantic-rename did not fire / returned unusable output, so assets were NOT renamed and no resources file was written. The per-screen build is blocked because it consumes the asset pipeline. Resolve model access and re-run the asset pass, then approve to continue.');
+          return;
         }
 
         // (c) Kick off the server-side orchestration.
