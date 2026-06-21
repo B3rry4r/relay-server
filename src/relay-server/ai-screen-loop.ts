@@ -1751,7 +1751,7 @@ export function registerScreenLoopRoutes(app: Express): void {
           const pass = await runAssetPass(projectId, framework, allAssets, b.model, assetEnv, { runId: run.id });
           if (pass) {
             await appendRunLog(projectId, run.id,
-              `[prep] asset pass: ${pass.renamed} named, ${pass.repaired} raster(s) repaired`
+              `[prep] asset pass: ${pass.gathered} gathered → ${pass.unique} unique-by-content, ${pass.renamed} named, ${pass.duplicatesDeleted} duplicate(s) deleted, ${pass.repaired} raster(s) repaired`
               + (pass.resourcesPath ? `, resources → ${pass.resourcesPath}` : ''));
           }
         } catch (e: any) {

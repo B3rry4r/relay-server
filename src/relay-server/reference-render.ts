@@ -600,22 +600,42 @@ export async function runAssetPass(
   model: AIModel,
   env: NodeJS.ProcessEnv,
   opts: { runId?: string; noAi?: boolean } = {},
-): Promise<{ resourcesPath: string | null; renamed: number; repaired: number } | null> {
+): Promise<{ resourcesPath: string | null; renamed: number; repaired: number; gathered: number; unique: number; duplicatesDeleted: number } | null> {
   const root = resolveProjectRoot(projectId);
   if (!root || assets.length === 0) return null;
 
-  // Dedupe by relPath (frames share assets).
+  // Dedupe by relPath (frames share assets) — first list-level dedup.
   const byPath = new Map<string, LocalizedAsset>();
   for (const a of assets) if (!byPath.has(a.relPath)) byPath.set(a.relPath, a);
-  const uniq = [...byPath.values()];
-  const repaired = uniq.filter(a => a.repaired).length;
+  const distinctPaths = [...byPath.values()];
+
+  // ── CONTENT-HASH DEDUP (RFC v2 §3 Phase 5) ─────────────────────────────────
+  // Ping has 368 asset FILES but only ~77 unique by CONTENT (the same icon was
+  // exported once per component-instance). Dedup-by-path keeps all 368 and would
+  // AI-name the same icon 32× — wasteful and the cause of rate-limit failures.
+  // We group every distinct-path asset by the sha256 of its BYTES (scoped by
+  // format+kind so an svg icon never merges with a png image), pick ONE
+  // deterministic representative per group, AI-name ONLY the representatives,
+  // map EVERY original path → the representative's symbol, and delete the
+  // redundant duplicate files. The deletes are reversible: asset-phase snapshots
+  // assets/ in full bytes and restoreSnapshot recreates pass-deleted files.
+  const dedup = await dedupAssetsByContent(root, distinctPaths);
+  const representatives = dedup.representatives;       // ~77 (one per content group)
+  const repaired = representatives.filter(a => a.repaired).length;
 
   // 1. Semantic rename — AI-REQUIRED, fails loud (propagated to the caller).
-  const renamed = await renameAssetsSemantic(root, uniq, model, env, {
+  //    ONLY the representatives are named → ~77 AI calls, not 368.
+  const renamed = await renameAssetsSemantic(root, representatives, model, env, {
     projectId, runId: opts.runId, noAi: opts.noAi,
   });
 
-  // 2. Emit the framework-agnostic resources file from the renamed paths.
+  // Index the renamed representatives by their ORIGINAL (pre-rename) relPath so we
+  // can resolve every duplicate's representative → its final symbol/newPath.
+  const renamedByOldPath = new Map<string, typeof renamed[number]>();
+  for (const r of renamed) renamedByOldPath.set(r.oldRelPath, r);
+
+  // 2. Emit the framework-agnostic resources file from the renamed REPRESENTATIVES
+  //    (one symbol per unique content — NOT one per duplicate file).
   let resourcesPath: string | null = null;
   if (canEmitResources(framework)) {
     const emitted = emitResources(framework, renamed.map(r => ({
@@ -629,25 +649,118 @@ export async function runAssetPass(
     }
   }
 
-  // 3. Persist the re-point mapping (IR node / old path → semantic path) under
-  //    .uix so a later re-point pass can swap opaque references for semantic ones.
+  // 3. DELETE the redundant duplicate files (every non-representative original).
+  //    The representative was renamed in place by renameAssetsSemantic; the
+  //    duplicates pointed at the same bytes and are now redundant. After this,
+  //    assets/ holds only the ~77 representatives.
+  let duplicatesDeleted = 0;
+  for (const dupRel of dedup.duplicatePaths) {
+    try {
+      const abs = path.join(root, dupRel);
+      if (fsSync.existsSync(abs)) { await fs.rm(abs, { force: true }); duplicatesDeleted++; }
+    } catch { /* best-effort; the map below still repoints it to the representative */ }
+  }
+
+  // 4. Persist the re-point mapping covering ALL ORIGINALS. Every one of the
+  //    original paths (representatives AND deleted duplicates) maps to the single
+  //    representative's symbol/newPath, so a screen referencing ANY old duplicate
+  //    path repoints to the one symbol. A representative may carry several source
+  //    nodeIds (one per duplicate instance) under `nodeIds`.
   try {
     const mapDir = path.join(root, '.uix');
     await fs.mkdir(mapDir, { recursive: true });
+    const mapEntries: Array<Record<string, unknown>> = [];
+    for (const a of distinctPaths) {
+      const repRel = dedup.repByOriginal.get(a.relPath);
+      if (!repRel) continue; // should not happen — every original belongs to a group
+      const r = renamedByOldPath.get(repRel);
+      if (!r) continue;
+      const group = dedup.groupNodeIds.get(repRel) ?? [];
+      mapEntries.push({
+        nodeId: a.nodeId,                 // THIS original's node id
+        name: r.name,
+        oldPath: a.relPath,               // THIS original's old path (all 368 covered)
+        newPath: r.newRelPath,            // the single representative's new path
+        format: r.format, kind: r.kind,
+        nodeIds: group,                   // all source nodeIds collapsed into this symbol
+      });
+    }
     await fs.writeFile(
       path.join(mapDir, 'asset-map.json'),
-      JSON.stringify({
-        framework, resourcesPath,
-        assets: renamed.map(r => ({
-          nodeId: r.nodeId, name: r.name,
-          oldPath: r.oldRelPath, newPath: r.newRelPath,
-          format: r.format, kind: r.kind,
-        })),
-      }, null, 2),
+      JSON.stringify({ framework, resourcesPath, assets: mapEntries }, null, 2),
     );
   } catch { /* mapping is an optimization for the re-point pass */ }
 
-  return { resourcesPath, renamed: renamed.length, repaired };
+  return {
+    resourcesPath,
+    renamed: renamed.length,
+    repaired,
+    gathered: distinctPaths.length,
+    unique: representatives.length,
+    duplicatesDeleted,
+  };
+}
+
+/**
+ * CONTENT-HASH DEDUP. Group `assets` (distinct by path already) by the sha256 of
+ * their on-disk BYTES, scoped by `format:kind` so a vector icon and a raster image
+ * never merge even on an (impossible) byte collision. For each group pick ONE
+ * deterministic REPRESENTATIVE — the lexicographically smallest relPath — so the
+ * result is idempotent across runs. Returns the representatives (to be AI-named),
+ * the duplicate paths (to be deleted), a map original→representative path (so the
+ * asset-map can point every original at the representative's symbol), and the
+ * collapsed source nodeIds per representative.
+ *
+ * Pure/deterministic apart from the file reads. An asset whose file can't be read
+ * is treated as its OWN unique group (never silently merged with another).
+ */
+async function dedupAssetsByContent(
+  root: string,
+  assets: LocalizedAsset[],
+): Promise<{
+  representatives: LocalizedAsset[];
+  duplicatePaths: string[];
+  repByOriginal: Map<string, string>;      // original relPath → representative relPath
+  groupNodeIds: Map<string, string[]>;     // representative relPath → all source nodeIds
+}> {
+  // group key → members (sorted later by relPath for determinism).
+  const groups = new Map<string, LocalizedAsset[]>();
+  let missingSeq = 0;
+  for (const a of assets) {
+    let key: string;
+    try {
+      const bytes = await fs.readFile(path.join(root, a.relPath));
+      const hash = crypto.createHash('sha256').update(bytes).digest('hex');
+      key = `${a.format}:${a.kind}:${hash}`;
+    } catch {
+      // Unreadable → its own group (a missing file is not a duplicate of anything).
+      key = `unreadable:${a.relPath}:${missingSeq++}`;
+    }
+    const arr = groups.get(key);
+    if (arr) arr.push(a); else groups.set(key, [a]);
+  }
+
+  const representatives: LocalizedAsset[] = [];
+  const duplicatePaths: string[] = [];
+  const repByOriginal = new Map<string, string>();
+  const groupNodeIds = new Map<string, string[]>();
+
+  for (const members of groups.values()) {
+    // Deterministic representative: lexicographically smallest relPath.
+    const sorted = [...members].sort((x, y) => x.relPath.localeCompare(y.relPath));
+    const rep = sorted[0];
+    representatives.push(rep);
+    const nodeIds: string[] = [];
+    for (const m of sorted) {
+      repByOriginal.set(m.relPath, rep.relPath);
+      if (m.nodeId) nodeIds.push(m.nodeId);
+      if (m.relPath !== rep.relPath) duplicatePaths.push(m.relPath);
+    }
+    groupNodeIds.set(rep.relPath, nodeIds);
+  }
+  // Stable representative order (mirrors gatherExistingAssets' sort) for idempotence.
+  representatives.sort((a, b) => a.relPath.localeCompare(b.relPath));
+  return { representatives, duplicatePaths, repByOriginal, groupNodeIds };
 }
 
 // ── gather EXISTING on-disk assets (for the resolve / already-built-app path) ────

@@ -80,6 +80,10 @@ export interface AssetPhaseReport {
   error?: string;
   /** assets discovered on disk (the input). */
   gathered: number;
+  /** unique-by-content representatives kept after dedup (the AI-named set). */
+  unique: number;
+  /** redundant byte-identical duplicate files deleted from disk. */
+  duplicatesDeleted: number;
   /** files renamed to semantic names (runAssetPass). */
   renamed: number;
   /** of `renamed`, how many were harness-repaired rasters (always 0 here — gathered
@@ -115,7 +119,8 @@ export async function runAssetPhaseOnBuild(
   const framework = await detectFramework(projectRoot);
 
   const base: AssetPhaseReport = {
-    status: 'skipped', framework, gathered: 0, renamed: 0, repaired: 0,
+    status: 'skipped', framework, gathered: 0, unique: 0, duplicatesDeleted: 0,
+    renamed: 0, repaired: 0,
     resourcesPath: null, assetMapPath: null, repointed: 0, repointSkipped: 0,
     warnings: [], baselineAnalyze: null, finalAnalyze: null,
   };
@@ -218,6 +223,8 @@ export async function runAssetPhaseOnBuild(
   // DESIGN; the single check after both steps is the only meaningful gate.
   let renamed = 0;
   let repaired = 0;
+  let unique = 0;
+  let duplicatesDeleted = 0;
   let resourcesPath: string | null = null;
   let repointed = 0;
   let repointSkipped = 0;
@@ -225,14 +232,16 @@ export async function runAssetPhaseOnBuild(
   let threw: Error | null = null;
 
   try {
-    log(`[asset-phase] runAssetPass: semantic-rename${noAi ? ' (DEGRADED: no-AI, hint names)' : ' (AI-required)'} + emit resources + asset-map…`);
+    log(`[asset-phase] runAssetPass: content-dedup + semantic-rename${noAi ? ' (DEGRADED: no-AI, hint names)' : ' (AI-required)'} + emit resources + asset-map…`);
     const ap = await runAssetPass(projectId, framework, gathered, model, env, { noAi });
     if (ap) {
       renamed = ap.renamed;
       repaired = ap.repaired;
+      unique = ap.unique;
+      duplicatesDeleted = ap.duplicatesDeleted;
       resourcesPath = ap.resourcesPath;
     }
-    log(`[asset-phase] runAssetPass: renamed=${renamed}, resources=${resourcesPath ?? 'none'}`);
+    log(`[asset-phase] runAssetPass: gathered=${base.gathered} unique-by-content=${unique} renamed=${renamed} duplicatesDeleted=${duplicatesDeleted}, resources=${resourcesPath ?? 'none'}`);
 
     log('[asset-phase] repointAssetUsage: rewrite code refs → AppAssets symbols…');
     const rp = await repointAssetUsage(projectId, {
@@ -254,6 +263,8 @@ export async function runAssetPhaseOnBuild(
 
   base.renamed = renamed;
   base.repaired = repaired;
+  base.unique = unique;
+  base.duplicatesDeleted = duplicatesDeleted;
   base.resourcesPath = resourcesPath;
   base.assetMapPath = fsSync.existsSync(assetMapAbs) ? ASSET_MAP_REL : null;
   base.repointed = repointed;

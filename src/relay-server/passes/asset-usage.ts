@@ -245,33 +245,56 @@ function toLowerCamel(s: string): string {
 }
 
 export function buildAssetIndex(map: AssetMap): AssetIndex {
-  const assets: IndexedAsset[] = [];
-  // resources-emit dedupes colliding keys by suffixing _2, _3… in emit order
-  // (icons first then images, alphabetical within). Mirror that EXACTLY so our
-  // symbol keys line up with what app_assets.dart actually declares.
-  const sorted = [...(map.assets ?? [])].sort((a, b) =>
+  // CONTENT-DEDUP AWARE. After content-hash dedup the asset-map lists EVERY
+  // original path (e.g. all 368 of Ping's), but many entries share a single
+  // representative `newPath`/symbol (the ~77 uniques). resources-emit only
+  // declares ONE symbol per representative, so the symbol keys MUST be computed
+  // over the DISTINCT representatives (keyed by newPath) — NOT over all 368
+  // entries, or the dedup-suffix counter (`_2`, `_3`…) would invent keys that
+  // app_assets.dart never declares and every re-point would be skipped.
+  const entries = [...(map.assets ?? [])];
+
+  // 1) Collapse to representatives by newPath (the symbols actually emitted).
+  const repByNewPath = new Map<string, AssetMapEntry>();
+  for (const e of entries) {
+    const np = normPath(e.newPath);
+    if (np && !repByNewPath.has(np)) repByNewPath.set(np, e);
+  }
+
+  // 2) Compute symbol keys over the representatives in resources-emit's EXACT
+  //    order (icons first then images, alphabetical within) so they line up with
+  //    what app_assets.dart declares.
+  const reps = [...repByNewPath.values()].sort((a, b) =>
     a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === 'icon' ? -1 : 1);
   const used = new Map<string, number>();
-  for (const e of sorted) {
+  const assets: IndexedAsset[] = [];
+  const repSymbolByNewPath = new Map<string, IndexedAsset>();
+  for (const e of reps) {
     let key = toLowerCamel(e.name);
     const n = used.get(key) ?? 0;
     used.set(key, n + 1);
     if (n > 0) key = `${key}_${n + 1}`;
-    assets.push({
+    const ia: IndexedAsset = {
       name: e.name, oldPath: e.oldPath, newPath: e.newPath,
       format: e.format, kind: e.kind, nodeId: e.nodeId, symbolKey: key,
-    });
+    };
+    assets.push(ia);
+    repSymbolByNewPath.set(normPath(e.newPath), ia);
   }
 
   const byPath = new Map<string, IndexedAsset>();
   const bySymbol = new Map<string, IndexedAsset>();
-  for (const a of assets) {
-    bySymbol.set(a.symbolKey, a);
-    for (const p of [a.oldPath, a.newPath]) {
+  for (const a of assets) bySymbol.set(a.symbolKey, a);
+
+  // 3) Map EVERY original path (all 368) → its representative's symbol, so a code
+  //    ref to any deleted duplicate's old path still repoints to the one symbol.
+  //    Also map each representative's newPath. First writer wins on a collision.
+  for (const e of entries) {
+    const rep = repSymbolByNewPath.get(normPath(e.newPath));
+    if (!rep) continue;
+    for (const p of [e.oldPath, e.newPath]) {
       const norm = normPath(p);
-      // First writer wins for a colliding path; never silently overwrite (a path
-      // colliding between two assets is an ambiguity we must not resolve blindly).
-      if (norm && !byPath.has(norm)) byPath.set(norm, a);
+      if (norm && !byPath.has(norm)) byPath.set(norm, rep);
     }
   }
   return { assets, byPath, bySymbol };
