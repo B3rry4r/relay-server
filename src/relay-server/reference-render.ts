@@ -23,6 +23,9 @@ import { resolveProjectRoot } from './runtime';
 import { captureUrlScreenshot, serveDir } from './visual-routes';
 import { buildAgentPacket, type FigFrame, type FlowGraph } from './agent-packet';
 import type { ScreenSpec } from './build-run-store';
+import { emitResources, canEmitResources } from './resources-emit';
+import { renameAssetsSemantic } from './asset-naming';
+import type { AIModel } from './ai-adapters';
 
 // ── env knobs ─────────────────────────────────────────────────────────────────
 // UIX base — where the IR / svg-assets / asset bytes live. Configurable so a
@@ -204,6 +207,44 @@ export async function renderFrameReference(args: {
   };
 }
 
+/**
+ * Render ONE node's subtree to a cropped PNG via the headless harness's
+ * node-scoped mode (`?node=<id>`). Used to re-rasterize a single asset node with
+ * the AUTHORITATIVE CanvasKit renderer when UIX's @grida/refig raster is broken
+ * (e.g. the netflix image-fill nodes that come back as a green fragment). The
+ * harness clears TRANSPARENT and crops to the node's own bbox.
+ *
+ * `frameId` is the node's containing frame — still required so the harness loads
+ * that frame's fonts/images/IR context before drawing the single node.
+ */
+export async function renderNodeReference(args: {
+  harnessBaseUrl?: string;
+  figStorageKey: string;
+  frameId: string;
+  nodeId: string;
+  width: number;   // node bb width (logical px)
+  height: number;  // node bb height (logical px)
+  scale?: number;
+}): Promise<{ png: Buffer; widthPx: number; heightPx: number } | null> {
+  const base = args.harnessBaseUrl ?? await harnessOrigin();
+  if (!base) return null;
+  // Small assets get a higher scale so the rasterized icon stays crisp; clamp so a
+  // large illustration node can't produce an enormous capture window.
+  const scale = args.scale && args.scale > 0 ? args.scale : 4;
+  const url = `${base.replace(/\/+$/, '')}/render-harness.html`
+    + `?fig=${encodeURIComponent(args.figStorageKey)}`
+    + `&frame=${encodeURIComponent(args.frameId)}`
+    + `&node=${encodeURIComponent(args.nodeId)}`
+    + `&scale=${scale}`
+    + `&base=${encodeURIComponent(UIX_BASE_URL)}`;
+  const dw = Math.max(1, Math.round(args.width * scale));
+  const dh = Math.max(1, Math.round(args.height * scale));
+  const png = await captureUrlScreenshot(url, dw, dh, 30000, { deviceScale: 1, fullPage: false, disableWebSecurity: true });
+  if (!png) return null;
+  const dims = pngDimensions(png);
+  return { png, widthPx: dims?.width ?? dw, heightPx: dims?.height ?? dh };
+}
+
 // ── asset localization (port of useGeneration.localizeAssetsOnce) ──────────────
 const safeName = (s: string) => s.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'asset';
 
@@ -215,28 +256,98 @@ const safeName = (s: string) => s.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+
  * Returns the number of assets written this call, and the dir-relative paths
  * written (so prepScreen can replay them on a cache hit).
  */
+/** One localized asset, recorded so the resources file + semantic-rename pass can
+ *  reference it. `kind` distinguishes valid SVG icons (kept as-is) from rasters,
+ *  and `repaired` flags an asset re-rasterized via the harness (broken UIX raster). */
+export interface LocalizedAsset {
+  /** dir-relative project path, e.g. `assets/icons/vector_290_4399.svg`. */
+  relPath: string;
+  /** the asset's source IR node id (when known) — feeds semantic naming. */
+  nodeId?: string;
+  format: 'svg' | 'png';
+  kind: 'icon' | 'image';
+  /** true when the PNG was re-rasterized via the harness (UIX raster was broken). */
+  repaired?: boolean;
+}
+
+/** A PNG smaller than this many bytes is treated as suspect (a broken @grida/refig
+ *  raster like the netflix green-fragment is ~900 bytes; valid asset rasters are
+ *  multi-KB). Combined with: any svg-asset flagged format:'png' is harness-rendered. */
+const SUSPECT_PNG_BYTES = 1500;
+
 export async function localizeFrameAssets(
   projectId: string,
   figStorageKey: string,
   frameId: string,
   irData: IrData | null,
   seen: Set<string>,
-): Promise<{ count: number; written: string[] }> {
+  opts: { harnessBaseUrl?: string } = {},
+): Promise<{ count: number; written: string[]; assets: LocalizedAsset[] }> {
   const root = resolveProjectRoot(projectId);
-  if (!root) return { count: 0, written: [] };
+  if (!root) return { count: 0, written: [], assets: [] };
   const written: string[] = [];
+  const assets: LocalizedAsset[] = [];
 
-  const upload = async (url: string, dir: string, name: string): Promise<void> => {
+  const writeBytes = async (dir: string, name: string, bytes: Buffer): Promise<void> => {
+    const abs = path.join(root, dir, name);
+    await fs.mkdir(path.dirname(abs), { recursive: true });
+    await fs.writeFile(abs, bytes);
+  };
+  const upload = async (
+    url: string, dir: string, name: string,
+    meta: { nodeId?: string; format: 'svg' | 'png'; kind: 'icon' | 'image' },
+  ): Promise<void> => {
     const key = `${dir}/${name}`;
     if (seen.has(key)) return;
     const res = await fetch(url);
     if (!res.ok) throw new Error(`fetch ${url} ${res.status}`);
     const bytes = Buffer.from(await res.arrayBuffer());
-    const abs = path.join(root, dir, name);
-    await fs.mkdir(path.dirname(abs), { recursive: true });
-    await fs.writeFile(abs, bytes);
+    await writeBytes(dir, name, bytes);
     seen.add(key);
     written.push(key);
+    assets.push({ relPath: key, nodeId: meta.nodeId, format: meta.format, kind: meta.kind });
+  };
+
+  /**
+   * RASTER REPAIR. A raster asset whose fetched bytes are suspect (tiny/broken) is
+   * re-rasterized via the harness's node-scoped render — the authoritative
+   * CanvasKit path — instead of trusting UIX's @grida/refig output. The png
+   * svg-assets are ALWAYS harness-rendered (UIX rasterizes them with the broken
+   * renderer); upload image-fills are only repaired when their bytes look broken.
+   */
+  const repairRaster = async (
+    nodeId: string, dir: string, name: string, fallbackUrl: string,
+  ): Promise<void> => {
+    const key = `${dir}/${name}`;
+    if (seen.has(key)) return;
+    const n = irData?.nodes?.[nodeId];
+    const bb = n?.bb as { w?: number; h?: number } | undefined;
+    let bytes: Buffer | null = null;
+    if (bb && (bb.w ?? 0) > 0 && (bb.h ?? 0) > 0) {
+      const r = await renderNodeReference({
+        harnessBaseUrl: opts.harnessBaseUrl, figStorageKey, frameId, nodeId,
+        width: bb.w!, height: bb.h!,
+      });
+      // Trust ANY successful harness render: a valid PNG with real dimensions is
+      // authoritative even when it's only a few hundred bytes (a simple icon).
+      // Do NOT gate on byte size here — a correct small icon (e.g. the Netflix
+      // logo at ~800B) is smaller than the broken UIX raster, so a size gate
+      // would wrongly reject it and fall back to the garbage.
+      if (r && r.png.length > 67 && r.widthPx > 0 && r.heightPx > 0) bytes = r.png;
+    }
+    let repaired = true;
+    if (!bytes) {
+      // Harness unavailable (no Chrome / no dist) — fall back to the UIX raster so
+      // the asset is at least present; mark it not-repaired.
+      const res = await fetch(fallbackUrl);
+      if (!res.ok) throw new Error(`fetch ${fallbackUrl} ${res.status}`);
+      bytes = Buffer.from(await res.arrayBuffer());
+      repaired = false;
+    }
+    await writeBytes(dir, name, bytes);
+    seen.add(key);
+    written.push(key);
+    assets.push({ relPath: key, nodeId, format: 'png', kind: dir.endsWith('icons') ? 'icon' : 'image', repaired });
   };
 
   // Walk the frame's subtree to collect the image-fill hashes it actually uses.
@@ -255,27 +366,40 @@ export async function localizeFrameAssets(
   }
 
   const tasks: Array<() => Promise<void>> = [];
-  // 1. Raster image fills referenced by THIS frame.
+  // 1. Raster image fills referenced by THIS frame. Fetch first; repair via harness
+  //    only when the bytes look broken (most photo fills are fine).
   const uploadAssets = await getUploadAssets(figStorageKey);
   for (const a of uploadAssets) {
     if (/svg/i.test(a.format)) continue;
     if (!usedHashes.has(a.hash)) continue;
     let name = safeName(a.originalName || `${a.hash}.${a.format || 'png'}`);
     if (!/\.[a-z0-9]+$/i.test(name)) name += `.${a.format || 'png'}`;
-    tasks.push(() => upload(a.url, 'assets/images', name));
+    const suspect = typeof a.sizeBytes === 'number' && a.sizeBytes > 0 && a.sizeBytes < SUSPECT_PNG_BYTES;
+    if (suspect) {
+      // Find a node carrying this hash so the harness can render it.
+      const nodeId = Object.keys(irData?.nodes ?? {}).find(id => irData!.nodes[id]?.ih === a.hash);
+      if (nodeId) { tasks.push(() => repairRaster(nodeId, 'assets/images', name, a.url)); continue; }
+    }
+    tasks.push(() => upload(a.url, 'assets/images', name, { format: 'png', kind: 'image' }));
   }
-  // 2. Icon + illustration assets under THIS frame (flat vectors → svg, gradient/
-  //    blend/mask/image art server-rasterised → png).
+  // 2. Icon + illustration assets under THIS frame. Flat vectors come back as SVG —
+  //    KEEP THEM AS SVG (never rasterize). Anything UIX flagged format:'png' is a
+  //    raster it produced with the broken @grida/refig renderer — re-rasterize via
+  //    the harness instead.
   const svgAssets = await getSvgAssets(figStorageKey, frameId);
   for (const s of svgAssets) {
-    const dir = s.format === 'png' ? 'assets/images' : 'assets/icons';
-    tasks.push(() => upload(s.url, dir, s.fileName));
+    if (s.format === 'png') {
+      tasks.push(() => repairRaster(s.nodeId, 'assets/images', s.fileName, s.url));
+    } else {
+      tasks.push(() => upload(s.url, 'assets/icons', s.fileName, { nodeId: s.nodeId, format: 'svg', kind: 'icon' }));
+    }
   }
 
   // Bounded concurrency — a big .fig can have 100+ vectors; failures are swallowed
-  // so a missing asset never blocks the build.
+  // so a missing asset never blocks the build. Lower pool than before because
+  // harness renders spawn Chrome (heavier than a plain fetch).
   let done = 0;
-  const POOL = 6;
+  const POOL = 4;
   let idx = 0;
   const worker = async (): Promise<void> => {
     while (idx < tasks.length) {
@@ -284,7 +408,7 @@ export async function localizeFrameAssets(
     }
   };
   await Promise.all(Array.from({ length: Math.min(POOL, tasks.length) }, worker));
-  return { count: done, written };
+  return { count: done, written, assets };
 }
 
 // ── per-frame PREP cache ───────────────────────────────────────────────────────
@@ -321,6 +445,9 @@ export interface PrepResult {
   cacheHit: boolean;
   assetCount: number;
   rendered: boolean;
+  /** assets localized for this frame (raster-repaired + svg), for the resources/
+   *  semantic-rename pass run once over the whole batch. */
+  assets: LocalizedAsset[];
 }
 
 interface PrepMeta {
@@ -390,7 +517,7 @@ export async function prepScreen(
       }
       // Replay assets (dedup-aware): re-fetch + write only assets not already seen
       // this batch. Cheap when the batch shares assets; correct on a fresh project.
-      const { count: assetCount } = await localizeFrameAssets(projectId, cfg.figStorageKey, frame.id, irData, seen);
+      const { count: assetCount, assets } = await localizeFrameAssets(projectId, cfg.figStorageKey, frame.id, irData, seen, { harnessBaseUrl: cfg.harnessBaseUrl });
       const spec: ScreenSpec = {
         packet,
         referenceImagePath: fsSync.existsSync(refAbs) ? refRel : (meta.referenceImagePath || ''),
@@ -398,7 +525,7 @@ export async function prepScreen(
         width: meta.width, height: meta.height,
         refWidthPx: meta.refWidthPx, refHeightPx: meta.refHeightPx,
       };
-      return { spec, cacheHit: true, assetCount, rendered: false };
+      return { spec, cacheHit: true, assetCount, rendered: false, assets };
     } catch { /* fall through to a fresh prep on any cache read error */ }
   }
 
@@ -421,8 +548,8 @@ export async function prepScreen(
     rendered = true;
   }
 
-  // 2. Localize the frame's assets.
-  const { count: assetCount } = await localizeFrameAssets(projectId, cfg.figStorageKey, frame.id, irData, seen);
+  // 2. Localize the frame's assets (broken rasters re-rasterized via the harness).
+  const { count: assetCount, assets } = await localizeFrameAssets(projectId, cfg.figStorageKey, frame.id, irData, seen, { harnessBaseUrl: cfg.harnessBaseUrl });
 
   // 3. Assemble the agent packet.
   const packet = buildAgentPacket({
@@ -450,5 +577,67 @@ export async function prepScreen(
     await fs.writeFile(path.join(cacheDir, 'assets.json'), JSON.stringify({ figStorageKey: cfg.figStorageKey, frameId: frame.id, count: assetCount }, null, 2));
   } catch { /* cache is an optimization */ }
 
-  return { spec, cacheHit: false, assetCount, rendered };
+  return { spec, cacheHit: false, assetCount, rendered, assets };
+}
+
+/**
+ * Whole-batch ASSET PASS: semantic-rename the localized assets, emit the
+ * framework's resources/constants file, and write a re-point mapping so a later
+ * pass can remap IR-path → semantic path. Run ONCE after all frames are prepped
+ * (operates on the union of localized assets). Best-effort — never blocks a build.
+ *
+ * Returns a summary for logging, or null when there's nothing to do.
+ */
+export async function runAssetPass(
+  projectId: string,
+  framework: string,
+  assets: LocalizedAsset[],
+  model: AIModel,
+  env: NodeJS.ProcessEnv,
+): Promise<{ resourcesPath: string | null; renamed: number; repaired: number } | null> {
+  const root = resolveProjectRoot(projectId);
+  if (!root || assets.length === 0) return null;
+
+  // Dedupe by relPath (frames share assets).
+  const byPath = new Map<string, LocalizedAsset>();
+  for (const a of assets) if (!byPath.has(a.relPath)) byPath.set(a.relPath, a);
+  const uniq = [...byPath.values()];
+  const repaired = uniq.filter(a => a.repaired).length;
+
+  // 1. Semantic rename (bounded AI call; falls back to filename hints).
+  const renamed = await renameAssetsSemantic(root, uniq, model, env, { projectId });
+
+  // 2. Emit the framework-agnostic resources file from the renamed paths.
+  let resourcesPath: string | null = null;
+  if (canEmitResources(framework)) {
+    const emitted = emitResources(framework, renamed.map(r => ({
+      name: r.name, relPath: r.newRelPath, format: r.format, kind: r.kind,
+    })));
+    if (emitted) {
+      const abs = path.join(root, emitted.filePath);
+      await fs.mkdir(path.dirname(abs), { recursive: true });
+      await fs.writeFile(abs, emitted.contents);
+      resourcesPath = emitted.filePath;
+    }
+  }
+
+  // 3. Persist the re-point mapping (IR node / old path → semantic path) under
+  //    .uix so a later re-point pass can swap opaque references for semantic ones.
+  try {
+    const mapDir = path.join(root, '.uix');
+    await fs.mkdir(mapDir, { recursive: true });
+    await fs.writeFile(
+      path.join(mapDir, 'asset-map.json'),
+      JSON.stringify({
+        framework, resourcesPath,
+        assets: renamed.map(r => ({
+          nodeId: r.nodeId, name: r.name,
+          oldPath: r.oldRelPath, newPath: r.newRelPath,
+          format: r.format, kind: r.kind,
+        })),
+      }, null, 2),
+    );
+  } catch { /* mapping is an optimization for the re-point pass */ }
+
+  return { resourcesPath, renamed: renamed.length, repaired };
 }

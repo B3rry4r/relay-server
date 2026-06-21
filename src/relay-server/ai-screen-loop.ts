@@ -47,7 +47,7 @@ import {
   type Canonical, type CanonicalScreen,
 } from './canonicalize';
 import { generateDesignSystem, seedContextWithThemeApi, ensureMainWired, consolidateDesignTokens, ensureScreenPreviewEntry, type ThemeTokens } from './design-system';
-import { prepScreen, ensureIrComplete, getIrData, type PrepConfig } from './reference-render';
+import { prepScreen, ensureIrComplete, getIrData, runAssetPass, type PrepConfig, type LocalizedAsset } from './reference-render';
 import type { FigFrame, FlowGraph } from './agent-packet';
 import { computePreflight } from './preflight';
 import { reconcileScreen, reconcileSummary, type ReconcileResult } from './reconcile';
@@ -1603,6 +1603,9 @@ export function registerScreenLoopRoutes(app: Express): void {
         // project; every later screen is forced bootstrapped (shared scaffold).
         // A shared `seen` set dedupes asset writes across the batch.
         const seen = new Set<string>();
+        // Accumulate every frame's localized assets so the asset pass (semantic
+        // rename + resources file) runs ONCE over the whole-app union below.
+        const allAssets: LocalizedAsset[] = [];
         const POOL = 3;
         let prepared = 0;
         let firstDone = false;
@@ -1629,6 +1632,7 @@ export function registerScreenLoopRoutes(app: Express): void {
             const r = await prepScreen(projectId, frame, cfg, seen);
             if (!r) { await appendRunLog(projectId, run.id, `[prep] frame "${frame.name}" — prep failed (no project root)`); return; }
             await persistSpec(frameId, r.spec);
+            if (r.assets?.length) allAssets.push(...r.assets);
             const how = r.cacheHit ? 'cache HIT' : (r.rendered ? 'rendered' : 'rendered (no harness — packet only)');
             await appendRunLog(projectId, run.id, `[prep] frame "${frame.name}" ${how}, localized ${r.assetCount} asset(s)`);
             prepared++;
@@ -1644,6 +1648,20 @@ export function registerScreenLoopRoutes(app: Express): void {
         };
         await Promise.all(Array.from({ length: Math.min(POOL, Math.max(0, order.length - 1)) }, worker));
         await appendRunLog(projectId, run.id, `[prep] done — ${prepared}/${frameIds.length} screen(s) prepared; starting build`);
+
+        // (b.5) ASSET PASS: semantic-rename the union of localized assets + emit the
+        // framework's resources/constants file (best-effort — never blocks the build).
+        try {
+          const assetEnv = createTerminalEnv(resolveWorkspace());
+          const pass = await runAssetPass(projectId, framework, allAssets, b.model, assetEnv);
+          if (pass) {
+            await appendRunLog(projectId, run.id,
+              `[prep] asset pass: ${pass.renamed} named, ${pass.repaired} raster(s) repaired`
+              + (pass.resourcesPath ? `, resources → ${pass.resourcesPath}` : ''));
+          }
+        } catch (e: any) {
+          await appendRunLog(projectId, run.id, `[prep] asset pass skipped: ${e?.message || 'unknown'}`);
+        }
 
         // (c) Kick off the server-side orchestration.
         void runAppLoop(projectId, run.id).catch(() => {});

@@ -9,6 +9,12 @@ import { AI_ADAPTERS, getAdapter, isAIModel, type AIModel, type AIFormat } from 
 import { appendJobLog, finishJobLog, findJobLogByProject, getJobLog, startJobLog } from './ai-job-log';
 import { createClaudeStreamParser } from './ai-stream';
 import { appendTurn, getConversation, listConversations } from './conversation-store';
+import { extractComponents } from './passes/component-extraction';
+import { applyModalOverlays } from './passes/modal-overlay';
+import { repointAssetUsage } from './passes/asset-usage';
+import { verifyFlowWiring } from './passes/flow-wiring';
+import { renameSemantic } from './passes/semantic-rename';
+import { deepenTokensAndCleanup } from './passes/token-cleanup';
 
 const execFileAsync = promisify(execFile);
 
@@ -423,5 +429,223 @@ export function registerAIRoutes(app: Express): void {
     const c = await getConversation(req.params.id);
     if (!c) { res.status(404).json({ error: 'conversation not found' }); return; }
     res.json(c);
+  });
+
+  /**
+   * POST /api/ai/extract-components — Phase 7a production-readiness pass.
+   * De-duplicates structurally-equivalent widgets across an already-built app's
+   * screens into shared components (framework-agnostic). Injects the real
+   * `runModel` for the AI near-match confirmation step.
+   */
+  app.post('/api/ai/extract-components', async (req, res) => {
+    const projectId = (req.body?.projectId ?? '') as string;
+    const projectRoot = resolveProjectRoot(projectId);
+    if (!projectRoot) { res.status(400).json({ error: `Invalid projectId: ${projectId}` }); return; }
+    const model = isAIModel(req.body?.model) ? (req.body.model as AIModel) : undefined;
+    const env = createTerminalEnv(resolveWorkspace());
+    try {
+      const result = await extractComponents(projectId, {
+        projectRoot,
+        model,
+        noAiConfirm: req.body?.noAiConfirm === true || !model,
+        dryRun: req.body?.dryRun === true,
+        env,
+        // Adapt relay's runModel (returns {text, sessionId}) to the pass's seam.
+        runModel: async (m, prompt, e, cwd, opts) => {
+          const { text } = await runModel(m, prompt, e, cwd, { format: opts?.format, projectId });
+          return { text };
+        },
+      });
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: `extract-components failed: ${err?.message ?? err}` });
+    }
+  });
+
+  /**
+   * POST /api/ai/apply-modal-overlays — Phase 7b production-readiness pass.
+   * Converts canonical modals (built as standalone full-screen routes) into true
+   * overlays presented over their base screen (bottom sheet / dialog / barrier
+   * overlay), wired to fire from the real trigger element, and removes the dead
+   * route. Framework-agnostic; flutter is implemented. Injects the real
+   * `runModel` for the ambiguous-only AI seams (presentation kind / fuzzy trigger).
+   */
+  app.post('/api/ai/apply-modal-overlays', async (req, res) => {
+    const projectId = (req.body?.projectId ?? '') as string;
+    const projectRoot = resolveProjectRoot(projectId);
+    if (!projectRoot) { res.status(400).json({ error: `Invalid projectId: ${projectId}` }); return; }
+    const model = isAIModel(req.body?.model) ? (req.body.model as AIModel) : undefined;
+    const env = createTerminalEnv(resolveWorkspace());
+    try {
+      const result = await applyModalOverlays(projectId, {
+        projectRoot,
+        model,
+        noAi: req.body?.noAi === true || !model,
+        dryRun: req.body?.dryRun === true,
+        onlyModals: Array.isArray(req.body?.onlyModals) ? req.body.onlyModals : undefined,
+        env,
+        // Adapt relay's runModel (returns {text, sessionId}) to the pass's seam.
+        runModel: async (m, prompt, e, cwd, opts) => {
+          const { text } = await runModel(m, prompt, e, cwd, { format: opts?.format, projectId });
+          return { text };
+        },
+      });
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: `apply-modal-overlays failed: ${err?.message ?? err}` });
+    }
+  });
+
+  /**
+   * POST /api/ai/repoint-asset-usage — Phase 7c production-readiness pass.
+   * Re-points asset usages in an already-built app: Material-icon substitutions
+   * and opaque/raw asset path string literals → the generated resources symbols
+   * (Flutter: `AppAssets.<name>` via SvgPicture.asset / Image.asset).
+   * Framework-agnostic; flutter is implemented. The DETERMINISTIC path-literal
+   * rewrites + import insertion never use AI; `runModel` is injected ONLY for the
+   * hard semantic icon→asset match.
+   */
+  app.post('/api/ai/repoint-asset-usage', async (req, res) => {
+    const projectId = (req.body?.projectId ?? '') as string;
+    const projectRoot = resolveProjectRoot(projectId);
+    if (!projectRoot) { res.status(400).json({ error: `Invalid projectId: ${projectId}` }); return; }
+    const model = isAIModel(req.body?.model) ? (req.body.model as AIModel) : undefined;
+    const env = createTerminalEnv(resolveWorkspace());
+    try {
+      const result = await repointAssetUsage(projectId, {
+        projectRoot,
+        model,
+        noAi: req.body?.noAi === true || !model,
+        dryRun: req.body?.dryRun === true,
+        onlyFiles: Array.isArray(req.body?.onlyFiles) ? req.body.onlyFiles : undefined,
+        env,
+        // Adapt relay's runModel (returns {text, sessionId}) to the pass's seam.
+        runModel: async (m, prompt, e, cwd, opts) => {
+          const { text } = await runModel(m, prompt, e, cwd, { format: opts?.format, projectId });
+          return { text };
+        },
+      });
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: `repoint-asset-usage failed: ${err?.message ?? err}` });
+    }
+  });
+
+  /**
+   * POST /api/ai/verify-flow-wiring — Phase 7d production-readiness pass.
+   * Verifies that the built app realizes the canonical flow graph: for every
+   * canonical flow edge {from → to via element}, checks the FROM screen actually
+   * navigates to the TO screen's route, and classifies each edge (wired /
+   * wrong-target / missing / dead-trigger / unmapped). Conservatively auto-wires
+   * ONLY dead-trigger edges (empty handler) whose target route unambiguously
+   * exists. Writes the report to .uix/flow-wiring-report.json. Framework-agnostic;
+   * flutter is implemented. The route lookup, nav scan, classification and report
+   * are deterministic; `runModel` is injected ONLY for fuzzy element location
+   * (matching a canonical element label to the actual empty handler in code).
+   */
+  app.post('/api/ai/verify-flow-wiring', async (req, res) => {
+    const projectId = (req.body?.projectId ?? '') as string;
+    const projectRoot = resolveProjectRoot(projectId);
+    if (!projectRoot) { res.status(400).json({ error: `Invalid projectId: ${projectId}` }); return; }
+    const model = isAIModel(req.body?.model) ? (req.body.model as AIModel) : undefined;
+    const env = createTerminalEnv(resolveWorkspace());
+    try {
+      const result = await verifyFlowWiring(projectId, {
+        projectRoot,
+        model,
+        noAi: req.body?.noAi === true || !model,
+        dryRun: req.body?.dryRun === true,
+        noAutoFix: req.body?.noAutoFix === true,
+        onlyFrom: Array.isArray(req.body?.onlyFrom) ? req.body.onlyFrom : undefined,
+        env,
+        // Adapt relay's runModel (returns {text, sessionId}) to the pass's seam.
+        runModel: async (m, prompt, e, cwd, opts) => {
+          const { text } = await runModel(m, prompt, e, cwd, { format: opts?.format, projectId });
+          return { text };
+        },
+      });
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: `verify-flow-wiring failed: ${err?.message ?? err}` });
+    }
+  });
+
+  /**
+   * POST /api/ai/rename-semantic — Phase 7e production-readiness pass.
+   * Renames machine-named built screens to their canonical SEMANTIC names
+   * (file `screen_290_3657.dart` → `link_banks_screen.dart`, class
+   * `IPhone1415Pro57Screen` → `LinkBanksScreen`, route const `c2903657` →
+   * `linkBanks`), rewriting every import / AppRoutes reference / router case /
+   * cross-screen instantiation across lib/**. Only screens that map to a
+   * canonical entry are renamed; unmapped screens keep their machine name.
+   * Writes the rename report to .uix/semantic-rename-report.json. Framework-
+   * agnostic; flutter is implemented. The find/replace, file moves and import
+   * rewrites are deterministic; `runModel` is injected ONLY to derive/sanity-
+   * check an identifier when a canonical name is ambiguous/collides.
+   */
+  app.post('/api/ai/rename-semantic', async (req, res) => {
+    const projectId = (req.body?.projectId ?? '') as string;
+    const projectRoot = resolveProjectRoot(projectId);
+    if (!projectRoot) { res.status(400).json({ error: `Invalid projectId: ${projectId}` }); return; }
+    const model = isAIModel(req.body?.model) ? (req.body.model as AIModel) : undefined;
+    const env = createTerminalEnv(resolveWorkspace());
+    try {
+      const result = await renameSemantic(projectId, {
+        projectRoot,
+        model,
+        noAi: req.body?.noAi === true || !model,
+        dryRun: req.body?.dryRun === true,
+        only: Array.isArray(req.body?.only) ? req.body.only : undefined,
+        env,
+        // Adapt relay's runModel (returns {text, sessionId}) to the pass's seam.
+        runModel: async (m, prompt, e, cwd, opts) => {
+          const { text } = await runModel(m, prompt, e, cwd, { format: opts?.format, projectId });
+          return { text };
+        },
+      });
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: `rename-semantic failed: ${err?.message ?? err}` });
+    }
+  });
+
+  /**
+   * POST /api/ai/deepen-tokens — Phase 7f production-readiness pass (FINAL).
+   * Token deepening + dead-code cleanup. Replaces remaining hardcoded literals
+   * across lib/** with the EXACT design-system token when the literal's value is
+   * identical to a defined token (colors / spacing / radius deterministically;
+   * inline text styles only when the AI confirms semantic equivalence to a named
+   * AppTheme helper). Removes provably-dead code (unused imports driven by
+   * `flutter analyze`, unused private top-level consts, unreferenced private
+   * widget classes). Ends with `flutter analyze` and reports before/after counts.
+   * Writes the report to .uix/token-cleanup-report.json. Framework-agnostic;
+   * flutter is implemented, react is stubbed. All value matching is deterministic;
+   * `runModel` is injected ONLY for the inline-text-style judgment call.
+   */
+  app.post('/api/ai/deepen-tokens', async (req, res) => {
+    const projectId = (req.body?.projectId ?? '') as string;
+    const projectRoot = resolveProjectRoot(projectId);
+    if (!projectRoot) { res.status(400).json({ error: `Invalid projectId: ${projectId}` }); return; }
+    const model = isAIModel(req.body?.model) ? (req.body.model as AIModel) : undefined;
+    const env = createTerminalEnv(resolveWorkspace());
+    try {
+      const result = await deepenTokensAndCleanup(projectId, {
+        projectRoot,
+        model,
+        noAi: req.body?.noAi === true || !model,
+        dryRun: req.body?.dryRun === true,
+        skipAnalyze: req.body?.skipAnalyze === true,
+        onlyFiles: Array.isArray(req.body?.onlyFiles) ? req.body.onlyFiles : undefined,
+        env,
+        // Adapt relay's runModel (returns {text, sessionId}) to the pass's seam.
+        runModel: async (m, prompt, e, cwd, opts) => {
+          const { text } = await runModel(m, prompt, e, cwd, { format: opts?.format, projectId });
+          return { text };
+        },
+      });
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: `deepen-tokens failed: ${err?.message ?? err}` });
+    }
   });
 }
