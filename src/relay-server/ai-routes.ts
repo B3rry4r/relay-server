@@ -76,9 +76,12 @@ function killJob(job: RunningJob): void {
   setTimeout(() => { try { process.kill(-pid, 'SIGKILL'); } catch { /* already dead */ } }, 2500);
 }
 
-// Timeout for AI generation calls (2 minutes for plain text; agentic runs that
-// scaffold + install + build need much longer).
-const AI_TIMEOUT_MS = 120_000;
+// Timeout for non-agent AI generation calls. Was 2 min, but the heavy-AI canon
+// reasoning (1c reduce / 1d adjudicate, holistic over ALL frame descriptors) and the
+// batched asset semantic-rename legitimately exceed 2 min on a large app (25+ frames) —
+// at 120s they were cut off mid-reasoning → threw → parked the whole run. 5 min gives
+// real headroom (rate-limit backoff handles quota; a true hang still caps here). Env-overridable.
+const AI_TIMEOUT_MS = Number(process.env.RELAY_AI_TIMEOUT_MS) || 300_000;
 // A single agent CLI call (implement / verify / fix). 600s let a HUNG or rate-limited
 // call waste 10 minutes before timing out; cap at 5 min (env-overridable). A real
 // screen build/fix completes well under this — a hang shouldn't burn 10 minutes.
