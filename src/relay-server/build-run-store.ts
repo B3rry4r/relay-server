@@ -13,6 +13,7 @@ import * as fsSync from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { resolveProjectRoot } from './runtime';
+import { emitRunEvent } from './run-events';
 
 // 'needs-review' = built but NOT a trustworthy visual match (accepted-but-not-matched,
 // verify said stop, or the deterministic reconciliation failed). It is NOT 'done':
@@ -241,6 +242,36 @@ function deriveStatus(screens: RunScreen[]): RunStatus {
   return 'done';
 }
 
+// ── T18: screen-count summary (for live run:state pushes) ────────────────────
+/** Roll the screens up into the {built,total,needsReview,failed} the live UI shows. */
+export function summarizeRunScreens(screens: RunScreen[]): { built: number; total: number; needsReview: number; failed: number } {
+  let built = 0, needsReview = 0, failed = 0;
+  for (const s of screens) {
+    if (s.status === 'done') built += 1;
+    else if (s.status === 'needs-review') needsReview += 1;
+    else if (s.status === 'failed') failed += 1;
+  }
+  return { built, total: screens.length, needsReview, failed };
+}
+
+// T18: push the run's live state (phase / status / AI / counts) over the run-event
+// bus → socket.ts → connected clients. Best-effort: never throws, never required.
+function emitRunState(run: BuildRun): void {
+  const s = summarizeRunScreens(run.screens);
+  emitRunEvent({
+    type: 'run:state',
+    projectId: run.projectId,
+    runId: run.id,
+    phase: run.phase,
+    status: run.status,
+    ai: run.ai,
+    built: s.built,
+    total: s.total,
+    needsReview: s.needsReview,
+    failed: s.failed,
+  });
+}
+
 // P5: statuses that must NOT be overwritten by a per-screen status derivation —
 // they are run-level lifecycle states owned by the orchestrator / human, not by
 // the screen rollup. (A screen finishing must not unpause an awaiting-approval run.)
@@ -356,6 +387,7 @@ export async function updateRunScreen(
   run.status = STICKY_RUN_STATUS.has(run.status) ? run.status : deriveStatus(run.screens);
   run.updatedAt = new Date().toISOString();
   await fs.writeFile(runFile(root, runId), JSON.stringify(run, null, 2), 'utf-8');
+  emitRunState(run); // T18: push the built/needs-review/failed count change live
   return run;
 }
 
@@ -391,6 +423,7 @@ export async function setRunStatus(projectId: string, runId: string, status: Run
   run.status = status;
   run.updatedAt = new Date().toISOString();
   await fs.writeFile(runFile(root, runId), JSON.stringify(run, null, 2), 'utf-8');
+  emitRunState(run); // T18: push the status change live
 }
 
 // ── T9 (RFC v2 §8.1): set the run's current pipeline phase ───────────────────
@@ -424,6 +457,7 @@ export async function setRunPhase(
     }
     run.updatedAt = new Date().toISOString();
     await fs.writeFile(runFile(root, runId), JSON.stringify(run, null, 2), 'utf-8');
+    emitRunState(run); // T18: push the phase change live (drives the live header)
   } catch { /* phase is observability — never break a run on it */ }
 }
 
@@ -447,6 +481,7 @@ export function bumpRunAi(projectId: string, runId: string, outcome: 'ok' | 'fai
       run.ai = ai;
       run.updatedAt = new Date().toISOString();
       await fs.writeFile(runFile(root, runId), JSON.stringify(run, null, 2), 'utf-8');
+      emitRunState(run); // T18: push the AI tally change live
     } catch { /* tally is observability — never throw */ }
   }).finally(() => { if (aiTallyChain.get(key) === next) aiTallyChain.delete(key); });
   aiTallyChain.set(key, next);
@@ -620,6 +655,11 @@ export async function putAsset(projectId: string, logicalKey: string, bytes: Buf
 
 // ── Durable, replayable run log ────────────────────────────────────────────────
 export async function appendRunLog(projectId: string, runId: string, line: string): Promise<void> {
+  // T18: PUSH the line live the instant it's written so prep/canon/assets (which
+  // have no per-CLI job, so never streamed over ai:progress) stream in real time.
+  // Best-effort + before the file write so a slow/failing disk write can't delay
+  // the live push. A socket emit must never break a run, so it's its own try/catch.
+  try { emitRunEvent({ type: 'run:log', projectId, runId, line }); } catch { /* never break a run */ }
   const root = rootFor(projectId);
   if (!root) return;
   try { await fs.mkdir(runsDir(root), { recursive: true }); await fs.appendFile(runLogFile(root, runId), line + '\n', 'utf-8'); }

@@ -19,6 +19,7 @@ import {
 } from './transcript';
 import { ScrollbackBuffer } from './scrollback';
 import { subscribeJobLog } from './ai-job-log';
+import { subscribeRunEvents } from './run-events';
 import { watchProject, type ProjectWatcher } from './project-watcher';
 import fsSync from 'node:fs';
 
@@ -223,6 +224,24 @@ export function registerSocketHandlers(
   // (single-user relay) — the client filters by jobId/projectId.
   subscribeJobLog((e) => {
     io.emit('ai:progress', { jobId: e.jobKey, kind: e.kind, line: e.line, projectId: e.projectId, done: e.kind === 'done' });
+  });
+
+  // T18: PUSH whole-app run-level activity over WS. The durable run store emits
+  // `run:log` (each [prep]/[canon]/[assets]/[screen …]/[ai:…] line the instant it's
+  // written) and `run:state` (phase / status / AI tally / screen counts the instant
+  // they change). Subscribed ONCE; broadcast to all sockets (single-user relay) — the
+  // client filters by runId. This replaces the 4-8s poll that left the UI on
+  // "Built 0/20" through the whole prep/canonicalize/assets stretch.
+  subscribeRunEvents((e) => {
+    if (e.type === 'run:log') {
+      io.emit('run:log', { projectId: e.projectId, runId: e.runId, line: e.line });
+    } else {
+      io.emit('run:state', {
+        projectId: e.projectId, runId: e.runId,
+        phase: e.phase, status: e.status, ai: e.ai,
+        built: e.built, total: e.total, needsReview: e.needsReview, failed: e.failed,
+      });
+    }
   });
 
   io.use((socket, next) => {
