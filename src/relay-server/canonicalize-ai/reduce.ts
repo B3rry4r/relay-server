@@ -724,7 +724,7 @@ export async function reduceToCanonical(
     return null;
   };
   // Entry: a modal entry falls back to its base screen so the app boots a real route.
-  const entryCanonicalId = safeFlow.entryFrameId ? resolveSource(safeFlow.entryFrameId) : null;
+  let entryCanonicalId = safeFlow.entryFrameId ? resolveSource(safeFlow.entryFrameId) : null;
   const seen = new Set<string>();
   const edges: CanonicalFlowEdge[] = [];
   for (const c of safeFlow.connections) {
@@ -746,8 +746,23 @@ export async function reduceToCanonical(
   if (!safeFlow.connections.length) {
     warnings.push('flow has 0 edges — no navigation graph; nav + modal binding must be set manually (HITL checkpoint)');
   }
-  if (!entryCanonicalId) {
-    warnings.push('no entry screen resolved from the flow — set the app entry manually');
+  // Intelligent entry fallback: if the declared entry isn't among the screens IN THIS
+  // build (e.g. a subset that excludes the set entry frame), infer the flow's START
+  // node — a screen that is a navigation SOURCE but never a TARGET (a root). If the
+  // graph is cyclic / has no clear root, use the first source; finally the first screen.
+  // Only warn when we had to guess, so a normal full-app build is silent.
+  if (!entryCanonicalId && edges.length) {
+    const targets = new Set(edges.map(e => e.to));
+    const sources = [...new Set(edges.map(e => e.from))];
+    const root = sources.find(id => !targets.has(id));
+    entryCanonicalId = root ?? edges[0].from ?? null;
+    if (entryCanonicalId) {
+      warnings.push(`entry frame not in this build set — defaulted to the flow's start screen "${entryCanonicalId}" (override by including the entry frame or setting it manually)`);
+    }
+  }
+  if (!entryCanonicalId && screens.length) {
+    entryCanonicalId = screens[0].canonicalId;
+    warnings.push(`no flow entry resolvable — defaulted to the first screen "${entryCanonicalId}" (set the app entry manually to override)`);
   }
 
   // assemble + hash. contentHash is over the canonical STRUCTURE (ids/relationships),

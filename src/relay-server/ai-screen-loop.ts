@@ -899,15 +899,20 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     kind: 'build' | 'verify' | 'fix',
     prompt: string,
     callOpts: { sessionId?: string } = {},
-  ): Promise<{ text: string; sessionId?: string }> => {
+  ): Promise<{ text: string; sessionId?: string; failed: boolean; rateLimited: boolean }> => {
     const r = await runModelObserved(model, prompt, env, projectRoot, {
       agent: true, modelId, sessionId: callOpts.sessionId,
       log: { projectId: req.projectId, runId: req.runId, jobId, step: stepLabel(kind) },
     });
     // Tolerant: a failed AI turn becomes empty text (already tallied `failed` by the
     // observed path) so the loop's existing handling (build/verify failure → fix or
-    // needs-review) proceeds without a fatal throw.
-    return r.ok ? { text: r.text, sessionId: r.sessionId } : { text: '', sessionId: callOpts.sessionId };
+    // needs-review) proceeds without a fatal throw. We surface `failed`/`rateLimited`
+    // so the caller can retry a transient hang (T25) and never mislabel an UNBUILT
+    // screen as an asset defect (T24). runModelObserved already backed off + retried a
+    // rate-limit several times before returning reason 'rate-limit'.
+    return r.ok
+      ? { text: r.text, sessionId: r.sessionId, failed: false, rateLimited: false }
+      : { text: '', sessionId: callOpts.sessionId, failed: true, rateLimited: r.reason === 'rate-limit' };
   };
   const screenDir = path.join(projectRoot, '.uix', 'screens', sanitizeId(frameId));
   await fs.mkdir(screenDir, { recursive: true });
@@ -951,7 +956,28 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
 
   // 1. IMPLEMENT
   appendJobLog(jobId, `[loop] implement: "${frameName}"`);
-  const impl = await observedBuildCall('build', implementPrompt);
+  let impl = await observedBuildCall('build', implementPrompt);
+  // T25: a transient CLI hang (~7% of build calls) returns empty after the timeout —
+  // retry ONCE before proceeding; a fresh call usually succeeds. (Rate-limit was already
+  // backed-off + retried inside runModelObserved, so don't double-retry that here.)
+  if (impl.failed && !impl.rateLimited) {
+    appendJobLog(jobId, `[loop] implement returned empty (transient hang) — retrying once`);
+    impl = await observedBuildCall('build', implementPrompt);
+  }
+  const implBuilt = !impl.failed;   // T24: only trust an asset-defect verdict if the screen was actually built
+  // T26: PERSISTENT rate limit — runModelObserved already backed off + retried several
+  // times and still got rejected (hourly/daily quota, not a per-minute blip). Do NOT
+  // cascade this + every following screen to spurious "broken/not converging"
+  // needs-review. PAUSE the run RESUMABLY (reuse the graceful-cancel path) so a resume
+  // after the quota resets continues from here; leave this screen pending so it rebuilds.
+  if (impl.rateLimited && req.runId) {
+    await appendRunLog(req.projectId, req.runId, `[run] PAUSED — rate limited: API quota exhausted (after backoff+retry). Resume after your quota resets — built screens are skipped, this one rebuilds.`);
+    try { await updateRunScreen(req.projectId, req.runId, frameId, { status: 'pending' }); } catch { /* non-fatal */ }
+    try { await setRunResumable(req.projectId, req.runId, true); } catch { /* non-fatal */ }
+    try { await setRunStatus(req.projectId, req.runId, 'stopped'); } catch { /* non-fatal */ }
+    markRunCancelled(req.runId);   // orchestrator halts gracefully after this screen
+    return session;
+  }
   if (impl.sessionId) session = impl.sessionId;
   await snapshotLastGen();   // capture this screen's previewEntry before any sibling can clobber it
   // Deterministic per-screen preview entry: render the screen we JUST built (at the
@@ -1051,7 +1077,12 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
       d.severity === 'high'
       && /illustrat|asset|image|graphic|icon|logo|photo/i.test(`${d.area ?? ''} ${d.issue}`)
       && /broke|corrupt|clip|cut[\s-]?off|missing|absent|incomplete|fragment|spill|overflow|empty (panel|white)/i.test(d.issue));
-    if (assetDefect) {
+    // T24: only trust an "asset defect" verdict if the screen actually BUILT this run
+    // (implBuilt) AND we screenshotted a real candidate (hasShot). If the implement
+    // hung/failed, the screen is UNBUILT — everything looks "missing/broken", which is
+    // a build failure to retry, NOT an upstream asset defect. (Screens 61/64 were
+    // mislabeled exactly this way.)
+    if (assetDefect && implBuilt && hasShot) {
       stopReason = `asset defect — ${assetDefect.area ?? 'illustration'}: broken/incomplete upstream asset; needs an ASSET fix (the build agent cannot repair it)`;
       appendJobLog(jobId, `[loop] asset defect detected — stopping early (no agent fix can repair a broken upstream asset): ${assetDefect.area ?? ''}`);
       break;

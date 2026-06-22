@@ -52,7 +52,22 @@ export type RunModelLike = (
 
 // ── Typed result + errors ────────────────────────────────────────────────────
 
-export type AiFailReason = 'empty' | 'error' | 'timeout' | 'no-runner';
+export type AiFailReason = 'empty' | 'error' | 'timeout' | 'no-runner' | 'rate-limit';
+
+/** Classify a CLI error message as a rate-limit / quota rejection (vs a real error
+ *  or a hang). These are recoverable by waiting, so callers back off + retry rather
+ *  than treating the call as a hard failure. */
+export function isRateLimitError(msg: string): boolean {
+  return /rate[\s_-]?limit|usage limit|quota|too many requests|\b429\b|overloaded|capacity|please try again later|resets at/i.test(msg);
+}
+
+// Rate-limit backoff: a per-window (per-minute) limit self-heals if we wait, so a
+// rate-limited call retries with exponential backoff before giving up. A longer
+// (hourly/daily) limit will exhaust these retries → the caller then pauses the run
+// resumably rather than failing the work. Env-overridable.
+const RATE_LIMIT_RETRIES = Number(process.env.RELAY_RATELIMIT_RETRIES) || 4;
+const RATE_LIMIT_BASE_MS = Number(process.env.RELAY_RATELIMIT_BASE_MS) || 20_000;
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export interface AiCallProof {
   /** Unique id for THIS model invocation (proof of firing, appears in the log). */
@@ -195,36 +210,50 @@ export async function runModelObserved(
     return { ok: false, reason: 'no-runner', error: 'no runModel runner bound', callId, durMs, model, tokens: 0 };
   }
 
-  try {
-    const { text, sessionId, tokens: usageTokens } = await runner(model, prompt, env, cwd, {
-      sessionId: opts.sessionId,
-      format: opts.format,
-      agent: opts.agent,
-      modelId: opts.modelId,
-      jobId: ctx.jobId,
-      projectId: ctx.projectId,
-    });
-    const durMs = Date.now() - t0;
-    const out = (text ?? '').trim();
-    // RFC v2 §0.2 — prefer the model's REAL reported usage (input+output tokens
-    // from the stream-json result) over the chars/4 estimate; fall back to the
-    // estimate only when the CLI didn't expose usage.
-    const tokens = (typeof usageTokens === 'number' && usageTokens > 0) ? usageTokens : estTokens(out);
-    if (!out) {
-      logAiLine(ctx, `model=${model} call=${callId} tokens≈0 status=empty dur=${durMs}ms`);
-      return { ok: false, reason: 'empty', callId, durMs, model, tokens: 0 };
+  // Rate-limit-aware: a per-window (per-minute) quota rejection self-heals if we wait,
+  // so a rate-limited call backs off + retries before giving up. A longer (hourly/daily)
+  // limit exhausts the retries → reason 'rate-limit', and the caller pauses the run
+  // resumably (never cascades the work to a spurious "broken" verdict).
+  for (let attempt = 0; ; attempt++) {
+    const aStart = Date.now();
+    try {
+      const { text, sessionId, tokens: usageTokens } = await runner(model, prompt, env, cwd, {
+        sessionId: opts.sessionId,
+        format: opts.format,
+        agent: opts.agent,
+        modelId: opts.modelId,
+        jobId: ctx.jobId,
+        projectId: ctx.projectId,
+      });
+      const durMs = Date.now() - aStart;
+      const out = (text ?? '').trim();
+      // RFC v2 §0.2 — prefer the model's REAL reported usage (input+output tokens
+      // from the stream-json result) over the chars/4 estimate; fall back to the
+      // estimate only when the CLI didn't expose usage.
+      const tokens = (typeof usageTokens === 'number' && usageTokens > 0) ? usageTokens : estTokens(out);
+      if (!out) {
+        logAiLine(ctx, `model=${model} call=${callId} tokens≈0 status=empty dur=${durMs}ms`);
+        return { ok: false, reason: 'empty', callId, durMs, model, tokens: 0 };
+      }
+      const preview = out.replace(/\s+/g, ' ').slice(0, 80);
+      logAiLine(ctx, `model=${model} call=${callId} tokens≈${tokens} status=ok dur=${durMs}ms :: ${preview}`);
+      return { ok: true, text, sessionId, callId, durMs, model, tokens };
+    } catch (err: any) {
+      const durMs = Date.now() - aStart;
+      const stderr = typeof err?.stderr === 'string' ? err.stderr.trim() : '';
+      const msg = (stderr || err?.message || 'unknown error').toString();
+      const rateLimited = isRateLimitError(msg);
+      if (rateLimited && attempt < RATE_LIMIT_RETRIES) {
+        const wait = RATE_LIMIT_BASE_MS * (attempt + 1);   // 20s, 40s, 60s, 80s
+        logAiLine(ctx, `model=${model} call=${callId} status=rate-limit dur=${durMs}ms — backing off ${Math.round(wait / 1000)}s (retry ${attempt + 1}/${RATE_LIMIT_RETRIES})`);
+        await sleep(wait);
+        continue;   // retry the SAME call after the window cools down
+      }
+      const timedOut = (err?.killed && /timed?\s*out|ETIMEDOUT/i.test(msg)) || err?.signal === 'SIGTERM';
+      const reason: AiFailReason = rateLimited ? 'rate-limit' : (timedOut ? 'timeout' : 'error');
+      logAiLine(ctx, `model=${model} call=${callId} tokens≈0 status=${reason === 'rate-limit' ? 'rate-limit' : 'error'} dur=${durMs}ms :: ${msg.slice(0, 80)}`);
+      return { ok: false, reason, error: msg.slice(0, 600), callId, durMs, model, tokens: 0 };
     }
-    const preview = out.replace(/\s+/g, ' ').slice(0, 80);
-    logAiLine(ctx, `model=${model} call=${callId} tokens≈${tokens} status=ok dur=${durMs}ms :: ${preview}`);
-    return { ok: true, text, sessionId, callId, durMs, model, tokens };
-  } catch (err: any) {
-    const durMs = Date.now() - t0;
-    const stderr = typeof err?.stderr === 'string' ? err.stderr.trim() : '';
-    const msg = (stderr || err?.message || 'unknown error').toString();
-    const timedOut = err?.killed && /timed?\s*out|ETIMEDOUT/i.test(msg) || err?.signal === 'SIGTERM';
-    const reason: AiFailReason = timedOut ? 'timeout' : 'error';
-    logAiLine(ctx, `model=${model} call=${callId} tokens≈0 status=error dur=${durMs}ms :: ${msg.slice(0, 80)}`);
-    return { ok: false, reason, error: msg.slice(0, 600), callId, durMs, model, tokens: 0 };
   }
 }
 
