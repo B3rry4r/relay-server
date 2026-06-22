@@ -137,6 +137,17 @@ export interface BuildRun {
   maxIterations?: number;
   verify?: boolean;
   userNotes?: string;
+  // ── T15: prep inputs persisted for resume-during-prep ─────────────────────────
+  // A generation run does SERVER-SIDE prep (reference render + packet + asset pass)
+  // BEFORE runAppLoop. A redeploy mid-prep must re-run prep, which needs these two
+  // inputs that aren't otherwise on the run (figmaUrl drives hybrid IR completion;
+  // scale is the reference export scale). Persisted at createRun so resumeInterruptedRuns
+  // can faithfully re-run prep. `prepDone` flips true once the asset pass completes —
+  // resume uses it to decide prep-vs-build (a run with prepDone resumes straight into
+  // runAppLoop; one without re-runs prep).
+  figmaUrl?: string;
+  scale?: number;
+  prepDone?: boolean;
   flow?: RunFlow;
   sessionId?: string;          // shared CLI session threaded across screens
   // ── P2: written-contract-driven builds (RFC §4.5) ────────────────────────────
@@ -306,6 +317,7 @@ export async function createRun(
   data: {
     kind: BuildRun['kind']; framework?: string; figStorageKey?: string;
     model: string; modelId?: string; maxIterations?: number; verify?: boolean; userNotes?: string;
+    figmaUrl?: string; scale?: number;
     flow?: RunFlow;
     freshSessions?: boolean; parallel?: number; canonical?: boolean;
     checkpoints?: CheckpointGate[];
@@ -322,6 +334,7 @@ export async function createRun(
   const run: BuildRun = {
     id, projectId, kind: data.kind, framework: data.framework, figStorageKey: data.figStorageKey,
     model: data.model, modelId: data.modelId, maxIterations: data.maxIterations, verify: data.verify, userNotes: data.userNotes,
+    figmaUrl: data.figmaUrl, scale: data.scale,
     flow: data.flow,
     freshSessions: data.freshSessions === true ? true : undefined,
     parallel: data.parallel != null ? clampParallel(data.parallel) : undefined,
@@ -409,6 +422,7 @@ export async function restartRun(projectId: string, runId: string): Promise<Buil
   run.checkpoint = undefined;
   run.approvedGates = undefined;
   run.resumable = false;
+  run.prepDone = undefined;    // T15: a restart re-runs prep too
   run.phase = undefined;       // T9: a restart re-runs every phase from the top
   run.status = 'running';
   await saveRun(projectId, run);
@@ -537,6 +551,20 @@ export async function setRunResumable(projectId: string, runId: string, resumabl
   const run = await getRun(projectId, runId);
   if (!run) return;
   run.resumable = resumable;
+  run.updatedAt = new Date().toISOString();
+  await fs.writeFile(runFile(root, runId), JSON.stringify(run, null, 2), 'utf-8');
+}
+
+// ── T15: prep-complete flag (resume-during-prep) ─────────────────────────────
+// Set true once the generation prep (reference render + packet + asset pass)
+// finishes, so a resume after a redeploy knows to go STRAIGHT into runAppLoop
+// instead of re-running prep. Cleared on restart.
+export async function setRunPrepDone(projectId: string, runId: string, prepDone: boolean): Promise<void> {
+  const root = rootFor(projectId);
+  if (!root) return;
+  const run = await getRun(projectId, runId);
+  if (!run) return;
+  run.prepDone = prepDone;
   run.updatedAt = new Date().toISOString();
   await fs.writeFile(runFile(root, runId), JSON.stringify(run, null, 2), 'utf-8');
 }

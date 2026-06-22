@@ -82,16 +82,47 @@ export function getRelayServerRepoRoot(): string {
 }
 
 /**
+ * Resolve a path to its REAL location (following symlinks) for scope checks. A
+ * lexical `path.resolve` does NOT collapse symlinks, so a symlink planted UNDER the
+ * projects root that points OUTSIDE it would pass a prefix check while actually
+ * touching files elsewhere (e.g. the relay-server repo / /workspace). `fs.realpathSync`
+ * collapses the link — but it throws when the path (or a parent) does not yet exist
+ * (a project root being created), so we realpath the deepest EXISTING ancestor and
+ * re-append the non-existent tail. The result is symlink-free for every segment that
+ * actually exists on disk, which is what the scope guard needs.
+ */
+function realpathGuarded(target: string): string {
+  let current = path.resolve(target);
+  const tail: string[] = [];
+  // Walk up until we hit a path that exists, collecting the non-existent tail.
+  for (;;) {
+    try {
+      const real = fsSync.realpathSync(current);
+      return tail.length ? path.join(real, ...tail.reverse()) : real;
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return path.resolve(target); // reached root, nothing existed
+      tail.push(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
+/**
  * HARD SAFETY GATE (RFC §9 / T11): throws unless `projectRoot` is a legitimate
  * MANAGED-PROJECT root — i.e. it lives STRICTLY under the projects root AND is not
  * the projects root, the workspace, a parent dir, or the relay-server repo itself.
  * Any harness operation that mutates files / runs git MUST call this first so the
  * pipeline can never `git add -A`/commit/reset the relay-server repo or /workspace.
+ *
+ * The scope check uses the REAL (symlink-resolved) path of BOTH the candidate and
+ * the projects root, so a symlink under the projects root that points outside it
+ * cannot bypass the lexical prefix check (T15 symlink-escape fix).
  */
 export function assertSafeProjectRoot(projectRoot: string): void {
-  const resolved = path.resolve(projectRoot);
-  const projects = getProjectsRoot();
-  const repo = getRelayServerRepoRoot();
+  const resolved = realpathGuarded(projectRoot);
+  const projects = realpathGuarded(getProjectsRoot());
+  const repo = realpathGuarded(getRelayServerRepoRoot());
   if (resolved === projects || !resolved.startsWith(`${projects}${path.sep}`)) {
     throw new Error(
       `[vc] REFUSING to operate on '${resolved}': not strictly under the projects root (${projects}). ` +

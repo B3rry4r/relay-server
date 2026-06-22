@@ -151,5 +151,9 @@ export function aiModelToCanonical(model: CanonicalModel): Canonical {
     flow,
     frameMap,
     warnings,
+    // T15: carry the AI model's structural contentHash onto the build Canonical so the
+    // per-run sidecar matches the live .uix/canonical.json — enabling verify-pipeline's
+    // auto-tie of the AI-fired proof log without an explicit --runId.
+    ...(model.contentHash ? { contentHash: model.contentHash } : {}),
   };
 }

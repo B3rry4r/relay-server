@@ -387,6 +387,37 @@ export interface LocalizedAsset {
  *  multi-KB). Combined with: any svg-asset flagged format:'png' is harness-rendered. */
 const SUSPECT_PNG_BYTES = 1500;
 
+// ── composite-illustration detection (T19) ─────────────────────────────────────
+// The UIX SVG synthesizer flattens a multi-element illustration (e.g. the Ping
+// `e_walletpana` welcome hero — a man, phone w/ bank-card UI, coins, cart…) into a
+// BROKEN FRAGMENT. The CanvasKit harness renders the same node correctly, so a
+// large/composite vector is routed to `renderNodeReference` (PNG) while small,
+// simple icons stay SVG (the user is adamant SVGs stay SVG where they extract
+// correctly). Conservative: only genuinely large illustrations rasterize.
+//
+// A vector is an ILLUSTRATION (→ rasterize) when its largest dimension is at least
+// this many logical px. An app icon is ~16–48px; a hero illustration is hundreds.
+// 160 sits well above the largest icons and well below any real illustration.
+const ILLUSTRATION_MIN_DIM = 160;
+
+/** Largest dimension (logical px) from an SVG's viewBox / width|height attrs, or 0
+ *  when neither is parseable. Used as the fallback signal when IR bb is missing. */
+function svgMaxDimension(svg: string): number {
+  const head = svg.slice(0, 2000);
+  const vb = /viewBox\s*=\s*["']\s*[-\d.]+[\s,]+[-\d.]+[\s,]+([\d.]+)[\s,]+([\d.]+)/i.exec(head);
+  if (vb) return Math.max(parseFloat(vb[1]), parseFloat(vb[2]));
+  const w = /\bwidth\s*=\s*["']\s*([\d.]+)/i.exec(head);
+  const h = /\bheight\s*=\s*["']\s*([\d.]+)/i.exec(head);
+  if (w || h) return Math.max(w ? parseFloat(w[1]) : 0, h ? parseFloat(h[1]) : 0);
+  return 0;
+}
+
+/** SVG features the UIX synth handles poorly — a vector using them is treated as a
+ *  composite illustration even at moderate size (defensive, not the primary gate). */
+function svgHasComplexPaint(svg: string): boolean {
+  return /<(linearGradient|radialGradient|mask|filter|image|pattern)\b/i.test(svg);
+}
+
 export async function localizeFrameAssets(
   projectId: string,
   figStorageKey: string,
@@ -494,17 +525,59 @@ export async function localizeFrameAssets(
     }
     tasks.push(() => upload(a.url, 'assets/images', name, { format: 'png', kind: 'image' }));
   }
-  // 2. Icon + illustration assets under THIS frame. Flat vectors come back as SVG —
-  //    KEEP THEM AS SVG (never rasterize). Anything UIX flagged format:'png' is a
-  //    raster it produced with the broken @grida/refig renderer — re-rasterize via
-  //    the harness instead.
+  // 2. Icon + illustration assets under THIS frame. SIMPLE flat icons come back as
+  //    SVG and STAY SVG (they extract correctly — never rasterize). But a COMPOSITE
+  //    ILLUSTRATION (large multi-element vector) is flattened into a broken fragment
+  //    by the UIX SVG synth, so it's routed to the CanvasKit harness (PNG) instead
+  //    (T19). Anything UIX already flagged format:'png' is a broken @grida/refig
+  //    raster — also harness-rendered.
   const svgAssets = await getSvgAssets(figStorageKey, frameId);
+  // Per-asset raster/SVG decision is logged so the split is auditable.
+  const svgDecisions: Array<{ fileName: string; nodeId: string; route: 'raster' | 'svg'; dim: number; reason: string }> = [];
   for (const s of svgAssets) {
     if (s.format === 'png') {
+      svgDecisions.push({ fileName: s.fileName, nodeId: s.nodeId, route: 'raster', dim: 0, reason: 'uix-flagged-png' });
       tasks.push(() => repairRaster(s.nodeId, 'assets/images', s.fileName, s.url));
+      continue;
+    }
+    // Decide ILLUSTRATION (→ raster) vs ICON (→ keep SVG). Primary signal: the IR
+    // node bbox (already in memory, authoritative). Fallback: the SVG's own
+    // viewBox/width-height (fetched once). A vector using gradient/mask/image paint
+    // is also treated as an illustration when it is not tiny.
+    const bb = irData?.nodes?.[s.nodeId]?.bb as { w?: number; h?: number } | undefined;
+    let dim = bb && (bb.w ?? 0) > 0 && (bb.h ?? 0) > 0 ? Math.max(bb.w!, bb.h!) : 0;
+    let complexPaint = false;
+    let dimSource = dim > 0 ? 'ir-bb' : 'none';
+    // Fetch the SVG bytes only when we need them: to fill in a missing IR dim, or to
+    // check for synth-hostile paint on a mid-sized vector (≥ half the threshold) that
+    // the dimension gate alone wouldn't catch. A clearly-small icon is never fetched
+    // here (upload() fetches it), and a clearly-large illustration needs no check.
+    if (dim === 0 || (dim >= ILLUSTRATION_MIN_DIM / 2 && dim < ILLUSTRATION_MIN_DIM)) {
+      try {
+        const res = await fetch(s.url);
+        if (res.ok) {
+          const svgText = await res.text();
+          complexPaint = svgHasComplexPaint(svgText);
+          if (dim === 0) { dim = svgMaxDimension(svgText); dimSource = dim > 0 ? 'svg-viewbox' : 'none'; }
+        }
+      } catch { /* fall through with whatever dim we have */ }
+    }
+    const isIllustration = dim >= ILLUSTRATION_MIN_DIM || (complexPaint && dim >= ILLUSTRATION_MIN_DIM / 2);
+    if (isIllustration) {
+      const reason = dim >= ILLUSTRATION_MIN_DIM ? `large(${dimSource})` : 'complex-paint';
+      svgDecisions.push({ fileName: s.fileName, nodeId: s.nodeId, route: 'raster', dim, reason });
+      // Rasterize the composite illustration via the harness; rename to .png so the
+      // asset map/resources treat it as a raster image (mirrors repairRaster output).
+      const pngName = s.fileName.replace(/\.svg$/i, '') + '.png';
+      tasks.push(() => repairRaster(s.nodeId, 'assets/images', pngName, s.url));
     } else {
+      svgDecisions.push({ fileName: s.fileName, nodeId: s.nodeId, route: 'svg', dim, reason: 'simple-icon' });
       tasks.push(() => upload(s.url, 'assets/icons', s.fileName, { nodeId: s.nodeId, format: 'svg', kind: 'icon' }));
     }
+  }
+  if (svgDecisions.length && process.env.RELAY_ASSET_DEBUG) {
+    console.log(`[localizeFrameAssets] vector split for frame ${frameId}:`);
+    for (const d of svgDecisions) console.log(`  ${d.route.toUpperCase().padEnd(6)} dim=${String(Math.round(d.dim)).padStart(4)} ${d.reason.padEnd(14)} ${d.fileName} (${d.nodeId})`);
   }
 
   // Bounded concurrency — a big .fig can have 100+ vectors; failures are swallowed

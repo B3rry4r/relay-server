@@ -510,15 +510,41 @@ function findRunLog(uix, runId) {
     if (fs.existsSync(p)) return { path: p, text: fs.readFileSync(p, 'utf8'), tied: true, runId };
     return null;   // a named-but-missing log is honestly "not found" (→ FAIL downstream)
   }
-  // 2) derive the run that produced the current canonical, by contentHash match.
+  // 2) derive the run that produced the current canonical. Primary: contentHash
+  //    match (the per-run sidecar now carries the AI model's contentHash — T15).
+  //    Fallback: STRUCTURAL identity match (same set of canonicalIds) for a sidecar
+  //    that predates contentHash propagation. Both are real ties (tied:true) — they
+  //    pin the proof to the run whose OUTPUT is the current canonical.
   const curCanon = (() => { try { return JSON.parse(fs.readFileSync(path.join(uix, 'canonical.json'), 'utf8')); } catch { return null; } })();
   const curHash = curCanon && curCanon.contentHash;
+  // The live canonical may be the AI-model shape (screens[].canonicalId) — collect its
+  // canonical-screen identity set for the structural fallback.
+  const curIds = curCanon && Array.isArray(curCanon.screens)
+    ? new Set(curCanon.screens.map((s) => s && s.canonicalId).filter(Boolean))
+    : new Set();
+  let perRun = [];
+  try { perRun = fs.readdirSync(runsDir).filter((f) => f.endsWith('.canonical.json')); } catch { /* none */ }
+  // 2a) contentHash match (strongest).
   if (curHash) {
-    let perRun = [];
-    try { perRun = fs.readdirSync(runsDir).filter((f) => f.endsWith('.canonical.json')); } catch { /* none */ }
     for (const f of perRun) {
       const rc = (() => { try { return JSON.parse(fs.readFileSync(path.join(runsDir, f), 'utf8')); } catch { return null; } })();
       if (rc && rc.contentHash && rc.contentHash === curHash) {
+        const rid = f.replace(/\.canonical\.json$/, '');
+        const lp = path.join(runsDir, `${rid}.log`);
+        if (fs.existsSync(lp)) return { path: lp, text: fs.readFileSync(lp, 'utf8'), tied: true, runId: rid };
+      }
+    }
+  }
+  // 2b) structural identity fallback: a sidecar whose canonicalId set EXACTLY equals
+  //     the live canonical's (no contentHash on either, or hashes from different
+  //     pipelines). An exact id-set match means this sidecar IS the current canonical.
+  if (curIds.size) {
+    for (const f of perRun) {
+      const rc = (() => { try { return JSON.parse(fs.readFileSync(path.join(runsDir, f), 'utf8')); } catch { return null; } })();
+      const rcIds = rc && Array.isArray(rc.screens)
+        ? new Set(rc.screens.map((s) => s && s.canonicalId).filter(Boolean))
+        : new Set();
+      if (rcIds.size === curIds.size && [...rcIds].every((id) => curIds.has(id))) {
         const rid = f.replace(/\.canonical\.json$/, '');
         const lp = path.join(runsDir, `${rid}.log`);
         if (fs.existsSync(lp)) return { path: lp, text: fs.readFileSync(lp, 'utf8'), tied: true, runId: rid };
@@ -574,7 +600,25 @@ function main() {
     flow = (canon && canon.resolvedFromCode === true) ? 'resolve' : 'generation';
   }
 
-  const runLog = findRunLog(uix, args.runId === true ? undefined : args.runId);
+  const explicitRunId = typeof args.runId === 'string' ? args.runId : null;
+  const runLog = findRunLog(uix, explicitRunId || undefined);
+
+  // FAIL-CLOSED (T15): a GENERATION run's proof MUST be tied to the run that produced
+  // the current canonical. If the auto-tie (contentHash / structural id-set) could not
+  // find a tied log AND no --runId was given, we cannot prove the AI fired for THIS
+  // run. Require --runId with a clear, top-level error instead of limping on with an
+  // untied newest-log guess that buries a confusing FAIL deep in the table. This is a
+  // hard REQUIRE, not a silent SKIP/PASS — the harness fails closed.
+  if (flow === 'generation' && !explicitRunId && (!runLog || !runLog.tied)) {
+    console.error(
+      `FAIL: generation flow needs the proof log tied to the run that produced .uix/canonical.json, ` +
+      `but auto-tie failed (no <runId>.canonical.json matched by contentHash or canonicalId set).\n` +
+      `      Re-run with --runId <id> (the run whose .uix/runs/<id>.log holds the [ai:canon.*] proof).\n` +
+      `      Available run logs: ${(() => { try { return fs.readdirSync(path.join(uix, 'runs')).filter((f) => f.endsWith('.log')).map((f) => f.replace(/\\.log$/, '')).join(', ') || '(none)'; } catch { return '(none)'; } })()}`,
+    );
+    console.log(`\nVERIFY ${projName} ${flow}: 0 PASS, 1 FAIL, 0 SKIP`);
+    process.exit(2);
+  }
 
   const ctx = { root, projName, uix, framework, flow, runLog, noBuild: !!args['no-build'] };
 

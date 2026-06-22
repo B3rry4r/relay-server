@@ -38,7 +38,7 @@ import {
   isRunActive, markRunActive, clearRunActive,
   setRunPhase,
   clampParallel,
-  gateIsActive, pauseAtCheckpoint, approveCheckpoint, setRunResumable,
+  gateIsActive, pauseAtCheckpoint, approveCheckpoint, setRunResumable, setRunPrepDone,
   addAmendment, resolveAmendment, writeFrameMap,
   type ScreenSpec, type CheckpointGate, type BuildRun, type AmendmentKind,
 } from './build-run-store';
@@ -1357,6 +1357,11 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
             } catch (e: any) {
               await appendRunLog(projectId, runId, `[canon] skeleton generation failed (continuing): ${e?.message || 'unknown'}`);
             }
+          } else {
+            // T15 (RFC §0.1 — no silent degrade): the write-locked router/theme/component
+            // skeleton is flutter-only. A react/web run gets NO skeleton — say so LOUDLY
+            // (canonical.json + the manifest are still written above) instead of a silent no-op.
+            await appendRunLog(projectId, runId, `[canon] skeleton SKIPPED — ${(run.framework || 'flutter')} not yet supported by this phase; flutter-only (no router/theme/component stubs were generated)`);
           }
           // Mark every NON-lead member (extra states, bound modals, components) done
           // up-front so the run completes — they're built inside their lead screen.
@@ -1424,6 +1429,16 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
     // the app run it, so the whole app was dead code behind a counter-demo main.dart.
     // Both are idempotent (skip when already done / never clobber a real main.dart).
     let themeTokens: ThemeTokens | undefined;
+    // T15 (RFC §0.1 — no silent degrade): the EXTRACT-FIRST theme file + main.dart
+    // router wiring + AppAssets repoint below are flutter-only. A react/web run gets
+    // a degraded design-system (description only, no importable token file) and NO
+    // main wiring — make that gap LOUD up-front so the user knows, rather than the
+    // theme/app-wiring phases quietly no-op'ing on a non-flutter build.
+    const isFlutterRun = (run.framework || 'flutter').toLowerCase() === 'flutter';
+    if (!isFlutterRun) {
+      await appendRunLog(projectId, runId, `[design-system] DEGRADED — ${(run.framework || 'flutter')} not yet supported by this phase; flutter-only. No importable AppTheme token file is generated (the agent gets a theme DESCRIPTION only).`);
+      await appendRunLog(projectId, runId, `[app-wiring] SKIPPED — ${(run.framework || 'flutter')} not yet supported by this phase; flutter-only. main.dart router wiring is a no-op (the entrypoint is NOT auto-wired).`);
+    }
     setGenPhase(projectId, runId, 'Pre-flight', 'design system + token extract');
     try {
       const digest = buildDesignDigest(run);
@@ -1774,6 +1789,209 @@ async function retryScreenLoop(projectId: string, runId: string, frameId: string
 }
 
 /**
+ * T15 (resume-during-prep): the GENERATION entrypoint's server-side PREP + start.
+ * Runs the reference render + packet build + asset pass over every screen, then
+ * hands off to runAppLoop. Reconstructs ALL its inputs from the persisted run
+ * (figStorageKey/framework/flow/model/figmaUrl/scale + frameIds/frameNames off
+ * run.screens), so it is callable BOTH from the prepare-and-run route (fresh) AND
+ * from resumeInterruptedRuns after a redeploy mid-prep.
+ *
+ * The MAJOR fix: it marks the run `resumable:true` the INSTANT prep begins (before
+ * the old code only set resumable once runAppLoop started), so a redeploy during
+ * PREP no longer leaves the run `running`+`resumable:false` (stuck — skipped by the
+ * boot scan). On a clean prep finish it sets `prepDone:true` so a later resume goes
+ * straight into runAppLoop instead of re-prepping. Prep itself is idempotent (the
+ * per-frame reference cache + content-addressed assets make a re-run cheap), so a
+ * mid-prep resume that re-runs prep is safe.
+ */
+async function prepAndRun(projectId: string, runId: string): Promise<void> {
+  const run = await getRun(projectId, runId);
+  if (!run) return;
+  const projectRoot = resolveProjectRoot(projectId);
+  if (!projectRoot || !fsSync.existsSync(projectRoot)) { await appendRunLog(projectId, runId, `[prep] fatal: project root missing — run not started`); return; }
+
+  // MAJOR FIX: a build interrupted DURING prep must be auto-resumable. Mark it the
+  // instant prep starts (the old gap: resumable was only set once runAppLoop ran, so
+  // a redeploy mid-prep left the run running+resumable:false → resumeInterruptedRuns
+  // skipped it → prep never re-ran → stuck).
+  await setRunResumable(projectId, runId, true);
+
+  const figStorageKey = run.figStorageKey ?? '';
+  if (!figStorageKey) { await appendRunLog(projectId, runId, `[prep] fatal: run has no figStorageKey — cannot prep`); return; }
+  const framework = run.framework || 'flutter';
+  const scale = typeof run.scale === 'number' && run.scale > 0 ? run.scale : 2;
+  const figmaUrl = run.figmaUrl ?? '';
+  const frameIds = run.screens.map(s => s.frameId);
+  const frameNames: Record<string, string> = {};
+  for (const s of run.screens) frameNames[s.frameId] = s.frameName;
+  // Reconstruct the FlowGraph (PrepConfig shape) from the run's RunFlow.
+  const flow: FlowGraph = {
+    entryFrameId: run.flow?.entryFrameId ?? null,
+    connections: (run.flow?.connections ?? []).map(c => ({
+      from: c.from, to: c.to, type: c.type as FlowGraph['connections'][number]['type'], label: c.label,
+    })),
+  };
+  const userNotes = run.userNotes;
+  const model = run.model;
+
+  try {
+    await appendRunLog(projectId, runId, `[prep] preparing ${frameIds.length} screen(s) server-side (framework ${framework}, scale ${scale}×)`);
+    // (a) Hybrid completion from the design URL (fill external/library gaps) — log progress.
+    if (figmaUrl) {
+      await appendRunLog(projectId, runId, `[prep] completing IR from design URL…`);
+      await ensureIrComplete(figStorageKey, figmaUrl, (s) => { void appendRunLog(projectId, runId, `[prep] ir-complete: ${s}`); });
+    }
+
+    // Resolve the frame geometry from the IR (the client used to pass it; the
+    // server reads it from UIX so the packet/cache get real dimensions).
+    const irData = await getIrData(figStorageKey);
+    const frameById = new Map<string, FigFrame>();
+    for (const f of (irData?.frames ?? [])) frameById.set(f.id, f);
+    const allFrames: FigFrame[] = frameIds.map(id => frameById.get(id) ?? {
+      id, name: frameNames[id] ?? id, x: 0, y: 0, width: 393, height: 852, pageId: '', pageName: '',
+    });
+
+    // (b) Prep each frame with bounded concurrency. Screen 1 bootstraps the
+    // project; every later screen is forced bootstrapped (shared scaffold).
+    // A shared `seen` set dedupes asset writes across the batch.
+    const seen = new Set<string>();
+    // Accumulate every frame's localized assets so the asset pass (semantic
+    // rename + resources file) runs ONCE over the whole-app union below.
+    const allAssets: LocalizedAsset[] = [];
+    const POOL = 3;
+    let prepared = 0;
+    // T16 (RFC §0.1 — no silent degrade): track how each screen's reference was
+    // resolved so the prep-done summary reports it honestly. A frame that FAILED
+    // to render (harness present, every attempt failed) is a weaker packet-only
+    // reference and a human must see it — it is NOT the same as a cache hit.
+    let renderedCount = 0;        // freshly rendered references this run
+    let cacheHitCount = 0;        // restored from the prep cache
+    let renderFailedCount = 0;    // harness present but render failed → packet-only
+    let noHarnessCount = 0;       // harness/Chrome absent → packet-only by design
+    let firstDone = false;
+    const order = [...frameIds];
+    let idx = 0;
+    // Serialize the run's read-modify-write so concurrent prep workers don't
+    // clobber each other's spec writes (each saves the WHOLE run object).
+    let saveChain: Promise<void> = Promise.resolve();
+    const persistSpec = (frameId: string, spec: ScreenSpec): Promise<void> => {
+      saveChain = saveChain.then(async () => {
+        const cur = await getRun(projectId, runId);
+        const sc = cur?.screens.find(s => s.frameId === frameId);
+        if (sc && cur) { sc.spec = spec; await saveRun(projectId, cur); }
+      });
+      return saveChain;
+    };
+    const prepOne = async (frameId: string, bootstrapped: boolean): Promise<void> => {
+      const frame = allFrames.find(f => f.id === frameId)!;
+      const cfg: PrepConfig = {
+        figStorageKey, framework, flow, frames: allFrames,
+        bootstrapped, userNotes, scale,
+      };
+      try {
+        const r = await prepScreen(projectId, frame, cfg, seen);
+        if (!r) { await appendRunLog(projectId, runId, `[prep] frame "${frame.name}" — prep failed (no project root)`); return; }
+        await persistSpec(frameId, r.spec);
+        if (r.assets?.length) allAssets.push(...r.assets);
+        // T16: report the reference outcome honestly and count each kind.
+        let how: string;
+        if (r.cacheHit) {
+          how = 'cache HIT'; cacheHitCount++;
+        } else if (r.rendered) {
+          how = 'rendered'; renderedCount++;
+        } else if (r.renderFailure === 'failed') {
+          // LOUD warning (RFC §0.1): the harness exists but every retry failed, so
+          // this screen builds against a WEAKER packet-only reference. Surface it
+          // attributably; do NOT hard-fail the whole run for one frame.
+          how = `WARNING: render FAILED after ${r.renderAttempts ?? '?'} attempt(s) — reference is packet-only (weaker verify)`;
+          renderFailedCount++;
+          await appendRunLog(projectId, runId,
+            `[prep] WARNING: frame "${frame.name}" failed to render after ${r.renderAttempts ?? '?'} attempt(s) — reference is packet-only (weaker verify)`);
+        } else {
+          how = 'no harness — packet only'; noHarnessCount++;
+        }
+        await appendRunLog(projectId, runId, `[prep] frame "${frame.name}" ${how}, localized ${r.assetCount} asset(s)`);
+        prepared++;
+      } catch (e: any) {
+        await appendRunLog(projectId, runId, `[prep] frame "${frame.name}" — prep error: ${e?.message || 'unknown'}`);
+      }
+    };
+    // Prep the FIRST frame alone (it bootstraps the project / establishes the
+    // cache for shared assets), then the rest with bounded concurrency.
+    if (order.length) { await prepOne(order[0], false); firstDone = true; idx = 1; }
+    const worker = async (): Promise<void> => {
+      while (idx < order.length) { const fid = order[idx++]; await prepOne(fid, firstDone); }
+    };
+    await Promise.all(Array.from({ length: Math.min(POOL, Math.max(0, order.length - 1)) }, worker));
+    // T16: report rendered vs packet-only counts so a human sees any degrade.
+    // packet-only = render-failed (loud) + cache-hit (no fresh render this run) is
+    // NOT counted as a degrade; only render-failed + no-harness are weaker refs.
+    const packetOnly = renderFailedCount + noHarnessCount;
+    const summaryTail = packetOnly > 0
+      ? `, ${packetOnly} packet-only (${renderFailedCount} render FAILED, ${noHarnessCount} no harness)`
+      : '';
+    await appendRunLog(projectId, runId,
+      `[prep] done — ${prepared}/${frameIds.length} prepared, ${renderedCount} rendered, ${cacheHitCount} cache-hit${summaryTail}; starting build`);
+    if (renderFailedCount > 0) {
+      await appendRunLog(projectId, runId,
+        `[prep] WARNING: ${renderFailedCount} screen(s) FAILED to render (harness present) and will build against a packet-only reference — verify is weaker for those screens`);
+    }
+
+    // (b.5) ASSET PASS: semantic-rename the union of localized assets + emit the
+    // framework's resources/constants file. The semantic rename is AI-REQUIRED
+    // (RFC §0.1 — "a fail is a fail"). If the model does not fire / returns
+    // unusable output it THROWS, and per the no-silent-fallback principle the
+    // run MUST NOT continue to the per-screen build as though assets succeeded —
+    // it PARKS at the design-system gate (HITL 2) so a human sees the failure.
+    let assetAiFailed = false;
+    try {
+      // T9: surface the asset phase (semantic rename count rides in `detail`).
+      setGenPhase(projectId, runId, 'Assets', `naming ${allAssets.length} asset(s)`);
+      const assetEnv = createTerminalEnv(resolveWorkspace());
+      const pass = await runAssetPass(projectId, framework, allAssets, model as AIModel, assetEnv, { runId });
+      if (pass) {
+        setGenPhase(projectId, runId, 'Assets', `${pass.renamed}/${pass.unique} named`);
+        await appendRunLog(projectId, runId,
+          `[prep] asset pass: ${pass.gathered} gathered → ${pass.unique} unique-by-content, ${pass.renamed} named, ${pass.duplicatesDeleted} duplicate(s) deleted, ${pass.repaired} raster(s) repaired`
+          + (pass.resourcesPath ? `, resources → ${pass.resourcesPath}` : ''));
+        // RFC §9.2 — checkpoint after the (generation) asset pass.
+        await runCheckpoint(projectId, runId, projectRoot, 'phase assets', `${pass.renamed} named, ${pass.duplicatesDeleted} deduped`);
+      }
+    } catch (e: any) {
+      // A loud AI failure (AiNotFiredError/AiUnusableError) is NOT a silent
+      // "skipped": surface it AND halt the run. No garbage resources file was
+      // written (the throw came before emit).
+      const isAiFail = e?.name === 'AiNotFiredError' || e?.name === 'AiUnusableError';
+      assetAiFailed = isAiFail;
+      await appendRunLog(projectId, runId,
+        isAiFail
+          ? `[prep] asset pass FAILED (AI did not fire — assets NOT renamed, no resources file written): ${e?.message || 'unknown'}`
+          : `[prep] asset pass error: ${e?.message || 'unknown'}`);
+    }
+
+    if (assetAiFailed) {
+      // PARK, do NOT proceed to the build. The run is held at the design-system
+      // gate (resumable): the asset pipeline is the contract the per-screen
+      // build consumes, so building on a failed asset pass would ship
+      // Material-icon substitutions / opaque paths and report "applied".
+      await appendRunLog(projectId, runId,
+        `[prep] HALTED at design-system gate — asset pipeline (AI semantic rename) failed; run will not build until assets resolve (re-run prep or fix model access, then approve)`);
+      await pauseAtCheckpoint(projectId, runId, 'design-system',
+        'Asset pipeline failed: the AI semantic-rename did not fire / returned unusable output, so assets were NOT renamed and no resources file was written. The per-screen build is blocked because it consumes the asset pipeline. Resolve model access and re-run the asset pass, then approve to continue.');
+      return;
+    }
+
+    // T15: prep finished cleanly — mark it so a later resume skips straight to the
+    // build (runAppLoop) instead of re-running prep.
+    await setRunPrepDone(projectId, runId, true);
+    // (c) Kick off the server-side orchestration.
+    void runAppLoop(projectId, runId).catch(() => {});
+  } catch (e: any) {
+    await appendRunLog(projectId, runId, `[prep] fatal: ${e?.message || 'unknown'} — run not started`);
+  }
+}
+
+/**
  * Re-start runs that were GRACEFULLY PAUSED when the process died (e.g. a redeploy).
  * Called once on server boot so a full-app build survives a container restart.
  *
@@ -1782,6 +2000,11 @@ async function retryScreenLoop(projectId: string, runId: string, frameId: string
  * 'running' (mid-screen) when the box died is left alone (its in-flight state is
  * untrustworthy) and a human restarts it from the Runs UI. This kills the old
  * behavior where any 'running' run was blindly re-launched on every redeploy.
+ *
+ * T15 (resume-during-prep): a resumable+running run that has NOT finished prep
+ * (`prepDone` falsy AND no screen yet carries a spec) re-enters via prepAndRun so
+ * PREP + the asset pass actually re-run — the old code always jumped to runAppLoop,
+ * which skipped prep entirely and left a mid-prep run with no specs/assets stuck.
  */
 export async function resumeInterruptedRuns(): Promise<void> {
   try {
@@ -1800,8 +2023,18 @@ export async function resumeInterruptedRuns(): Promise<void> {
         // are terminal-for-orchestration and likewise left alone.
         const resumable = r.resumable === true && r.status === 'running';
         if (resumable && !isRunActive(r.id)) {
-          void appendRunLog(projectId, r.id, '[run] resuming interrupted run after server restart (redeploy)');
-          void runAppLoop(projectId, r.id);
+          // T15: a generation run (has figStorageKey) interrupted BEFORE prep
+          // finished (prepDone falsy) re-enters via prepAndRun so PREP + the asset
+          // pass actually re-run; otherwise jump straight into runAppLoop. Without
+          // this, a redeploy mid-prep resumed into runAppLoop with no specs/assets.
+          const needsPrep = !!r.figStorageKey && r.prepDone !== true;
+          if (needsPrep) {
+            void appendRunLog(projectId, r.id, '[run] resuming interrupted run after server restart (redeploy) — prep was not complete, re-running prep + asset pass');
+            void prepAndRun(projectId, r.id);
+          } else {
+            void appendRunLog(projectId, r.id, '[run] resuming interrupted run after server restart (redeploy)');
+            void runAppLoop(projectId, r.id);
+          }
         }
       }
     }
@@ -2004,6 +2237,8 @@ export function registerScreenLoopRoutes(app: Express): void {
       maxIterations: typeof b.maxIterations === 'number' ? b.maxIterations : undefined,
       verify: b.verify !== false,
       userNotes,
+      // T15: persist prep inputs so a redeploy mid-prep can re-run prep on resume.
+      figmaUrl: figmaUrl || undefined, scale,
       freshSessions: b.freshSessions === true || (typeof b.parallel === 'number' && b.parallel > 1),
       parallel: typeof b.parallel === 'number' ? b.parallel : undefined,
       canonical: b.canonical === true,
@@ -2016,161 +2251,12 @@ export function registerScreenLoopRoutes(app: Express): void {
     res.json({ run });
 
     // ── Prep + start in the background (survives the request returning) ───────────
-    void (async () => {
-      try {
-        await appendRunLog(projectId, run.id, `[prep] preparing ${frameIds.length} screen(s) server-side (framework ${framework}, scale ${scale}×)`);
-        // (a) Hybrid completion from the design URL (fill external/library gaps) — log progress.
-        if (figmaUrl) {
-          await appendRunLog(projectId, run.id, `[prep] completing IR from design URL…`);
-          await ensureIrComplete(figStorageKey, figmaUrl, (s) => { void appendRunLog(projectId, run.id, `[prep] ir-complete: ${s}`); });
-        }
-
-        // Resolve the frame geometry from the IR (the client used to pass it; the
-        // server reads it from UIX so the packet/cache get real dimensions).
-        const irData = await getIrData(figStorageKey);
-        const frameById = new Map<string, FigFrame>();
-        for (const f of (irData?.frames ?? [])) frameById.set(f.id, f);
-        const allFrames: FigFrame[] = frameIds.map(id => frameById.get(id) ?? {
-          id, name: frameNames[id] ?? id, x: 0, y: 0, width: 393, height: 852, pageId: '', pageName: '',
-        });
-
-        // (b) Prep each frame with bounded concurrency. Screen 1 bootstraps the
-        // project; every later screen is forced bootstrapped (shared scaffold).
-        // A shared `seen` set dedupes asset writes across the batch.
-        const seen = new Set<string>();
-        // Accumulate every frame's localized assets so the asset pass (semantic
-        // rename + resources file) runs ONCE over the whole-app union below.
-        const allAssets: LocalizedAsset[] = [];
-        const POOL = 3;
-        let prepared = 0;
-        // T16 (RFC §0.1 — no silent degrade): track how each screen's reference was
-        // resolved so the prep-done summary reports it honestly. A frame that FAILED
-        // to render (harness present, every attempt failed) is a weaker packet-only
-        // reference and a human must see it — it is NOT the same as a cache hit.
-        let renderedCount = 0;        // freshly rendered references this run
-        let cacheHitCount = 0;        // restored from the prep cache
-        let renderFailedCount = 0;    // harness present but render failed → packet-only
-        let noHarnessCount = 0;       // harness/Chrome absent → packet-only by design
-        let firstDone = false;
-        const order = [...frameIds];
-        let idx = 0;
-        // Serialize the run's read-modify-write so concurrent prep workers don't
-        // clobber each other's spec writes (each saves the WHOLE run object).
-        let saveChain: Promise<void> = Promise.resolve();
-        const persistSpec = (frameId: string, spec: ScreenSpec): Promise<void> => {
-          saveChain = saveChain.then(async () => {
-            const cur = await getRun(projectId, run.id);
-            const sc = cur?.screens.find(s => s.frameId === frameId);
-            if (sc && cur) { sc.spec = spec; await saveRun(projectId, cur); }
-          });
-          return saveChain;
-        };
-        const prepOne = async (frameId: string, bootstrapped: boolean): Promise<void> => {
-          const frame = allFrames.find(f => f.id === frameId)!;
-          const cfg: PrepConfig = {
-            figStorageKey, framework, flow, frames: allFrames,
-            bootstrapped, userNotes, scale,
-          };
-          try {
-            const r = await prepScreen(projectId, frame, cfg, seen);
-            if (!r) { await appendRunLog(projectId, run.id, `[prep] frame "${frame.name}" — prep failed (no project root)`); return; }
-            await persistSpec(frameId, r.spec);
-            if (r.assets?.length) allAssets.push(...r.assets);
-            // T16: report the reference outcome honestly and count each kind.
-            let how: string;
-            if (r.cacheHit) {
-              how = 'cache HIT'; cacheHitCount++;
-            } else if (r.rendered) {
-              how = 'rendered'; renderedCount++;
-            } else if (r.renderFailure === 'failed') {
-              // LOUD warning (RFC §0.1): the harness exists but every retry failed, so
-              // this screen builds against a WEAKER packet-only reference. Surface it
-              // attributably; do NOT hard-fail the whole run for one frame.
-              how = `WARNING: render FAILED after ${r.renderAttempts ?? '?'} attempt(s) — reference is packet-only (weaker verify)`;
-              renderFailedCount++;
-              await appendRunLog(projectId, run.id,
-                `[prep] WARNING: frame "${frame.name}" failed to render after ${r.renderAttempts ?? '?'} attempt(s) — reference is packet-only (weaker verify)`);
-            } else {
-              how = 'no harness — packet only'; noHarnessCount++;
-            }
-            await appendRunLog(projectId, run.id, `[prep] frame "${frame.name}" ${how}, localized ${r.assetCount} asset(s)`);
-            prepared++;
-          } catch (e: any) {
-            await appendRunLog(projectId, run.id, `[prep] frame "${frame.name}" — prep error: ${e?.message || 'unknown'}`);
-          }
-        };
-        // Prep the FIRST frame alone (it bootstraps the project / establishes the
-        // cache for shared assets), then the rest with bounded concurrency.
-        if (order.length) { await prepOne(order[0], false); firstDone = true; idx = 1; }
-        const worker = async (): Promise<void> => {
-          while (idx < order.length) { const fid = order[idx++]; await prepOne(fid, firstDone); }
-        };
-        await Promise.all(Array.from({ length: Math.min(POOL, Math.max(0, order.length - 1)) }, worker));
-        // T16: report rendered vs packet-only counts so a human sees any degrade.
-        // packet-only = render-failed (loud) + cache-hit (no fresh render this run) is
-        // NOT counted as a degrade; only render-failed + no-harness are weaker refs.
-        const packetOnly = renderFailedCount + noHarnessCount;
-        const summaryTail = packetOnly > 0
-          ? `, ${packetOnly} packet-only (${renderFailedCount} render FAILED, ${noHarnessCount} no harness)`
-          : '';
-        await appendRunLog(projectId, run.id,
-          `[prep] done — ${prepared}/${frameIds.length} prepared, ${renderedCount} rendered, ${cacheHitCount} cache-hit${summaryTail}; starting build`);
-        if (renderFailedCount > 0) {
-          await appendRunLog(projectId, run.id,
-            `[prep] WARNING: ${renderFailedCount} screen(s) FAILED to render (harness present) and will build against a packet-only reference — verify is weaker for those screens`);
-        }
-
-        // (b.5) ASSET PASS: semantic-rename the union of localized assets + emit the
-        // framework's resources/constants file. The semantic rename is AI-REQUIRED
-        // (RFC §0.1 — "a fail is a fail"). If the model does not fire / returns
-        // unusable output it THROWS, and per the no-silent-fallback principle the
-        // run MUST NOT continue to the per-screen build as though assets succeeded —
-        // it PARKS at the design-system gate (HITL 2) so a human sees the failure.
-        let assetAiFailed = false;
-        try {
-          // T9: surface the asset phase (semantic rename count rides in `detail`).
-          setGenPhase(projectId, run.id, 'Assets', `naming ${allAssets.length} asset(s)`);
-          const assetEnv = createTerminalEnv(resolveWorkspace());
-          const pass = await runAssetPass(projectId, framework, allAssets, b.model, assetEnv, { runId: run.id });
-          if (pass) {
-            setGenPhase(projectId, run.id, 'Assets', `${pass.renamed}/${pass.unique} named`);
-            await appendRunLog(projectId, run.id,
-              `[prep] asset pass: ${pass.gathered} gathered → ${pass.unique} unique-by-content, ${pass.renamed} named, ${pass.duplicatesDeleted} duplicate(s) deleted, ${pass.repaired} raster(s) repaired`
-              + (pass.resourcesPath ? `, resources → ${pass.resourcesPath}` : ''));
-            // RFC §9.2 — checkpoint after the (generation) asset pass.
-            await runCheckpoint(projectId, run.id, projectRoot, 'phase assets', `${pass.renamed} named, ${pass.duplicatesDeleted} deduped`);
-          }
-        } catch (e: any) {
-          // A loud AI failure (AiNotFiredError/AiUnusableError) is NOT a silent
-          // "skipped": surface it AND halt the run. No garbage resources file was
-          // written (the throw came before emit).
-          const isAiFail = e?.name === 'AiNotFiredError' || e?.name === 'AiUnusableError';
-          assetAiFailed = isAiFail;
-          await appendRunLog(projectId, run.id,
-            isAiFail
-              ? `[prep] asset pass FAILED (AI did not fire — assets NOT renamed, no resources file written): ${e?.message || 'unknown'}`
-              : `[prep] asset pass error: ${e?.message || 'unknown'}`);
-        }
-
-        if (assetAiFailed) {
-          // PARK, do NOT proceed to the build. The run is held at the design-system
-          // gate (resumable): the asset pipeline is the contract the per-screen
-          // build consumes, so building on a failed asset pass would ship
-          // Material-icon substitutions / opaque paths and report "applied".
-          await appendRunLog(projectId, run.id,
-            `[prep] HALTED at design-system gate — asset pipeline (AI semantic rename) failed; run will not build until assets resolve (re-run prep or fix model access, then approve)`);
-          await pauseAtCheckpoint(projectId, run.id, 'design-system',
-            'Asset pipeline failed: the AI semantic-rename did not fire / returned unusable output, so assets were NOT renamed and no resources file was written. The per-screen build is blocked because it consumes the asset pipeline. Resolve model access and re-run the asset pass, then approve to continue.');
-          return;
-        }
-
-        // (c) Kick off the server-side orchestration.
-        void runAppLoop(projectId, run.id).catch(() => {});
-      } catch (e: any) {
-        await appendRunLog(projectId, run.id, `[prep] fatal: ${e?.message || 'unknown'} — run not started`);
-      }
-    })();
+    // T15: prepAndRun marks the run resumable the instant prep begins and re-runs
+    // prep faithfully on a redeploy mid-prep (resume reconstructs its inputs off the
+    // run). The route just kicks it off; resumeInterruptedRuns calls the same fn.
+    void prepAndRun(projectId, run.id).catch(() => {});
   });
+
 
   // POST /api/ai/runs/:runId/start { projectId, steerNotes?, restart? } — kick off
   // (or resume) the SERVER-SIDE orchestration of the whole run. Returns immediately.

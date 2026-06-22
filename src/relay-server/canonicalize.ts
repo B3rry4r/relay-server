@@ -73,6 +73,14 @@ export interface Canonical {
   frameMap: Record<string, string>;
   /** non-fatal diagnostics for HITL Checkpoint 0 (unbound modals, lone frames…). */
   warnings: string[];
+  /**
+   * T15: the heavy-AI model's structural contentHash, carried through the adapter so
+   * the per-run `<runId>.canonical.json` sidecar matches the live `.uix/canonical.json`
+   * hash. This is what lets test/verify-pipeline.cjs AUTO-TIE the AI-fired proof log to
+   * the run that produced the current canonical WITHOUT requiring --runId. Absent on the
+   * deterministic clusterer path (it doesn't hash) — verify then requires --runId.
+   */
+  contentHash?: string;
 }
 
 /** The per-frame input the pre-pass needs (a slice of RunScreen + its spec). */
