@@ -171,11 +171,68 @@ function pngDimensions(png: Buffer): { width: number; height: number } | null {
   return { width: png.readUInt32BE(16), height: png.readUInt32BE(20) };
 }
 
+// ── render reliability knobs (T16) ─────────────────────────────────────────────
+// Per-render screenshot timeout. The harness fetches resolved IR + assets cross-
+// origin from UIX inside the page and draws to CanvasKit; under load a cold-Chrome
+// launch + that fetch can exceed the old 30s and return null (a transient miss the
+// caller then treats as a silent "packet-only" degrade). 60s gives a slow-but-OK
+// render room to finish.
+const RENDER_SCREENSHOT_TIMEOUT_MS = Number(process.env.RELAY_RENDER_TIMEOUT_MS) > 0
+  ? Number(process.env.RELAY_RENDER_TIMEOUT_MS) : 60_000;
+// In-page time budget for the harness to fetch IR/assets + paint before the shot.
+// Raised from 8s so a complex frame finishes drawing rather than being captured
+// blank/partial.
+const RENDER_VIRTUAL_TIME_BUDGET_MS = Number(process.env.RELAY_RENDER_VTB_MS) > 0
+  ? Number(process.env.RELAY_RENDER_VTB_MS) : 15_000;
+// How many ATTEMPTS a single frame render gets (1 try + N-1 retries). A transient
+// timeout/contention should self-heal rather than degrade to packet-only.
+const RENDER_MAX_ATTEMPTS = Number(process.env.RELAY_RENDER_ATTEMPTS) > 0
+  ? Number(process.env.RELAY_RENDER_ATTEMPTS) : 3;
+// Concurrency cap for the SCREENSHOT step only. The prep loop renders frames with
+// POOL=3, and three cold-Chrome launches contending with cross-origin UIX fetches
+// is exactly what pushed some renders over the timeout. A semaphore of 1 serializes
+// the heavy headless-Chrome launch while leaving the rest of prep (asset
+// localization etc.) parallel. Override via env if a render box has headroom.
+const RENDER_CONCURRENCY = Number(process.env.RELAY_RENDER_CONCURRENCY) > 0
+  ? Number(process.env.RELAY_RENDER_CONCURRENCY) : 1;
+
+/** Minimal FIFO semaphore: at most N holders run concurrently; the rest queue. */
+function makeSemaphore(max: number): <T>(fn: () => Promise<T>) => Promise<T> {
+  const limit = Math.max(1, Math.floor(max));
+  let active = 0;
+  const queue: Array<() => void> = [];
+  const release = (): void => {
+    active--;
+    const next = queue.shift();
+    if (next) next();
+  };
+  return async function run<T>(fn: () => Promise<T>): Promise<T> {
+    if (active >= limit) await new Promise<void>(resolve => queue.push(resolve));
+    active++;
+    try { return await fn(); }
+    finally { release(); }
+  };
+}
+// Module-singleton: every renderFrameReference / renderNodeReference screenshot in
+// this process funnels through ONE semaphore so concurrent prep workers can't launch
+// more than RENDER_CONCURRENCY cold Chromes at once.
+const renderSem = makeSemaphore(RENDER_CONCURRENCY);
+// Exposed for tests/tracing: the configured render concurrency cap.
+export const renderConcurrencyLimit = RENDER_CONCURRENCY;
+const sleep = (ms: number): Promise<void> => new Promise(res => setTimeout(res, ms));
+
 /**
  * Render ONE frame to a reference PNG via the headless harness. Serves nothing
  * here (the harness server is the module singleton); just screenshots the harness
  * page at the matched device-scale and full height. Returns the PNG + its actual
- * pixel dimensions (read from the IHDR), or null if the harness/Chrome is absent.
+ * pixel dimensions (read from the IHDR).
+ *
+ * `null` means the HARNESS IS ABSENT (no relay-web/dist, no Chrome) — that is the
+ * "no harness" condition the caller reports as packet-only-by-design. A transient
+ * render FAILURE (timeout/crash) does NOT return null silently: the screenshot is
+ * retried RENDER_MAX_ATTEMPTS times behind the render semaphore, and only if EVERY
+ * attempt fails does this return null with `failed:true` set on the result-less
+ * path — distinguishable via the second overload below.
  */
 export async function renderFrameReference(args: {
   harnessBaseUrl?: string;
@@ -185,8 +242,32 @@ export async function renderFrameReference(args: {
   width: number;
   height: number;
 }): Promise<{ png: Buffer; widthPx: number; heightPx: number } | null> {
+  const r = await renderFrameReferenceEx(args);
+  return r.png ? { png: r.png, widthPx: r.widthPx!, heightPx: r.heightPx! } : null;
+}
+
+/** Outcome of a frame render attempt, distinguishing the three states the caller
+ *  must NOT collapse into one (RFC §0.1 — no silent degrade):
+ *   - ok       → a PNG was produced.
+ *   - no-harness → the harness/Chrome is absent (packet-only is expected here).
+ *   - failed   → the harness exists but every render attempt failed (LOUD degrade). */
+export type RenderOutcome =
+  | { status: 'ok'; png: Buffer; widthPx: number; heightPx: number; attempts: number }
+  | { status: 'no-harness'; png: null; attempts: 0 }
+  | { status: 'failed'; png: null; attempts: number };
+
+/** Internal wrapper carrying the explicit outcome; renderFrameReference adapts it to
+ *  the legacy nullable shape so existing callers are unchanged. */
+async function renderFrameReferenceEx(args: {
+  harnessBaseUrl?: string;
+  figStorageKey: string;
+  frameId: string;
+  scale: number;
+  width: number;
+  height: number;
+}): Promise<{ png: Buffer | null; widthPx?: number; heightPx?: number; outcome: RenderOutcome }> {
   const base = args.harnessBaseUrl ?? await harnessOrigin();
-  if (!base) return null;
+  if (!base) return { png: null, outcome: { status: 'no-harness', png: null, attempts: 0 } };
   const url = `${base.replace(/\/+$/, '')}/render-harness.html`
     + `?fig=${encodeURIComponent(args.figStorageKey)}`
     + `&frame=${encodeURIComponent(args.frameId)}`
@@ -197,14 +278,39 @@ export async function renderFrameReference(args: {
   // those device pixels at scale 1 (NOT scale=args.scale + fullPage, which forces a
   // ≥4000px window and yields an 8000px blank-below canvas). window = W×H, 1:1.
   const dw = Math.round(args.width * args.scale), dh = Math.round(args.height * args.scale);
-  const png = await captureUrlScreenshot(url, dw, dh, 30000, { deviceScale: 1, fullPage: false, disableWebSecurity: true });
-  if (!png) return null;
+  // RETRY behind the render semaphore: a transient timeout/contention self-heals
+  // rather than degrading to a weaker packet-only reference.
+  let png: Buffer | null = null;
+  let attempts = 0;
+  for (let attempt = 1; attempt <= RENDER_MAX_ATTEMPTS; attempt++) {
+    attempts = attempt;
+    png = await renderSem(() => captureUrlScreenshot(url, dw, dh, RENDER_SCREENSHOT_TIMEOUT_MS, {
+      deviceScale: 1, fullPage: false, disableWebSecurity: true,
+      virtualTimeBudgetMs: RENDER_VIRTUAL_TIME_BUDGET_MS,
+    }));
+    if (png) break;
+    // short backoff between attempts to let transient contention clear.
+    if (attempt < RENDER_MAX_ATTEMPTS) await sleep(500 * attempt);
+  }
+  if (!png) return { png: null, outcome: { status: 'failed', png: null, attempts } };
   const dims = pngDimensions(png);
-  return {
-    png,
-    widthPx: dims?.width ?? Math.round(args.width * args.scale),
-    heightPx: dims?.height ?? Math.round(args.height * args.scale),
-  };
+  const widthPx = dims?.width ?? Math.round(args.width * args.scale);
+  const heightPx = dims?.height ?? Math.round(args.height * args.scale);
+  return { png, widthPx, heightPx, outcome: { status: 'ok', png, widthPx, heightPx, attempts } };
+}
+
+/** Render a frame returning the EXPLICIT outcome (ok / no-harness / failed) so the
+ *  prep path can tell a transient render failure from an absent harness and surface
+ *  it loudly (RFC §0.1). Wraps renderFrameReferenceEx. */
+export async function renderFrameReferenceOutcome(args: {
+  harnessBaseUrl?: string;
+  figStorageKey: string;
+  frameId: string;
+  scale: number;
+  width: number;
+  height: number;
+}): Promise<RenderOutcome> {
+  return (await renderFrameReferenceEx(args)).outcome;
 }
 
 /**
@@ -239,7 +345,13 @@ export async function renderNodeReference(args: {
     + `&base=${encodeURIComponent(UIX_BASE_URL)}`;
   const dw = Math.max(1, Math.round(args.width * scale));
   const dh = Math.max(1, Math.round(args.height * scale));
-  const png = await captureUrlScreenshot(url, dw, dh, 30000, { deviceScale: 1, fullPage: false, disableWebSecurity: true });
+  // Funnel through the SAME render semaphore as frame renders so node re-rasterizes
+  // (raster-repair) can't add extra concurrent cold-Chrome launches alongside the
+  // frame renders. Same bumped timeout + in-page budget.
+  const png = await renderSem(() => captureUrlScreenshot(url, dw, dh, RENDER_SCREENSHOT_TIMEOUT_MS, {
+    deviceScale: 1, fullPage: false, disableWebSecurity: true,
+    virtualTimeBudgetMs: RENDER_VIRTUAL_TIME_BUDGET_MS,
+  }));
   if (!png) return null;
   const dims = pngDimensions(png);
   return { png, widthPx: dims?.width ?? dw, heightPx: dims?.height ?? dh };
@@ -445,6 +557,14 @@ export interface PrepResult {
   cacheHit: boolean;
   assetCount: number;
   rendered: boolean;
+  /** When NOT rendered, WHY (RFC §0.1 — distinguish an absent harness from a real
+   *  render failure so the latter is surfaced loudly, never as a quiet packet-only):
+   *   - 'no-harness' → relay-web/dist or Chrome absent (packet-only is by design).
+   *   - 'failed'     → harness exists but every render attempt failed (LOUD degrade).
+   *  undefined on a cache HIT (the cached render already proved out) or when rendered. */
+  renderFailure?: 'no-harness' | 'failed';
+  /** attempts spent on the (failed) render, for logging. */
+  renderAttempts?: number;
   /** assets localized for this frame (raster-repaired + svg), for the resources/
    *  semantic-rename pass run once over the whole batch. */
   assets: LocalizedAsset[];
@@ -530,22 +650,30 @@ export async function prepScreen(
   }
 
   // ── CACHE MISS ─────────────────────────────────────────────────────────────────
-  // 1. Reference render via the harness (best-effort).
+  // 1. Reference render via the harness (retried; outcome is explicit). A failed
+  //    render after all retries is NOT silently treated as "no harness" — the caller
+  //    surfaces it loudly (RFC §0.1).
   let referenceImagePath = '';
   let refWidthPx = frame.width ? Math.round(frame.width * scale) : 0;
   let refHeightPx = frame.height ? Math.round(frame.height * scale) : 0;
   let rendered = false;
-  const ref = await renderFrameReference({
+  let renderFailure: 'no-harness' | 'failed' | undefined;
+  let renderAttempts: number | undefined;
+  const outcome = await renderFrameReferenceOutcome({
     harnessBaseUrl: cfg.harnessBaseUrl,
     figStorageKey: cfg.figStorageKey, frameId: frame.id, scale,
     width: frame.width, height: frame.height,
   });
+  const ref = outcome.status === 'ok' ? outcome : null;
   if (ref) {
     await fs.mkdir(path.dirname(refAbs), { recursive: true });
     await fs.writeFile(refAbs, ref.png);
     referenceImagePath = refRel;
     refWidthPx = ref.widthPx; refHeightPx = ref.heightPx;
     rendered = true;
+  } else if (outcome.status !== 'ok') {
+    renderFailure = outcome.status; // 'no-harness' | 'failed'
+    renderAttempts = outcome.attempts;
   }
 
   // 2. Localize the frame's assets (broken rasters re-rasterized via the harness).
@@ -577,7 +705,7 @@ export async function prepScreen(
     await fs.writeFile(path.join(cacheDir, 'assets.json'), JSON.stringify({ figStorageKey: cfg.figStorageKey, frameId: frame.id, count: assetCount }, null, 2));
   } catch { /* cache is an optimization */ }
 
-  return { spec, cacheHit: false, assetCount, rendered, assets };
+  return { spec, cacheHit: false, assetCount, rendered, renderFailure, renderAttempts, assets };
 }
 
 /**

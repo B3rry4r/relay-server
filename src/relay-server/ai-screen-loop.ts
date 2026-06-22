@@ -2007,6 +2007,14 @@ export function registerScreenLoopRoutes(app: Express): void {
         const allAssets: LocalizedAsset[] = [];
         const POOL = 3;
         let prepared = 0;
+        // T16 (RFC §0.1 — no silent degrade): track how each screen's reference was
+        // resolved so the prep-done summary reports it honestly. A frame that FAILED
+        // to render (harness present, every attempt failed) is a weaker packet-only
+        // reference and a human must see it — it is NOT the same as a cache hit.
+        let renderedCount = 0;        // freshly rendered references this run
+        let cacheHitCount = 0;        // restored from the prep cache
+        let renderFailedCount = 0;    // harness present but render failed → packet-only
+        let noHarnessCount = 0;       // harness/Chrome absent → packet-only by design
         let firstDone = false;
         const order = [...frameIds];
         let idx = 0;
@@ -2032,7 +2040,23 @@ export function registerScreenLoopRoutes(app: Express): void {
             if (!r) { await appendRunLog(projectId, run.id, `[prep] frame "${frame.name}" — prep failed (no project root)`); return; }
             await persistSpec(frameId, r.spec);
             if (r.assets?.length) allAssets.push(...r.assets);
-            const how = r.cacheHit ? 'cache HIT' : (r.rendered ? 'rendered' : 'rendered (no harness — packet only)');
+            // T16: report the reference outcome honestly and count each kind.
+            let how: string;
+            if (r.cacheHit) {
+              how = 'cache HIT'; cacheHitCount++;
+            } else if (r.rendered) {
+              how = 'rendered'; renderedCount++;
+            } else if (r.renderFailure === 'failed') {
+              // LOUD warning (RFC §0.1): the harness exists but every retry failed, so
+              // this screen builds against a WEAKER packet-only reference. Surface it
+              // attributably; do NOT hard-fail the whole run for one frame.
+              how = `WARNING: render FAILED after ${r.renderAttempts ?? '?'} attempt(s) — reference is packet-only (weaker verify)`;
+              renderFailedCount++;
+              await appendRunLog(projectId, run.id,
+                `[prep] WARNING: frame "${frame.name}" failed to render after ${r.renderAttempts ?? '?'} attempt(s) — reference is packet-only (weaker verify)`);
+            } else {
+              how = 'no harness — packet only'; noHarnessCount++;
+            }
             await appendRunLog(projectId, run.id, `[prep] frame "${frame.name}" ${how}, localized ${r.assetCount} asset(s)`);
             prepared++;
           } catch (e: any) {
@@ -2046,7 +2070,19 @@ export function registerScreenLoopRoutes(app: Express): void {
           while (idx < order.length) { const fid = order[idx++]; await prepOne(fid, firstDone); }
         };
         await Promise.all(Array.from({ length: Math.min(POOL, Math.max(0, order.length - 1)) }, worker));
-        await appendRunLog(projectId, run.id, `[prep] done — ${prepared}/${frameIds.length} screen(s) prepared; starting build`);
+        // T16: report rendered vs packet-only counts so a human sees any degrade.
+        // packet-only = render-failed (loud) + cache-hit (no fresh render this run) is
+        // NOT counted as a degrade; only render-failed + no-harness are weaker refs.
+        const packetOnly = renderFailedCount + noHarnessCount;
+        const summaryTail = packetOnly > 0
+          ? `, ${packetOnly} packet-only (${renderFailedCount} render FAILED, ${noHarnessCount} no harness)`
+          : '';
+        await appendRunLog(projectId, run.id,
+          `[prep] done — ${prepared}/${frameIds.length} prepared, ${renderedCount} rendered, ${cacheHitCount} cache-hit${summaryTail}; starting build`);
+        if (renderFailedCount > 0) {
+          await appendRunLog(projectId, run.id,
+            `[prep] WARNING: ${renderFailedCount} screen(s) FAILED to render (harness present) and will build against a packet-only reference — verify is weaker for those screens`);
+        }
 
         // (b.5) ASSET PASS: semantic-rename the union of localized assets + emit the
         // framework's resources/constants file. The semantic rename is AI-REQUIRED

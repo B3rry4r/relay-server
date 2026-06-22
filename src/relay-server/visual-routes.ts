@@ -91,7 +91,7 @@ export async function captureUrlScreenshot(
   width: number,
   height: number,
   timeoutMs = 30000,
-  opts: { deviceScale?: number; fullPage?: boolean; disableWebSecurity?: boolean } = {},
+  opts: { deviceScale?: number; fullPage?: boolean; disableWebSecurity?: boolean; virtualTimeBudgetMs?: number } = {},
 ): Promise<Buffer | null> {
   const out = path.join(os.tmpdir(), `relay-shot-${Date.now()}-${Math.random().toString(36).slice(2)}.png`);
   const scale = opts.deviceScale && opts.deviceScale > 0 ? opts.deviceScale : 1;
@@ -99,12 +99,18 @@ export async function captureUrlScreenshot(
   // page lands in one shot (headless captures the window, and --hide-scrollbars
   // keeps the bar out of the frame). Cap it so a runaway-tall page can't OOM.
   const winH = opts.fullPage ? Math.min(Math.max(Math.round(height), 4000), 20000) : Math.round(height);
+  // In-page time budget before the shot is taken. The harness fetches resolved IR +
+  // assets cross-origin and draws to CanvasKit, which can exceed the old 8s on a
+  // complex frame (capturing a blank/partial canvas). Callers that draw heavy
+  // content (the render harness) raise this; keep 8s as the cheap default.
+  const virtualTimeBudget = opts.virtualTimeBudgetMs && opts.virtualTimeBudgetMs > 0
+    ? Math.round(opts.virtualTimeBudgetMs) : 8000;
   const args = [
     '--headless=new', '--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu',
     '--disable-dev-shm-usage', '--hide-scrollbars',
     `--force-device-scale-factor=${scale}`,
     `--window-size=${Math.round(width)},${winH}`,
-    '--virtual-time-budget=8000',
+    `--virtual-time-budget=${virtualTimeBudget}`,
     // The render harness fetches resolved IR + assets from the UIX origin (cross-
     // origin to the localhost harness), so harness renders need CORS disabled. Safe
     // on a headless render box (we only ever load our own harness/app). Requires a
