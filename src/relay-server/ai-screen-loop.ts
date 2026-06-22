@@ -524,6 +524,17 @@ function buildWrittenContract(
       `No .uix/context.md exists yet — you are establishing the project contract. Create .uix/context.md (design system, routing, screens index) so every later screen builds against it.`,
     );
   }
+  // THEME TOKENS — the reconciliation gate flags inline TextStyle/GoogleFonts/Color
+  // literals (recon:inline-textstyle / recon:inline-color), which pushes otherwise-good
+  // screens into needs-review. Tell the agent, authoritatively, to use AppTheme tokens.
+  // (The exact token names live in .uix/context.md / lib/theme/app_theme.dart, already
+  // injected above via the established contract.)
+  parts.push([
+    `THEME TOKENS — MANDATORY (the reconciliation gate REJECTS inline type/colour literals):`,
+    `- Use the generated AppTheme for ALL text and colour: AppTheme text-style helpers for every Text, AppTheme colour tokens for every colour. Import lib/theme/app_theme.dart.`,
+    `- NEVER inline a TextStyle(...), GoogleFonts.*(), Color(0x........), or Colors.* literal in a screen — these are flagged and the screen is sent back for review.`,
+    `- The available token names are in the established project contract above (.uix/context.md). If a token you genuinely need is missing, request it via the amendment protocol below rather than inlining a literal.`,
+  ].join('\n'));
   // P5 (RFC §4.8): AMENDMENT PROTOCOL. The plan is append-only + namespace-locked,
   // NOT frozen — but the agent must not silently invent routes/components. When a
   // route/component it genuinely needs is missing from the plan above, it REQUESTS
@@ -1030,6 +1041,21 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
       break;
     }
     if (verdict.recommendation === 'stop') { stopReason = 'verify agent said stop (broken / not converging)'; break; }
+    // ASSET-DEFECT fast-fail: a broken/incomplete/missing illustration or asset is an
+    // UPSTREAM extraction defect — the build agent cannot repair it no matter how many
+    // passes. Don't burn iterations + the fix timeout (we saw a screen waste ~10 min on
+    // exactly this). Detect a HIGH-severity discrepancy about an asset/illustration that
+    // is broken/clipped/missing and stop NOW, flagged distinctly so it's queued for an
+    // ASSET fix, not a generic non-convergence.
+    const assetDefect = verdict.discrepancies.find(d =>
+      d.severity === 'high'
+      && /illustrat|asset|image|graphic|icon|logo|photo/i.test(`${d.area ?? ''} ${d.issue}`)
+      && /broke|corrupt|clip|cut[\s-]?off|missing|absent|incomplete|fragment|spill|overflow|empty (panel|white)/i.test(d.issue));
+    if (assetDefect) {
+      stopReason = `asset defect — ${assetDefect.area ?? 'illustration'}: broken/incomplete upstream asset; needs an ASSET fix (the build agent cannot repair it)`;
+      appendJobLog(jobId, `[loop] asset defect detected — stopping early (no agent fix can repair a broken upstream asset): ${assetDefect.area ?? ''}`);
+      break;
+    }
     // Plateau guard: after a real attempt, if the score didn't improve, more
     // automated passes are unlikely to help — stop rather than waste calls.
     const score = verdict.score ?? 0;
@@ -1450,7 +1476,15 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
       return live?.screens.filter(s => isBuildTarget(s.frameId) && (s.status === 'done' || s.status === 'needs-review' || s.status === 'failed')).length ?? 0;
     };
     const emitBuildProgress = async (): Promise<void> => {
-      setGenPhase(projectId, runId, 'Build screens', `screen ${await countBuilt()}/${buildTargets}`);
+      setGenPhase(projectId, runId, 'Build screens', `${await countBuilt()}/${buildTargets} built`);
+    };
+    // Show the screen CURRENTLY building (not just the completed count) so the phase
+    // visibly advances the moment a screen starts — otherwise the detail sits on the
+    // completed count for the whole multi-minute implement→verify→fix loop and reads
+    // as "stuck". `n` is the 1-based position of the screen about to build.
+    const emitBuilding = async (frameName: string): Promise<void> => {
+      const n = Math.min((await countBuilt()) + 1, buildTargets);
+      setGenPhase(projectId, runId, 'Build screens', `building ${n}/${buildTargets}: ${frameName}`);
     };
     await emitBuildProgress();
 
@@ -1473,6 +1507,7 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
           const screen = queue.shift();
           if (!screen) return;
           if (!(await stillNeeded(screen.frameId))) continue;
+          await emitBuilding(screen.frameName);   // show the screen as it STARTS
           await buildRunScreen(run, screen, projectRoot, appPlan, undefined, canonCtxFor(screen.frameId));
           await emitBuildProgress();   // T9: bump "screen X/N" as each worker finishes one
           // RFC §9.2 — checkpoint when a screen reaches a terminal accepted/done state.
@@ -1505,6 +1540,7 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
         const live = await getRun(projectId, runId);
         const cur = live?.screens.find(s => s.frameId === screen.frameId);
         if (cur?.status === 'done') { session = run.freshSessions ? undefined : (cur.sessionId || session); continue; }
+        await emitBuilding(screen.frameName);   // show the screen as it STARTS (not just on completion)
         const sess = await buildRunScreen(run, screen, projectRoot, appPlan, session, canonCtxFor(screen.frameId));
         // In fresh-session mode there is no cross-screen thread to carry forward.
         if (sess && !run.freshSessions) { session = sess; await setRunSession(projectId, runId, session); }

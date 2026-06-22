@@ -79,7 +79,10 @@ function killJob(job: RunningJob): void {
 // Timeout for AI generation calls (2 minutes for plain text; agentic runs that
 // scaffold + install + build need much longer).
 const AI_TIMEOUT_MS = 120_000;
-const AI_AGENT_TIMEOUT_MS = 600_000;
+// A single agent CLI call (implement / verify / fix). 600s let a HUNG or rate-limited
+// call waste 10 minutes before timing out; cap at 5 min (env-overridable). A real
+// screen build/fix completes well under this — a hang shouldn't burn 10 minutes.
+const AI_AGENT_TIMEOUT_MS = Number(process.env.RELAY_AI_AGENT_TIMEOUT_MS) || 300_000;
 
 interface GenerateRequest {
   prompt: string;
