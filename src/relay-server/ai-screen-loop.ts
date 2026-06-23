@@ -46,6 +46,7 @@ import { getProjectsRoot } from './runtime';
 import {
   canonicalizeRun, writeCanonical, readCanonical, generateFlutterSkeleton,
   restampCanonicalHeaders, cleanOrphanScreens, syncLiveCanonical,
+  nukeGeneratedAppSurface,
   type Canonical, type CanonicalScreen,
 } from './canonicalize';
 import { canonicalize as aiCanonicalize, type CanonicalizeOptions } from './canonicalize-ai/orchestrate';
@@ -2384,7 +2385,60 @@ export function registerScreenLoopRoutes(app: Express): void {
     if (!run) { res.status(404).json({ error: 'run not found' }); return; }
     if (isRunActive(runId)) { res.json({ run, started: false, alreadyRunning: true }); return; }
     clearRunCancelled(runId);
-    if (b.restart) run = await restartRun(projectId, runId) ?? run;
+    if (b.restart) {
+      run = await restartRun(projectId, runId) ?? run;
+      // RESTART = CLEAN SLATE. restartRun resets screen statuses + clears phase/
+      // checkpoint/finalized + drops finalize-report.json, but NEVER clears the
+      // generated lib/ tree — so a same-.fig restart would rebuild ON TOP of the
+      // prior build (old+new files mix, stale components/previews, scrambled assets).
+      // Take a RECOVERABLE git checkpoint first, THEN nuke the generated surface so
+      // the existing flow regenerates it fresh. SAFE-BY-CONSTRUCTION: if version
+      // control can't give us a recoverable snapshot, we DO NOT nuke (fail safe —
+      // never irrecoverably delete). The resume path never reaches here.
+      const projectRoot = resolveProjectRoot(projectId);
+      if (projectRoot) {
+        const framework = run.framework || 'flutter';
+        const vc = { log: (msg: string) => { void appendRunLog(projectId, runId, msg); } };
+        let snapshotSha: string | null = null;
+        try {
+          await ensureProjectGit(projectRoot, vc);
+          if (fsSync.existsSync(path.join(projectRoot, '.git'))) {
+            snapshotSha = await commitCheckpoint(
+              projectRoot,
+              `pre-restart: clean slate snapshot (${runId})`,
+              undefined,
+              vc,
+            );
+          }
+        } catch { snapshotSha = null; }
+        // A recoverable snapshot is a HARD requirement before a destructive nuke. A
+        // clean tree (nothing to commit) returns null but is STILL recoverable — git
+        // is initialized and HEAD captures the pre-nuke state — so allow the nuke when
+        // .git exists. Only refuse when there's no repo at all (data safety OFF).
+        const gitReady = fsSync.existsSync(path.join(projectRoot, '.git'));
+        if (!gitReady) {
+          await appendRunLog(projectId, runId,
+            `[run] restart — ABORTED clean-slate nuke: NO recoverable version-control snapshot ` +
+            `(git unavailable at ${projectRoot}); refusing to irrecoverably delete the generated surface. ` +
+            `Rebuilding additively instead (resume-like). Fix git to enable a true clean-slate restart.`);
+        } else {
+          try {
+            const nuked = await nukeGeneratedAppSurface(projectRoot, framework);
+            const removedCount = nuked.removedDirs.length + nuked.removedFiles.length;
+            if (nuked.skipped) {
+              await appendRunLog(projectId, runId, `[run] restart — clean slate: ${nuked.skipped}`);
+            } else {
+              await appendRunLog(projectId, runId,
+                `[run] restart — clean slate: snapshot ${snapshotSha ? snapshotSha.slice(0, 8) : '(clean tree, HEAD recoverable)'}, ` +
+                `removed ${removedCount} generated file(s); regenerating from scratch`);
+            }
+          } catch (e) {
+            // Nuke is best-effort + never throws, but belt+braces: never break the handler.
+            await appendRunLog(projectId, runId, `[run] restart — clean-slate nuke error (non-fatal): ${(e as Error).message}`);
+          }
+        }
+      }
+    }
     const steer = typeof b.steerNotes === 'string' ? b.steerNotes.trim() : '';
     if (steer) {
       run.userNotes = [run.userNotes?.trim(), steer].filter(Boolean).join('\n\n');

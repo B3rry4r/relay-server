@@ -609,6 +609,76 @@ export async function cleanOrphanScreens(projectRoot: string, canonical: Canonic
   return { removed, kept };
 }
 
+// ── RESTART: nuke the generated app surface (clean-slate rebuild) ─────────────
+// A RESTART of a whole-app build must regenerate from scratch — NOT on top of the
+// prior build. The skeleton is additive ("a built screen file is never clobbered")
+// and cleanOrphanScreens only drops screens absent from the NEW canonical, so a
+// same-.fig restart would otherwise keep every old file (stale components/previews,
+// scrambled assets, dead routes). This removes the PIPELINE-OWNED generated surface
+// so the existing flow rebuilds it fresh.
+//
+// REMOVES (flutter):
+//   - the entire `lib/` directory — it is FULLY generated for these apps (main.dart,
+//     app_router.dart, app_routes.dart, screens/, components/, theme/, resources/,
+//     _preview/). Any hand-authored file under lib/ is recoverable from the git
+//     checkpoint the caller commits BEFORE invoking this (data-safety contract).
+//   - stale per-build code reports under `.uix/`: finalize-report.json,
+//     flow-wiring-report.json, semantic-rename-report.json, token-cleanup-report.json,
+//     component-extraction-report.json, last-gen.json (any that exist).
+//
+// PRESERVES (never deleted): pubspec.yaml + other project-root config, assets/
+// (localized assets are expensive; a regenerated app_assets.dart only references
+// current ones, stale files are harmless), .uix/prep-cache, .uix/canon-refs,
+// .uix/refs, .uix/asset-map.json, the .fig/inputs, and .uix/canonical.json (canon
+// rewrites it anyway).
+//
+// Non-flutter: NO-OP — the skeleton is flutter-only; we never guess another
+// framework's surface.
+//
+// Idempotent + robust: a missing dir/file is fine and never throws.
+export interface NukeResult { removedDirs: string[]; removedFiles: string[]; skipped?: string }
+
+/** The per-build code reports under .uix/ a restart must drop so a stale report
+ *  doesn't make a gated pass (e.g. finalize) skip on the rebuild. */
+const NUKE_UIX_REPORTS = [
+  'finalize-report.json',
+  'flow-wiring-report.json',
+  'semantic-rename-report.json',
+  'token-cleanup-report.json',
+  'component-extraction-report.json',
+  'last-gen.json',
+] as const;
+
+export async function nukeGeneratedAppSurface(
+  projectRoot: string, framework: string,
+): Promise<NukeResult> {
+  const removedDirs: string[] = [];
+  const removedFiles: string[] = [];
+  if ((framework || 'flutter').toLowerCase() !== 'flutter') {
+    // Skeleton is flutter-only — don't guess any other framework's generated surface.
+    return { removedDirs, removedFiles, skipped: `non-flutter (${framework}) — skeleton is flutter-only; nothing removed` };
+  }
+  // 1. The entire generated lib/ tree.
+  const libDir = path.join(projectRoot, 'lib');
+  try {
+    const before = await fs.stat(libDir).then(() => true, () => false);
+    if (before) {
+      await fs.rm(libDir, { recursive: true, force: true });
+      removedDirs.push('lib');
+    }
+  } catch { /* best-effort: a missing/locked lib never fails the restart */ }
+  // 2. Stale per-build code reports under .uix/.
+  for (const name of NUKE_UIX_REPORTS) {
+    const rel = path.join('.uix', name);
+    const abs = path.join(projectRoot, rel);
+    try {
+      const existed = await fs.stat(abs).then(() => true, () => false);
+      if (existed) { await fs.rm(abs, { force: true }); removedFiles.push(rel); }
+    } catch { /* best-effort */ }
+  }
+  return { removedDirs, removedFiles };
+}
+
 // ── deterministic write-locked skeleton (RFC §4.2) ───────────────────────────
 // The server generates and WRITE-LOCKS: the router (every canonical route, real
 // builder or explicit stub), the theme/token file, and empty shared-component
