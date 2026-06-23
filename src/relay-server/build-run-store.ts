@@ -451,20 +451,35 @@ export async function saveRun(projectId: string, run: BuildRun): Promise<void> {
   await fs.writeFile(runFile(root, run.id), JSON.stringify(run, null, 2), 'utf-8');
 }
 
-/** Reset every screen to pending + status running (for a restart). */
+/** Reset every screen to pending + status running (for a restart). Routed through
+ *  `mutateRun` (T31) so a concurrent fire-and-forget phase/tally write can't clobber
+ *  the reset. */
 export async function restartRun(projectId: string, runId: string): Promise<BuildRun | null> {
-  const run = await getRun(projectId, runId);
+  const run = await mutateRun(projectId, runId, (run) => {
+    for (const s of run.screens) { s.status = 'pending'; s.matched = undefined; s.at = undefined; s.review = undefined; }
+    run.sessionId = undefined;
+    // P5: a restart re-runs every gate from scratch and drops a parked checkpoint.
+    run.checkpoint = undefined;
+    run.approvedGates = undefined;
+    run.resumable = false;
+    run.prepDone = undefined;    // T15: a restart re-runs prep too
+    run.phase = undefined;       // T9: a restart re-runs every phase from the top
+    // T31: a restart re-runs the P7 finalize phase. Clear the `finalized` marker so
+    // the run is NOT shown finalized and the loop's finalize gate re-fires. The gate
+    // is ALSO keyed on .uix/finalize-report.json existing on disk, so a stale report
+    // from the prior build would skip finalize — delete it below so the rebuilt app
+    // re-finalizes from scratch.
+    run.finalized = undefined;
+    run.status = 'running';
+  });
   if (!run) return null;
-  for (const s of run.screens) { s.status = 'pending'; s.matched = undefined; s.at = undefined; s.review = undefined; }
-  run.sessionId = undefined;
-  // P5: a restart re-runs every gate from scratch and drops a parked checkpoint.
-  run.checkpoint = undefined;
-  run.approvedGates = undefined;
-  run.resumable = false;
-  run.prepDone = undefined;    // T15: a restart re-runs prep too
-  run.phase = undefined;       // T9: a restart re-runs every phase from the top
-  run.status = 'running';
-  await saveRun(projectId, run);
+  // Delete the stale finalize report so finalizeAlreadyRan (existsSync) is false on
+  // the rebuild (best-effort: a missing/locked file never fails the restart).
+  const root = rootFor(projectId);
+  if (root) {
+    try { await fs.rm(path.join(root, '.uix', 'finalize-report.json'), { force: true }); } catch { /* non-fatal */ }
+  }
+  emitRunState(run); // push the cleared finalized/status so the UI updates live
   return run;
 }
 
@@ -541,28 +556,28 @@ export function gateIsActive(run: BuildRun, gate: CheckpointGate): boolean {
 /** Park a run at a checkpoint gate (status 'awaiting-approval', resumable). The
  *  orchestrator calls this then returns; a human approve resumes the build. */
 export async function pauseAtCheckpoint(projectId: string, runId: string, gate: CheckpointGate, message?: string): Promise<BuildRun | null> {
-  const root = rootFor(projectId);
-  if (!root) return null;
-  const run = await getRun(projectId, runId);
-  if (!run) return null;
-  run.status = 'awaiting-approval';
-  run.checkpoint = { gate, message, at: new Date().toISOString() };
-  run.resumable = true;                 // a gracefully-paused run IS resumable
-  await saveRun(projectId, run);
+  // T31: through mutateRun so an un-awaited setRunPhase (read before this write, landing
+  // after) can't revert awaiting-approval→running and silently un-pause the run.
+  const run = await mutateRun(projectId, runId, (run) => {
+    run.status = 'awaiting-approval';
+    run.checkpoint = { gate, message, at: new Date().toISOString() };
+    run.resumable = true;                 // a gracefully-paused run IS resumable
+  });
+  if (run) emitRunState(run);
   return run;
 }
 /** Clear a parked checkpoint (human approved). Marks the gate cleared so it does
  *  not re-fire on resume, drops the parked checkpoint and flips back to 'running'. */
 export async function approveCheckpoint(projectId: string, runId: string, gate?: CheckpointGate): Promise<BuildRun | null> {
-  const root = rootFor(projectId);
-  if (!root) return null;
-  const run = await getRun(projectId, runId);
-  if (!run) return null;
-  const g = gate ?? run.checkpoint?.gate;
-  if (g) run.approvedGates = [...new Set([...(run.approvedGates ?? []), g])];
-  run.checkpoint = undefined;
-  run.status = 'running';
-  await saveRun(projectId, run);
+  // T31: serialize through mutateRun so the approve (running) composes with concurrent
+  // status/phase writes instead of clobbering or being clobbered.
+  const run = await mutateRun(projectId, runId, (run) => {
+    const g = gate ?? run.checkpoint?.gate;
+    if (g) run.approvedGates = [...new Set([...(run.approvedGates ?? []), g])];
+    run.checkpoint = undefined;
+    run.status = 'running';
+  });
+  if (run) emitRunState(run);
   return run;
 }
 
@@ -601,40 +616,46 @@ export async function addAmendment(
   projectId: string, runId: string,
   req: { kind: AmendmentKind; rationale: string; proposedApi: string; fromFrameId?: string },
 ): Promise<{ run: BuildRun; amendment: AmendmentRequest } | null> {
-  const root = rootFor(projectId);
-  if (!root) return null;
-  const run = await getRun(projectId, runId);
-  if (!run) return null;
-  const auto = amendmentIsWhitelisted(run, req);
-  const amendment: AmendmentRequest = {
-    id: `amd_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-    kind: req.kind, rationale: req.rationale, proposedApi: req.proposedApi,
-    fromFrameId: req.fromFrameId,
-    status: auto ? 'approved' : 'pending',
-    auto: auto || undefined,
-    at: new Date().toISOString(),
-  };
-  run.amendments = [...(run.amendments ?? []), amendment];
-  // An approved amendment bumps the plan version (skeleton regen is the caller's job).
-  if (auto) run.planVersion = (run.planVersion ?? 1) + 1;
-  await saveRun(projectId, run);
+  // T31: append the amendment + bump planVersion INSIDE the chain. A parallel>1 run
+  // fires per-screen `done` writes (updateRunScreen → mutateRun) concurrently; a raw
+  // read-then-saveRun here re-serialized the run it read EARLIER and clobbered a
+  // screen's freshly-written `done`. Going through mutateRun re-reads inside the chain
+  // so the append composes with those writes.
+  let amendment: AmendmentRequest | null = null;
+  const run = await mutateRun(projectId, runId, (run) => {
+    const auto = amendmentIsWhitelisted(run, req);
+    amendment = {
+      id: `amd_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      kind: req.kind, rationale: req.rationale, proposedApi: req.proposedApi,
+      fromFrameId: req.fromFrameId,
+      status: auto ? 'approved' : 'pending',
+      auto: auto || undefined,
+      at: new Date().toISOString(),
+    };
+    run.amendments = [...(run.amendments ?? []), amendment];
+    // An approved amendment bumps the plan version (skeleton regen is the caller's job).
+    if (auto) run.planVersion = (run.planVersion ?? 1) + 1;
+  });
+  if (!run || !amendment) return null;
   return { run, amendment };
 }
 /** Resolve a pending amendment (human at the rolling gate). Approved → planVersion++. */
 export async function resolveAmendment(
   projectId: string, runId: string, amendmentId: string, decision: 'approved' | 'rejected',
 ): Promise<{ run: BuildRun; amendment: AmendmentRequest } | null> {
-  const root = rootFor(projectId);
-  if (!root) return null;
-  const run = await getRun(projectId, runId);
-  if (!run) return null;
-  const amendment = run.amendments?.find(a => a.id === amendmentId);
-  if (!amendment) return null;
-  if (amendment.status === 'pending') {
-    amendment.status = decision;
-    if (decision === 'approved') run.planVersion = (run.planVersion ?? 1) + 1;
-  }
-  await saveRun(projectId, run);
+  // T31: mutate INSIDE the chain so the decision + planVersion bump compose with
+  // concurrent screen/status writes instead of clobbering them.
+  let amendment: AmendmentRequest | undefined;
+  let missing = false;
+  const run = await mutateRun(projectId, runId, (run) => {
+    amendment = run.amendments?.find(a => a.id === amendmentId);
+    if (!amendment) { missing = true; return; }
+    if (amendment.status === 'pending') {
+      amendment.status = decision;
+      if (decision === 'approved') run.planVersion = (run.planVersion ?? 1) + 1;
+    }
+  });
+  if (!run || missing || !amendment) return null;
   return { run, amendment };
 }
 

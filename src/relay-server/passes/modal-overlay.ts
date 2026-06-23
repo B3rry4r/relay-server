@@ -167,8 +167,16 @@ export interface ModalStrategy {
     modal: CanonModal,
     screens: CanonScreen[],
     opts: ModalOverlayOptions,
-  ): Promise<{ transform: ModalTransform } | { skip: string }>;
+  ): Promise<ConvertOutcome>;
 }
+
+/** The outcome of converting one modal. A `skip` may carry `folded` metadata (T32):
+ *  the modal has no standalone file but its base screen renders in-place overlays.
+ *  The orchestrator correlates folded modals to their base's presenter call-sites and
+ *  only credits as many as the base actually presents — the rest are REAL gaps. */
+type ConvertOutcome =
+  | { transform: ModalTransform }
+  | { skip: string; folded?: { baseFile: string; presenter: string; presenterCount: number } };
 
 // ── Orchestrator ─────────────────────────────────────────────────────────────
 
@@ -197,6 +205,10 @@ export async function applyModalOverlays(projectId: string, opts: ModalOverlayOp
   let modals = canonical.modals;
   if (opts.onlyModals?.length) modals = modals.filter((m) => opts.onlyModals!.includes(m.canonicalId));
 
+  // T32: per-base-file tally of FOLDED modals so we can correlate them to the base's
+  // presenter call-sites after the loop. baseFile → { presenterCount, the folded skips }.
+  const foldedByBase = new Map<string, { presenterCount: number; entries: ModalOverlaySkip[] }>();
+
   for (const modal of modals) {
     // Orphan guard: a modal with no resolvable base / trigger is left alone with
     // a warning — we never guess-wire an overlay onto an arbitrary screen.
@@ -205,8 +217,29 @@ export async function applyModalOverlays(projectId: string, opts: ModalOverlayOp
       continue;
     }
     const out = await strategy.convert(projectRoot, modal, screens, opts);
-    if ('transform' in out) transformed.push(out.transform);
-    else skipped.push({ canonicalId: modal.canonicalId, name: modal.name, reason: out.skip });
+    if ('transform' in out) { transformed.push(out.transform); continue; }
+    const entry: ModalOverlaySkip = { canonicalId: modal.canonicalId, name: modal.name, reason: out.skip };
+    skipped.push(entry);
+    if (out.folded) {
+      const g = foldedByBase.get(out.folded.baseFile) ?? { presenterCount: out.folded.presenterCount, entries: [] };
+      g.presenterCount = out.folded.presenterCount; // identical for the same base
+      g.entries.push(entry);
+      foldedByBase.set(out.folded.baseFile, g);
+    }
+  }
+
+  // T32 OVER-CREDIT CHECK: a base screen with N showModal*/showDialog call-sites can
+  // only fold in N modals. When MORE modals claim to be folded into the same base than
+  // it has presenters, the surplus are NOT actually presented — flag them as REAL gaps
+  // instead of crediting all. We keep the FIRST `presenterCount` skips as folded (stable
+  // order) and re-write the reason on the rest. Don't fabricate: a 1:1 (or under) base
+  // is left exactly as-is.
+  for (const [baseFile, g] of foldedByBase) {
+    if (g.entries.length <= g.presenterCount) continue;
+    const excess = g.entries.slice(g.presenterCount);
+    for (const e of excess) {
+      e.reason = `REAL gap — base screen ${path.basename(baseFile)} folds in ${g.presenterCount} modal(s) (showModal*/showDialog call-site count) but ${g.entries.length} modal(s) claim it as their base; this one is UNMATCHED (no presenter for it) and is NOT actually wired`;
+    }
   }
 
   return { framework, transformed, skipped, dryRun: !!opts.dryRun };
@@ -275,15 +308,19 @@ async function resolveScreenFile(projectRoot: string, canonicalId: string, frame
 async function baseRendersFoldedOverlay(
   projectRoot: string,
   baseScreen: CanonScreen,
-): Promise<{ baseFile: string; presenter: string } | null> {
+): Promise<{ baseFile: string; presenter: string; presenterCount: number } | null> {
   const resolvedBase = await resolveScreenFile(projectRoot, baseScreen.canonicalId, baseScreen.frameIds);
   if (!resolvedBase) return null;
   let src: string;
   try { src = await fs.readFile(resolvedBase.file, 'utf8'); } catch { return null; }
-  const m = /\b(showModalBottomSheet|showDialog|showGeneralDialog)\s*</.exec(src)
-    ?? /\b(showModalBottomSheet|showDialog|showGeneralDialog)\s*\(/.exec(src);
-  if (!m) return null;
-  return { baseFile: resolvedBase.file, presenter: m[1] };
+  // T32: COUNT distinct presenter CALL-SITES, not just "has one". A base that hosts
+  // several folded modals must present each — one showModal*/showDialog call can only
+  // fold ONE modal in. The count gates the per-base over-credit check in
+  // applyModalOverlays so an UNPRESENTED sibling modal isn't credited as handled.
+  const calls = src.match(/\b(?:showModalBottomSheet|showDialog|showGeneralDialog)\s*[<(]/g);
+  if (!calls || calls.length === 0) return null;
+  const presenter = /\b(showModalBottomSheet|showDialog|showGeneralDialog)\b/.exec(calls[0])?.[1] ?? 'showModalBottomSheet';
+  return { baseFile: resolvedBase.file, presenter, presenterCount: calls.length };
 }
 
 /** The frame-id core of a canonical id: strip the `c_`/`m_` namespace prefix so a
@@ -351,7 +388,7 @@ async function convertFlutterModal(
   modal: CanonModal,
   screens: CanonScreen[],
   opts: ModalOverlayOptions,
-): Promise<{ transform: ModalTransform } | { skip: string }> {
+): Promise<ConvertOutcome> {
   const baseScreen = screens.find((s) => s.canonicalId === modal.baseCanonicalId);
   if (!baseScreen) return { skip: `base screen ${modal.baseCanonicalId} not in canonical screens` };
 
@@ -367,7 +404,14 @@ async function convertFlutterModal(
     // honestly as already-overlay/not-applicable, instead of "no built screen file".
     const folded = await baseRendersFoldedOverlay(projectRoot, baseScreen);
     if (folded) {
-      return { skip: `already an in-base overlay (folded into base screen ${path.basename(folded.baseFile)} via ${folded.presenter}) — not-applicable (generated apps render modals as in-place overlays)` };
+      // T32: report folded but CARRY the base file + presenter count so the orchestrator
+      // can verify the base actually presents enough overlays for every folded modal it
+      // hosts. A base with 1 showModal* but 2 folded modals presents only one — the other
+      // is a real gap, not "handled".
+      return {
+        skip: `already an in-base overlay (folded into base screen ${path.basename(folded.baseFile)} via ${folded.presenter}) — not-applicable (generated apps render modals as in-place overlays)`,
+        folded: { baseFile: folded.baseFile, presenter: folded.presenter, presenterCount: folded.presenterCount },
+      };
     }
     return { skip: `modal ${modal.canonicalId} (frame ${modal.frameId}) has no built screen file and its base screen renders no in-place overlay — REAL gap (modal not built)` };
   }

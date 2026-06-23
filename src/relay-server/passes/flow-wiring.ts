@@ -381,25 +381,36 @@ async function verifyFlutter(
   // edge is SATISFIED by the base screen's in-place overlay — it must NOT be
   // reported `unmapped` (that mislabels correct folded-modal handling as drift).
   // Resolve a modal id → {its base's built file, the presenter} when folded.
-  const foldedModalCache = new Map<string, { baseFile: string; presenter: string } | null>();
-  const resolveFoldedModal = async (toId: string): Promise<{ baseFile: string; presenter: string } | null> => {
+  const foldedModalCache = new Map<string, { baseFile: string; presenter: string; presenterCount: number } | null>();
+  const resolveFoldedModal = async (toId: string): Promise<{ baseFile: string; presenter: string; presenterCount: number } | null> => {
     if (foldedModalCache.has(toId)) return foldedModalCache.get(toId)!;
     const modal = modals.find((m) => m.canonicalId === toId);
-    let result: { baseFile: string; presenter: string } | null = null;
+    let result: { baseFile: string; presenter: string; presenterCount: number } | null = null;
     if (modal?.baseCanonicalId) {
       const baseFrames = framesFor(modal.baseCanonicalId);
       const baseScreen = resolveCanon(modal.baseCanonicalId, baseFrames);
       if (baseScreen) {
         try {
           const baseSrc = await readSrc(baseScreen.file);
-          const pm = /\b(showModalBottomSheet|showDialog|showGeneralDialog)\s*[<(]/.exec(baseSrc);
-          if (pm) result = { baseFile: baseScreen.file, presenter: pm[1] };
+          // T32: COUNT presenter call-sites — one showModal*/showDialog folds in ONE
+          // modal. A base hosting several folded modals must present each; the count
+          // gates the over-credit check below so an unpresented sibling isn't wired.
+          const calls = baseSrc.match(/\b(?:showModalBottomSheet|showDialog|showGeneralDialog)\s*[<(]/g);
+          if (calls && calls.length) {
+            const presenter = /\b(showModalBottomSheet|showDialog|showGeneralDialog)\b/.exec(calls[0])?.[1] ?? 'showModalBottomSheet';
+            result = { baseFile: baseScreen.file, presenter, presenterCount: calls.length };
+          }
         } catch { /* unreadable base → not folded */ }
       }
     }
     foldedModalCache.set(toId, result);
     return result;
   };
+  // T32 OVER-CREDIT GUARD: track how many DISTINCT folded modals each base file has
+  // already been credited for this pass. A base can satisfy only `presenterCount`
+  // folded-modal edges; beyond that, an edge to an UNPRESENTED sibling modal is a real
+  // gap (unmapped), not "wired".
+  const foldedCreditByBase = new Map<string, { count: number; cap: number; ids: Set<string> }>();
 
   // Map a TO canonical screen → its route const + route string. The route is the
   // one the screen is registered under in the route table. Prefer the screen's
@@ -460,10 +471,26 @@ async function verifyFlutter(
     if (fromScreen && !toScreen) {
       const folded = await resolveFoldedModal(edge.to);
       if (folded) {
-        base.status = 'wired';
-        base.toFile = rel(projectRoot, folded.baseFile);
-        base.detail = `TO is a folded modal — presented as an in-place overlay (${folded.presenter}) inside its base screen ${path.basename(folded.baseFile)}; the routed-screen target does not exist by design`;
-        mapped.add(edge.to);
+        // T32 OVER-CREDIT GUARD: only credit this folded modal if the base still has a
+        // free presenter call-site. Track distinct modal ids already credited to the
+        // base; an already-counted modal (a second edge to the SAME folded modal) is
+        // free, but a NEW sibling modal beyond the presenter cap is a real gap.
+        const credit = foldedCreditByBase.get(folded.baseFile)
+          ?? { count: 0, cap: folded.presenterCount, ids: new Set<string>() };
+        foldedCreditByBase.set(folded.baseFile, credit);
+        const alreadyCredited = credit.ids.has(edge.to);
+        if (alreadyCredited || credit.count < credit.cap) {
+          if (!alreadyCredited) { credit.ids.add(edge.to); credit.count += 1; }
+          base.status = 'wired';
+          base.toFile = rel(projectRoot, folded.baseFile);
+          base.detail = `TO is a folded modal — presented as an in-place overlay (${folded.presenter}) inside its base screen ${path.basename(folded.baseFile)}; the routed-screen target does not exist by design`;
+          mapped.add(edge.to);
+          findings.push(base);
+          continue;
+        }
+        // More folded modals on this base than it has presenters → this sibling is NOT
+        // actually presented. Fall through to the unmapped/real-gap reporting below.
+        base.detail = `TO is a modal whose base screen ${path.basename(folded.baseFile)} folds in only ${credit.cap} modal(s) (showModal*/showDialog call-sites) but is the base for more; this sibling is UNMATCHED — no presenter wires it (REAL gap, not folded)`;
         findings.push(base);
         continue;
       }

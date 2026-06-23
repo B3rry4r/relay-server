@@ -472,9 +472,14 @@ function analyzeIconSvg(svg: string): IconSvgSignals {
   }
   let min = Infinity, max = -Infinity;
   for (const d of dBodies) {
-    const nums = d.match(/-?\d+(?:\.\d+)?/g);
+    // T30: CONSUME scientific notation. A valid near-zero coord like `1.77636e-15`
+    // is ONE number — without the exponent group the regex split it into mantissa
+    // `1.77636` + a phantom `-15`, which tripped a FALSE `neg-coords` and wrongly
+    // rasterized clean single-path icons (check_circle/scan/vector_290_4337). parseFloat
+    // reads the whole `…e-15` and yields its real (≈0) magnitude.
+    const nums = d.match(/-?\d+(?:\.\d+)?(?:e[-+]?\d+)?/gi);
     if (!nums) continue;
-    for (const ns of nums) { const v = parseFloat(ns); if (v < min) min = v; if (v > max) max = v; }
+    for (const ns of nums) { const v = parseFloat(ns); if (!Number.isFinite(v)) continue; if (v < min) min = v; if (v > max) max = v; }
   }
   if (!isFinite(min) || !isFinite(max)) {
     return { pathCount, clean: true, broken: false, reason: 'no-coords' };
