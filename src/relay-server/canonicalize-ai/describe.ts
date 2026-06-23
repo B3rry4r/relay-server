@@ -26,7 +26,7 @@ import { resolveProjectRoot, createTerminalEnv, resolveWorkspace } from '../runt
 import { requireModel } from '../ai-observability';
 import type { AIModel } from '../ai-adapters';
 import { getNodeTree, renderFrameReference } from '../reference-render';
-import { isWidgetKind, lexiconForPrompt } from './lexicon';
+import { isWidgetKind, isSectionKind, isRole, lexiconForPrompt } from './lexicon';
 import {
   FRAME_DESCRIPTOR_SCHEMA, schemaForPrompt,
   type FrameDescriptor, type DescriptorWidget, type DescriptorProposal,
@@ -114,10 +114,14 @@ function normalizeDescriptor(
 
   const sectionsRaw: any[] = Array.isArray(obj.sections) ? obj.sections : [];
   const sections = sectionsRaw
-    .map(s => ({ kind: s?.kind, brief: String(s?.brief ?? '').slice(0, 120) }))
-    .filter(s => typeof s.kind === 'string');
+    // Coerce an out-of-enum section kind → 'other' (the catch-all), mirroring the
+    // widget coercion above. A single AI near-miss (e.g. "scrim"/"overlay") must NOT
+    // fail strict schema validation and nuke the whole canonicalization.
+    .map(s => ({ kind: isSectionKind(s?.kind) ? s.kind : 'other', brief: String(s?.brief ?? '').slice(0, 120) }))
+    .filter(s => typeof s.brief === 'string');
 
-  const role = typeof obj.role === 'string' ? obj.role : 'screen';
+  // Same coercion for role: an unknown role → 'screen' rather than a hard validation fail.
+  const role = isRole(obj.role) ? obj.role : 'screen';
   const semanticName = (typeof obj.semanticName === 'string' && obj.semanticName.trim())
     ? obj.semanticName.trim().slice(0, 80) : 'screen';
 
