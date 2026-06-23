@@ -157,23 +157,79 @@ export interface FlowWiringResult {
 
 // ── Canonical model (subset we read) ─────────────────────────────────────────
 
+// Internal normalized edge shape the pass reads (`.from`/`.to`).
 interface CanonFlowEdge { from: string; to: string; kind: string; label?: string }
 interface CanonFlow { entryCanonicalId: string | null; edges: CanonFlowEdge[] }
-interface CanonScreen { canonicalId: string; name: string; route: string; frameIds: string[] }
+
+/**
+ * Raw edge as it appears on disk. The authoritative canonical schema emits
+ * `fromCanonicalId`/`toCanonicalId` (see CanonicalFlowEdge in canonicalize.ts);
+ * legacy/test canonicals may use `from`/`to`. We accept both and normalize.
+ */
+interface RawCanonFlowEdge {
+  fromCanonicalId?: string;
+  toCanonicalId?: string;
+  from?: string;
+  to?: string;
+  kind?: string;
+  label?: string;
+}
+interface RawCanonFlow { entryCanonicalId?: string | null; edges?: RawCanonFlowEdge[] }
+/** A modal as it lives on disk: nested under its base screen's `modals[]`. */
+interface CanonScreenModal { id: string; frameId: string; baseCanonicalId: string | null }
+interface CanonScreen { canonicalId: string; name: string; route: string; frameIds: string[]; modals?: CanonScreenModal[] }
 interface CanonModalTrigger { fromScreen: string; element?: string; edgeType: string }
-interface CanonModal { canonicalId: string; name: string; frameId: string; baseCanonicalId: string; trigger: CanonModalTrigger }
+interface CanonModal { canonicalId: string; name: string; frameId: string; baseCanonicalId: string; trigger?: CanonModalTrigger }
 interface CanonModel {
   projectId?: string;
   contentHash?: string;
   screens?: CanonScreen[];
+  /** Top-level modal list (legacy/optional). The authoritative schema nests modals
+   *  under each screen's `modals[]`; collectModals() flattens both into one list. */
   modals?: CanonModal[];
   flow?: CanonFlow;
+}
+
+/**
+ * The flow-wiring strategies look modals up in a single flat `CanonModal[]`, but the
+ * authoritative on-disk canonical (canonicalize.ts `CanonicalScreen.modals`) NESTS
+ * each modal under its base screen as `{id, frameId, baseCanonicalId}` and emits NO
+ * top-level `modals[]`. Flatten both sources so folded-modal resolution actually
+ * fires against real canonicals.
+ */
+function collectModals(canonical: CanonModel): CanonModal[] {
+  const out: CanonModal[] = [...(canonical.modals ?? [])];
+  const seen = new Set(out.map((m) => m.canonicalId));
+  for (const s of canonical.screens ?? []) {
+    for (const m of s.modals ?? []) {
+      if (!m?.id || seen.has(m.id)) continue;
+      seen.add(m.id);
+      out.push({ canonicalId: m.id, name: m.id, frameId: m.frameId, baseCanonicalId: m.baseCanonicalId ?? s.canonicalId });
+    }
+  }
+  return out;
+}
+
+interface RawCanonModel extends Omit<CanonModel, 'flow'> { flow?: RawCanonFlow }
+
+/** Normalize a raw on-disk flow into the internal `{from,to}` edge shape. */
+function normalizeFlow(raw: RawCanonFlow | undefined): CanonFlow | undefined {
+  if (!raw || !Array.isArray(raw.edges)) return undefined;
+  const edges: CanonFlowEdge[] = raw.edges.map((e) => ({
+    from: e.fromCanonicalId ?? e.from ?? '',
+    to: e.toCanonicalId ?? e.to ?? '',
+    kind: e.kind ?? '',
+    ...(e.label != null ? { label: e.label } : {}),
+  }));
+  return { entryCanonicalId: raw.entryCanonicalId ?? null, edges };
 }
 
 async function readCanonical(root: string): Promise<CanonModel | null> {
   try {
     const raw = await fs.readFile(path.join(root, '.uix', 'canonical.json'), 'utf8');
-    return JSON.parse(raw) as CanonModel;
+    const parsed = JSON.parse(raw) as RawCanonModel;
+    const flow = normalizeFlow(parsed.flow);
+    return { ...parsed, ...(flow ? { flow } : { flow: undefined }) } as CanonModel;
   } catch {
     return null;
   }
@@ -256,7 +312,7 @@ export async function verifyFlowWiring(projectId: string, opts: FlowWiringOption
   }
 
   const { findings, autoFixes, screensMapped, screensReferenced } =
-    await strategy.verify(projectRoot, flow, canonical.screens ?? [], canonical.modals ?? [], opts);
+    await strategy.verify(projectRoot, flow, canonical.screens ?? [], collectModals(canonical), opts);
 
   const report = emptyReport(findings, autoFixes, screensMapped, screensReferenced);
   const reportPath = await maybeWriteReport(projectRoot, report, opts);
