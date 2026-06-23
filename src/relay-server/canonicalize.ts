@@ -33,6 +33,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import type { RunFlow, RunScreen } from './build-run-store';
+import { deriveSemanticIdentifiers } from './semantic-names';
 
 // ── canonical.json schema (RFC §4.1) ─────────────────────────────────────────
 export interface CanonicalState { id: string; frameId: string }
@@ -295,10 +296,12 @@ export function isSameScreenState(a: ParsedFrame, b: ParsedFrame): boolean {
 export function canonicalIdFor(frameId: string): string {
   return 'c_' + frameId.replace(/[^a-zA-Z0-9]+/g, '_');
 }
-/** Stable route slug derived from the canonicalId — cosmetic name is separate. */
+/** Semantic route path from the screen's human name (machine/frame-code names fall
+ *  back to `/screen`). The skeleton's planSemanticScreens later re-derives this WITH
+ *  cross-screen collision suffixing and rewrites `c.route`; this is the initial value
+ *  (and the value used by non-flutter runs that skip the skeleton). */
 export function routeForCanonical(c: CanonicalScreen): string {
-  const slug = (c.name || c.canonicalId).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
-  return '/' + (slug || c.canonicalId.toLowerCase());
+  return deriveSemanticIdentifiers(c.name).routePath;
 }
 
 // ── the pre-pass ─────────────────────────────────────────────────────────────
@@ -500,6 +503,22 @@ export async function readCanonical(projectRoot: string, runId: string): Promise
   catch { return null; }
 }
 
+// ── T35: live `.uix/canonical.json` ↔ run sync ───────────────────────────────
+// The finalize passes (semantic-rename / flow-wiring / component-extraction) read
+// `<root>/.uix/canonical.json`, NOT the per-run sidecar. On a deterministic run
+// that file was never written; on any run it could be left over from a DIFFERENT,
+// earlier build — so finalize renamed against the wrong model. This writes the
+// LIVE `.uix/canonical.json` from THIS run's canonical and stamps an `ownerRunId`
+// so a stale file from another run is detectable. Call it after the skeleton has
+// finalized the semantic routes so the live file matches the built app.
+const liveCanonicalFile = (root: string) => path.join(root, '.uix', 'canonical.json');
+export async function syncLiveCanonical(projectRoot: string, runId: string, canonical: Canonical): Promise<string> {
+  const file = liveCanonicalFile(projectRoot);
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, JSON.stringify({ ...canonical, ownerRunId: runId }, null, 2), 'utf-8');
+  return file;
+}
+
 // ── header re-stamp (RFC v2 §3 Phase 8 — header preservation) ────────────────
 // The per-screen build REWRITES each screen file and can DROP the
 // `// canonicalId: c_<frame>  route: <route>` header that the skeleton stamped —
@@ -524,14 +543,26 @@ export async function restampCanonicalHeaders(
 ): Promise<RestampResult> {
   const stamped: string[] = [];
   const missingFiles: string[] = [];
-  const slugFile = (canonicalId: string) => `screen_${canonicalId.replace(/^c_/, '')}`.toLowerCase();
+  // The skeleton names files SEMANTICALLY (login_screen.dart), so locate each
+  // screen's file via the SAME semantic plan. Keep the legacy machine slug
+  // (screen_<id>.dart) as a fallback for files from an older skeleton convention.
+  const semantics = planSemanticScreens(canonical);
+  const legacySlug = (canonicalId: string) => `screen_${canonicalId.replace(/^c_/, '')}`.toLowerCase();
   const headerRe = /^\/\/\s*canonicalId:\s*\S+/m;
   for (const c of canonical.screens) {
-    const rel = path.join('lib', 'screens', `${slugFile(c.canonicalId)}.dart`);
-    const abs = path.join(projectRoot, rel);
+    const sem = semantics.get(c.canonicalId);
+    const semRel = path.join('lib', 'screens', `${(sem?.fileBase) ?? legacySlug(c.canonicalId)}.dart`);
+    const legacyRel = path.join('lib', 'screens', `${legacySlug(c.canonicalId)}.dart`);
+    let rel = semRel;
+    let abs = path.join(projectRoot, semRel);
     let src: string;
     try { src = await fs.readFile(abs, 'utf-8'); }
-    catch { missingFiles.push(c.canonicalId); continue; }
+    catch {
+      // Fall back to the legacy machine-named file if the semantic one is absent.
+      rel = legacyRel; abs = path.join(projectRoot, legacyRel);
+      try { src = await fs.readFile(abs, 'utf-8'); }
+      catch { missingFiles.push(c.canonicalId); continue; }
+    }
     if (headerRe.test(src)) continue;            // already present → idempotent no-op
     const route = c.route || routeForCanonical(c);
     const header =
@@ -543,6 +574,39 @@ export async function restampCanonicalHeaders(
     stamped.push(rel);
   }
   return { stamped, missingFiles };
+}
+
+// ── T35: orphan-screen cleanup ───────────────────────────────────────────────
+// A re-build with a SMALLER/different canonical leaves stale screen files in
+// lib/screens/ from a prior build (different frame set, different names). They
+// pollute the app (dead routes, broken imports, AI/human confusion). This removes
+// every generated screen file whose `// canonicalId:` header is NOT in the CURRENT
+// canonical. Conservative: a file with NO canonicalId header (hand-authored, not a
+// generated screen) is LEFT untouched; we only reap files we recognise as generated
+// screens for OTHER canonical ids. Returns the removed (project-relative) files.
+export interface OrphanCleanResult { removed: string[]; kept: number }
+export async function cleanOrphanScreens(projectRoot: string, canonical: Canonical): Promise<OrphanCleanResult> {
+  const screensDir = path.join(projectRoot, 'lib', 'screens');
+  const removed: string[] = [];
+  let kept = 0;
+  const liveIds = new Set(canonical.screens.map(s => s.canonicalId));
+  const headerRe = /^\/\/\s*canonicalId:\s*(\S+)/m;
+  let files: string[] = [];
+  try { files = (await fs.readdir(screensDir)).filter(f => f.endsWith('.dart')); }
+  catch { return { removed, kept }; }
+  for (const f of files) {
+    const abs = path.join(screensDir, f);
+    let src: string;
+    try { src = await fs.readFile(abs, 'utf-8'); } catch { continue; }
+    const m = headerRe.exec(src);
+    if (!m) { kept++; continue; }              // no header → not a generated screen; leave it
+    const id = m[1];
+    if (liveIds.has(id)) { kept++; continue; } // belongs to the current canonical → keep
+    // Orphan: a generated screen for a canonicalId not in the current build.
+    try { await fs.rm(abs, { force: true }); removed.push(path.join('lib', 'screens', f)); }
+    catch { /* best-effort */ }
+  }
+  return { removed, kept };
 }
 
 // ── deterministic write-locked skeleton (RFC §4.2) ───────────────────────────
@@ -557,19 +621,65 @@ export async function restampCanonicalHeaders(
 const pascal = (s: string): string =>
   (s.replace(/[^a-zA-Z0-9]+/g, ' ').trim().split(/\s+/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join('') || 'Screen');
 
-/** A Dart class name for a canonical screen (deterministic, collision-suffixed). */
-function screenClassName(c: CanonicalScreen, used: Set<string>): string {
-  let base = pascal(c.name) + 'Screen';
-  let name = base;
-  let n = 2;
-  while (used.has(name)) name = `${base}${n++}`;
-  used.add(name);
-  return name;
+/** The reader-facing semantic identifiers for one canonical screen (identity stays on canonicalId). */
+export interface ScreenSemantics {
+  canonicalId: string;
+  fileBase: string;    // login_screen          (no extension)
+  className: string;   // LoginScreen
+  routeConst: string;  // login                 (camelCase const in AppRoutes)
+  routePath: string;   // /login                (router switch key)
+}
+
+/**
+ * Plan SEMANTIC identifiers for every canonical screen — file base, class name,
+ * route const, AND route path — all derived from the human display name with a
+ * `screen` fallback for raw frame-code names, collision-suffixed (`-2`/`2`/`_2`)
+ * so two screens never grab the same identifier. Identity stays on `canonicalId`
+ * (frame-map). Side effect: rewrites each screen's `c.route` to the semantic path
+ * so the persisted canonical.json + skeleton + downstream passes all agree on the
+ * SAME human route (no `/283-1967` machine paths survive). Pure aside from that.
+ */
+export function planSemanticScreens(canonical: Canonical): Map<string, ScreenSemantics> {
+  const plan = new Map<string, ScreenSemantics>();
+  const usedFiles = new Set<string>();
+  const usedClasses = new Set<string>();
+  const usedConsts = new Set<string>();
+  const usedPaths = new Set<string>();
+  // Stable order = canonical.screens order (deterministic across runs).
+  for (const c of canonical.screens) {
+    let n = 1;
+    let ids = deriveSemanticIdentifiers(c.name);
+    // Suffix until ALL four identifiers are free (one suffix token keeps them in sync).
+    while (
+      usedFiles.has(`${ids.fileBase}.dart`) ||
+      usedClasses.has(ids.className) ||
+      usedConsts.has(ids.routeConst) ||
+      usedPaths.has(ids.routePath)
+    ) {
+      n += 1;
+      ids = deriveSemanticIdentifiers(c.name, [String(n)]);
+    }
+    usedFiles.add(`${ids.fileBase}.dart`);
+    usedClasses.add(ids.className);
+    usedConsts.add(ids.routeConst);
+    usedPaths.add(ids.routePath);
+    const s: ScreenSemantics = {
+      canonicalId: c.canonicalId,
+      fileBase: ids.fileBase,
+      className: ids.className,
+      routeConst: ids.routeConst,
+      routePath: ids.routePath,
+    };
+    plan.set(c.canonicalId, s);
+    // Rewrite the canonical route to the semantic path so canonical.json matches.
+    c.route = ids.routePath;
+  }
+  return plan;
 }
 
 export interface SkeletonResult {
   files: string[];           // project-relative files written
-  routes: Array<{ canonicalId: string; route: string; className: string; file: string }>;
+  routes: Array<{ canonicalId: string; route: string; className: string; routeConst: string; file: string }>;
 }
 
 /**
@@ -592,14 +702,18 @@ export async function generateFlutterSkeleton(projectRoot: string, canonical: Ca
   await fs.mkdir(themeDir, { recursive: true });
 
   const files: string[] = [];
-  const used = new Set<string>();
   const routes: SkeletonResult['routes'] = [];
-  const slugFile = (c: CanonicalScreen) => `screen_${c.canonicalId.replace(/^c_/, '')}`.toLowerCase();
+  // SEMANTIC plan: file base / class / route const / route PATH for every screen,
+  // derived from the human name (machine/frame-code names fall back to `screen`),
+  // collision-suffixed. This ALSO rewrites each screen's `c.route` to the semantic
+  // path so the persisted canonical.json + router agree (no machine paths survive).
+  const semantics = planSemanticScreens(canonical);
 
   // Per-screen write-locked stubs.
   for (const c of canonical.screens) {
-    const className = screenClassName(c, used);
-    const fileBase = slugFile(c);
+    const sem = semantics.get(c.canonicalId)!;
+    const className = sem.className;
+    const fileBase = sem.fileBase;
     const rel = path.join('lib', 'screens', `${fileBase}.dart`);
     const stub = `// GENERATED SKELETON — write-locked route slot for canonical screen.
 // canonicalId: ${c.canonicalId}  route: ${c.route}
@@ -616,7 +730,7 @@ class ${className} extends StatelessWidget {
   Widget build(BuildContext context) {
     // TODO(build): implement this screen against its reference. Each state is
     // verified individually via ${className}(state: '<id>').
-    return const Scaffold(body: Center(child: Text('${c.name}')));
+    return const Scaffold(body: Center(child: Text('${c.name.replace(/'/g, "\\'")}')));
   }
 }
 `;
@@ -624,7 +738,7 @@ class ${className} extends StatelessWidget {
     // resumable — never clobber a built screen).
     try { await fs.access(path.join(projectRoot, rel)); }
     catch { await fs.writeFile(path.join(projectRoot, rel), stub, 'utf-8'); files.push(rel); }
-    routes.push({ canonicalId: c.canonicalId, route: c.route, className, file: rel });
+    routes.push({ canonicalId: c.canonicalId, route: c.route, className, routeConst: sem.routeConst, file: rel });
   }
 
   // Shared-component stubs.
@@ -659,8 +773,10 @@ ThemeData appTheme() => ThemeData(useMaterial3: true);
   }
 
   // Central route table + router (always regenerated — it's the contract).
+  // Route CONST names are SEMANTIC (login, not c2831967) and route PATHS are
+  // SEMANTIC (/login, not /283-1967) — both come from the plan above.
   const routesRel = path.join('lib', 'app_routes.dart');
-  const routeConsts = routes.map(r => `  static const String ${pascal(r.canonicalId).charAt(0).toLowerCase() + pascal(r.canonicalId).slice(1)} = '${r.route}';`).join('\n');
+  const routeConsts = routes.map(r => `  static const String ${r.routeConst} = '${r.route}';`).join('\n');
   await fs.writeFile(path.join(projectRoot, routesRel), `// GENERATED SKELETON — central route table (canonical routes; write-locked).
 // Per-screen builds wire navigation to these constants; do NOT add routes here.
 class AppRoutes {

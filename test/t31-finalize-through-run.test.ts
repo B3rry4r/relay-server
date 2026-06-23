@@ -20,6 +20,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { registerScreenLoopRoutes } from '../src/relay-server/ai-screen-loop';
 import { readRunLog, getRun, type BuildRun } from '../src/relay-server/build-run-store';
+import { subscribeRunEvents } from '../src/relay-server/run-events';
 
 const PROJECT_ID = 'app';
 let tmpWorkspace: string;
@@ -137,6 +138,14 @@ describe('T31 — finalize runs through the run', () => {
     run.screens[4].matched = false;
     await writeRun(run);
 
+    // T33: capture run:state statuses so we can prove the auto-finalize path flips
+    // the run to `running` (via mutateRun/emitRunState) BEFORE runAppLoop, instead of
+    // leaving the UI on a `done` run with no live stream.
+    const statuses: string[] = [];
+    const unsub = subscribeRunEvents((e) => {
+      if (e.type === 'run:state' && e.runId === runId && e.status) statuses.push(e.status);
+    });
+
     const res = await request(app)
       .post(`/api/ai/runs/${runId}/accept`)
       .send({ projectId: PROJECT_ID, frameId: 'frame_5' });
@@ -145,6 +154,9 @@ describe('T31 — finalize runs through the run', () => {
     // The accept route fired the auto-finalize trigger…
     const log = await waitForLog(runId, '[review] last blocker cleared');
     expect(log).toMatch(/\[review] last blocker cleared — auto-running finalize/);
+    // T33: the run flipped to `running` for the live finalize stream.
+    expect(statuses).toContain('running');
+    unsub();
     // …and finalize ran through THIS run (no rebuilds) to terminal done.
     const joined = await waitForLog(runId, '[run] complete');
     expect(joined).not.toMatch(/\[loop] implement/);

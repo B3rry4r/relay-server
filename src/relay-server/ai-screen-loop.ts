@@ -45,7 +45,7 @@ import {
 import { getProjectsRoot } from './runtime';
 import {
   canonicalizeRun, writeCanonical, readCanonical, generateFlutterSkeleton,
-  restampCanonicalHeaders,
+  restampCanonicalHeaders, cleanOrphanScreens, syncLiveCanonical,
   type Canonical, type CanonicalScreen,
 } from './canonicalize';
 import { canonicalize as aiCanonicalize, type CanonicalizeOptions } from './canonicalize-ai/orchestrate';
@@ -1357,7 +1357,11 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
       const persisted = await readCanonical(projectRoot, runId);
       if (persisted) {
         canonical = persisted;
-        await appendRunLog(projectId, runId, `[canon] reusing persisted canonicalization (${canonical.screens.length} screen(s), ${canonical.components.length} component(s)) — prep already done, skipping re-canonicalize + skeleton + fold`);
+        // T35: re-assert OWNERSHIP of the live `.uix/canonical.json` on resume — a
+        // DIFFERENT run may have written it since. Keyed to THIS run so the finalize
+        // passes (which read the live file) always reconcile against the built app.
+        await syncLiveCanonical(projectRoot, runId, canonical);
+        await appendRunLog(projectId, runId, `[canon] reusing persisted canonicalization (${canonical.screens.length} screen(s), ${canonical.components.length} component(s)) — prep already done, skipping re-canonicalize + skeleton + fold; re-synced live canonical.json to this run`);
       } else {
         // RFC v2 §4.2: the HEAVY-AI chain is THE canonicalization. The deterministic
         // clusterer is ONLY reachable as an EXPLICIT, logged `degraded` mode
@@ -1410,16 +1414,20 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
             // modals into base screens, rebuilds frameMap, maps states/templates/flow).
             canonical = aiModelToCanonical(result.canonical);
           }
-          await writeCanonical(projectRoot, runId, canonical);
-          // P5 (RFC §4.2/§4.9): persist frame-map.json — the SINGLE identity axis
-          // (frameId → canonicalId). All durability + route derivation key on this.
-          await writeFrameMap(projectId, runId, canonical.frameMap);
           // Generate the deterministic skeleton (Flutter only for now; other
           // frameworks still get canonical.json + the manifest, no router file).
           // (Skeleton writes are additive — a built screen file is never clobbered.)
+          // generateFlutterSkeleton derives SEMANTIC file/class/route-const/route-PATH
+          // names and REWRITES canonical.screens[].route to the semantic path, so the
+          // canonical must be PERSISTED AFTER the skeleton runs (below) — otherwise the
+          // sidecar carries machine routes the router no longer uses.
           if ((run.framework || 'flutter').toLowerCase() === 'flutter') {
             try {
               setGenPhase(projectId, runId, 'Skeleton');
+              // T35: reap stale screen files from a prior (different/smaller) build so
+              // lib/screens/ holds ONLY the current canonical's screens before we add stubs.
+              const orphans = await cleanOrphanScreens(projectRoot, canonical);
+              if (orphans.removed.length) await appendRunLog(projectId, runId, `[canon] orphan cleanup — removed ${orphans.removed.length} stale screen file(s) not in the current canonical`);
               const sk = await generateFlutterSkeleton(projectRoot, canonical);
               await appendRunLog(projectId, runId, `[canon] skeleton: ${sk.files.length} file(s), ${sk.routes.length} route(s)`);
             } catch (e: any) {
@@ -1431,6 +1439,15 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
             // (canonical.json + the manifest are still written above) instead of a silent no-op.
             await appendRunLog(projectId, runId, `[canon] skeleton SKIPPED — ${(run.framework || 'flutter')} not yet supported by this phase; flutter-only (no router/theme/component stubs were generated)`);
           }
+          // Persist AFTER the skeleton has rewritten canonical.screens[].route to the
+          // SEMANTIC path — so the per-run sidecar + the live `.uix/canonical.json`
+          // (which the finalize passes read) both match the built router. T35: stamp
+          // the live file with this run's id so a stale file from another run is detectable.
+          await writeCanonical(projectRoot, runId, canonical);
+          await syncLiveCanonical(projectRoot, runId, canonical);
+          // P5 (RFC §4.2/§4.9): persist frame-map.json — the SINGLE identity axis
+          // (frameId → canonicalId). All durability + route derivation key on this.
+          await writeFrameMap(projectId, runId, canonical.frameMap);
           // Mark every NON-lead member (extra states, bound modals, components) done
           // up-front so the run completes — they're built inside their lead screen.
           // Only on the FIRST canonicalization; on resume these are already 'done'.
@@ -2371,19 +2388,21 @@ export function registerScreenLoopRoutes(app: Express): void {
     const steer = typeof b.steerNotes === 'string' ? b.steerNotes.trim() : '';
     if (steer) {
       run.userNotes = [run.userNotes?.trim(), steer].filter(Boolean).join('\n\n');
-      if (run.status !== 'running') run.status = 'running';
       await saveRun(projectId, run);
+      // T33: set status THROUGH mutateRun (emits run:state) so the UI flips to running.
+      if (run.status !== 'running') { await setRunStatus(projectId, runId, 'running'); run.status = 'running'; }
     } else if (run.status === 'stopped') {
+      await setRunStatus(projectId, runId, 'running');
       run.status = 'running';
-      await saveRun(projectId, run);
     } else if ((run.status === 'done' || run.status === 'needs-review') && !b.restart) {
       // T31: resume a done-but-unfinalized run (or one whose last needs-review screen
       // was just Accepted) to RUN FINALIZE through the run. runAppLoop's all-done
       // fast-path skips the build loop and goes straight to the finalize branch — no
-      // screen rebuilds, no re-verify. Flip to running so the UI reflects the active
-      // finalize phase (the loop sets it back to 'done' on completion).
+      // screen rebuilds, no re-verify. T33: flip to running THROUGH mutateRun (emits
+      // run:state) so the UI reflects the active finalize phase + streams it (the loop
+      // sets it back to 'done' on completion).
+      await setRunStatus(projectId, runId, 'running');
       run.status = 'running';
-      await saveRun(projectId, run);
       await appendRunLog(projectId, runId, `[run] resume → finalize (no rebuilds; all screens already done)`);
     }
     void runAppLoop(projectId, runId).catch(() => {});
@@ -2528,6 +2547,10 @@ export function registerScreenLoopRoutes(app: Express): void {
       const finalizeReportPath = projectRoot ? path.join(projectRoot, '.uix', 'finalize-report.json') : '';
       const alreadyFinalized = after.finalized === true || (!!finalizeReportPath && fsSync.existsSync(finalizeReportPath));
       if (!alreadyFinalized) {
+        // T33: the Accept rolled the run to 'done' (deriveStatus). Flip it back to
+        // 'running' THROUGH mutateRun (emits run:state) BEFORE kicking runAppLoop, or
+        // the UI shows a stopped/done run with no live finalize stream.
+        await setRunStatus(projectId, runId, 'running');
         await appendRunLog(projectId, runId, `[review] last blocker cleared — auto-running finalize`);
         void runAppLoop(projectId, runId).catch(() => {});
       }

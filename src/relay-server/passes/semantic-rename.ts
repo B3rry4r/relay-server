@@ -43,6 +43,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import type { AIModel } from '../ai-adapters';
+import { deriveSemanticIdentifiers } from '../semantic-names';
 
 // ── Public contract ──────────────────────────────────────────────────────────
 
@@ -92,6 +93,8 @@ export interface ScreenRename {
   newStateClass?: string; // e.g. _LinkBanksScreenState
   oldRouteConst?: string; // e.g. c2903657
   newRouteConst?: string; // e.g. linkBanks
+  oldRoutePath?: string;  // e.g. /283-1967   (the URL string the router switches on)
+  newRoutePath?: string;  // e.g. /link-banks
   /** how the identifier was derived. */
   identifierHow: 'deterministic' | 'ai-disambiguated';
 }
@@ -250,6 +253,9 @@ async function maybeWriteReport(projectRoot: string, report: RenameSemanticRepor
 }
 
 // ── Identifier derivation (shared, framework-neutral naming math) ─────────────
+// The naming MATH lives in ../semantic-names (the single source of truth shared
+// with the skeleton). `deriveIdentifiers` (below) delegates to it; the only thing
+// kept local is the exported `tokenizeName` (used by tests + the AI seam).
 
 /** Split a human/camel/snake name into lowercase word tokens. */
 export function tokenizeName(name: string): string[] {
@@ -263,44 +269,21 @@ export function tokenizeName(name: string): string[] {
     .map((t) => t.toLowerCase());
 }
 
-/** Drop a trailing "screen" token so we can re-append a single, consistent one. */
-function stripScreenToken(tokens: string[]): string[] {
-  const out = [...tokens];
-  while (out.length > 1 && out[out.length - 1] === 'screen') out.pop();
-  return out;
-}
-
-/** snake_case base (no suffix), e.g. ['link','banks'] → 'link_banks'. */
-function snake(tokens: string[]): string { return tokens.join('_'); }
-
-/** PascalCase, e.g. ['link','banks'] → 'LinkBanks'. */
-function pascal(tokens: string[]): string {
-  return tokens.map((t) => (t ? t[0].toUpperCase() + t.slice(1) : t)).join('');
-}
-
-/** camelCase, e.g. ['link','banks'] → 'linkBanks'. */
-function camel(tokens: string[]): string {
-  return tokens.map((t, i) => (i === 0 ? t : (t ? t[0].toUpperCase() + t.slice(1) : t))).join('');
-}
-
 /** Derived semantic identifiers for one screen from its canonical name. */
 export interface DerivedIdentifiers {
   fileBase: string;   // link_banks_screen        (no extension)
   className: string;  // LinkBanksScreen
   routeConst: string; // linkBanks
+  routePath: string;  // /link-banks
 }
 
-/** Deterministically derive identifiers; respects the framework file convention
- *  via `fileSuffix`/`classSuffix`. Pure — no IO. */
-export function deriveIdentifiers(canonicalName: string): DerivedIdentifiers {
-  const base = stripScreenToken(tokenizeName(canonicalName));
-  // A blank/degenerate name can't be derived — caller must skip.
-  const safe = base.length ? base : ['screen'];
-  return {
-    fileBase: `${snake(safe)}_screen`,
-    className: `${pascal(safe)}Screen`,
-    routeConst: camel(safe),
-  };
+/** Deterministically derive identifiers from the canonical name. Pure — no IO.
+ *  Delegates to the SHARED semantic-name math so the safety-net pass derives the
+ *  EXACT SAME names the skeleton does (machine/frame-code names fall back to
+ *  `screen`, with the caller's collision suffixing). */
+export function deriveIdentifiers(canonicalName: string, suffixTokens: string[] = []): DerivedIdentifiers {
+  const ids = deriveSemanticIdentifiers(canonicalName, suffixTokens);
+  return { fileBase: ids.fileBase, className: ids.className, routeConst: ids.routeConst, routePath: ids.routePath };
 }
 
 // =============================================================================
@@ -406,7 +389,14 @@ async function renameFlutter(
 
     const collision = collides(ids);
     if (collision) {
-      const disamb = await disambiguate(screen, ids, collision, [...existingClasses, ...claimedClasses], opts);
+      // The screen's OWN current identifiers are NOT "taken" against itself — the
+      // skeleton may have already given it a valid collision-suffixed semantic name
+      // (LoginScreen → Login2Screen); the deterministic fallback should REUSE that
+      // suffix, not bump past it to Login3Screen. Exclude its own class/state class.
+      const taken = [...existingClasses, ...claimedClasses].filter(
+        (c) => c !== built.widgetClass && c !== built.stateClass,
+      );
+      const disamb = await disambiguate(screen, ids, collision, taken, opts);
       if (disamb && !collides(disamb)) {
         ids = disamb;
         identifierHow = 'ai-disambiguated';
@@ -416,15 +406,20 @@ async function renameFlutter(
       }
     }
 
-    // IDEMPOTENCE: if the screen ALREADY carries the semantic file + class, skip.
+    // IDEMPOTENCE: if the screen ALREADY carries the semantic file + class + route
+    // const + route PATH, skip. The old route PATH is the screen's header route (or
+    // the const's mapped path); the new one is the derived semantic path.
     const newBase = `${ids.fileBase}.dart`;
     const oldRouteConst = built.route ? routeToConst.get(built.route) ?? undefined : undefined;
+    const oldRoutePath = built.route ?? (oldRouteConst ? constToRoute.get(oldRouteConst) : undefined);
+    const pathNeedsRewrite = !!oldRoutePath && oldRoutePath !== ids.routePath;
     const alreadySemantic =
       built.base === newBase &&
       built.widgetClass === ids.className &&
-      (!oldRouteConst || oldRouteConst === ids.routeConst);
+      (!oldRouteConst || oldRouteConst === ids.routeConst) &&
+      !pathNeedsRewrite;
     if (alreadySemantic) {
-      skipped.push({ canonicalId: screen.canonicalId, reason: 'already semantic (file/class/route match canonical) — nothing to rename' });
+      skipped.push({ canonicalId: screen.canonicalId, reason: 'already semantic (file/class/route/path match canonical) — nothing to rename' });
       continue;
     }
 
@@ -437,6 +432,7 @@ async function renameFlutter(
       newClass: ids.className,
       ...(built.stateClass ? { oldStateClass: built.stateClass, newStateClass: stateClassFromWidget(ids.className) } : {}),
       ...(oldRouteConst ? { oldRouteConst, newRouteConst: ids.routeConst } : {}),
+      ...(pathNeedsRewrite ? { oldRoutePath, newRoutePath: ids.routePath } : {}),
       identifierHow,
     };
     renames.push(plan);
@@ -475,6 +471,10 @@ async function renameFlutter(
       next = replaceIdentifier(next, r.oldClass, r.newClass);
       if (r.oldStateClass && r.newStateClass) next = replaceIdentifier(next, r.oldStateClass, r.newStateClass);
       if (r.oldRouteConst && r.newRouteConst) next = replaceIdentifier(next, r.oldRouteConst, r.newRouteConst);
+      // 1b) Rewrite the route PATH string LITERAL ('/283-1967' → '/link-banks') —
+      // the const NAME rewrite above does not touch the VALUE. Whole-quoted-literal
+      // only (route paths are unique), so it never clobbers a substring elsewhere.
+      if (r.oldRoutePath && r.newRoutePath) next = replaceQuotedLiteral(next, r.oldRoutePath, r.newRoutePath);
       // 2) Rewrite import/path references to the moved file (basename-level).
       next = rewriteImportPath(next, path.basename(r.oldFile), path.basename(r.newFile));
       if (next !== src) contents.set(file, next);
@@ -558,6 +558,18 @@ export function rewriteImportPath(src: string, oldBase: string, newBase: string)
   return src.replace(re, (_m, pre: string) => `${pre}${newBase}`);
 }
 
+/**
+ * Replace a WHOLE quoted string literal `oldVal` → `newVal` (single OR double
+ * quote), matching only when the ENTIRE quoted contents equal `oldVal` — so a
+ * route path `/283-1967` is rewritten in `'/283-1967'` but never inside a longer
+ * string. Used for route-PATH literals in app_routes.dart + Navigator calls.
+ */
+export function replaceQuotedLiteral(src: string, oldVal: string, newVal: string): string {
+  if (!oldVal || oldVal === newVal) return src;
+  const re = new RegExp(`(['"])(${escapeRe(oldVal)})\\1`, 'g');
+  return src.replace(re, (_m, q: string) => `${q}${newVal}${q}`);
+}
+
 function escapeRe(s: string): string { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
 // ── AI disambiguation seam (identifier derivation ONLY) ───────────────────────
@@ -584,15 +596,15 @@ async function disambiguate(
       if (isValidDartClassBase(ids.className) && !taken.includes(ids.className)) return ids;
     }
   }
-  // Deterministic fallback: append the frame core to guarantee uniqueness.
-  const core = idCore(screen.canonicalId).replace(/[^a-zA-Z0-9]+/g, '');
-  const tokens = stripScreenToken(tokenizeName(screen.name));
-  const suffixed = [...tokens, core];
-  return {
-    fileBase: `${snake(suffixed)}_screen`,
-    className: `${pascal(suffixed)}Screen`,
-    routeConst: camel(suffixed),
-  };
+  // Deterministic fallback: append an incrementing NUMBER (NOT the frame core —
+  // that would reintroduce a machine name). Try -2, -3, … until the class is free.
+  // Uses the SHARED derivation so file/class/const/path stay in sync + semantic.
+  const takenSet = new Set(taken);
+  for (let n = 2; n < 1000; n++) {
+    const ids = deriveIdentifiers(screen.name, [String(n)]);
+    if (!takenSet.has(ids.className)) return ids;
+  }
+  return deriveIdentifiers(screen.name, ['x']);
 }
 
 async function aiProposeName(
