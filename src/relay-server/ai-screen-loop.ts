@@ -38,7 +38,7 @@ import {
   isRunActive, markRunActive, clearRunActive,
   setRunPhase,
   clampParallel,
-  gateIsActive, pauseAtCheckpoint, approveCheckpoint, setRunResumable, setRunPrepDone,
+  gateIsActive, pauseAtCheckpoint, approveCheckpoint, setRunResumable, setRunPrepDone, setRunFinalized,
   addAmendment, resolveAmendment, writeFrameMap,
   type ScreenSpec, type CheckpointGate, type BuildRun, type AmendmentKind,
 } from './build-run-store';
@@ -87,10 +87,14 @@ const GEN_PHASES = [
 const GEN_TOTAL = GEN_PHASES.length;
 type GenPhaseName = typeof GEN_PHASES[number];
 /** Best-effort: set the run's generation phase by name (index derived from the
- *  canonical sequence). `detail` carries live sub-progress ("screen 7/24"). */
-function setGenPhase(projectId: string, runId: string, name: GenPhaseName, detail?: string, done?: boolean): void {
+ *  canonical sequence). `detail` carries live sub-progress ("screen 7/24").
+ *  Returns the underlying write promise so a caller that MUST order a phase write
+ *  before a subsequent run mutation (the terminal completion) can `await` it — both
+ *  setRunPhase and setRunStatus do a full run read-modify-write, so a fire-and-forget
+ *  final phase write can land AFTER setRunStatus('done') and clobber status back. */
+function setGenPhase(projectId: string, runId: string, name: GenPhaseName, detail?: string, done?: boolean): Promise<void> {
   const index = GEN_PHASES.indexOf(name) + 1;
-  void setRunPhase(projectId, runId, { index, total: GEN_TOTAL, name, detail, done });
+  return setRunPhase(projectId, runId, { index, total: GEN_TOTAL, name, detail, done });
 }
 
 /**
@@ -1540,7 +1544,22 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
       return cur?.status !== 'done';   // skip already-built (resume)
     };
 
-    if (workers > 1) {
+    // ── T31: all-done fast-path — skip the WHOLE build loop on resume/finalize ────
+    // When every buildable target is already 'done' (the run reached terminal
+    // success, e.g. resuming a done-but-unfinalized run, or after the last
+    // needs-review screen was Accepted), there is NOTHING to (re)build or (re)verify.
+    // The serial loop already `continue`s a 'done' screen, but a resume still spun
+    // through the worker setup + per-screen live reads + phase emits; worse, ANY
+    // non-done screen (a stale 'building' from a hard crash) would re-implement.
+    // Make the skip authoritative: if blocking==0 over the build targets, bypass the
+    // loop entirely and fall straight through to the verify-rollup + finalize branch
+    // below. Result: resuming a done run does ZERO screen rebuilds and reaches
+    // finalize in seconds.
+    const buildTargetScreens = run.screens.filter(s => isBuildTarget(s.frameId));
+    const allTargetsDone = buildTargetScreens.length > 0 && buildTargetScreens.every(s => s.status === 'done');
+    if (allTargetsDone) {
+      await appendRunLog(projectId, runId, `[run] all ${buildTargetScreens.length} target screen(s) already done — skipping build loop, proceeding to verify/finalize`);
+    } else if (workers > 1) {
       // ── Bounded parallel worker pool (fresh sessions only) ──────────────────
       // A shared work queue drained by `workers` concurrent builders. No session
       // threading (each screen is cold against the written contract), so order
@@ -1669,7 +1688,9 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
     if (blocking > 0) {
       // T9: terminal-but-blocked — leave the phase on Verify with a queue detail so
       // the UI reads "Phase 6/7: Verify — k need review" alongside the needs-review state.
-      setGenPhase(projectId, runId, 'Verify', `${needsReview} need review${failed ? `, ${failed} failed` : ''}`, true);
+      // AWAIT the phase write before the status flip (same read-modify-write clobber as
+      // the terminal-done path: a fire-and-forget phase write could overwrite status).
+      await setGenPhase(projectId, runId, 'Verify', `${needsReview} need review${failed ? `, ${failed} failed` : ''}`, true);
       await setRunStatus(projectId, runId, 'needs-review');
       await appendRunLog(projectId, runId, `[run] paused for review — ${built}/${total} matched, ${needsReview} need review${failed ? `, ${failed} failed` : ''}`);
     } else {
@@ -1738,10 +1759,23 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
         await appendRunLog(projectId, runId, `[finalize] already ran for this run (finalize-report.json present) — skipping`);
       }
 
+      // T31: mark the run finalized once the P7 phase has actually run (report on
+      // disk) OR when finalize is disabled for this run (a no-finalize run is, by
+      // definition, "done with no further finalize to do"). This drives the Runs UI
+      // "Finalize" action and the resume/accept auto-finalize guard below — a done
+      // run that is NOT finalized still has finalize to run.
+      const finalizeDidRun = !finalizeEnabled || fsSync.existsSync(finalizeReportPath);
+      if (finalizeDidRun) { try { await setRunFinalized(projectId, runId, true); } catch { /* non-fatal */ } }
+
       // Terminal completion: clear the resumable flag so a finished run is never
       // re-launched on a later boot (audit A.4).
       await setRunResumable(projectId, runId, false);
-      setGenPhase(projectId, runId, 'Finalize', `done — ${built}/${total} accepted`, true);
+      // AWAIT the terminal phase write BEFORE flipping status: both setRunPhase and
+      // setRunStatus do a full run read-modify-write, so a fire-and-forget phase write
+      // here could land AFTER setRunStatus('done') and clobber status back to the value
+      // it had read ('running') — leaving a finished run stuck reporting 'running'. The
+      // all-done fast-path made this race deterministic (the writes interleave tightly).
+      await setGenPhase(projectId, runId, 'Finalize', `done — ${built}/${total} accepted`, true);
       await setRunStatus(projectId, runId, 'done');
       await appendRunLog(projectId, runId, `[run] complete — ${built}/${total} built`);
     }
@@ -2309,6 +2343,15 @@ export function registerScreenLoopRoutes(app: Express): void {
     } else if (run.status === 'stopped') {
       run.status = 'running';
       await saveRun(projectId, run);
+    } else if ((run.status === 'done' || run.status === 'needs-review') && !b.restart) {
+      // T31: resume a done-but-unfinalized run (or one whose last needs-review screen
+      // was just Accepted) to RUN FINALIZE through the run. runAppLoop's all-done
+      // fast-path skips the build loop and goes straight to the finalize branch — no
+      // screen rebuilds, no re-verify. Flip to running so the UI reflects the active
+      // finalize phase (the loop sets it back to 'done' on completion).
+      run.status = 'running';
+      await saveRun(projectId, run);
+      await appendRunLog(projectId, runId, `[run] resume → finalize (no rebuilds; all screens already done)`);
     }
     void runAppLoop(projectId, runId).catch(() => {});
     res.json({ run, started: true });
@@ -2435,6 +2478,27 @@ export function registerScreenLoopRoutes(app: Express): void {
     const updated = await updateRunScreen(projectId, runId, frameId, { status: 'done', review: undefined });
     await appendRunLog(projectId, runId, `[review] accepted "${screen.frameName}" as-is (human)`);
     res.json({ run: updated });
+
+    // T31: AUTO-RUN FINALIZE when this Accept clears the LAST blocker. Previously
+    // accepting the final needs-review screen flipped the run to 'done' (via the
+    // deriveStatus rollup in updateRunScreen) but NEVER re-entered the finalize phase
+    // — so Phase 8 only ran via the standalone finalize-app endpoint, invisible in the
+    // run log. Here: if the run is now fully done (blocking==0) on a whole-app run that
+    // hasn't finalized yet, kick off runAppLoop. Its all-done fast-path skips every
+    // screen (zero rebuilds) and runs the existing finalize branch — streaming
+    // [finalize] + the Finalize phase into THIS run. Fire-and-forget, guarded so it
+    // never runs twice (isRunActive) or on a non-whole-app / already-finalized run.
+    const after = updated ?? (await getRun(projectId, runId));
+    const blocking = after?.screens.filter(s => s.status === 'needs-review' || s.status === 'failed').length ?? 0;
+    if (after && blocking === 0 && after.kind === 'whole-app' && after.finalize !== false && !isRunActive(runId)) {
+      const projectRoot = resolveProjectRoot(projectId);
+      const finalizeReportPath = projectRoot ? path.join(projectRoot, '.uix', 'finalize-report.json') : '';
+      const alreadyFinalized = after.finalized === true || (!!finalizeReportPath && fsSync.existsSync(finalizeReportPath));
+      if (!alreadyFinalized) {
+        await appendRunLog(projectId, runId, `[review] last blocker cleared — auto-running finalize`);
+        void runAppLoop(projectId, runId).catch(() => {});
+      }
+    }
   });
 
   // POST /api/ai/runs/:runId/retry { projectId, frameId, note } — human Corrected-

@@ -36,6 +36,7 @@ export interface RunStateEvent {
   total: number;        // total screens in the run
   needsReview: number;  // screens needs-review
   failed: number;       // screens failed
+  finalized?: boolean;  // T31: the P7 finalize phase has run for this run
 }
 
 export type RunEvent = RunLogEvent | RunStateEvent;

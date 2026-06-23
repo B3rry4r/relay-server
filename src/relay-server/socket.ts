@@ -240,6 +240,7 @@ export function registerSocketHandlers(
         projectId: e.projectId, runId: e.runId,
         phase: e.phase, status: e.status, ai: e.ai,
         built: e.built, total: e.total, needsReview: e.needsReview, failed: e.failed,
+        finalized: e.finalized,
       });
     }
   });

@@ -209,6 +209,13 @@ export interface BuildRun {
   // phase. Default (undefined/true) = run finalize on whole-app builds; set false
   // to skip it. A finalize failure NEVER flips a successful build to failed.
   finalize?: boolean;
+  // ── T31: finalize-ran marker ─────────────────────────────────────────────────
+  // Set true once the P7 finalize phase has actually run through this run (the
+  // .uix/finalize-report.json was produced). The client uses it to show a
+  // "Finalize" action on a done-but-unfinalized run; the server uses it (alongside
+  // the report file) to decide whether resuming/accepting should kick finalize.
+  // Persisted on the run so it survives a redeploy + drives the Runs UI.
+  finalized?: boolean;
   // ── T9 (RFC v2 §8.1): the pipeline phase this run is currently in. ──────────
   phase?: RunPhase;
   // ── T9 (RFC v2 §8.4): AI-firing tally (proof the model is actually working).
@@ -280,6 +287,7 @@ function emitRunState(run: BuildRun): void {
     total: s.total,
     needsReview: s.needsReview,
     failed: s.failed,
+    finalized: run.finalized,
   });
 }
 
@@ -362,6 +370,41 @@ export async function getRun(projectId: string, id: string): Promise<BuildRun | 
   catch { return null; }
 }
 
+// ── T31: per-run write serialization ─────────────────────────────────────────
+// Every run mutator (status / phase / finalized / resumable / screen / session)
+// does a full read-modify-write of <runId>.json. Without serialization, a
+// fire-and-forget phase write (setRunPhase is fired un-awaited from the loop) can
+// READ the run, then a later AWAITED mutator (setRunFinalized / setRunStatus) writes,
+// then the stale phase write LANDS LAST and clobbers the finalized/status fields it
+// never touched (it re-serializes the whole object it read earlier). This silently
+// dropped the T31 `finalized` flag and could leave a finished run stuck 'running'.
+// `mutateRun` funnels ALL such writes through one promise chain per run, each step
+// re-reading inside the chain — so writes compose instead of clobbering. Mirrors the
+// existing `aiTallyChain` pattern, generalized.
+const runWriteChain = new Map<string, Promise<unknown>>();
+async function mutateRun(
+  projectId: string, runId: string,
+  mutate: (run: BuildRun) => void | Promise<void>,
+): Promise<BuildRun | null> {
+  const key = `${projectId}:${runId}`;
+  // Chain on the prior write for this run (swallow its rejection so one failure
+  // doesn't poison the chain); each step re-reads inside the chain so writes compose.
+  const prev = (runWriteChain.get(key) ?? Promise.resolve()).catch(() => undefined);
+  const next = prev.then(async (): Promise<BuildRun | null> => {
+    const root = rootFor(projectId);
+    if (!root) return null;
+    const run = await getRun(projectId, runId);
+    if (!run) return null;
+    await mutate(run);
+    run.updatedAt = new Date().toISOString();
+    await fs.writeFile(runFile(root, runId), JSON.stringify(run, null, 2), 'utf-8');
+    return run;
+  });
+  runWriteChain.set(key, next);
+  try { return await next; }
+  finally { if (runWriteChain.get(key) === next) runWriteChain.delete(key); }
+}
+
 // A real run file is EXACTLY `<runId>.json` where runId = `run_<ts>_<rand>`. The
 // sidecars `<runId>.canonical.json` and `<runId>.frame-map.json` are also *.json
 // but are NOT runs — frame-map has no `screens` (so `r.screens.map` threw and the
@@ -391,16 +434,12 @@ export async function listRuns(projectId: string, limit = 30): Promise<BuildRun[
 export async function updateRunScreen(
   projectId: string, runId: string, frameId: string, patch: Partial<Omit<RunScreen, 'frameId' | 'frameName' | 'spec'>>,
 ): Promise<BuildRun | null> {
-  const root = rootFor(projectId);
-  if (!root) return null;
-  const run = await getRun(projectId, runId);
-  if (!run) return null;
-  const s = run.screens.find(x => x.frameId === frameId);
-  if (s) Object.assign(s, patch, { at: new Date().toISOString() });
-  run.status = STICKY_RUN_STATUS.has(run.status) ? run.status : deriveStatus(run.screens);
-  run.updatedAt = new Date().toISOString();
-  await fs.writeFile(runFile(root, runId), JSON.stringify(run, null, 2), 'utf-8');
-  emitRunState(run); // T18: push the built/needs-review/failed count change live
+  const run = await mutateRun(projectId, runId, (run) => {
+    const s = run.screens.find(x => x.frameId === frameId);
+    if (s) Object.assign(s, patch, { at: new Date().toISOString() });
+    run.status = STICKY_RUN_STATUS.has(run.status) ? run.status : deriveStatus(run.screens);
+  });
+  if (run) emitRunState(run); // T18: push the built/needs-review/failed count change live
   return run;
 }
 
@@ -430,14 +469,16 @@ export async function restartRun(projectId: string, runId: string): Promise<Buil
 }
 
 export async function setRunStatus(projectId: string, runId: string, status: RunStatus): Promise<void> {
-  const root = rootFor(projectId);
-  if (!root) return;
-  const run = await getRun(projectId, runId);
-  if (!run) return;
-  run.status = status;
-  run.updatedAt = new Date().toISOString();
-  await fs.writeFile(runFile(root, runId), JSON.stringify(run, null, 2), 'utf-8');
-  emitRunState(run); // T18: push the status change live
+  const run = await mutateRun(projectId, runId, (run) => { run.status = status; });
+  if (run) emitRunState(run); // T18: push the status change live
+}
+
+// ── T31: mark the run's finalize phase as having run (or not) ─────────────────
+// Best-effort persistence of the finalize-ran marker. Pushes run:state so the
+// Runs UI can immediately drop the "Finalize" action once finalize completes.
+export async function setRunFinalized(projectId: string, runId: string, finalized: boolean): Promise<void> {
+  const run = await mutateRun(projectId, runId, (run) => { run.finalized = finalized; });
+  if (run) emitRunState(run);
 }
 
 // ── T9 (RFC v2 §8.1): set the run's current pipeline phase ───────────────────
@@ -450,28 +491,26 @@ export async function setRunPhase(
   phase: { index?: number; total?: number; name?: string; detail?: string; done?: boolean } | null,
 ): Promise<void> {
   try {
-    const root = rootFor(projectId);
-    if (!root) return;
-    const run = await getRun(projectId, runId);
-    if (!run) return;
-    if (phase === null) {
-      run.phase = undefined;
-    } else {
-      const prev = run.phase;
-      run.phase = {
-        index: phase.index ?? prev?.index ?? 0,
-        total: phase.total ?? prev?.total ?? 0,
-        name: phase.name ?? prev?.name ?? '',
-        // detail is replaced each call (undefined clears it) so stale sub-progress
-        // (e.g. "naming 62/77") doesn't linger into the next phase.
-        detail: phase.detail,
-        done: phase.done ?? (phase.name ? false : prev?.done),
-        at: new Date().toISOString(),
-      };
-    }
-    run.updatedAt = new Date().toISOString();
-    await fs.writeFile(runFile(root, runId), JSON.stringify(run, null, 2), 'utf-8');
-    emitRunState(run); // T18: push the phase change live (drives the live header)
+    // Serialized via mutateRun so a fire-and-forget phase write can NEVER clobber a
+    // status/finalized write that landed between this call's read and its write (T31).
+    const run = await mutateRun(projectId, runId, (run) => {
+      if (phase === null) {
+        run.phase = undefined;
+      } else {
+        const prev = run.phase;
+        run.phase = {
+          index: phase.index ?? prev?.index ?? 0,
+          total: phase.total ?? prev?.total ?? 0,
+          name: phase.name ?? prev?.name ?? '',
+          // detail is replaced each call (undefined clears it) so stale sub-progress
+          // (e.g. "naming 62/77") doesn't linger into the next phase.
+          detail: phase.detail,
+          done: phase.done ?? (phase.name ? false : prev?.done),
+          at: new Date().toISOString(),
+        };
+      }
+    });
+    if (run) emitRunState(run); // T18: push the phase change live (drives the live header)
   } catch { /* phase is observability — never break a run on it */ }
 }
 
@@ -480,35 +519,18 @@ export async function setRunPhase(
 // seam). Serialized per-run so concurrent AI calls (parallel screen workers) don't
 // clobber each other's read-modify-write. Best-effort: a tally miss never breaks a
 // run, and a missing run id is a no-op.
-const aiTallyChain = new Map<string, Promise<void>>();
 export function bumpRunAi(projectId: string, runId: string, outcome: 'ok' | 'failed'): void {
-  const key = `${projectId}:${runId}`;
-  const prev = aiTallyChain.get(key) ?? Promise.resolve();
-  const next = prev.then(async () => {
-    try {
-      const root = rootFor(projectId);
-      if (!root) return;
-      const run = await getRun(projectId, runId);
-      if (!run) return;
-      const ai = run.ai ?? { ok: 0, failed: 0 };
-      ai[outcome] += 1;
-      run.ai = ai;
-      run.updatedAt = new Date().toISOString();
-      await fs.writeFile(runFile(root, runId), JSON.stringify(run, null, 2), 'utf-8');
-      emitRunState(run); // T18: push the AI tally change live
-    } catch { /* tally is observability — never throw */ }
-  }).finally(() => { if (aiTallyChain.get(key) === next) aiTallyChain.delete(key); });
-  aiTallyChain.set(key, next);
+  // Routed through the SHARED per-run chain (mutateRun) so the tally serializes with
+  // status/phase/finalized writes too — not just with other tallies (T31).
+  void mutateRun(projectId, runId, (run) => {
+    const ai = run.ai ?? { ok: 0, failed: 0 };
+    ai[outcome] += 1;
+    run.ai = ai;
+  }).then((run) => { if (run) emitRunState(run); }).catch(() => { /* tally is observability */ });
 }
 
 export async function setRunSession(projectId: string, runId: string, sessionId: string): Promise<void> {
-  const root = rootFor(projectId);
-  if (!root) return;
-  const run = await getRun(projectId, runId);
-  if (!run) return;
-  run.sessionId = sessionId;
-  run.updatedAt = new Date().toISOString();
-  await fs.writeFile(runFile(root, runId), JSON.stringify(run, null, 2), 'utf-8');
+  await mutateRun(projectId, runId, (run) => { run.sessionId = sessionId; });
 }
 
 // ── P5 (RFC §5): HITL checkpoint gate control ────────────────────────────────
@@ -546,13 +568,7 @@ export async function approveCheckpoint(projectId: string, runId: string, gate?:
 
 // ── P5 (RFC §4.9): explicit resumable graceful-pause flag ────────────────────
 export async function setRunResumable(projectId: string, runId: string, resumable: boolean): Promise<void> {
-  const root = rootFor(projectId);
-  if (!root) return;
-  const run = await getRun(projectId, runId);
-  if (!run) return;
-  run.resumable = resumable;
-  run.updatedAt = new Date().toISOString();
-  await fs.writeFile(runFile(root, runId), JSON.stringify(run, null, 2), 'utf-8');
+  await mutateRun(projectId, runId, (run) => { run.resumable = resumable; });
 }
 
 // ── T15: prep-complete flag (resume-during-prep) ─────────────────────────────
@@ -560,13 +576,7 @@ export async function setRunResumable(projectId: string, runId: string, resumabl
 // finishes, so a resume after a redeploy knows to go STRAIGHT into runAppLoop
 // instead of re-running prep. Cleared on restart.
 export async function setRunPrepDone(projectId: string, runId: string, prepDone: boolean): Promise<void> {
-  const root = rootFor(projectId);
-  if (!root) return;
-  const run = await getRun(projectId, runId);
-  if (!run) return;
-  run.prepDone = prepDone;
-  run.updatedAt = new Date().toISOString();
-  await fs.writeFile(runFile(root, runId), JSON.stringify(run, null, 2), 'utf-8');
+  await mutateRun(projectId, runId, (run) => { run.prepDone = prepDone; });
 }
 
 // ── P5 (RFC §4.8): plan amendment protocol ───────────────────────────────────
