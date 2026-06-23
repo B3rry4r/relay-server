@@ -49,6 +49,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import type { AIModel } from '../ai-adapters';
+import { tokenizeName } from '../semantic-names';
 
 // ── Public contract ──────────────────────────────────────────────────────────
 
@@ -59,6 +60,7 @@ export type EdgeStatus =
   | 'wrong-target'  // a nav call exists on FROM but lands on a DIFFERENT route
   | 'missing'       // no nav call on FROM reaches TO and no matching dead trigger
   | 'dead-trigger'  // the element exists on FROM but its handler is empty/TODO
+  | 'duplicate'     // TO modal is the SAME UI as a standalone built screen (intentional dup, NOT a gap)
   | 'unmapped';     // FROM or TO has no built screen file (design/build drift)
 
 export interface FlowWiringOptions {
@@ -137,6 +139,8 @@ export interface FlowWiringReport {
     wrongTarget: number;
     missing: number;
     deadTrigger: number;
+    /** modal edges that are an intentional duplicate of a standalone built screen (benign). */
+    duplicate: number;
     unmapped: number;
     autoFixesApplied: number;
     /** screens in canonical flow that mapped to a built file / total referenced. */
@@ -333,6 +337,7 @@ function summarize(findings: EdgeFinding[], autoFixes: number, mapped: number, r
     wrongTarget: count('wrong-target'),
     missing: count('missing'),
     deadTrigger: count('dead-trigger'),
+    duplicate: count('duplicate'),
     unmapped: count('unmapped'),
     autoFixesApplied: autoFixes,
     screensMapped: mapped,
@@ -468,6 +473,80 @@ async function verifyFlutter(
   // gap (unmapped), not "wired".
   const foldedCreditByBase = new Map<string, { count: number; cap: number; ids: Set<string> }>();
 
+  // DUPLICATE-MODAL CANDIDATE SET: standalone canonical SCREENS (top-level
+  // `screens[]`, NOT nested modals) that have BOTH a built file AND a route. A
+  // would-be-gap modal edge may be a benign duplicate of one of these (same UI as
+  // a standalone screen the designer left unwired). Built lazily once.
+  let dupCandidates: DupCandidate[] | null = null;
+  const buildDupCandidates = (): DupCandidate[] => {
+    if (dupCandidates) return dupCandidates;
+    const out: DupCandidate[] = [];
+    for (const s of screens) {
+      const resolved = resolveCanon(s.canonicalId, s.frameIds);
+      if (!resolved || !resolved.route) continue;
+      const { route, constName } = routeForCanon(resolved);
+      if (!route) continue;
+      out.push({
+        canonicalId: s.canonicalId,
+        name: s.name || s.canonicalId,
+        route,
+        routeConst: constName,
+        frameId: s.frameIds[0] ?? '',
+        file: resolved.file,
+      });
+    }
+    dupCandidates = out;
+    return out;
+  };
+
+  // DUPLICATE RESOLUTION (only invoked for would-be "unmatched sibling REAL gap"
+  // edges). Returns the standalone screen this modal duplicates, or null. Cached
+  // by the modal's frame id. AI assists (image-grounded) when available; otherwise
+  // a conservative deterministic token rule. Never invoked for any other status.
+  const dupCache = new Map<string, DupCandidate | null>();
+  const resolveDuplicate = async (edge: CanonFlowEdge, modal: CanonModal): Promise<DupCandidate | null> => {
+    const cacheKey = modal.frameId;
+    if (dupCache.has(cacheKey)) return dupCache.get(cacheKey)!;
+    // Candidates = standalone screens with file+route, excluding the modal's base.
+    const all = buildDupCandidates().filter((c) => c.canonicalId !== modal.baseCanonicalId);
+    if (all.length === 0) { dupCache.set(cacheKey, null); return null; }
+
+    // Prefilter by name/label token affinity (reuse tokenizeName) to bound cost.
+    // The AI is the AUTHORITY on the visual match, so the prefilter must NOT prune
+    // a genuinely-plausible candidate: keep EVERY candidate sharing >=1 distinctive
+    // domain token (these are the only ones that could be the same flow component),
+    // capped at 6; only when NONE share a token do we fall back to the top 3 by rank.
+    const labelToks = distinctiveTokens(edge.label ?? modal.name);
+    const ranked = all
+      .map((c) => ({ c, score: tokenOverlap(distinctiveTokens(c.name), labelToks) }))
+      .sort((a, b) => b.score - a.score);
+    const shared = ranked.filter((r) => r.score > 0);
+    const top = (shared.length ? shared.slice(0, 6) : ranked.slice(0, 3)).map((r) => r.c);
+
+    // Image-grounded AI check (preferred), when a model + runner are available and
+    // the modal's canon-ref renders on disk.
+    if (opts.model && opts.runModel && !opts.noAi) {
+      const modalRef = canonRefPath(projectRoot, modal.frameId);
+      const candRefs: { ref: string; cand: DupCandidate }[] = [];
+      for (const c of top) {
+        const ref = canonRefPath(projectRoot, c.frameId);
+        try { await fs.access(ref); candRefs.push({ ref, cand: c }); } catch { /* no render */ }
+      }
+      let modalRefExists = false;
+      try { await fs.access(modalRef); modalRefExists = true; } catch { /* none */ }
+      if (modalRefExists && candRefs.length) {
+        const aiHit = await aiResolveDuplicate(edge, modalRef, candRefs, opts);
+        dupCache.set(cacheKey, aiHit);
+        return aiHit;
+      }
+    }
+
+    // Deterministic fallback (no model / noAi / no render): conservative token rule.
+    const detHit = deterministicDupMatch(edge.label ?? modal.name, top);
+    dupCache.set(cacheKey, detHit);
+    return detHit;
+  };
+
   // Map a TO canonical screen → its route const + route string. The route is the
   // one the screen is registered under in the route table. Prefer the screen's
   // header route; cross-check against the route table so we have the const name.
@@ -545,7 +624,24 @@ async function verifyFlutter(
           continue;
         }
         // More folded modals on this base than it has presenters → this sibling is NOT
-        // actually presented. Fall through to the unmapped/real-gap reporting below.
+        // presented as a folded overlay. Before calling it a REAL gap, check whether
+        // it is instead a benign DUPLICATE of a standalone built screen (same UI, the
+        // designer intentionally left it unwired). This is the ONLY status the dup
+        // resolver may set — it can flip a would-be gap to `duplicate`, nothing else.
+        const modal = modals.find((mm) => mm.canonicalId === edge.to);
+        if (modal) {
+          const dup = await resolveDuplicate(edge, modal);
+          if (dup) {
+            base.status = 'duplicate';
+            base.toRoute = dup.route;
+            if (dup.routeConst) base.toRouteConst = dup.routeConst;
+            base.toFile = rel(projectRoot, dup.file);
+            base.detail = `duplicate of ${dup.route} (${dup.name}) — same UI as a standalone screen; intentionally not folded`;
+            mapped.add(edge.to);
+            findings.push(base);
+            continue;
+          }
+        }
         base.detail = `TO is a modal whose base screen ${path.basename(folded.baseFile)} folds in only ${credit.cap} modal(s) (showModal*/showDialog call-sites) but is the base for more; this sibling is UNMATCHED — no presenter wires it (REAL gap, not folded)`;
         findings.push(base);
         continue;
@@ -950,6 +1046,121 @@ async function aiLocateDeadTrigger(edge: CanonFlowEdge, baseSrc: string, opts: F
   } catch (e) {
     // eslint-disable-next-line no-console
     console.log(`[ai:flow-locate] status=error — ${(e as Error).message.slice(0, 80)}; trigger left unwired`);
+    return null;
+  }
+}
+
+// ── duplicate-modal resolution (benign dup of a standalone screen) ────────────
+//
+// An edge classified as the "unmatched sibling REAL gap" (a modal whose base
+// screen has more folded-modal edges than it has presenter call-sites) is NOT
+// always a gap: the sheet may be the SAME UI as a STANDALONE built screen the
+// designer intentionally left unwired (e.g. Ping's reset-PIN / change-PIN sheets
+// also exist as standalone screens c_313_3605 / c_313_4811 with their own routes).
+// We try to resolve such an edge to a standalone duplicate; if matched it is
+// reported `duplicate` (benign), not `unmapped`. AI only ASSISTS — it can flip a
+// would-be-gap to `duplicate`, never the reverse and never any other status.
+
+/** A standalone screen that is a candidate duplicate for a modal. */
+interface DupCandidate {
+  canonicalId: string;
+  name: string;
+  route: string;          // header route (e.g. /313-3605)
+  routeConst: string | null;
+  frameId: string;        // primary frame id (for the canon-ref render)
+  file: string;           // built file (absolute)
+}
+
+/** Canon-ref render path for a frame id: `:`/`-` → `_`, under .uix/canon-refs. */
+function canonRefPath(projectRoot: string, frameId: string): string {
+  const fid = String(frameId).replace(/[^a-zA-Z0-9]+/g, '_');
+  return path.join(projectRoot, '.uix', 'canon-refs', `${fid}.png`);
+}
+
+/** Distinctive domain tokens shared between a candidate screen-name and an edge
+ *  label, ignoring generic chrome words. Used for prefilter + the conservative
+ *  deterministic fallback. */
+const DUP_STOPWORDS = new Set([
+  'screen', 'sheet', 'modal', 'state', 'page', 'view', 'forgot', 'enter', 'new',
+  'the', 'a', 'an', 'of', 'to', 'and', 'your',
+]);
+function distinctiveTokens(text: string): Set<string> {
+  return new Set(
+    tokenizeName(text)
+      .filter((t) => t.length >= 2 && !/^[0-9]+$/.test(t) && !DUP_STOPWORDS.has(t)),
+  );
+}
+function tokenOverlap(a: Set<string>, b: Set<string>): number {
+  let n = 0;
+  for (const t of a) if (b.has(t)) n++;
+  return n;
+}
+
+/** CONSERVATIVE deterministic fallback (no model): treat a candidate as a
+ *  duplicate ONLY on a STRONG, UNAMBIGUOUS distinctive-token overlap between the
+ *  candidate's screen-name and the edge label. Requirements:
+ *    - the winner shares >= 2 distinctive domain tokens with the label, AND
+ *    - the winner is unambiguous: it beats the runner-up by a margin >= 2 (or the
+ *      runner-up shares 0 tokens). When two candidates are both plausible (e.g.
+ *      resetPinSheet vs changePinSheet for a "Change PIN" sheet), name tokens
+ *      alone CANNOT tell which is the same UI — abstain (leave it the REAL-gap
+ *      finding) rather than guess. AI (image-grounded) is the resolver for those. */
+function deterministicDupMatch(label: string | undefined, candidates: DupCandidate[]): DupCandidate | null {
+  if (!label) return null;
+  const labelToks = distinctiveTokens(label);
+  if (labelToks.size === 0) return null;
+  const scored = candidates
+    .map((cand) => ({ cand, score: tokenOverlap(distinctiveTokens(cand.name), labelToks) }))
+    .sort((a, b) => b.score - a.score);
+  const best = scored[0];
+  if (!best || best.score < 2) return null;
+  const runnerUp = scored[1]?.score ?? 0;
+  if (runnerUp !== 0 && best.score - runnerUp < 2) return null; // ambiguous → abstain
+  return best.cand;
+}
+
+/** Build the image-grounded duplicate-check prompt (same file-reading convention
+ *  as ai-screen-loop's verify prompts). Forces a structured yes/no + route. */
+function dupCheckPrompt(modalRef: string, modalLabel: string | undefined, candidates: { ref: string; cand: DupCandidate }[]): string {
+  return [
+    `You are deciding whether a MODAL overlay is just a DUPLICATE of an existing standalone screen.`,
+    `Open these images with your file-reading tool:`,
+    `  - MODAL (the overlay/sheet under test${modalLabel ? `, labelled "${modalLabel}"` : ''}): ${modalRef}`,
+    ...candidates.map((c, i) => `  - CANDIDATE ${i + 1} (standalone screen "${c.cand.name}", route ${c.cand.route}): ${c.ref}`),
+    `For the MODAL, look ONLY at the FOREGROUND sheet/overlay/popup — IGNORE the dimmed/blurred backdrop behind it and IGNORE minor differences in title text or backdrop.`,
+    `Decide: is the modal's foreground sheet the SAME UI component as one of the standalone candidate screens (same fields, buttons, layout)?`,
+    `Respond with ONLY one JSON object (no prose, no code fences):`,
+    `{"equivalent": <true|false>, "route": "<the matching candidate route, or empty string>"}`,
+    `- "equivalent": true ONLY if the foreground sheet clearly matches a candidate's UI.`,
+  ].join('\n');
+}
+
+/**
+ * Image-grounded duplicate check. Asks the model to OPEN the modal's canon-ref and
+ * each candidate's canon-ref and answer whether the FOREGROUND sheet is the SAME UI
+ * as one of the standalone screens. Returns the matched candidate or null. AI only
+ * ASSISTS the would-be-gap reclassification; on any failure it is a conservative
+ * no-op (LOGGED, not silent — RFC §0.1).
+ */
+async function aiResolveDuplicate(
+  edge: CanonFlowEdge,
+  modalRef: string,
+  candidates: { ref: string; cand: DupCandidate }[],
+  opts: FlowWiringOptions,
+): Promise<DupCandidate | null> {
+  if (!opts.model || !opts.runModel) return null;
+  const prompt = dupCheckPrompt(modalRef, edge.label, candidates);
+  try {
+    const { text } = await opts.runModel(opts.model, prompt, opts.env ?? process.env, opts.projectRoot, { format: 'text' });
+    const m = text.match(/\{[\s\S]*\}/);
+    if (!m) { console.log('[ai:flow-dup] status=empty — no JSON; left as gap'); return null; } // eslint-disable-line no-console
+    const parsed = JSON.parse(m[0]) as { equivalent?: boolean; route?: string };
+    if (!parsed.equivalent || !parsed.route) return null;
+    const route = String(parsed.route).trim();
+    return candidates.find((c) => c.cand.route === route)?.cand ?? null;
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.log(`[ai:flow-dup] status=error — ${(e as Error).message.slice(0, 80)}; left as gap`);
     return null;
   }
 }
