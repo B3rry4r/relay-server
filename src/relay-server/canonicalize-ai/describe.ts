@@ -34,6 +34,7 @@ import {
 import {
   frameFingerprint, widgetFingerprint, widgetGroups, type WidgetGroup,
 } from './fingerprint';
+import { readDescriptorCache, lookupDescriptor, putDescriptor } from './descriptor-cache';
 
 export interface DescribeFrameInput {
   frameId: string;
@@ -51,6 +52,8 @@ export interface DescribeResult {
   rendered: boolean;
   /** the raw model text (for debugging a validation failure). */
   raw: string;
+  /** T28: this descriptor came from the persisted cache (describe AI call SKIPPED). */
+  cached: boolean;
 }
 
 const _validator = new Validator(FRAME_DESCRIPTOR_SCHEMA as unknown as Record<string, unknown>);
@@ -178,7 +181,14 @@ export async function describeFrame(
   projectId: string,
   figStorageKey: string,
   frame: DescribeFrameInput,
-  opts: { provider?: AIModel; modelId?: string; harnessBaseUrl?: string; scale?: number; runId?: string } = {},
+  opts: {
+    provider?: AIModel; modelId?: string; harnessBaseUrl?: string; scale?: number; runId?: string;
+    /** T28: skip the cache (force a fresh describe + overwrite the entry). */
+    force?: boolean;
+    /** T28: pre-loaded cache file (the orchestrator loads it ONCE for the whole fan-out
+     *  so each frame doesn't re-read the JSON). Omit → describeFrame loads it itself. */
+    cache?: Awaited<ReturnType<typeof readDescriptorCache>>;
+  } = {},
 ): Promise<DescribeResult> {
   const root = resolveProjectRoot(projectId);
   if (!root || !fsSync.existsSync(root)) throw new Error(`describeFrame: project not found: ${projectId}`);
@@ -189,6 +199,18 @@ export async function describeFrame(
 
   const frameFp = frameFingerprint(tree);
   const groups = widgetGroups(tree);
+
+  // T28 CACHE LOOKUP — if this frame was already described AND its structure is
+  // unchanged (fingerprint match), REUSE the persisted descriptor and SKIP the AI
+  // call. This is the resume-cost fix: a re-run/resume re-describes only new/changed
+  // frames instead of all of them from scratch. `force` bypasses the cache.
+  if (!opts.force) {
+    const cache = opts.cache ?? (await readDescriptorCache(root));
+    const hit = lookupDescriptor(cache, frame.frameId, frameFp);
+    if (hit) {
+      return { descriptor: hit, fingerprint: frameFp, rendered: false, raw: '', cached: true };
+    }
+  }
 
   // Reference render (best-effort): write into .uix/canon-refs so the agent can open
   // it by a project-relative path (same convention the verify loop uses).
@@ -235,5 +257,8 @@ export async function describeFrame(
     const errs = result.errors.map(e => `${e.instanceLocation}: ${e.error}`).join('; ');
     throw new Error(`describeFrame: descriptor failed schema validation for ${frame.frameId}: ${errs}\nraw: ${text.slice(0, 800)}`);
   }
-  return { descriptor, fingerprint: frameFp, rendered, raw: text };
+  // T28 CACHE WRITE — persist the validated descriptor keyed by frameId + fingerprint
+  // so a later run/resume reuses it. Best-effort (never breaks the build).
+  await putDescriptor(root, frame.frameId, frameFp, descriptor);
+  return { descriptor, fingerprint: frameFp, rendered, raw: text, cached: false };
 }

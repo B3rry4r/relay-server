@@ -64,10 +64,71 @@ export function isRateLimitError(msg: string): boolean {
 // Rate-limit backoff: a per-window (per-minute) limit self-heals if we wait, so a
 // rate-limited call retries with exponential backoff before giving up. A longer
 // (hourly/daily) limit will exhaust these retries → the caller then pauses the run
-// resumably rather than failing the work. Env-overridable.
-const RATE_LIMIT_RETRIES = Number(process.env.RELAY_RATELIMIT_RETRIES) || 4;
-const RATE_LIMIT_BASE_MS = Number(process.env.RELAY_RATELIMIT_BASE_MS) || 20_000;
+// resumably rather than failing the work. Env-overridable — read at CALL TIME (not
+// module-load) so a deploy/env change (and tests) take effect without a restart.
+const rateLimitRetries = (): number => Number(process.env.RELAY_RATELIMIT_RETRIES) || 4;
+const rateLimitBaseMs = (): number => Number(process.env.RELAY_RATELIMIT_BASE_MS) || 20_000;
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+// ── T29: EMPTY-STREAK → soft rate-limit ──────────────────────────────────────
+// When a quota is exhausted mid-build, the CLI can return EMPTY output (reason
+// 'empty') instead of a classifiable rate-limit ERROR — so the T26 isRateLimitError
+// backoff never fired and screens went to needs-review ("verify agent produced no
+// output"). We track recent outcomes per run/loop: an empty that follows a STREAK of
+// empties/rate-limits is a probable SOFT rate-limit → back off + retry (reuse T26's
+// backoff), and if it persists, surface reason 'rate-limit' so the caller PAUSES the
+// run resumably (T26's pause path) rather than dumping the screen to needs-review. A
+// genuinely-isolated single empty (a real model no-op) is NOT a streak → behaves as
+// today. Threshold env-overridable (RELAY_EMPTY_STREAK_THRESHOLD).
+//
+// DEFAULT 3 (not 2) deliberately: T25's transient-hang retry produces TWO empties on
+// ONE screen (implement + its single retry) for a genuinely transient CLI hang — that
+// must NOT be mistaken for a soft rate limit. A real quota exhaustion produces a
+// SUSTAINED streak (every following call empties), which 3-in-a-row catches while a
+// lone screen's hang-retry (2) does not. Set RELAY_EMPTY_STREAK_THRESHOLD=2 to be
+// more aggressive.
+const emptyStreakThreshold = (): number => Math.max(2, Number(process.env.RELAY_EMPTY_STREAK_THRESHOLD) || 3);
+// How many recent outcomes to remember per key (enough to see a streak; bounded).
+const STREAK_WINDOW = 8;
+
+// Per-run/loop ring of recent outcomes. Keyed by the run/job/step the call belongs to
+// so one screen's isolated empty doesn't poison an unrelated run's count. In-process
+// (one process owns a run); a redeploy resets it, which is fine — a fresh process
+// re-observes the streak from scratch.
+type Outcome = 'ok' | 'empty' | 'rate-limit' | 'error';
+const streaks = new Map<string, Outcome[]>();
+
+function streakKey(ctx: LogCtx): string {
+  // Prefer the durable run, else the job, else the step label, else a global bucket.
+  return ctx.runId ? `run:${ctx.runId}` : ctx.jobId ? `job:${ctx.jobId}` : ctx.step ? `step:${ctx.step}` : 'global';
+}
+function recordOutcome(ctx: LogCtx, o: Outcome): void {
+  const key = streakKey(ctx);
+  const ring = streaks.get(key) ?? [];
+  ring.push(o);
+  if (ring.length > STREAK_WINDOW) ring.shift();
+  streaks.set(key, ring);
+}
+/** Count the trailing run of empty/rate-limit outcomes (an 'ok' or 'error' breaks it).
+ *  A real-error breaks the streak so a genuinely broken call isn't mistaken for a soft
+ *  limit; an 'ok' obviously clears it. */
+function trailingSoftStreak(ctx: LogCtx): number {
+  const ring = streaks.get(streakKey(ctx)) ?? [];
+  let n = 0;
+  for (let i = ring.length - 1; i >= 0; i--) {
+    if (ring[i] === 'empty' || ring[i] === 'rate-limit') n++;
+    else break;
+  }
+  return n;
+}
+/** Test/trace hook: reset the streak ring (e.g. between simulated runs). */
+export function _resetEmptyStreaks(key?: string): void {
+  if (key) streaks.delete(key); else streaks.clear();
+}
+export const _emptyStreakConfig = {
+  get EMPTY_STREAK_THRESHOLD() { return emptyStreakThreshold(); },
+  STREAK_WINDOW,
+};
 
 export interface AiCallProof {
   /** Unique id for THIS model invocation (proof of firing, appears in the log). */
@@ -232,10 +293,33 @@ export async function runModelObserved(
       // estimate only when the CLI didn't expose usage.
       const tokens = (typeof usageTokens === 'number' && usageTokens > 0) ? usageTokens : estTokens(out);
       if (!out) {
+        // T29: an empty output can be a real model no-op OR the SILENT face of an
+        // exhausted quota (the CLI returns empty rather than a classifiable rate-limit
+        // error). Record it; if recent calls in this run/loop were ALSO empty/rate-
+        // limited (a streak ≥ threshold), treat THIS empty as a probable soft rate
+        // limit: back off + retry like a rate-limit, and once the backoff retries are
+        // exhausted surface reason 'rate-limit' so the caller PAUSES the run resumably
+        // (not needs-review). A genuinely-isolated empty (no streak) returns 'empty' as
+        // before. We count THIS empty before measuring so a 2-in-a-row trips threshold=2.
+        recordOutcome(ctx, 'empty');
+        const streak = trailingSoftStreak(ctx);
+        if (streak >= emptyStreakThreshold() && attempt < rateLimitRetries()) {
+          const wait = rateLimitBaseMs() * (attempt + 1);   // reuse T26's backoff
+          logAiLine(ctx, `model=${model} call=${callId} status=empty dur=${durMs}ms — SUSPICIOUS empty streak (${streak}, soft rate-limit?) — backing off ${Math.round(wait / 1000)}s (retry ${attempt + 1}/${rateLimitRetries()})`);
+          await sleep(wait);
+          continue;   // retry the SAME call after the window cools down
+        }
+        if (streak >= emptyStreakThreshold()) {
+          // Persisted past the backoff retries → a longer (hourly/daily) limit. Surface
+          // 'rate-limit' so the caller pauses the run RESUMABLY via T26's pause path.
+          logAiLine(ctx, `model=${model} call=${callId} status=rate-limit dur=${durMs}ms — empty streak persisted past backoff (${streak}); treating as soft rate-limit → pause`);
+          return { ok: false, reason: 'rate-limit', callId, durMs, model, tokens: 0 };
+        }
         logAiLine(ctx, `model=${model} call=${callId} tokens≈0 status=empty dur=${durMs}ms`);
         return { ok: false, reason: 'empty', callId, durMs, model, tokens: 0 };
       }
       const preview = out.replace(/\s+/g, ' ').slice(0, 80);
+      recordOutcome(ctx, 'ok');   // T29: a real output clears the empty streak
       logAiLine(ctx, `model=${model} call=${callId} tokens≈${tokens} status=ok dur=${durMs}ms :: ${preview}`);
       return { ok: true, text, sessionId, callId, durMs, model, tokens };
     } catch (err: any) {
@@ -243,14 +327,18 @@ export async function runModelObserved(
       const stderr = typeof err?.stderr === 'string' ? err.stderr.trim() : '';
       const msg = (stderr || err?.message || 'unknown error').toString();
       const rateLimited = isRateLimitError(msg);
-      if (rateLimited && attempt < RATE_LIMIT_RETRIES) {
-        const wait = RATE_LIMIT_BASE_MS * (attempt + 1);   // 20s, 40s, 60s, 80s
-        logAiLine(ctx, `model=${model} call=${callId} status=rate-limit dur=${durMs}ms — backing off ${Math.round(wait / 1000)}s (retry ${attempt + 1}/${RATE_LIMIT_RETRIES})`);
+      if (rateLimited && attempt < rateLimitRetries()) {
+        const wait = rateLimitBaseMs() * (attempt + 1);   // 20s, 40s, 60s, 80s
+        logAiLine(ctx, `model=${model} call=${callId} status=rate-limit dur=${durMs}ms — backing off ${Math.round(wait / 1000)}s (retry ${attempt + 1}/${rateLimitRetries()})`);
         await sleep(wait);
         continue;   // retry the SAME call after the window cools down
       }
       const timedOut = (err?.killed && /timed?\s*out|ETIMEDOUT/i.test(msg)) || err?.signal === 'SIGTERM';
       const reason: AiFailReason = rateLimited ? 'rate-limit' : (timedOut ? 'timeout' : 'error');
+      // T29: a classifiable rate-limit error CONTINUES the soft-limit streak (so a
+      // mix of empties + rate-limit errors still trips the pause); a real error/timeout
+      // BREAKS it (a genuinely broken call must not be mistaken for a soft limit).
+      recordOutcome(ctx, rateLimited ? 'rate-limit' : 'error');
       logAiLine(ctx, `model=${model} call=${callId} tokens≈0 status=${reason === 'rate-limit' ? 'rate-limit' : 'error'} dur=${durMs}ms :: ${msg.slice(0, 80)}`);
       return { ok: false, reason, error: msg.slice(0, 600), callId, durMs, model, tokens: 0 };
     }

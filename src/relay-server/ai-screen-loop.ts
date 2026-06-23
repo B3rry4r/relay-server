@@ -873,6 +873,23 @@ async function renderPreview(
   }
 }
 
+// T26/T29: pause a run RESUMABLY because a model call hit a persistent rate limit
+// (a classifiable quota rejection, or an empty-streak the observed path re-classified
+// as a soft rate-limit). The SINGLE pause path: mark this screen pending so it
+// rebuilds, flag the run resumable + stopped, and request a graceful orchestrator
+// halt — a resume after the quota resets continues from here instead of dumping
+// screens to needs-review. Idempotent: a second call (e.g. impl + verify both rate
+// limited in the same screen) just re-asserts the same stopped/resumable state.
+async function pauseRunRateLimited(
+  projectId: string, runId: string, frameId: string, _session?: string,
+): Promise<void> {
+  await appendRunLog(projectId, runId, `[run] PAUSED — rate limited: API quota exhausted (after backoff+retry). Resume after your quota resets — built screens are skipped, this one rebuilds.`);
+  try { await updateRunScreen(projectId, runId, frameId, { status: 'pending' }); } catch { /* non-fatal */ }
+  try { await setRunResumable(projectId, runId, true); } catch { /* non-fatal */ }
+  try { await setRunStatus(projectId, runId, 'stopped'); } catch { /* non-fatal */ }
+  markRunCancelled(runId);   // orchestrator halts gracefully after this screen
+}
+
 // ── the loop ──────────────────────────────────────────────────────────────────
 async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: string): Promise<string | undefined> {
   const { model, modelId, framework, frameId, frameName, referenceImagePath, implementPrompt } = req;
@@ -969,17 +986,14 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     impl = await observedBuildCall('build', implementPrompt);
   }
   const implBuilt = !impl.failed;   // T24: only trust an asset-defect verdict if the screen was actually built
-  // T26: PERSISTENT rate limit — runModelObserved already backed off + retried several
-  // times and still got rejected (hourly/daily quota, not a per-minute blip). Do NOT
+  // T26/T29: PERSISTENT rate limit (a classifiable quota REJECTION, or — T29 — a
+  // SILENT empty-streak the observed path re-classified as a soft rate-limit). Do NOT
   // cascade this + every following screen to spurious "broken/not converging"
-  // needs-review. PAUSE the run RESUMABLY (reuse the graceful-cancel path) so a resume
-  // after the quota resets continues from here; leave this screen pending so it rebuilds.
+  // needs-review. PAUSE the run RESUMABLY so a resume after the quota resets continues
+  // from here; leave this screen pending so it rebuilds. ONE pause path (used by the
+  // implement, verify AND fix calls) so we never double-pause with a conflicting one.
   if (impl.rateLimited && req.runId) {
-    await appendRunLog(req.projectId, req.runId, `[run] PAUSED — rate limited: API quota exhausted (after backoff+retry). Resume after your quota resets — built screens are skipped, this one rebuilds.`);
-    try { await updateRunScreen(req.projectId, req.runId, frameId, { status: 'pending' }); } catch { /* non-fatal */ }
-    try { await setRunResumable(req.projectId, req.runId, true); } catch { /* non-fatal */ }
-    try { await setRunStatus(req.projectId, req.runId, 'stopped'); } catch { /* non-fatal */ }
-    markRunCancelled(req.runId);   // orchestrator halts gracefully after this screen
+    await pauseRunRateLimited(req.projectId, req.runId, frameId, session);
     return session;
   }
   if (impl.sessionId) session = impl.sessionId;
@@ -1051,6 +1065,9 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
       lastCandRel = tileRels[0];   // first band is the representative thumbnail for review
       appendJobLog(jobId, `[loop] verify ${iter}: comparing to reference (${tileRels.length} tiles)`);
       const v = await observedBuildCall('verify', tiledVerifyPrompt(referenceImagePath, tileRels, frameName, prevScore, req.userNotes));
+      // T29: a rate-limited (incl. empty-streak soft-limit) verify must PAUSE the run
+      // resumably — NOT fall through to parseVerdict('') → needs-review.
+      if (v.rateLimited && req.runId) { await pauseRunRateLimited(req.projectId, req.runId, frameId, session); return session; }
       verdict = parseVerdict(v.text);
     } else {
       const candAbs = path.join(screenDir, `cand-${iter}.png`);
@@ -1059,6 +1076,8 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
       lastCandRel = candRel;
       appendJobLog(jobId, `[loop] verify ${iter}: comparing to reference`);
       const v = await observedBuildCall('verify', verifyPrompt(referenceImagePath, candRel, frameName, prevScore, req.userNotes));
+      // T29: rate-limited (incl. empty-streak soft-limit) verify → pause resumably.
+      if (v.rateLimited && req.runId) { await pauseRunRateLimited(req.projectId, req.runId, frameId, session); return session; }
       verdict = parseVerdict(v.text);
     }
     finalVerdict = verdict;
@@ -1101,6 +1120,9 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     // FIX (resume the implementation session so the agent keeps full context).
     appendJobLog(jobId, `[loop] fix ${iter}: applying ${verdict.discrepancies.length} change(s)`);
     const fix = await observedBuildCall('fix', fixPrompt(frameName, referenceImagePath, candRel ?? '(build failed — no screenshot)', verdict, req.userNotes), { sessionId: session });
+    // T29: a rate-limited (incl. empty-streak soft-limit) fix → pause resumably rather
+    // than burning the remaining iterations on empty calls + ending in needs-review.
+    if (fix.rateLimited && req.runId) { await pauseRunRateLimited(req.projectId, req.runId, frameId, session); return session; }
     if (fix.sessionId) session = fix.sessionId;
     await snapshotLastGen();   // re-capture in case the fix moved/renamed the previewEntry (audit A.2)
     // Re-assert the deterministic per-screen entry (the screen file the agent just
@@ -1369,6 +1391,17 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
               runId,
               ...(isAIModel(run.model) ? { provider: run.model } : {}),
               ...(run.modelId ? { modelId: run.modelId } : {}),
+              // T28: GRANULAR PROGRESS — surface `describing N/total` (and the later
+              // 1b/1c/1d sub-stage) as the heavy-AI chain runs, so the Runs UI shows
+              // real progress instead of a static "Canonicalize" that looks stuck.
+              onDescribeProgress: (p) => {
+                const detail = p.stage === 'describe'
+                  ? `describing ${p.done}/${p.total}${p.cached ? ` (${p.cached} cached)` : ''}`
+                  : p.stage === 'reconcile' ? 'reconciling lexicon'
+                  : p.stage === 'reduce' ? 'reducing to canonical'
+                  : 'adjudicating (vision)';
+                setGenPhase(projectId, runId, 'Canonicalize', detail);
+              },
             };
             await appendRunLog(projectId, runId, `[canon] heavy-AI canonicalization — 1a describe → 1b reconcile → 1c reduce → 1d adjudicate over ${aiFrames.length} frame(s)`);
             const result = await aiCanonicalize(projectId, figKey, aiFrames, aiFlow, aiOpts);
