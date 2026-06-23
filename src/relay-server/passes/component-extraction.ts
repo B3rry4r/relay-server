@@ -54,6 +54,34 @@ export interface ExtractOptions {
   env?: NodeJS.ProcessEnv;
   /** Restrict to these screen file basenames (testing). */
   onlyFiles?: string[];
+  /**
+   * PER-GROUP build safety (T32). When provided, EACH extracted group is verified
+   * independently: snapshot → write the group → buildOk() → keep if clean, else
+   * restore JUST that group and record it rejected. This makes one code-gen-unsafe
+   * merge skip in isolation instead of forcing the orchestrator to revert ALL
+   * groups (the all-or-nothing 6→15 regression). Omitted (or in dryRun) → groups
+   * apply without an inner build gate (legacy behaviour; the orchestrator's outer
+   * gate still protects the whole pass).
+   */
+  perGroupGuard?: ExtractGroupGuard;
+}
+
+/**
+ * Inner build-safety hooks for per-group extraction (T32). The pass owns the
+ * extract/rollback LOOP; the orchestrator owns the snapshot/restore/build
+ * mechanism (git + `flutter analyze`/`build web`) and injects it here so the pass
+ * stays decoupled from version control. `snapshot()` returns an opaque token (a
+ * git sha) for the current clean tree; `restore(token)` resets the tree to it
+ * (un-writing the group just applied); `buildOk()` reports whether the tree still
+ * builds at or below the running error budget.
+ */
+export interface ExtractGroupGuard {
+  /** Capture the current (clean) tree; returns an opaque restore token. */
+  snapshot: () => Promise<string>;
+  /** Restore the tree to a previously-captured token (drops the last group). */
+  restore: (token: string) => Promise<void>;
+  /** True when the tree still builds within budget after the group was written. */
+  buildOk: () => Promise<{ ok: boolean; reason?: string }>;
 }
 
 export type RunModelFn = (
@@ -200,6 +228,40 @@ export async function extractComponents(projectId: string, opts: ExtractOptions)
 
     const kind = inferKind(group, canonical);
     const chosen = chooseName(group, canonical);
+
+    // PER-GROUP BUILD SAFETY (T32). With a guard injected (real run), snapshot the
+    // clean tree, write THIS group, build-check it, and revert only this group if it
+    // regressed — so a single code-gen-unsafe merge is skipped while the safe groups
+    // still apply (no more all-or-nothing full revert). Without a guard (dryRun /
+    // standalone), fall back to the plain extract.
+    const guard = !opts.dryRun ? opts.perGroupGuard : undefined;
+    if (guard) {
+      let token: string;
+      try {
+        token = await guard.snapshot();
+      } catch {
+        // No snapshot point → cannot guarantee per-group rollback; skip this group
+        // rather than risk an unrevertable bad merge (the outer gate still applies).
+        rejected.push({ names: group.map((g) => g.localName), reason: 'per-group snapshot unavailable — skipped (no rollback point)' });
+        continue;
+      }
+      const result = await strategy.extractGroup(projectRoot, group, chosen, kind, false);
+      if (!result) {
+        // Strategy bailed without writing; nothing to roll back, but restore to be safe.
+        await guard.restore(token).catch(() => { /* best-effort */ });
+        rejected.push({ names: group.map((g) => g.localName), reason: 'strategy bailed (unsafe to merge)' });
+        continue;
+      }
+      const built = await guard.buildOk();
+      if (built.ok) {
+        extracted.push(result);
+      } else {
+        await guard.restore(token).catch(() => { /* best-effort */ });
+        rejected.push({ names: group.map((g) => g.localName), reason: `extraction regressed the build (${built.reason ?? 'build check failed'}) — group reverted, others kept` });
+      }
+      continue;
+    }
+
     const result = await strategy.extractGroup(projectRoot, group, chosen, kind, !!opts.dryRun);
     if (result) extracted.push(result);
     else rejected.push({ names: group.map((g) => g.localName), reason: 'strategy bailed (unsafe to merge)' });

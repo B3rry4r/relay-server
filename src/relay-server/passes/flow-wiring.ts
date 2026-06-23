@@ -375,6 +375,32 @@ async function verifyFlutter(
     return [];
   };
 
+  // T32 FOLDED-MODAL RESOLUTION: an edge whose TO is a MODAL has no standalone
+  // built screen file when the generated app FOLDS the modal into its base screen
+  // (rendered there as an in-place showModalBottomSheet/showDialog overlay). Such an
+  // edge is SATISFIED by the base screen's in-place overlay — it must NOT be
+  // reported `unmapped` (that mislabels correct folded-modal handling as drift).
+  // Resolve a modal id → {its base's built file, the presenter} when folded.
+  const foldedModalCache = new Map<string, { baseFile: string; presenter: string } | null>();
+  const resolveFoldedModal = async (toId: string): Promise<{ baseFile: string; presenter: string } | null> => {
+    if (foldedModalCache.has(toId)) return foldedModalCache.get(toId)!;
+    const modal = modals.find((m) => m.canonicalId === toId);
+    let result: { baseFile: string; presenter: string } | null = null;
+    if (modal?.baseCanonicalId) {
+      const baseFrames = framesFor(modal.baseCanonicalId);
+      const baseScreen = resolveCanon(modal.baseCanonicalId, baseFrames);
+      if (baseScreen) {
+        try {
+          const baseSrc = await readSrc(baseScreen.file);
+          const pm = /\b(showModalBottomSheet|showDialog|showGeneralDialog)\s*[<(]/.exec(baseSrc);
+          if (pm) result = { baseFile: baseScreen.file, presenter: pm[1] };
+        } catch { /* unreadable base → not folded */ }
+      }
+    }
+    foldedModalCache.set(toId, result);
+    return result;
+  };
+
   // Map a TO canonical screen → its route const + route string. The route is the
   // one the screen is registered under in the route table. Prefer the screen's
   // header route; cross-check against the route table so we have the const name.
@@ -425,6 +451,23 @@ async function verifyFlutter(
       ...(toScreen ? { toFile: rel(projectRoot, toScreen.file) } : {}),
       detail: '',
     };
+
+    // T32: TO is a folded modal? If FROM is built and TO is a modal that the app
+    // folded into its base screen (in-place overlay), the edge is SATISFIED by that
+    // base screen's overlay — report `wired`, not `unmapped`. We require the FROM
+    // screen to actually present the overlay (it IS the modal's base/trigger screen
+    // in the canonical) so we only credit a genuinely-handled folded modal.
+    if (fromScreen && !toScreen) {
+      const folded = await resolveFoldedModal(edge.to);
+      if (folded) {
+        base.status = 'wired';
+        base.toFile = rel(projectRoot, folded.baseFile);
+        base.detail = `TO is a folded modal — presented as an in-place overlay (${folded.presenter}) inside its base screen ${path.basename(folded.baseFile)}; the routed-screen target does not exist by design`;
+        mapped.add(edge.to);
+        findings.push(base);
+        continue;
+      }
+    }
 
     // UNMAPPED: a screen has no built file (true design/build drift).
     if (!fromScreen || !toScreen) {

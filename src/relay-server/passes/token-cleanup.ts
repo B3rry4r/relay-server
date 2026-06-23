@@ -146,6 +146,23 @@ export interface ThemeModel {
   radius: NumTokenDef[];       // r8=8, r12=12, … (the circular radius value)
   /** Names of the text-style helper methods, e.g. ['grotesk','inter','montserrat','display']. */
   textStyleHelpers: string[];
+  /** Per-helper signature detail (T32): the parameter NAMES the helper actually
+   *  declares (so we never emit an arg the helper can't accept — the 6→10 break),
+   *  the font family it wraps, and the size/weight it BAKES IN (so a substitution
+   *  whose load-bearing size/weight the helper can't carry is skipped, not lost). */
+  textStyleSigs: TextHelperSig[];
+}
+
+export interface TextHelperSig {
+  name: string;
+  /** Declared parameter names, e.g. ['color'] for `badge7({Color color = …})`. */
+  params: string[];
+  /** Font family the helper wraps (montserrat/grotesk/inter/poppins/…), if detectable. */
+  family?: string;
+  /** fontSize baked into the helper body (a literal), if detectable. */
+  bakedSize?: number;
+  /** fontWeight baked into the helper body (e.g. 'FontWeight.w700'), if detectable. */
+  bakedWeight?: string;
 }
 
 // ── Per-framework strategy seam ──────────────────────────────────────────────
@@ -265,13 +282,46 @@ export function parseFlutterThemeSource(src: string, themeFileRel = path.join('l
     radius.push({ name: rm[1], value: Number(rm[2]) });
   }
 
-  // Text-style helpers: `static TextStyle <name>({...}) => …`
+  // Text-style helpers: `static TextStyle <name>(<params>) => <body>;`. Capture the
+  // helper NAME, its declared PARAM names, the wrapped font FAMILY, and any baked
+  // size/weight so substitution emits only accepted args and skips lossy mappings.
   const textStyleHelpers: string[] = [];
+  const textStyleSigs: TextHelperSig[] = [];
   const tsRe = /static\s+TextStyle\s+([A-Za-z_]\w*)\s*\(/g;
   let tm: RegExpExecArray | null;
-  while ((tm = tsRe.exec(src)) !== null) textStyleHelpers.push(tm[1]);
+  while ((tm = tsRe.exec(src)) !== null) {
+    const name = tm[1];
+    textStyleHelpers.push(name);
+    // Parameter list: from the `(` to its matching `)`.
+    const openIdx = tm.index + tm[0].length - 1;
+    const closeIdx = matchParen(src, openIdx);
+    const paramSrc = closeIdx > openIdx ? src.slice(openIdx + 1, closeIdx) : '';
+    const params: string[] = [];
+    // Named params live inside `{ … }`; positional are bare. For each segment the
+    // param NAME is the identifier immediately before `=` (default) or end-of-seg —
+    // i.e. the last identifier in the `Type name` prefix.
+    for (const seg of splitArgs(paramSrc.replace(/^\s*\{|\}\s*$/g, ''))) {
+      const decl = seg.trim().split('=')[0].trim(); // drop any default value
+      if (!decl) continue;
+      const ids = decl.match(/[A-Za-z_]\w*/g);
+      if (ids && ids.length) params.push(ids[ids.length - 1]);
+    }
+    // Body: from `)` to the terminating `;` (single-expression `=> …;`). Good
+    // enough to read the wrapped family + baked size/weight literals.
+    const body = closeIdx > openIdx ? src.slice(closeIdx + 1, src.indexOf(';', closeIdx) + 1) : '';
+    const famM = /GoogleFonts\.([A-Za-z_]\w*)\s*\(/.exec(body);
+    const sizeM = /fontSize\s*:\s*(\d+(?:\.\d+)?)/.exec(body);
+    const weightM = /fontWeight\s*:\s*(FontWeight\.[A-Za-z0-9_]+)/.exec(body);
+    textStyleSigs.push({
+      name,
+      params,
+      ...(famM ? { family: famM[1] } : {}),
+      ...(sizeM ? { bakedSize: Number(sizeM[1]) } : {}),
+      ...(weightM ? { bakedWeight: weightM[1] } : {}),
+    });
+  }
 
-  return { className, themeFileRel: themeFileRel.split(path.sep).join('/'), colors, spacing, radius, textStyleHelpers };
+  return { className, themeFileRel: themeFileRel.split(path.sep).join('/'), colors, spacing, radius, textStyleHelpers, textStyleSigs };
 }
 
 // =============================================================================
@@ -618,6 +668,17 @@ async function substituteTextStyles(
     const parsed = parseInlineTextStyle(callText);
     if (!parsed) { rejected.push({ file: rel, kind: 'text-style', literal: trunc(callText), reason: 'unparseable / positional args' }); continue; }
 
+    // T32 BRAND GUARD: an inline style whose color is a non-token BRAND color — a
+    // raw `Color(0x…)` or a private `_name` const (brand marks keep their own
+    // `static const Color _red`/`_blue` deliberately, NOT design tokens) — must NOT
+    // be mapped to a theme helper: the helper carries a token color/family, so the
+    // mapping would lose the brand identity (and, when the color can't be passed,
+    // break the build). Skip the literal, leave it as-is.
+    if (parsed.fields.color !== undefined && isBrandColor(parsed.fields.color, theme)) {
+      rejected.push({ file: rel, kind: 'text-style', literal: trunc(callText), reason: `brand color (${trunc(parsed.fields.color)}) is intentionally not a token — left as-is` });
+      continue;
+    }
+
     // Deterministic gate: the inline style MUST carry a fontSize+fontWeight pair
     // we can pass to the helper. A GoogleFonts.<fam> call whose <fam> matches a
     // helper-mapped family is the strongest signal.
@@ -626,9 +687,13 @@ async function substituteTextStyles(
       rejected.push({ file: rel, kind: 'text-style', literal: trunc(callText), reason: ask.reason || 'AI: not equivalent to a named style' });
       continue;
     }
+    // Resolve the helper's real signature so we only emit accepted args + skip
+    // lossy mappings (the helper-can't-represent case) instead of breaking the build.
+    const sig = theme.textStyleSigs.find((s) => s.name === ask.helper);
+    if (!sig) { rejected.push({ file: rel, kind: 'text-style', literal: trunc(callText), reason: `helper '${ask.helper}' has no resolvable signature — left as-is` }); continue; }
     // Build the helper call from the parsed fields (only fields the helper accepts).
-    const repl = buildHelperCall(theme.className, ask.helper, parsed.fields);
-    if (!repl) { rejected.push({ file: rel, kind: 'text-style', literal: trunc(callText), reason: 'fields not representable by helper signature' }); continue; }
+    const repl = buildHelperCall(theme.className, sig, parsed.fields);
+    if (!repl) { rejected.push({ file: rel, kind: 'text-style', literal: trunc(callText), reason: 'fields not representable by helper signature — left as-is' }); continue; }
     out = out.slice(0, c.start) + repl + out.slice(c.end);
     count++;
     changes.push({ file: rel, kind: 'text-style', from: trunc(callText), to: repl });
@@ -700,17 +765,81 @@ async function aiConfirmTextStyle(
   }
 }
 
-/** Render `AppTheme.<helper>(size: …, weight: …, color: …, height: …, letterSpacing: …)`
- *  using only the fields present. Returns null if there's nothing meaningful. */
-function buildHelperCall(className: string, helper: string, f: ParsedTextStyle): string | null {
+/**
+ * Render `AppTheme.<helper>(<only the args the helper actually declares>)`.
+ *
+ * T32 FIX: the previous version blindly emitted `size:`/`weight:`/`height:`/
+ * `letterSpacing:` even though Ping's helpers declare ONLY `{Color color}` — every
+ * such arg is `The named parameter 'size' isn't defined` → the 6→10 build break.
+ * Now we consult the helper's real signature (`sig.params`):
+ *   - emit ONLY fields the helper declares (mapping fontSize→a `size`-like param,
+ *     fontWeight→a `weight`-like param, etc.) — never an undeclared arg;
+ *   - for a field the helper does NOT declare, it is acceptable ONLY when the
+ *     helper BAKES that exact value in (so dropping it is lossless). If the inline
+ *     style's size/weight differs from the helper's baked size/weight and the
+ *     helper can't take it as a param, we SKIP (return null) — never emit a
+ *     substitution that silently changes the rendering.
+ * Returns null to mean "skip this literal" (the caller records a reject + leaves
+ * the original style untouched).
+ */
+/** True when a `color:` value expression is a NON-TOKEN brand color that must not
+ *  be folded into a theme helper: a private `_name` const (brand marks declare
+ *  their own `static const Color _red`/`_blue`), or a raw `Color(0x…)` literal
+ *  whose ARGB is NOT a defined design token. A reference to a theme token
+ *  (`AppTheme.x` / a bare token name) is NOT a brand color. */
+function isBrandColor(colorExpr: string, theme: ThemeModel): boolean {
+  const v = colorExpr.trim();
+  // Private local const → brand mark color (deliberately not a token).
+  if (/^_[A-Za-z0-9_]+$/.test(v)) return true;
+  // Raw Color(0xAARRGGBB) → brand iff its ARGB isn't a token.
+  const m = /^(?:const\s+)?Color\(0x([0-9A-Fa-f]{8})\)$/.exec(v);
+  if (m) {
+    const argb = m[1].toLowerCase();
+    return !theme.colors.some((c) => c.argb === argb);
+  }
+  return false;
+}
+
+function buildHelperCall(className: string, sig: TextHelperSig, f: ParsedTextStyle): string | null {
+  const has = (p: string) => sig.params.includes(p);
+  // Find a declared param matching each logical field, if any.
+  const sizeParam = ['size', 'fontSize'].find(has);
+  const weightParam = ['weight', 'fontWeight'].find(has);
+  const heightParam = ['height'].find(has);
+  const lsParam = ['letterSpacing', 'spacing'].find(has);
+  const colorParam = ['color'].find(has);
+
   const args: string[] = [];
-  if (f.fontSize !== undefined) args.push(`size: ${f.fontSize}`);
-  if (f.fontWeight !== undefined) args.push(`weight: ${f.fontWeight}`);
-  if (f.color !== undefined) args.push(`color: ${f.color}`);
-  if (f.height !== undefined) args.push(`height: ${f.height}`);
-  if (f.letterSpacing !== undefined) args.push(`letterSpacing: ${f.letterSpacing}`);
-  if (!args.length) return null;
-  return `${className}.${helper}(${args.join(', ')})`;
+
+  // fontSize: pass if the helper accepts it; else require the helper to bake the
+  // SAME size (lossless drop), otherwise skip.
+  if (f.fontSize !== undefined) {
+    if (sizeParam) args.push(`${sizeParam}: ${f.fontSize}`);
+    else if (sig.bakedSize === undefined || sig.bakedSize !== f.fontSize) return null;
+  }
+  // fontWeight: same rule.
+  if (f.fontWeight !== undefined) {
+    if (weightParam) args.push(`${weightParam}: ${f.fontWeight}`);
+    else if (sig.bakedWeight === undefined || sig.bakedWeight !== f.fontWeight) return null;
+  }
+  // color: pass if accepted; else only OK to drop when no explicit color was set.
+  if (f.color !== undefined) {
+    if (colorParam) args.push(`${colorParam}: ${f.color}`);
+    else return null; // an explicit color the helper can't carry → would be lost.
+  }
+  // height / letterSpacing: pass if accepted; otherwise these are non-default and
+  // the helper can't represent them → skip (lossless only if helper bakes them,
+  // which we can't confirm generically, so be conservative).
+  if (f.height !== undefined) {
+    if (heightParam) args.push(`${heightParam}: ${f.height}`);
+    else return null;
+  }
+  if (f.letterSpacing !== undefined) {
+    if (lsParam) args.push(`${lsParam}: ${f.letterSpacing}`);
+    else return null;
+  }
+
+  return `${className}.${sig.name}(${args.join(', ')})`;
 }
 
 // ── Cleanup: dead-decl detection ──────────────────────────────────────────────

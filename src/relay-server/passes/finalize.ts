@@ -40,7 +40,7 @@ import type { AIModel } from '../ai-adapters';
 import { getFlutterRoot } from '../runtime';
 import { runModelObserved } from '../ai-observability';
 
-import { extractComponents } from './component-extraction';
+import { extractComponents, type ExtractGroupGuard } from './component-extraction';
 import { applyModalOverlays } from './modal-overlay';
 import { repointAssetUsage } from './asset-usage';
 import { verifyFlowWiring } from './flow-wiring';
@@ -148,8 +148,17 @@ export interface FinalizeReport {
 interface PassDef {
   name: PassName;
   /** Run the pass with the shared finalize opts; return counts + warnings. The
-   *  `proof` collector is swapped in per pass to tally AI firing. */
-  run: (projectId: string, opts: FinalizeOptions, proof: AiProofCollector) => Promise<{ counts: Record<string, number>; warnings: string[] }>;
+   *  `proof` collector is swapped in per pass to tally AI firing. `ctx` carries
+   *  orchestrator capabilities a pass may opt into (e.g. the per-group build guard
+   *  for extractComponents — T32). */
+  run: (projectId: string, opts: FinalizeOptions, proof: AiProofCollector, ctx: PassRunCtx) => Promise<{ counts: Record<string, number>; warnings: string[] }>;
+}
+
+/** Orchestrator-provided capabilities a pass may use during a real run. */
+interface PassRunCtx {
+  /** Build the per-group build-safety guard for component extraction (T32), or
+   *  null when this run cannot build-gate (dry-run / no git / not flutter). */
+  makeExtractGroupGuard: () => ExtractGroupGuard | null;
 }
 
 /** A mutable collector the orchestrator swaps in PER PASS so the wrapped runner
@@ -202,7 +211,7 @@ function noAi(opts: FinalizeOptions): boolean {
 const PASSES: PassDef[] = [
   {
     name: 'extractComponents',
-    run: async (projectId, opts, proof) => {
+    run: async (projectId, opts, proof, ctx) => {
       const r = await extractComponents(projectId, {
         projectRoot: opts.projectRoot,
         model: opts.model,
@@ -211,6 +220,9 @@ const PASSES: PassDef[] = [
         dryRun: opts.dryRun,
         env: opts.env,
         runModel: passRunModel(opts, proof, 'extractComponents'),
+        // T32: per-group build safety. One code-gen-unsafe merge is reverted in
+        // isolation; the safe groups still apply (no all-or-nothing revert).
+        perGroupGuard: ctx.makeExtractGroupGuard() ?? undefined,
       });
       return {
         counts: { extracted: r.extracted.length, rejected: r.rejected.length },
@@ -440,8 +452,34 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
     // Fresh AI-firing collector for THIS pass. `available` reflects whether a
     // model + runner were injected (the pass could fire AI at all).
     const proof: AiProofCollector = { available: !noAi(opts), calls: 0, okCalls: 0 };
+
+    // Per-pass context. T32: a per-group build guard for extractComponents — built
+    // only when this run can actually build-gate (buildCheckable + git ready). It
+    // snapshots/restores via git and build-checks against the CURRENT error budget
+    // (`lastGoodErrors` at the moment this pass starts), so one bad group reverts in
+    // isolation while safe groups persist. Captured by value below.
+    const budgetAtPassStart = lastGoodErrors;
+    const ctx: PassRunCtx = {
+      makeExtractGroupGuard: (): ExtractGroupGuard | null => {
+        if (!buildCheckable || !gitReady) return null;
+        return {
+          snapshot: () => snapshotBeforeMutation(projectRoot, `${def.name} group (P8 per-group)`, vc),
+          restore: (token: string) => rollbackTo(projectRoot, token, vc),
+          buildOk: async () => {
+            const a = await flutterAnalyze(projectRoot, opts.env);
+            const afterErrors = a?.errors ?? null;
+            if (afterErrors != null && budgetAtPassStart != null && afterErrors > budgetAtPassStart) {
+              return { ok: false, reason: `analyze errors ${budgetAtPassStart} → ${afterErrors}` };
+            }
+            const built = await flutterBuildWebOk(projectRoot, opts.env);
+            return built.ok ? { ok: true } : { ok: false, reason: `build web failed: ${built.error}` };
+          },
+        };
+      },
+    };
+
     try {
-      const out = await def.run(projectId, opts, proof);
+      const out = await def.run(projectId, opts, proof, ctx);
       counts = out.counts;
       warnings = out.warnings;
     } catch (e) {

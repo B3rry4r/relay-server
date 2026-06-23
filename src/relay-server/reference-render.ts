@@ -418,6 +418,78 @@ function svgHasComplexPaint(svg: string): boolean {
   return /<(linearGradient|radialGradient|mask|filter|image|pattern)\b/i.test(svg);
 }
 
+// ── broken-SMALL-icon detection (T30) ──────────────────────────────────────────
+// T19 only rasterizes LARGE (≥160px) illustrations. But the SMALL functional icons
+// in the Ping app (biometric / NIN / scan — iconscan, fi_2, scan) ship BROKEN: they
+// are external-component INSTANCES of COMPOSITE icons and the UIX SVG synthesizer
+// drops / mis-positions sub-paths (e.g. iconscan's 24×24 viewBox holds a glyph whose
+// coords run only 0–5.75 and dip to −0.75 — a tiny, partly-clipped fragment). The
+// build AI then sees a broken glyph and improvises a substitute → asset defect.
+//
+// The CanvasKit harness renders these icons CORRECTLY, so a SMALL icon that LOOKS
+// broken (or is an external-component instance with non-trivial geometry) is routed
+// to renderNodeReference (PNG) too — NOT only ≥160px illustrations. We stay
+// conservative: a genuinely-simple, well-formed single/two-path icon (a clean
+// chevron / arrow / ellipse) is KEPT as SVG even when it is an instance.
+
+/** An external-component INSTANCE node id carries Figma's instance notation
+ *  `I<masterPath>;<masterId>` — an `I` prefix and at least one `;` (e.g.
+ *  `I313:10170;3614:45`). These are the prime offenders for the broken composite
+ *  icons, so an instance with non-trivial geometry is rasterized. */
+function isComponentInstanceId(nodeId: string | undefined): boolean {
+  return !!nodeId && nodeId.startsWith('I') && nodeId.includes(';');
+}
+
+/** Breakage signals for a synthesized icon SVG. Parses the viewBox and the union of
+ *  all `<path d="…">` coordinates and flags the synth-failure patterns seen on the
+ *  Ping icons:
+ *   - pathCount      number of <path> elements (composite when many).
+ *   - clean          parseable + has drawable coords (not an empty wrapper).
+ *   - broken         a breakage pattern fired (see `reason`).
+ *  Conservative thresholds (ratios are relative to the largest viewBox dimension):
+ *   - neg-coords  : content dips > 20% below the box AND > 1px absolute  → mis-placed
+ *                   (scan: min −6 on a 22px box; check_circle: −15 on 22px). A clean
+ *                   chevron's −0.8px stroke bleed (ratio ~0.1) does NOT trip this.
+ *   - over-coords : content overshoots the box by > 20%                  → mis-placed
+ *   - composite   : ≥ 6 sub-paths whose union fills < 60% of the box     → fragment
+ *                   (fi_2: 12 paths filling 49%; lock/id_card; …).
+ *   - tiny        : ≥ 2 sub-paths whose union fills < 40% of the box     → clipped
+ *                   fragment (iconscan: 4 paths filling 27%).
+ *   - g-transform : ≥ 2 `<g transform=…>` groups                         → composite. */
+interface IconSvgSignals { pathCount: number; clean: boolean; broken: boolean; reason: string }
+function analyzeIconSvg(svg: string): IconSvgSignals {
+  const head = svg.slice(0, 4000);
+  const vb = /viewBox\s*=\s*["']\s*[-\d.]+[\s,]+[-\d.]+[\s,]+([\d.]+)[\s,]+([\d.]+)/i.exec(head);
+  const maxDim = vb ? Math.max(parseFloat(vb[1]), parseFloat(vb[2])) : 0;
+  // All <path d="…"> bodies (cap the scan so a giant illustration can't blow up regex).
+  const dBodies = [...svg.slice(0, 60000).matchAll(/\bd\s*=\s*["']([^"']+)["']/gi)].map(m => m[1]);
+  const pathCount = dBodies.length;
+  const gTransforms = (svg.match(/<g[^>]*\btransform\s*=/gi) ?? []).length;
+  // No parseable viewBox or no drawable path → not a coordinate-breakage candidate
+  // (empty <circle>/<rect>/<ellipse> wrappers are clean and stay SVG).
+  if (!(maxDim > 0) || pathCount === 0) {
+    return { pathCount, clean: pathCount > 0, broken: false, reason: 'no-coords' };
+  }
+  let min = Infinity, max = -Infinity;
+  for (const d of dBodies) {
+    const nums = d.match(/-?\d+(?:\.\d+)?/g);
+    if (!nums) continue;
+    for (const ns of nums) { const v = parseFloat(ns); if (v < min) min = v; if (v > max) max = v; }
+  }
+  if (!isFinite(min) || !isFinite(max)) {
+    return { pathCount, clean: true, broken: false, reason: 'no-coords' };
+  }
+  const negRatio = -min / maxDim;
+  const overRatio = (max - maxDim) / maxDim;
+  const extentRatio = (max - min) / maxDim;
+  if (negRatio > 0.20 && min < -1) return { pathCount, clean: true, broken: true, reason: `neg-coords(${min.toFixed(1)})` };
+  if (overRatio > 0.20 && max > maxDim + 1) return { pathCount, clean: true, broken: true, reason: `over-coords(${max.toFixed(1)})` };
+  if (pathCount >= 6 && extentRatio < 0.60) return { pathCount, clean: true, broken: true, reason: `composite(${pathCount},${extentRatio.toFixed(2)})` };
+  if (pathCount >= 2 && extentRatio < 0.40) return { pathCount, clean: true, broken: true, reason: `tiny-content(${pathCount},${extentRatio.toFixed(2)})` };
+  if (gTransforms >= 2) return { pathCount, clean: true, broken: true, reason: `g-transforms(${gTransforms})` };
+  return { pathCount, clean: true, broken: false, reason: `simple(${pathCount})` };
+}
+
 export async function localizeFrameAssets(
   projectId: string,
   figStorageKey: string,
@@ -548,21 +620,34 @@ export async function localizeFrameAssets(
     let dim = bb && (bb.w ?? 0) > 0 && (bb.h ?? 0) > 0 ? Math.max(bb.w!, bb.h!) : 0;
     let complexPaint = false;
     let dimSource = dim > 0 ? 'ir-bb' : 'none';
-    // Fetch the SVG bytes only when we need them: to fill in a missing IR dim, or to
-    // check for synth-hostile paint on a mid-sized vector (≥ half the threshold) that
-    // the dimension gate alone wouldn't catch. A clearly-small icon is never fetched
-    // here (upload() fetches it), and a clearly-large illustration needs no check.
-    if (dim === 0 || (dim >= ILLUSTRATION_MIN_DIM / 2 && dim < ILLUSTRATION_MIN_DIM)) {
+    // T30: a SMALL icon can also be broken (external-component instance of a composite
+    // icon whose synthesized SVG is a clipped fragment). To decide that we must look at
+    // the SVG bytes, so fetch them for any SMALL vector (below the illustration
+    // threshold) too — not only mid-sized ones. A clearly-large illustration still
+    // needs no byte check (the dimension gate alone routes it). The bytes are reused by
+    // both the T19 complex-paint check and the T30 breakage analysis.
+    const instance = isComponentInstanceId(s.nodeId);
+    let iconSig: IconSvgSignals | null = null;
+    const needBytes = dim === 0 || dim < ILLUSTRATION_MIN_DIM;
+    if (needBytes) {
       try {
         const res = await fetch(s.url);
         if (res.ok) {
           const svgText = await res.text();
           complexPaint = svgHasComplexPaint(svgText);
           if (dim === 0) { dim = svgMaxDimension(svgText); dimSource = dim > 0 ? 'svg-viewbox' : 'none'; }
+          if (dim < ILLUSTRATION_MIN_DIM) iconSig = analyzeIconSvg(svgText);
         }
       } catch { /* fall through with whatever dim we have */ }
     }
     const isIllustration = dim >= ILLUSTRATION_MIN_DIM || (complexPaint && dim >= ILLUSTRATION_MIN_DIM / 2);
+    // T30: a SMALL (non-illustration) icon is BROKEN and must be rasterized when its
+    // synthesized SVG shows a breakage signal, OR when it is an external-component
+    // INSTANCE with non-trivial geometry (> 2 sub-paths). A genuinely-simple,
+    // well-formed icon (a clean 1–2 path chevron / arrow / ellipse) is KEPT as SVG
+    // even when it is an instance — we never over-rasterize a clean icon.
+    const brokenIcon = !!iconSig && iconSig.broken;
+    const instanceComposite = instance && !!iconSig && iconSig.clean && iconSig.pathCount > 2;
     if (isIllustration) {
       const reason = dim >= ILLUSTRATION_MIN_DIM ? `large(${dimSource})` : 'complex-paint';
       svgDecisions.push({ fileName: s.fileName, nodeId: s.nodeId, route: 'raster', dim, reason });
@@ -570,8 +655,16 @@ export async function localizeFrameAssets(
       // asset map/resources treat it as a raster image (mirrors repairRaster output).
       const pngName = s.fileName.replace(/\.svg$/i, '') + '.png';
       tasks.push(() => repairRaster(s.nodeId, 'assets/images', pngName, s.url));
+    } else if (brokenIcon || instanceComposite) {
+      const reason = brokenIcon ? `broken-icon:${iconSig!.reason}` : 'instance-composite';
+      svgDecisions.push({ fileName: s.fileName, nodeId: s.nodeId, route: 'raster', dim, reason });
+      // Route the broken/composite SMALL icon through the CanvasKit harness too. Keep
+      // it under assets/icons (it IS an icon) but as a .png — the harness renders the
+      // complete glyph the broken SVG synth dropped.
+      const pngName = s.fileName.replace(/\.svg$/i, '') + '.png';
+      tasks.push(() => repairRaster(s.nodeId, 'assets/icons', pngName, s.url));
     } else {
-      svgDecisions.push({ fileName: s.fileName, nodeId: s.nodeId, route: 'svg', dim, reason: 'simple-icon' });
+      svgDecisions.push({ fileName: s.fileName, nodeId: s.nodeId, route: 'svg', dim, reason: iconSig ? iconSig.reason : 'simple-icon' });
       tasks.push(() => upload(s.url, 'assets/icons', s.fileName, { nodeId: s.nodeId, format: 'svg', kind: 'icon' }));
     }
   }

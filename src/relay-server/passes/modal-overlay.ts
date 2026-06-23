@@ -265,6 +265,27 @@ async function resolveScreenFile(projectRoot: string, canonicalId: string, frame
   return null;
 }
 
+/** T32: does the modal's BASE screen render the modal FOLDED IN as an in-place
+ *  overlay? A generated app renders a sheet/dialog modal directly inside its base
+ *  screen via `showModalBottomSheet` / `showDialog` / `showGeneralDialog` rather
+ *  than as a standalone routed screen. When the base file resolves AND contains
+ *  such a presenter, the modal is already an overlay — 8b's goal — so this is a
+ *  not-applicable (folded) case, NOT a failure. Returns the base file + the
+ *  presenter we matched, or null when no in-place overlay is present. */
+async function baseRendersFoldedOverlay(
+  projectRoot: string,
+  baseScreen: CanonScreen,
+): Promise<{ baseFile: string; presenter: string } | null> {
+  const resolvedBase = await resolveScreenFile(projectRoot, baseScreen.canonicalId, baseScreen.frameIds);
+  if (!resolvedBase) return null;
+  let src: string;
+  try { src = await fs.readFile(resolvedBase.file, 'utf8'); } catch { return null; }
+  const m = /\b(showModalBottomSheet|showDialog|showGeneralDialog)\s*</.exec(src)
+    ?? /\b(showModalBottomSheet|showDialog|showGeneralDialog)\s*\(/.exec(src);
+  if (!m) return null;
+  return { baseFile: resolvedBase.file, presenter: m[1] };
+}
+
 /** The frame-id core of a canonical id: strip the `c_`/`m_` namespace prefix so a
  *  modal id (`m_300_3600`) and a built screen header (`c_300_3600`) for the SAME
  *  frame compare equal. */
@@ -336,7 +357,20 @@ async function convertFlutterModal(
 
   const modalFrames = [modal.frameId];
   const resolvedModal = await resolveScreenFile(projectRoot, modal.canonicalId, modalFrames);
-  if (!resolvedModal) return { skip: `modal ${modal.canonicalId} (frame ${modal.frameId}) has no built screen file — not mapped to this app` };
+  if (!resolvedModal) {
+    // T32 FOLDED-MODAL RECONCILIATION: a GENERATED app frequently FOLDS a modal into
+    // its base screen — the build agent renders it as an in-base overlay
+    // (showModalBottomSheet/showDialog/showGeneralDialog) rather than a standalone
+    // routed screen. There is therefore NO standalone modal file to convert: this is
+    // the DESIRED end state (8b's whole purpose), not a failure. Detect it by
+    // checking the base screen for an in-place overlay presenter and report it
+    // honestly as already-overlay/not-applicable, instead of "no built screen file".
+    const folded = await baseRendersFoldedOverlay(projectRoot, baseScreen);
+    if (folded) {
+      return { skip: `already an in-base overlay (folded into base screen ${path.basename(folded.baseFile)} via ${folded.presenter}) — not-applicable (generated apps render modals as in-place overlays)` };
+    }
+    return { skip: `modal ${modal.canonicalId} (frame ${modal.frameId}) has no built screen file and its base screen renders no in-place overlay — REAL gap (modal not built)` };
+  }
 
   const resolvedBase = await resolveScreenFile(projectRoot, baseScreen.canonicalId, baseScreen.frameIds);
   if (!resolvedBase) return { skip: `base screen ${baseScreen.canonicalId} has no built screen file` };
