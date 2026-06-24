@@ -82,10 +82,15 @@ function killJob(job: RunningJob): void {
 // at 120s they were cut off mid-reasoning → threw → parked the whole run. 5 min gives
 // real headroom (rate-limit backoff handles quota; a true hang still caps here). Env-overridable.
 const AI_TIMEOUT_MS = Number(process.env.RELAY_AI_TIMEOUT_MS) || 300_000;
-// A single agent CLI call (implement / verify / fix). 600s let a HUNG or rate-limited
-// call waste 10 minutes before timing out; cap at 5 min (env-overridable). A real
-// screen build/fix completes well under this — a hang shouldn't burn 10 minutes.
-const AI_AGENT_TIMEOUT_MS = Number(process.env.RELAY_AI_AGENT_TIMEOUT_MS) || 300_000;
+// A single agent CLI call (implement / verify / fix). These are MULTI-TURN agent
+// calls (read IR, open the reference render, write Dart, run `flutter analyze`,
+// write the preview) — under elevated API latency a legitimate, actively-working
+// build/fix routinely takes 200–300s+, and the old 300s cap was KILLING those mid-
+// work (a 299.8s call succeeded while 305s ones were SIGTERM'd → false "hang", 0
+// output). This is a generous backstop for genuinely-stuck calls, NOT a hang-killer:
+// 20 min (env-overridable). The soft-stall streak detector + idle handling catch
+// true no-progress stalls without amputating slow-but-progressing work.
+const AI_AGENT_TIMEOUT_MS = Number(process.env.RELAY_AI_AGENT_TIMEOUT_MS) || 1_200_000;
 
 interface GenerateRequest {
   prompt: string;
