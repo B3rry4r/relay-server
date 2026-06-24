@@ -95,7 +95,17 @@ const STREAK_WINDOW = 8;
 // so one screen's isolated empty doesn't poison an unrelated run's count. In-process
 // (one process owns a run); a redeploy resets it, which is fine — a fresh process
 // re-observes the streak from scratch.
-type Outcome = 'ok' | 'empty' | 'rate-limit' | 'error';
+// 'zero-fail' = a call that THREW (timeout / status=error) but produced ~0 output.
+// T-hang-storm (BUG 2): the claude CLI hangs on many calls → each dies at the 300s
+// timeout with 0 tokens (status=error/timeout, empty text). That is NOT a genuinely
+// broken call — it's a "can't make progress / likely soft-throttle / agent stall"
+// condition, indistinguishable in effect from an exhausted-quota empty. So a
+// zero-output FAILURE counts toward the SAME soft streak as an ok-but-empty call (it
+// does NOT break the streak the way a substantive error would). When the streak
+// crosses the threshold we re-classify it as 'rate-limit' so the caller PAUSES the
+// run resumably (mirroring the empty-streak path) instead of dumping every hung
+// screen to needs-review.
+type Outcome = 'ok' | 'empty' | 'rate-limit' | 'error' | 'zero-fail';
 const streaks = new Map<string, Outcome[]>();
 
 function streakKey(ctx: LogCtx): string {
@@ -109,14 +119,17 @@ function recordOutcome(ctx: LogCtx, o: Outcome): void {
   if (ring.length > STREAK_WINDOW) ring.shift();
   streaks.set(key, ring);
 }
-/** Count the trailing run of empty/rate-limit outcomes (an 'ok' or 'error' breaks it).
- *  A real-error breaks the streak so a genuinely broken call isn't mistaken for a soft
- *  limit; an 'ok' obviously clears it. */
+/** Count the trailing run of soft/zero-output outcomes (an 'ok' or substantive
+ *  'error' breaks it). The soft bucket is: ok-but-empty, rate-limit, AND a
+ *  zero-output FAILURE (timeout/status=error with no text — a likely throttle/agent
+ *  stall, BUG 2). An 'ok' obviously clears it; a substantive 'error' (a call that
+ *  produced output but errored — currently none, reserved) breaks it so a genuinely
+ *  broken call isn't mistaken for a soft limit. */
 function trailingSoftStreak(ctx: LogCtx): number {
   const ring = streaks.get(streakKey(ctx)) ?? [];
   let n = 0;
   for (let i = ring.length - 1; i >= 0; i--) {
-    if (ring[i] === 'empty' || ring[i] === 'rate-limit') n++;
+    if (ring[i] === 'empty' || ring[i] === 'rate-limit' || ring[i] === 'zero-fail') n++;
     else break;
   }
   return n;
@@ -143,7 +156,13 @@ export interface AiCallProof {
 
 export type ObservedResult =
   | ({ ok: true; text: string; sessionId?: string } & AiCallProof)
-  | ({ ok: false; reason: AiFailReason; error?: string } & Omit<AiCallProof, 'tokens'> & { tokens: number });
+  | ({ ok: false; reason: AiFailReason; error?: string;
+       /** True when `reason==='rate-limit'` came from a SOFT signal — an empty/zero-output
+        *  STREAK crossing the threshold (likely throttle / agent stall) — NOT a classifiable
+        *  429. Lets the caller log a distinguishing pause reason while taking the same
+        *  resumable-pause action as a real rate limit. */
+       softStall?: boolean }
+     & Omit<AiCallProof, 'tokens'> & { tokens: number });
 
 /** Base class for loud AI failures — distinct from ordinary Errors so callers /
  *  the orchestrator can recognise "the AI step failed" specifically. */
@@ -313,7 +332,7 @@ export async function runModelObserved(
           // Persisted past the backoff retries → a longer (hourly/daily) limit. Surface
           // 'rate-limit' so the caller pauses the run RESUMABLY via T26's pause path.
           logAiLine(ctx, `model=${model} call=${callId} status=rate-limit dur=${durMs}ms — empty streak persisted past backoff (${streak}); treating as soft rate-limit → pause`);
-          return { ok: false, reason: 'rate-limit', callId, durMs, model, tokens: 0 };
+          return { ok: false, reason: 'rate-limit', softStall: true, callId, durMs, model, tokens: 0 };
         }
         logAiLine(ctx, `model=${model} call=${callId} tokens≈0 status=empty dur=${durMs}ms`);
         return { ok: false, reason: 'empty', callId, durMs, model, tokens: 0 };
@@ -334,13 +353,29 @@ export async function runModelObserved(
         continue;   // retry the SAME call after the window cools down
       }
       const timedOut = (err?.killed && /timed?\s*out|ETIMEDOUT/i.test(msg)) || err?.signal === 'SIGTERM';
-      const reason: AiFailReason = rateLimited ? 'rate-limit' : (timedOut ? 'timeout' : 'error');
-      // T29: a classifiable rate-limit error CONTINUES the soft-limit streak (so a
-      // mix of empties + rate-limit errors still trips the pause); a real error/timeout
-      // BREAKS it (a genuinely broken call must not be mistaken for a soft limit).
-      recordOutcome(ctx, rateLimited ? 'rate-limit' : 'error');
-      logAiLine(ctx, `model=${model} call=${callId} tokens≈0 status=${reason === 'rate-limit' ? 'rate-limit' : 'error'} dur=${durMs}ms :: ${msg.slice(0, 80)}`);
-      return { ok: false, reason, error: msg.slice(0, 600), callId, durMs, model, tokens: 0 };
+      // T29 + BUG 2: feed the soft-streak. A classifiable rate-limit error CONTINUES the
+      // soft-limit streak (a mix of empties + 429s still trips the pause). A throw that
+      // produced ~0 output (timeout/error — and in the catch path there is, by
+      // definition, no usable text) is a likely throttle / agent stall (the 300s-hang
+      // storm), so it ALSO counts toward the SAME soft streak ('zero-fail') rather than
+      // breaking it. Only a substantive error (output-bearing) would break the streak.
+      recordOutcome(ctx, rateLimited ? 'rate-limit' : 'zero-fail');
+      const streak = trailingSoftStreak(ctx);
+      // When a STREAK of zero-output failures crosses the threshold, re-classify this
+      // failure as a soft rate-limit so the caller PAUSES the run resumably (mirrors the
+      // ok-but-empty streak path) instead of cascading every hung screen to needs-review.
+      // An ISOLATED hang (streak < threshold) still returns its real reason → that one
+      // screen parks as before. (A genuine 429 already returns 'rate-limit' directly.)
+      const reason: AiFailReason =
+        rateLimited ? 'rate-limit'
+        : (streak >= emptyStreakThreshold() ? 'rate-limit' : (timedOut ? 'timeout' : 'error'));
+      const softStall = !rateLimited && reason === 'rate-limit';
+      if (softStall) {
+        logAiLine(ctx, `model=${model} call=${callId} status=rate-limit dur=${durMs}ms — ${streak} consecutive zero-output/timeout agent call(s) (likely throttle/agent stall, not a 429); treating as soft rate-limit → pause`);
+      } else {
+        logAiLine(ctx, `model=${model} call=${callId} tokens≈0 status=${reason === 'rate-limit' ? 'rate-limit' : 'error'} dur=${durMs}ms :: ${msg.slice(0, 80)}`);
+      }
+      return { ok: false, reason, softStall, error: msg.slice(0, 600), callId, durMs, model, tokens: 0 };
     }
   }
 }

@@ -53,7 +53,7 @@ import { canonicalize as aiCanonicalize, type CanonicalizeOptions } from './cano
 import { aiModelToCanonical } from './canonicalize-ai/to-canonical';
 import type { DescribeFrameInput } from './canonicalize-ai/describe';
 import type { ReduceFlow } from './canonicalize-ai/reduce';
-import { AiStepError, runModelObserved } from './ai-observability';
+import { AiStepError, runModelObserved, _emptyStreakConfig } from './ai-observability';
 import { generateDesignSystem, seedContextWithThemeApi, ensureMainWired, consolidateDesignTokens, ensureScreenPreviewEntry, type ThemeTokens } from './design-system';
 import { prepScreen, ensureIrComplete, getIrData, runAssetPass, type PrepConfig, type LocalizedAsset } from './reference-render';
 import type { FigFrame, FlowGraph } from './agent-packet';
@@ -874,6 +874,78 @@ async function renderPreview(
   }
 }
 
+// ── BUG 1: robust verify-rollup verdict (no silent 0/0 finalize) ──────────────
+// The verify rollup read `getRun` ONCE and let `total/built/blocking` collapse to 0
+// when that read returned null / a screens-less / an under-populated run (a transient
+// read during heavy concurrent writes). A 0/0 collapse skipped the `blocking>0` park
+// and FINALIZED a half-built app (a run with 17/30 needs-review screens shipped done).
+//
+// `resolveRollupVerdict` is the PURE guard: given the freshly-read run and the
+// authoritative expected count (the in-memory run.screens.length), it returns one of:
+//   - 'finalize'           : the read is consistent (total === expected), blocking 0,
+//                            AND built > 0 → safe to finalize / mark done.
+//   - 'park-needs-review'  : consistent read, blocking > 0 → park at needs-review
+//                            (unchanged normal behavior).
+//   - 'fault'              : the read is null / under-populated (screens vanished) OR
+//                            a zero-built "complete" → a FAULT: never finalize, never
+//                            mark done; the caller logs loudly + parks resumable.
+// It is total/built/needsReview/failed computed from the RESOLVED run so a fault read
+// can never masquerade as a clean 0/0 completion.
+export type RollupVerdict = 'finalize' | 'park-needs-review' | 'fault';
+export interface RollupRollup {
+  verdict: RollupVerdict;
+  total: number;
+  built: number;
+  needsReview: number;
+  failed: number;
+  blocking: number;
+}
+export function resolveRollupVerdict(resolved: BuildRun | null | undefined, expectedCount: number): RollupRollup {
+  const screens = resolved?.screens;
+  // A null / undefined / screens-less / under-populated read is a FAULT — refuse to
+  // collapse it to 0/0. Require the resolved read to be non-null AND carry EXACTLY the
+  // expected number of screens (no screens vanished mid-read).
+  if (!resolved || !Array.isArray(screens) || screens.length !== expectedCount) {
+    const total = Array.isArray(screens) ? screens.length : 0;
+    const built = Array.isArray(screens) ? screens.filter(s => s.status === 'done').length : 0;
+    const needsReview = Array.isArray(screens) ? screens.filter(s => s.status === 'needs-review').length : 0;
+    const failed = Array.isArray(screens) ? screens.filter(s => s.status === 'failed').length : 0;
+    return { verdict: 'fault', total, built, needsReview, failed, blocking: needsReview + failed };
+  }
+  const total = screens.length;
+  const built = screens.filter(s => s.status === 'done').length;
+  const needsReview = screens.filter(s => s.status === 'needs-review').length;
+  // Audit A.1: a 'failed' screen ALSO blocks completion (never silently ship a run
+  // with an errored screen). Both needs-review and failed hold the run open.
+  const failed = screens.filter(s => s.status === 'failed').length;
+  const blocking = needsReview + failed;
+  if (blocking > 0) return { verdict: 'park-needs-review', total, built, needsReview, failed, blocking };
+  // blocking === 0, but a ZERO-built run is never "complete" — that is itself a fault
+  // (e.g. every screen was skipped/never ran). Only a positive built count finalizes.
+  if (built <= 0) return { verdict: 'fault', total, built, needsReview, failed, blocking };
+  return { verdict: 'finalize', total, built, needsReview, failed, blocking };
+}
+
+// Re-read the run with a bounded retry until it returns a run whose screens.length
+// matches the EXPECTED count (the authoritative in-memory list size). Prefer the
+// freshest CONSISTENT read; if all retries fail, fall back to the in-memory run
+// (NEVER an empty object) so the guard sees real data, not a collapsed 0/0.
+async function readRollupRun(
+  projectId: string, runId: string, inMemory: BuildRun, tries = 3, delayMs = 250,
+): Promise<BuildRun | null> {
+  const expected = inMemory.screens.length;
+  let last: BuildRun | null = null;
+  for (let i = 0; i < tries; i++) {
+    const r = await getRun(projectId, runId);
+    if (r) last = r;
+    if (r && Array.isArray(r.screens) && r.screens.length === expected) return r;
+    if (i < tries - 1) await new Promise<void>((res) => setTimeout(res, delayMs));
+  }
+  // No consistent read after the retries → fall back to the freshest non-null read,
+  // else the authoritative in-memory run (never null/empty).
+  return last ?? inMemory;
+}
+
 // T26/T29: pause a run RESUMABLY because a model call hit a persistent rate limit
 // (a classifiable quota rejection, or an empty-streak the observed path re-classified
 // as a soft rate-limit). The SINGLE pause path: mark this screen pending so it
@@ -882,9 +954,10 @@ async function renderPreview(
 // screens to needs-review. Idempotent: a second call (e.g. impl + verify both rate
 // limited in the same screen) just re-asserts the same stopped/resumable state.
 async function pauseRunRateLimited(
-  projectId: string, runId: string, frameId: string, _session?: string,
+  projectId: string, runId: string, frameId: string, _session?: string, reason?: string,
 ): Promise<void> {
-  await appendRunLog(projectId, runId, `[run] PAUSED — rate limited: API quota exhausted (after backoff+retry). Resume after your quota resets — built screens are skipped, this one rebuilds.`);
+  await appendRunLog(projectId, runId, reason
+    ?? `[run] PAUSED — rate limited: API quota exhausted (after backoff+retry). Resume after your quota resets — built screens are skipped, this one rebuilds.`);
   try { await updateRunScreen(projectId, runId, frameId, { status: 'pending' }); } catch { /* non-fatal */ }
   try { await setRunResumable(projectId, runId, true); } catch { /* non-fatal */ }
   try { await setRunStatus(projectId, runId, 'stopped'); } catch { /* non-fatal */ }
@@ -921,7 +994,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     kind: 'build' | 'verify' | 'fix',
     prompt: string,
     callOpts: { sessionId?: string } = {},
-  ): Promise<{ text: string; sessionId?: string; failed: boolean; rateLimited: boolean }> => {
+  ): Promise<{ text: string; sessionId?: string; failed: boolean; rateLimited: boolean; stalled: boolean }> => {
     const r = await runModelObserved(model, prompt, env, projectRoot, {
       agent: true, modelId, sessionId: callOpts.sessionId,
       log: { projectId: req.projectId, runId: req.runId, jobId, step: stepLabel(kind) },
@@ -933,9 +1006,16 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     // screen as an asset defect (T24). runModelObserved already backed off + retried a
     // rate-limit several times before returning reason 'rate-limit'.
     return r.ok
-      ? { text: r.text, sessionId: r.sessionId, failed: false, rateLimited: false }
-      : { text: '', sessionId: callOpts.sessionId, failed: true, rateLimited: r.reason === 'rate-limit' };
+      ? { text: r.text, sessionId: r.sessionId, failed: false, rateLimited: false, stalled: false }
+      // BUG 2: a `rate-limit` reason flagged `softStall` is NOT a real 429 — it's a
+      // STREAK of zero-output/timeout agent calls (likely throttle / agent stall). It
+      // takes the SAME resumable-pause action as a rate limit but logs a distinct reason.
+      : { text: '', sessionId: callOpts.sessionId, failed: true, rateLimited: r.reason === 'rate-limit', stalled: r.reason === 'rate-limit' && r.softStall === true };
   };
+  // The pause reason for a soft agent-stall storm (vs a real 429). Mirrors the
+  // rate-limit pause action (screen→pending, resumable, stopped) but tells the human
+  // the API/agent stalled rather than the quota being exhausted.
+  const stallPauseReason = `[run] PAUSED — ${_emptyStreakConfig.EMPTY_STREAK_THRESHOLD}+ consecutive zero-output/timeout agent calls (likely throttle/agent stall); resume after the API recovers — built screens are skipped, this one rebuilds.`;
   const screenDir = path.join(projectRoot, '.uix', 'screens', sanitizeId(frameId));
   await fs.mkdir(screenDir, { recursive: true });
   const relScreenDir = path.join('.uix', 'screens', sanitizeId(frameId));
@@ -994,7 +1074,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
   // from here; leave this screen pending so it rebuilds. ONE pause path (used by the
   // implement, verify AND fix calls) so we never double-pause with a conflicting one.
   if (impl.rateLimited && req.runId) {
-    await pauseRunRateLimited(req.projectId, req.runId, frameId, session);
+    await pauseRunRateLimited(req.projectId, req.runId, frameId, session, impl.stalled ? stallPauseReason : undefined);
     return session;
   }
   if (impl.sessionId) session = impl.sessionId;
@@ -1068,7 +1148,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
       const v = await observedBuildCall('verify', tiledVerifyPrompt(referenceImagePath, tileRels, frameName, prevScore, req.userNotes));
       // T29: a rate-limited (incl. empty-streak soft-limit) verify must PAUSE the run
       // resumably — NOT fall through to parseVerdict('') → needs-review.
-      if (v.rateLimited && req.runId) { await pauseRunRateLimited(req.projectId, req.runId, frameId, session); return session; }
+      if (v.rateLimited && req.runId) { await pauseRunRateLimited(req.projectId, req.runId, frameId, session, v.stalled ? stallPauseReason : undefined); return session; }
       verdict = parseVerdict(v.text);
     } else {
       const candAbs = path.join(screenDir, `cand-${iter}.png`);
@@ -1078,7 +1158,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
       appendJobLog(jobId, `[loop] verify ${iter}: comparing to reference`);
       const v = await observedBuildCall('verify', verifyPrompt(referenceImagePath, candRel, frameName, prevScore, req.userNotes));
       // T29: rate-limited (incl. empty-streak soft-limit) verify → pause resumably.
-      if (v.rateLimited && req.runId) { await pauseRunRateLimited(req.projectId, req.runId, frameId, session); return session; }
+      if (v.rateLimited && req.runId) { await pauseRunRateLimited(req.projectId, req.runId, frameId, session, v.stalled ? stallPauseReason : undefined); return session; }
       verdict = parseVerdict(v.text);
     }
     finalVerdict = verdict;
@@ -1123,7 +1203,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     const fix = await observedBuildCall('fix', fixPrompt(frameName, referenceImagePath, candRel ?? '(build failed — no screenshot)', verdict, req.userNotes), { sessionId: session });
     // T29: a rate-limited (incl. empty-streak soft-limit) fix → pause resumably rather
     // than burning the remaining iterations on empty calls + ending in needs-review.
-    if (fix.rateLimited && req.runId) { await pauseRunRateLimited(req.projectId, req.runId, frameId, session); return session; }
+    if (fix.rateLimited && req.runId) { await pauseRunRateLimited(req.projectId, req.runId, frameId, session, fix.stalled ? stallPauseReason : undefined); return session; }
     if (fix.sessionId) session = fix.sessionId;
     await snapshotLastGen();   // re-capture in case the fix moved/renamed the previewEntry (audit A.2)
     // Re-assert the deterministic per-screen entry (the screen file the agent just
@@ -1690,14 +1770,16 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
       return;
     }
     setGenPhase(projectId, runId, 'Verify', 'rolling up screen verdicts');
-    const done = await getRun(projectId, runId);
-    const total = done?.screens.length ?? 0;
-    const built = done?.screens.filter(s => s.status === 'done').length ?? 0;
-    const needsReview = done?.screens.filter(s => s.status === 'needs-review').length ?? 0;
-    // Audit A.1: a 'failed' screen ALSO blocks completion (never silently ship a run
-    // with an errored screen). Both needs-review and failed hold the run open.
-    const failed = done?.screens.filter(s => s.status === 'failed').length ?? 0;
-    const blocking = needsReview + failed;
+    // BUG 1: ROBUST + FAULT-SAFE rollup read. A single getRun could return null / a
+    // screens-less / an under-populated run during heavy concurrent writes → total &
+    // blocking collapsed to 0 → the blocking>0 park was skipped → it FINALIZED a half-
+    // built app (a 17/30 needs-review run shipped done, logged "0/0 built"). Re-read
+    // with a bounded retry until screens.length matches the authoritative in-memory
+    // count; never fall back to an empty object. Then derive the verdict from a pure,
+    // tested guard that NEVER lets a fault read masquerade as a clean 0/0 completion.
+    const done = await readRollupRun(projectId, runId, run);
+    const rollup = resolveRollupVerdict(done, run.screens.length);
+    const { total, built, needsReview, failed, blocking } = rollup;
 
     // ── CONSOLIDATION PASS (option 3): de-duplicate token literals ───────────────
     // Every screen is built; sweep the generated screens/components and replace raw
@@ -1727,16 +1809,28 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
     } catch (e: any) {
       await appendRunLog(projectId, runId, `[assets] re-point safety net skipped (non-fatal): ${e?.message || 'unknown'}`);
     }
+    // ── BUG 1 HARD GUARD: a FAULT rollup never finalizes / marks done ────────────
+    // The resolved read was null / under-populated (screens vanished mid-read) OR the
+    // run is zero-built "complete". Either way it is NOT a real completion — refuse to
+    // finalize. Park the run resumable so a human / resume rebuilds it (an empty 0/0
+    // never silently ships). RETURN before the finalize/park branch.
+    if (rollup.verdict === 'fault') {
+      await appendRunLog(projectId, runId, `[run] rollup read inconsistent — refusing to finalize a possibly-incomplete app (no silent 0/0). expected=${run.screens.length} read=${total} built=${built} needs-review=${needsReview} failed=${failed}`);
+      await setGenPhase(projectId, runId, 'Verify', 'rollup read inconsistent — held for review', true);
+      try { await setRunResumable(projectId, runId, true); } catch { /* non-fatal */ }
+      await setRunStatus(projectId, runId, 'needs-review');
+      return;
+    }
     // ── HITL Checkpoint 4 (RFC §5): before global wiring / full build / deploy ────
     // Only gate here when the queue is clear (a blocking screen parks the run for
     // review below — the pre-global gate is the human sign-off once it's clean).
-    if (blocking === 0 && done) {
+    if (rollup.verdict === 'finalize' && done) {
       if (await gate(done, 'pre-global', `pre-global sign-off — ${built}/${total} built, needs-review 0`)) return;
     }
     // RFC §4.7 + audit A.1: a run does NOT report complete while any screen is
     // needs-review OR failed — it parks in 'needs-review' until a human Accepts /
     // Corrected-retries / restarts every queued or errored screen.
-    if (blocking > 0) {
+    if (rollup.verdict === 'park-needs-review') {
       // T9: terminal-but-blocked — leave the phase on Verify with a queue detail so
       // the UI reads "Phase 6/7: Verify — k need review" alongside the needs-review state.
       // AWAIT the phase write before the status flip (same read-modify-write clobber as
