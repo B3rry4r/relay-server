@@ -33,7 +33,7 @@
 import * as fs from 'fs/promises';
 import * as fsSync from 'fs';
 import * as path from 'path';
-import type { Canonical } from './canonicalize';
+import { planSemanticScreens, type Canonical } from './canonicalize';
 
 export interface ReconcileFlag {
   /** machine code so the UI / logs can group: 'unbacked-route' | 'new-route' |
@@ -110,15 +110,16 @@ export async function reconcileScreen(opts: {
   const cs = canonical.screens.find(s => s.canonicalId === canonicalId);
   if (!cs) return empty;
 
-  // The set of LEGAL routes: every canonical route slug + its constant name.
-  const legalRouteSlugs = new Set(canonical.screens.map(s => s.route));
-  // Constant names are derived the same way the skeleton derives them.
-  const constName = (id: string): string => {
-    const p = id.replace(/[^a-zA-Z0-9]+/g, ' ').trim().split(/\s+/)
-      .map(w => w.charAt(0).toUpperCase() + w.slice(1)).join('') || 'Screen';
-    return p.charAt(0).toLowerCase() + p.slice(1);
-  };
-  const legalRouteConsts = new Set(canonical.screens.map(s => constName(s.canonicalId)));
+  // The set of LEGAL routes/consts — derived from the SAME source the skeleton uses
+  // (planSemanticScreens), so reconcile and the generated AppRoutes agree BY
+  // CONSTRUCTION. Previously this re-derived consts from canonicalId (c_290_3657 →
+  // c2903657), which stopped matching once the skeleton began emitting SEMANTIC
+  // consts (addCard, cardListSuccessState, …): every valid `AppRoutes.<const>`
+  // reference then false-flagged 'unbacked-route' and good screens (90+ visual,
+  // routes fully registered) were demoted to needs-review en masse.
+  const plan = planSemanticScreens(canonical);
+  const legalRouteSlugs = new Set([...plan.values()].map(p => p.routePath));
+  const legalRouteConsts = new Set([...plan.values()].map(p => p.routeConst));
   legalRouteConsts.add('entry');
 
   const rel = [
