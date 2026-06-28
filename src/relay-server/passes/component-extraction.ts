@@ -287,20 +287,20 @@ function getStrategy(fw: Framework): ExtractorStrategy | null {
 /** Pick the shared component name: prefer a canonical mapping, else derive from
  *  the most common private name (stripped of the leading underscore). */
 function chooseName(group: WidgetUnit[], canonical: CanonicalComponent[]): string {
-  const base = mostCommon(group.map((g) => g.localName.replace(/^_+/, '')));
+  const base = mostCommon(group.map((g) => (g.localName ?? '').replace(/^_+/, '')));
   // Map onto a canonical component by name affinity (case-insensitive contains).
   const lower = base.toLowerCase();
   const hit = canonical.find((c) => {
-    const cn = c.canonicalName.toLowerCase();
+    const cn = (c.canonicalName ?? '').toLowerCase();
     return cn === lower || cn.includes(lower) || lower.includes(cn);
   });
-  if (hit) return pascal(hit.canonicalName);
+  if (hit) return pascal(hit.canonicalName || base);
   return pascal(base);
 }
 
 function inferKind(group: WidgetUnit[], canonical: CanonicalComponent[]): string {
-  const base = mostCommon(group.map((g) => g.localName.replace(/^_+/, ''))).toLowerCase();
-  const hit = canonical.find((c) => c.canonicalName.toLowerCase().includes(base) || base.includes(c.canonicalName.toLowerCase()));
+  const base = mostCommon(group.map((g) => (g.localName ?? '').replace(/^_+/, ''))).toLowerCase();
+  const hit = canonical.find((c) => { const cn = (c.canonicalName ?? '').toLowerCase(); return cn.includes(base) || base.includes(cn); });
   if (hit?.kind) return hit.kind;
   if (/button|pill|cta/.test(base)) return 'button';
   if (/field|input|otp|pin/.test(base)) return 'input';
@@ -316,7 +316,7 @@ function mostCommon(arr: string[]): string {
 }
 
 function pascal(s: string): string {
-  return s
+  return (s ?? '')
     .replace(/[^A-Za-z0-9]+/g, ' ')
     .split(' ')
     .filter(Boolean)
@@ -1259,7 +1259,7 @@ function importPathFromScreen(componentPath: string): string {
 /** Stable per-occurrence key: a file may hold multiple distinct group members. */
 function unitKey(u: WidgetUnit): string { return `${u.file}::${u.localName}`; }
 function relPath(root: string, abs: string): string { return path.relative(root, abs); }
-function snake(s: string): string { return s.replace(/([a-z0-9])([A-Z])/g, '$1_$2').replace(/[^A-Za-z0-9]+/g, '_').toLowerCase().replace(/^_+|_+$/g, ''); }
+function snake(s: string): string { return (s ?? '').replace(/([a-z0-9])([A-Z])/g, '$1_$2').replace(/[^A-Za-z0-9]+/g, '_').toLowerCase().replace(/^_+|_+$/g, ''); }
 function escapeRe(s: string): string { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
 // =============================================================================
