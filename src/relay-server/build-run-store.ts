@@ -203,6 +203,16 @@ export interface BuildRun {
   //   that crashed or was stopped. Set true on graceful stop / checkpoint pause;
   //   cleared while a run is actively orchestrating.
   resumable?: boolean;
+  // ── Auto-resume after a rate-limit reset ──────────────────────────────────────
+  // When pauseRunRateLimited fires, the CLI's reset hint (e.g. "resets 6pm (UTC)")
+  // is parsed to an absolute epoch (resumeAt). A periodic sweep (sweepRateLimitedRuns)
+  // re-launches a `stopped` run flagged `rateLimitPaused` once `resumeAt <= now`, up
+  // to `AUTO_RESUME_CAP` times (autoResumeCount guards against an infinite re-pause
+  // loop if the quota is still exhausted). A normal user Stop never sets these, so it
+  // is NEVER auto-resumed. A successful completion clears `rateLimitPaused`.
+  resumeAt?: number;            // epoch ms — earliest time the sweep may auto-resume
+  rateLimitPaused?: boolean;    // true iff this stop was a rate-limit pause (sweep gate)
+  autoResumeCount?: number;     // how many times the sweep has auto-resumed this run
   // ── P7: finalize phase ───────────────────────────────────────────────────────
   // After the screen loop reaches terminal success, runAppLoop runs the six P7
   // production-readiness passes (finalizeApp) as a best-effort, build-safe final
@@ -382,7 +392,7 @@ export async function getRun(projectId: string, id: string): Promise<BuildRun | 
 // re-reading inside the chain — so writes compose instead of clobbering. Mirrors the
 // existing `aiTallyChain` pattern, generalized.
 const runWriteChain = new Map<string, Promise<unknown>>();
-async function mutateRun(
+export async function mutateRun(
   projectId: string, runId: string,
   mutate: (run: BuildRun) => void | Promise<void>,
 ): Promise<BuildRun | null> {
@@ -470,6 +480,11 @@ export async function restartRun(projectId: string, runId: string): Promise<Buil
     // from the prior build would skip finalize — delete it below so the rebuilt app
     // re-finalizes from scratch.
     run.finalized = undefined;
+    // A restart is a clean slate → drop the rate-limit auto-resume bookkeeping so the
+    // CAP counts fresh and a stale resumeAt can't trip the sweep.
+    run.rateLimitPaused = undefined;
+    run.resumeAt = undefined;
+    run.autoResumeCount = undefined;
     run.status = 'running';
   });
   if (!run) return null;

@@ -39,9 +39,10 @@ import {
   setRunPhase,
   clampParallel,
   gateIsActive, pauseAtCheckpoint, approveCheckpoint, setRunResumable, setRunPrepDone, setRunFinalized,
-  addAmendment, resolveAmendment, writeFrameMap,
+  addAmendment, resolveAmendment, writeFrameMap, mutateRun,
   type ScreenSpec, type CheckpointGate, type BuildRun, type AmendmentKind,
 } from './build-run-store';
+import { notify } from './notify';
 import { getProjectsRoot } from './runtime';
 import {
   canonicalizeRun, writeCanonical, readCanonical, generateFlutterSkeleton,
@@ -946,6 +947,60 @@ async function readRollupRun(
   return last ?? inMemory;
 }
 
+// ── Auto-resume after a rate-limit reset ──────────────────────────────────────
+// The claude CLI emits a reset hint in its error text ("You've hit your session
+// limit · resets 6pm (UTC)" / "resets at 18:00" / "resets in 2 hours"). We parse it
+// to an absolute epoch so a periodic sweep can re-launch the paused run the moment
+// the quota window reopens — no human, no long in-process timer (which a redeploy
+// would lose). CAP bounds the re-pause loop if the quota is STILL exhausted on
+// resume; the sweep runs every SWEEP_INTERVAL_MS.
+export const AUTO_RESUME_CAP = 12;
+export const AUTO_RESUME_SWEEP_MS = 2 * 60 * 1000;   // 2 min
+const DEFAULT_RESUME_DELAY_MS = 60 * 60 * 1000;       // 60 min — used when the hint is unparseable
+
+/**
+ * Parse a CLI rate-limit reset hint into an absolute epoch (ms, UTC). Handles:
+ *   "resets 6pm (UTC)" / "resets 11 pm" / "resets at 18:00"     → next occurrence of that clock time
+ *   "resets in 2 hours" / "resets in 90 minutes"                → now + that duration
+ * Anything unrecognised → `now + DEFAULT_RESUME_DELAY_MS` (a safe 60-min retry). All
+ * absolute clock times are interpreted in UTC (the CLI quotes UTC); if the parsed
+ * time already passed today it rolls to tomorrow. Pure + deterministic given `now`.
+ */
+export function parseResetHintToEpoch(hint: string | undefined, now: number = Date.now()): number {
+  const fallback = now + DEFAULT_RESUME_DELAY_MS;
+  if (!hint) return fallback;
+  const text = hint.toLowerCase();
+
+  // "resets in N hour(s)/minute(s)" — a relative duration from now.
+  const rel = text.match(/resets?\s+in\s+(\d+)\s*(hour|hr|minute|min)/);
+  if (rel) {
+    const n = parseInt(rel[1], 10);
+    if (Number.isFinite(n)) {
+      const unitMs = /hour|hr/.test(rel[2]) ? 60 * 60 * 1000 : 60 * 1000;
+      return now + n * unitMs;
+    }
+  }
+
+  // "resets [at] 6pm" / "11 pm" / "18:00" / "6:30pm" — an absolute UTC clock time.
+  // Matches an optional "at", then H[:MM] with an optional am/pm suffix.
+  const abs = text.match(/resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/);
+  if (abs) {
+    let hour = parseInt(abs[1], 10);
+    const minute = abs[2] ? parseInt(abs[2], 10) : 0;
+    const mer = abs[3];
+    if (Number.isFinite(hour) && hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59) {
+      if (mer === 'pm' && hour < 12) hour += 12;
+      if (mer === 'am' && hour === 12) hour = 0;
+      const d = new Date(now);
+      const target = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), hour, minute, 0, 0);
+      // If that clock time already passed today, the window reopens tomorrow.
+      return target > now ? target : target + 24 * 60 * 60 * 1000;
+    }
+  }
+
+  return fallback;
+}
+
 // T26/T29: pause a run RESUMABLY because a model call hit a persistent rate limit
 // (a classifiable quota rejection, or an empty-streak the observed path re-classified
 // as a soft rate-limit). The SINGLE pause path: mark this screen pending so it
@@ -953,15 +1008,39 @@ async function readRollupRun(
 // halt — a resume after the quota resets continues from here instead of dumping
 // screens to needs-review. Idempotent: a second call (e.g. impl + verify both rate
 // limited in the same screen) just re-asserts the same stopped/resumable state.
+//
+// `resetHint` is the CLI's error text (carries "resets …"); it is parsed to an
+// absolute `resumeAt` epoch and stamped on the run (with `rateLimitPaused:true` and
+// the bumped `autoResumeCount`) so the auto-resume sweep can relaunch the run once
+// the window reopens. A user Stop does NOT go through here, so it never gets the
+// rateLimitPaused flag and is never auto-resumed.
 async function pauseRunRateLimited(
-  projectId: string, runId: string, frameId: string, _session?: string, reason?: string,
+  projectId: string, runId: string, frameId: string, _session?: string, reason?: string, resetHint?: string,
 ): Promise<void> {
+  const resumeAt = parseResetHintToEpoch(resetHint);
   await appendRunLog(projectId, runId, reason
-    ?? `[run] PAUSED — rate limited: API quota exhausted (after backoff+retry). Resume after your quota resets — built screens are skipped, this one rebuilds.`);
+    ?? `[run] PAUSED — rate limited: API quota exhausted (after backoff+retry). Auto-resume ~${new Date(resumeAt).toISOString().slice(11, 16)} UTC when the window resets — built screens are skipped, this one rebuilds.`);
   try { await updateRunScreen(projectId, runId, frameId, { status: 'pending' }); } catch { /* non-fatal */ }
+  // Stamp the rate-limit pause metadata so the sweep can auto-resume. mutateRun
+  // serializes this with the status/screen writes (T31). The counter is PRESERVED
+  // across re-pauses (a resume that immediately re-limits keeps counting → CAP stops
+  // the loop); it is reset to 0 only on a fresh non-rate-limit start (see runAppLoop).
+  try {
+    await mutateRun(projectId, runId, (run) => {
+      run.rateLimitPaused = true;
+      run.resumeAt = resumeAt;
+      run.autoResumeCount = run.autoResumeCount ?? 0;
+    });
+  } catch { /* non-fatal */ }
   try { await setRunResumable(projectId, runId, true); } catch { /* non-fatal */ }
   try { await setRunStatus(projectId, runId, 'stopped'); } catch { /* non-fatal */ }
   markRunCancelled(runId);   // orchestrator halts gracefully after this screen
+  // Best-effort push notification (inert unless a sink env is set).
+  const at = new Date(resumeAt).toISOString().slice(11, 16);
+  void notify({
+    kind: 'rate-limit-paused', projectId, runId, resumeAt,
+    detail: `Build paused — rate limit, auto-resume ~${at} UTC`,
+  });
 }
 
 // ── the loop ──────────────────────────────────────────────────────────────────
@@ -994,7 +1073,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     kind: 'build' | 'verify' | 'fix',
     prompt: string,
     callOpts: { sessionId?: string } = {},
-  ): Promise<{ text: string; sessionId?: string; failed: boolean; rateLimited: boolean; stalled: boolean }> => {
+  ): Promise<{ text: string; sessionId?: string; failed: boolean; rateLimited: boolean; stalled: boolean; resetHint?: string }> => {
     const r = await runModelObserved(model, prompt, env, projectRoot, {
       agent: true, modelId, sessionId: callOpts.sessionId,
       log: { projectId: req.projectId, runId: req.runId, jobId, step: stepLabel(kind) },
@@ -1004,13 +1083,15 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     // needs-review) proceeds without a fatal throw. We surface `failed`/`rateLimited`
     // so the caller can retry a transient hang (T25) and never mislabel an UNBUILT
     // screen as an asset defect (T24). runModelObserved already backed off + retried a
-    // rate-limit several times before returning reason 'rate-limit'.
+    // rate-limit several times before returning reason 'rate-limit'. `resetHint` carries
+    // the CLI error text (which holds the "resets …" window) into the pause so it can
+    // compute an absolute auto-resume time.
     return r.ok
       ? { text: r.text, sessionId: r.sessionId, failed: false, rateLimited: false, stalled: false }
       // BUG 2: a `rate-limit` reason flagged `softStall` is NOT a real 429 — it's a
       // STREAK of zero-output/timeout agent calls (likely throttle / agent stall). It
       // takes the SAME resumable-pause action as a rate limit but logs a distinct reason.
-      : { text: '', sessionId: callOpts.sessionId, failed: true, rateLimited: r.reason === 'rate-limit', stalled: r.reason === 'rate-limit' && r.softStall === true };
+      : { text: '', sessionId: callOpts.sessionId, failed: true, rateLimited: r.reason === 'rate-limit', stalled: r.reason === 'rate-limit' && r.softStall === true, resetHint: r.error };
   };
   // The pause reason for a soft agent-stall storm (vs a real 429). Mirrors the
   // rate-limit pause action (screen→pending, resumable, stopped) but tells the human
@@ -1074,7 +1155,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
   // from here; leave this screen pending so it rebuilds. ONE pause path (used by the
   // implement, verify AND fix calls) so we never double-pause with a conflicting one.
   if (impl.rateLimited && req.runId) {
-    await pauseRunRateLimited(req.projectId, req.runId, frameId, session, impl.stalled ? stallPauseReason : undefined);
+    await pauseRunRateLimited(req.projectId, req.runId, frameId, session, impl.stalled ? stallPauseReason : undefined, impl.resetHint);
     return session;
   }
   if (impl.sessionId) session = impl.sessionId;
@@ -1148,7 +1229,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
       const v = await observedBuildCall('verify', tiledVerifyPrompt(referenceImagePath, tileRels, frameName, prevScore, req.userNotes));
       // T29: a rate-limited (incl. empty-streak soft-limit) verify must PAUSE the run
       // resumably — NOT fall through to parseVerdict('') → needs-review.
-      if (v.rateLimited && req.runId) { await pauseRunRateLimited(req.projectId, req.runId, frameId, session, v.stalled ? stallPauseReason : undefined); return session; }
+      if (v.rateLimited && req.runId) { await pauseRunRateLimited(req.projectId, req.runId, frameId, session, v.stalled ? stallPauseReason : undefined, v.resetHint); return session; }
       verdict = parseVerdict(v.text);
     } else {
       const candAbs = path.join(screenDir, `cand-${iter}.png`);
@@ -1158,7 +1239,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
       appendJobLog(jobId, `[loop] verify ${iter}: comparing to reference`);
       const v = await observedBuildCall('verify', verifyPrompt(referenceImagePath, candRel, frameName, prevScore, req.userNotes));
       // T29: rate-limited (incl. empty-streak soft-limit) verify → pause resumably.
-      if (v.rateLimited && req.runId) { await pauseRunRateLimited(req.projectId, req.runId, frameId, session, v.stalled ? stallPauseReason : undefined); return session; }
+      if (v.rateLimited && req.runId) { await pauseRunRateLimited(req.projectId, req.runId, frameId, session, v.stalled ? stallPauseReason : undefined, v.resetHint); return session; }
       verdict = parseVerdict(v.text);
     }
     finalVerdict = verdict;
@@ -1203,7 +1284,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     const fix = await observedBuildCall('fix', fixPrompt(frameName, referenceImagePath, candRel ?? '(build failed — no screenshot)', verdict, req.userNotes), { sessionId: session });
     // T29: a rate-limited (incl. empty-streak soft-limit) fix → pause resumably rather
     // than burning the remaining iterations on empty calls + ending in needs-review.
-    if (fix.rateLimited && req.runId) { await pauseRunRateLimited(req.projectId, req.runId, frameId, session, fix.stalled ? stallPauseReason : undefined); return session; }
+    if (fix.rateLimited && req.runId) { await pauseRunRateLimited(req.projectId, req.runId, frameId, session, fix.stalled ? stallPauseReason : undefined, fix.resetHint); return session; }
     if (fix.sessionId) session = fix.sessionId;
     await snapshotLastGen();   // re-capture in case the fix moved/renamed the previewEntry (audit A.2)
     // Re-assert the deterministic per-screen entry (the screen file the agent just
@@ -1389,6 +1470,11 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
   // (which the boot scan excludes), so the only thing auto-resumed is a build that was
   // genuinely interrupted while running — never a user-stopped or completed run.
   void setRunResumable(projectId, runId, true);
+  // The run is actively orchestrating again → it is no longer rate-limit-paused. Clear
+  // the flag (so the sweep won't double-fire) + the scheduled resumeAt; the
+  // autoResumeCount counter is PRESERVED so a resume that immediately re-limits keeps
+  // counting toward AUTO_RESUME_CAP (only a fresh /start or restart resets it).
+  void mutateRun(projectId, runId, (run) => { run.rateLimitPaused = false; run.resumeAt = undefined; });
   const projectRoot = resolveProjectRoot(projectId);
   if (!projectRoot || !fsSync.existsSync(projectRoot)) { clearRunActive(runId); return; }
 
@@ -1838,6 +1924,10 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
       await setGenPhase(projectId, runId, 'Verify', `${needsReview} need review${failed ? `, ${failed} failed` : ''}`, true);
       await setRunStatus(projectId, runId, 'needs-review');
       await appendRunLog(projectId, runId, `[run] paused for review — ${built}/${total} matched, ${needsReview} need review${failed ? `, ${failed} failed` : ''}`);
+      void notify({
+        kind: 'needs-review', projectId, runId,
+        detail: `Build parked — ${needsReview} screen(s) need review${failed ? `, ${failed} failed` : ''} (${built}/${total} matched)`,
+      });
     } else {
       // ── P7 FINALIZE PHASE (best-effort, build-safe) ──────────────────────────
       // The screen loop is finished and every screen matched (blocking === 0), so
@@ -1913,8 +2003,10 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
       if (finalizeDidRun) { try { await setRunFinalized(projectId, runId, true); } catch { /* non-fatal */ } }
 
       // Terminal completion: clear the resumable flag so a finished run is never
-      // re-launched on a later boot (audit A.4).
+      // re-launched on a later boot (audit A.4). Also clear any rate-limit pause
+      // bookkeeping so a stale resumeAt can't make the sweep re-launch a done run.
       await setRunResumable(projectId, runId, false);
+      try { await mutateRun(projectId, runId, (run) => { run.rateLimitPaused = false; run.resumeAt = undefined; }); } catch { /* non-fatal */ }
       // AWAIT the terminal phase write BEFORE flipping status: both setRunPhase and
       // setRunStatus do a full run read-modify-write, so a fire-and-forget phase write
       // here could land AFTER setRunStatus('done') and clobber status back to the value
@@ -1923,6 +2015,10 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
       await setGenPhase(projectId, runId, 'Finalize', `done — ${built}/${total} accepted`, true);
       await setRunStatus(projectId, runId, 'done');
       await appendRunLog(projectId, runId, `[run] complete — ${built}/${total} built`);
+      void notify({
+        kind: 'done', projectId, runId,
+        detail: `Build finished: ${built}/${total} screens built`,
+      });
     }
   } catch (e: any) {
     await appendRunLog(projectId, runId, `[run] error: ${e?.message || 'unknown'}`);
@@ -2249,6 +2345,68 @@ export async function resumeInterruptedRuns(): Promise<void> {
       }
     }
   } catch { /* boot resume is best-effort */ }
+}
+
+// ── Auto-resume sweep ─────────────────────────────────────────────────────────
+/**
+ * Pure decision: should the periodic sweep auto-resume this run NOW? A run qualifies
+ * iff it was paused by a RATE LIMIT (rateLimitPaused — never a user Stop), is parked
+ * 'stopped', its parsed reset window (resumeAt) has elapsed, and it is under the cap.
+ * The `active` check is applied by the sweep (it knows the in-process set), not here.
+ */
+export function shouldAutoResume(run: BuildRun, now: number = Date.now()): boolean {
+  return run.status === 'stopped'
+    && run.rateLimitPaused === true
+    && typeof run.resumeAt === 'number'
+    && run.resumeAt <= now
+    && (run.autoResumeCount ?? 0) < AUTO_RESUME_CAP;
+}
+
+/**
+ * Periodic sweep (every AUTO_RESUME_SWEEP_MS) — robust across redeploys (no long
+ * in-process timer to lose). Scans every run; any run that `shouldAutoResume` AND is
+ * not already orchestrating in this process gets its counter bumped, the
+ * rateLimitPaused flag cleared, status flipped to 'running', and runAppLoop kicked
+ * (the same resume path as POST /start with restart:false). A run that immediately
+ * re-limits sets a fresh resumeAt + keeps the counter climbing; the CAP stops an
+ * infinite loop. Best-effort: never throws.
+ */
+export async function sweepRateLimitedRuns(now: number = Date.now()): Promise<void> {
+  try {
+    const root = getProjectsRoot();
+    if (!fsSync.existsSync(root)) return;
+    const projectIds = (await fs.readdir(root, { withFileTypes: true })).filter(d => d.isDirectory()).map(d => d.name);
+    for (const projectId of projectIds) {
+      const runs = await listRuns(projectId, 50);
+      for (const r of runs) {
+        if (!shouldAutoResume(r, now) || isRunActive(r.id)) continue;
+        const attempt = (r.autoResumeCount ?? 0) + 1;
+        // Bump the counter + clear the pause flag + flip to running ATOMICALLY before
+        // kicking the loop, so a concurrent sweep tick can't double-resume the run.
+        await mutateRun(projectId, r.id, (run) => {
+          run.autoResumeCount = attempt;
+          run.rateLimitPaused = false;
+          run.resumeAt = undefined;
+          run.status = 'running';
+        });
+        await appendRunLog(projectId, r.id, `[run] auto-resume — rate-limit window reset (attempt ${attempt}/${AUTO_RESUME_CAP})`);
+        void notify({
+          kind: 'auto-resumed', projectId, runId: r.id,
+          detail: `Build auto-resumed (attempt ${attempt}/${AUTO_RESUME_CAP}) — rate-limit window reset`,
+        });
+        void runAppLoop(projectId, r.id).catch(() => {});
+      }
+    }
+  } catch { /* the sweep is best-effort */ }
+}
+
+let sweepTimer: ReturnType<typeof setInterval> | null = null;
+/** Start the periodic auto-resume sweep (idempotent). Wired on boot next to
+ *  resumeInterruptedRuns. The interval is unref'd so it never holds the process open. */
+export function startAutoResumeSweep(): void {
+  if (sweepTimer) return;
+  sweepTimer = setInterval(() => { void sweepRateLimitedRuns(); }, AUTO_RESUME_SWEEP_MS);
+  if (typeof sweepTimer.unref === 'function') sweepTimer.unref();
 }
 
 /**
