@@ -15,6 +15,7 @@ import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { spawn, execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createServer } from 'node:http';
@@ -71,6 +72,113 @@ async function runStep(
   }
 }
 
+// ── small-window paint bug workaround ────────────────────────────────────────
+// Headless Chrome ("new" mode) enforces a MINIMUM window size. When the requested
+// --window-size height is below ~200px, the laid-out/painted viewport comes out
+// ~80–140px SHORTER than requested (version-dependent window-chrome subtraction),
+// while --screenshot still writes a PNG at the full requested size — so the bottom
+// of the page is captured as unpainted white. This is exactly what truncated the
+// node-scoped asset renders (composite avatars/banners/icons are small: e.g. a
+// 36×35 avatar at 4× = a 144×141 window whose bottom ~half never painted → the
+// "half-circle avatar" defect). Empirically ≥400px always paints fully across the
+// Chrome builds we run, so: pad the capture window height up to this floor and
+// crop the PNG back to the requested height afterwards. Width is unaffected
+// (Chrome pads the layout viewport to its 500px minimum but crops the shot to the
+// requested width, and the full width paints).
+const MIN_CAPTURE_WINDOW_H = 400;
+
+// CRC32 (PNG chunk checksums) — plain table implementation; zlib.crc32 only
+// exists on Node ≥22.2, and this must run on whatever Node the deploy has.
+let _crcTable: Uint32Array | null = null;
+function crc32(buf: Buffer): number {
+  if (!_crcTable) {
+    _crcTable = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      _crcTable[n] = c >>> 0;
+    }
+  }
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) c = _crcTable[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+/**
+ * Crop a PNG to its top `targetHeight` rows, pure Node (no native image dep —
+ * sharp/jimp are unavailable per the deploy guard). Works because PNG scanlines
+ * are stored top-to-bottom and row filters only reference the PREVIOUS row, so
+ * keeping the first N unfiltered scanlines and re-deflating is lossless.
+ * Returns null (caller keeps the original) when the PNG is interlaced, already
+ * short enough, or anything fails to parse — never throws.
+ */
+export function cropPngHeight(png: Buffer, targetHeight: number): Buffer | null {
+  try {
+    if (png.length < 45 || png.readUInt32BE(0) !== 0x89504e47) return null;
+    // IHDR is always the first chunk at offset 8: len(4) type(4) data(13) crc(4).
+    if (png.toString('latin1', 12, 16) !== 'IHDR') return null;
+    const width = png.readUInt32BE(16);
+    const height = png.readUInt32BE(20);
+    const bitDepth = png[24];
+    const colorType = png[25];
+    const interlace = png[28];
+    if (interlace !== 0 || targetHeight <= 0 || targetHeight >= height) return null;
+    const channels = colorType === 2 ? 3 : colorType === 4 ? 2 : colorType === 6 ? 4 : 1;
+    const scanlineBytes = 1 + Math.ceil((width * bitDepth * channels) / 8);
+
+    // Walk the chunks: concatenate IDAT data, keep every other chunk verbatim.
+    const before: Buffer[] = [];   // chunks before the first IDAT
+    const after: Buffer[] = [];    // chunks after the last IDAT (IEND et al.)
+    const idatParts: Buffer[] = [];
+    let off = 8;
+    let sawIdat = false;
+    while (off + 8 <= png.length) {
+      const len = png.readUInt32BE(off);
+      const type = png.toString('latin1', off + 4, off + 8);
+      const chunkEnd = off + 12 + len;
+      if (chunkEnd > png.length) return null;
+      if (type === 'IDAT') {
+        sawIdat = true;
+        idatParts.push(png.subarray(off + 8, off + 8 + len));
+      } else {
+        (sawIdat ? after : before).push(png.subarray(off, chunkEnd));
+      }
+      off = chunkEnd;
+      if (type === 'IEND') break;
+    }
+    if (!sawIdat) return null;
+
+    const raw = zlib.inflateSync(Buffer.concat(idatParts));
+    const keep = targetHeight * scanlineBytes;
+    if (raw.length < keep) return null;
+    const recompressed = zlib.deflateSync(raw.subarray(0, keep));
+
+    // Rebuild: patch IHDR height + CRC, splice the single new IDAT back in.
+    const out: Buffer[] = [];
+    out.push(png.subarray(0, 8)); // signature
+    for (const chunk of before) {
+      if (chunk.toString('latin1', 4, 8) === 'IHDR') {
+        const patched = Buffer.from(chunk);
+        patched.writeUInt32BE(targetHeight, 12); // height field (data offset 4)
+        patched.writeUInt32BE(crc32(patched.subarray(4, 8 + 13)), 8 + 13);
+        out.push(patched);
+      } else {
+        out.push(chunk);
+      }
+    }
+    const idat = Buffer.alloc(12 + recompressed.length);
+    idat.writeUInt32BE(recompressed.length, 0);
+    idat.write('IDAT', 4, 'latin1');
+    recompressed.copy(idat, 8);
+    idat.writeUInt32BE(crc32(idat.subarray(4, 8 + recompressed.length)), 8 + recompressed.length);
+    out.push(idat);
+    for (const chunk of after) out.push(chunk);
+    return Buffer.concat(out);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Screenshot a URL with headless Chrome. Returns PNG bytes, or null if Chrome
  * isn't available / the capture fails.
@@ -98,7 +206,16 @@ export async function captureUrlScreenshot(
   // For full-height capture, make the window very tall in CSS px so the whole
   // page lands in one shot (headless captures the window, and --hide-scrollbars
   // keeps the bar out of the frame). Cap it so a runaway-tall page can't OOM.
-  const winH = opts.fullPage ? Math.min(Math.max(Math.round(height), 4000), 20000) : Math.round(height);
+  //
+  // SMALL windows: below ~200px height headless Chrome silently paints a viewport
+  // shorter than the window (see MIN_CAPTURE_WINDOW_H) and the shot's bottom comes
+  // out blank — the "half-circle avatar" asset bug. Pad the window up to the safe
+  // floor and crop the PNG back to the requested height after capture.
+  const reqH = Math.round(height);
+  const padSmallWindow = !opts.fullPage && reqH < MIN_CAPTURE_WINDOW_H;
+  const winH = opts.fullPage
+    ? Math.min(Math.max(reqH, 4000), 20000)
+    : (padSmallWindow ? MIN_CAPTURE_WINDOW_H : reqH);
   // In-page time budget before the shot is taken. The harness fetches resolved IR +
   // assets cross-origin and draws to CanvasKit, which can exceed the old 8s on a
   // complex frame (capturing a blank/partial canvas). Callers that draw heavy
@@ -126,6 +243,12 @@ export async function captureUrlScreenshot(
   try {
     await execFile(await chromeBin(), args, { timeout: timeoutMs });
     const buf = await fs.readFile(out);
+    if (padSmallWindow) {
+      // Drop the padding rows so callers get exactly the height they asked for
+      // (device px = CSS px × scale). On any crop failure keep the padded shot —
+      // extra white at the bottom beats a null capture.
+      return cropPngHeight(buf, Math.round(reqH * scale)) ?? buf;
+    }
     return buf;
   } catch {
     return null;
