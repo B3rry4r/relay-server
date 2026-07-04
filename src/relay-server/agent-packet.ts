@@ -163,6 +163,11 @@ export function buildAgentPacket(input: AgentPacketInput): string {
       `OPEN this image first with your file-reading tool and treat it as the visual ground truth — match its layout, proportions, spacing and colours. Use the IR tree below for exact values (hex colours, text, sizes).`,
       ``,
     ] : []),
+    // DEMO DATA rule — sits next to the exact-values instruction on purpose: "use
+    // exact values" + text-fidelity grading otherwise pushes agents to bake mock
+    // identities ("3554", "Jameswaller@gmail.com") inline across every screen.
+    `DEMO DATA — user-identifying mock content in the design (person names, emails, phone numbers, OTP codes, account/card numbers, dates of birth) must render EXACTLY as the reference shows, but must NOT be scattered as inline literals: hoist it to constructor parameters or one shared demo fixture (e.g. a \`DemoUser\` constant) whose DEFAULTS are the reference values, and reference that. Pixel output stays identical. Use ONE consistent demo identity app-wide — never mix two different mock users across screens.`,
+    ``,
     `Design — IR tree notation (readable form of the Figma IR; complete: layout, text, colours, typography, effects, clip/mask):`,
     '```',
     tree,

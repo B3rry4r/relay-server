@@ -632,19 +632,21 @@ function sourceDirsFor(framework: Framework, projectRoot: string): string[] {
 // ── Build-safety checks (flutter) ─────────────────────────────────────────────
 
 /** Run `flutter analyze` and return BOTH the total issue count (for the report)
- *  and the ERROR count (the gate keys on errors, not total — see the gate). Null
+ *  and the ERROR count (the gate keys on errors, not total — see the gate), plus
+ *  the raw `error •` lines (the analyze-gate repair prompt lists them). Null
  *  when flutter is unavailable. Mirrors asset-phase.flutterAnalyze. */
-async function flutterAnalyze(projectRoot: string, env?: NodeJS.ProcessEnv): Promise<{ total: number; errors: number } | null> {
+async function flutterAnalyze(projectRoot: string, env?: NodeJS.ProcessEnv): Promise<{ total: number; errors: number; errorLines: string[] } | null> {
   const flutter = flutterBin();
   if (!flutter) return null;
   const raw = await runCmd(flutter, ['analyze', '--no-pub'], projectRoot, env).catch(() => null);
   if (raw == null) return null;
-  const errors = (raw.match(/^\s*error\s+•/gm) || []).length;
-  if (/no issues found/i.test(raw)) return { total: 0, errors: 0 };
+  const errorLines = (raw.match(/^\s*error\s+•.*$/gm) || []).map((l) => l.trim());
+  const errors = errorLines.length;
+  if (/no issues found/i.test(raw)) return { total: 0, errors: 0, errorLines: [] };
   const summ = /(\d+)\s+issues?\s+found/.exec(raw);
-  if (summ) return { total: Number(summ[1]), errors };
+  if (summ) return { total: Number(summ[1]), errors, errorLines };
   const total = (raw.match(/^\s*(error|warning|info)\s+•/gm) || []).length;
-  return { total, errors };
+  return { total, errors, errorLines };
 }
 
 /** Back-compat total-only count (used for the report fields baseline/finalAnalyze). */
@@ -698,6 +700,102 @@ function runCmd(cmd: string, args: string[], cwd: string, env?: NodeJS.ProcessEn
       else resolve(out);
     });
   });
+}
+
+// ── P3: ANALYZE GATE — analyzer ERRORS gate run completion ─────────────────────
+// The Ping run finalized and logged `complete — 35/35 built` while flutter analyze
+// reported 17 ERRORS (finalize only *measured* baseline/final analyze and moved
+// on). The gate makes analyzer ERRORS (never warnings/infos) a completion blocker:
+// after finalize, if the final analyze reports >0 errors, run ONE bounded AI
+// repair attempt ("fix these N analyzer errors, change nothing else") through the
+// same runModel plumbing finalize already has, re-analyze, and if errors remain
+// the caller parks the run `needs-review` (finalized stays false) instead of
+// logging complete. Opt-out for emergencies: env RELAY_ANALYZE_GATE=off|0|false,
+// or per-run `analyzeGate: false`. Default ON.
+
+export interface AnalyzeGateResult {
+  /** Error count AFTER any repair attempt (null = unmeasurable → gate passes). */
+  errors: number | null;
+  /** Error count when the gate started (before the repair attempt). */
+  initialErrors: number | null;
+  /** True when the single bounded AI repair call was made. */
+  repairAttempted: boolean;
+  /** True when the gate passes: 0 errors, or unmeasurable (never block blind). */
+  ok: boolean;
+}
+
+/** Gate on/off switch. Default ON; env RELAY_ANALYZE_GATE=off|0|false or a run
+ *  flag `analyzeGate === false` disables it (emergency escape hatch). */
+export function analyzeGateEnabled(run?: { analyzeGate?: boolean }, env: NodeJS.ProcessEnv = process.env): boolean {
+  const v = String(env.RELAY_ANALYZE_GATE ?? '').trim().toLowerCase();
+  if (v === 'off' || v === '0' || v === 'false') return false;
+  if (run && run.analyzeGate === false) return false;
+  return true;
+}
+
+/**
+ * Measure analyzer ERRORS and, when >0 and a model is available, make ONE bounded
+ * repair attempt then re-measure. Warnings/infos never gate. When the live
+ * analyzer is unavailable (no flutter SDK / non-flutter project) the measurement
+ * falls back to `initialErrors` (the finalize report's persisted finalErrors);
+ * when NOTHING is measurable the gate passes — it never blocks blind.
+ * `analyze` is an injection seam for tests; production uses flutterAnalyze.
+ */
+export async function runAnalyzeGate(opts: {
+  projectRoot: string;
+  env?: NodeJS.ProcessEnv;
+  model?: AIModel;
+  runModel?: RunModelFn;
+  log?: (msg: string) => void;
+  /** Persisted finalErrors from the finalize report — the fallback measurement
+   *  when the live analyzer is unavailable. */
+  initialErrors?: number | null;
+  analyze?: (projectRoot: string, env?: NodeJS.ProcessEnv) => Promise<{ total: number; errors: number; errorLines: string[] } | null>;
+}): Promise<AnalyzeGateResult> {
+  const log = opts.log ?? (() => { /* no-op */ });
+  const analyze = opts.analyze ?? flutterAnalyze;
+
+  const a = await analyze(opts.projectRoot, opts.env).catch(() => null);
+  const initialErrors = a?.errors ?? opts.initialErrors ?? null;
+  let errorLines = a?.errorLines ?? [];
+
+  if (initialErrors == null) {
+    log(`[finalize] analyze gate: analyzer unavailable — gate passes (cannot measure)`);
+    return { errors: null, initialErrors: null, repairAttempted: false, ok: true };
+  }
+  if (initialErrors === 0) {
+    return { errors: 0, initialErrors: 0, repairAttempted: false, ok: true };
+  }
+
+  // >0 errors. ONE bounded repair attempt when a model + runner are available;
+  // skip gracefully (straight to the verdict) when not.
+  let errors: number | null = initialErrors;
+  let repairAttempted = false;
+  if (opts.model && opts.runModel) {
+    repairAttempted = true;
+    log(`[finalize] analyze gate: ${initialErrors} analyzer error(s) — one bounded AI repair attempt (model=${opts.model})`);
+    const listed = errorLines.slice(0, 40);
+    const prompt = [
+      `The Flutter project in the current directory has ${initialErrors} analyzer ERROR(S) (run \`flutter analyze\` to see them).`,
+      `Fix these ${initialErrors} analyzer errors, change nothing else — no refactors, no style changes, no new features. Warnings/infos are out of scope.`,
+      ...(listed.length ? [`The errors:`, ...listed.map((l) => `  ${l}`)] : []),
+      `When done, output a one-line summary of what you fixed.`,
+    ].join('\n');
+    try {
+      await opts.runModel(opts.model, prompt, opts.env ?? process.env, opts.projectRoot, { format: 'text' });
+    } catch (e) {
+      log(`[finalize] analyze gate: repair attempt failed (non-fatal): ${(e as Error).message}`);
+    }
+    const b = await analyze(opts.projectRoot, opts.env).catch(() => null);
+    // Unmeasurable after a repair → keep the initial count (conservative: still
+    // parked; a later resume with a working analyzer re-measures).
+    errors = b?.errors ?? errors;
+    log(`[finalize] analyze gate: post-repair analyze — ${b ? `${b.errors} error(s)` : 'unavailable (keeping pre-repair count)'}`);
+  } else {
+    log(`[finalize] analyze gate: ${initialErrors} analyzer error(s), no model/runner — skipping repair attempt`);
+  }
+
+  return { errors, initialErrors, repairAttempted, ok: errors === 0 };
 }
 
 // ── small utils ────────────────────────────────────────────────────────────────

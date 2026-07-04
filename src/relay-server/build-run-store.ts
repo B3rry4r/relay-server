@@ -219,6 +219,12 @@ export interface BuildRun {
   // phase. Default (undefined/true) = run finalize on whole-app builds; set false
   // to skip it. A finalize failure NEVER flips a successful build to failed.
   finalize?: boolean;
+  // ── P3: analyzer-error completion gate ───────────────────────────────────────
+  // Analyzer ERRORS (never warnings/infos) gate run completion: after finalize,
+  // >0 errors → one bounded AI repair attempt, then park needs-review (finalized
+  // stays false) if errors remain. Default ON (undefined/true). Set false — or
+  // env RELAY_ANALYZE_GATE=off — to restore the old measure-and-move-on behavior.
+  analyzeGate?: boolean;
   // ── T31: finalize-ran marker ─────────────────────────────────────────────────
   // Set true once the P7 finalize phase has actually run through this run (the
   // .uix/finalize-report.json was produced). The client uses it to show a

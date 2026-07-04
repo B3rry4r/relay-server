@@ -39,7 +39,7 @@
 import * as fs from 'fs/promises';
 import * as fsSync from 'fs';
 import * as path from 'path';
-import { planSemanticScreens, type Canonical } from './canonicalize';
+import { planSemanticScreens, computeTabCluster, type Canonical } from './canonicalize';
 
 export interface ReconcileFlag {
   /** machine code so the UI / logs can group: 'unbacked-route' | 'new-route' |
@@ -78,6 +78,11 @@ const INLINE_TEXTSTYLE_RE = /\bTextStyle\s*\(|\bGoogleFonts\.[a-zA-Z]/g;
 const ROUTE_LITERAL_RE = /['"](\/[a-z0-9][a-z0-9/_-]*)['"]/gi;
 // A reference to an AppRoutes.<const> route constant.
 const ROUTE_CONST_RE = /\bAppRoutes\.([a-zA-Z_][a-zA-Z0-9_]*)/g;
+// P3 nav-stack advisory: a plain `pushNamed(...)` call and its (first-line) args.
+// \bpushNamed matches ONLY the plain verb: `pushReplacementNamed(` has no
+// `pushNamed` word-boundary token and `pushNamedAndRemoveUntil(` continues with
+// `A`, not `(` — so neither stack-correct verb fires the advisory.
+const PUSH_NAMED_RE = /\bpushNamed\s*\(([^)]*)\)/g;
 
 // How many inline literals before we flag (a couple is noise; many = real drift).
 const INLINE_COLOR_THRESHOLD = 4;
@@ -239,6 +244,39 @@ export async function reconcileScreen(opts: {
     if (dead.length) {
       flags.push({ code: 'dead-handler', severity: 'high',
         message: `${dead.length} empty interaction handler(s) (${dead.join(', ')}) — every visible control must do something real (navigate via AppRoutes, present its modal, or mutate state).` });
+    }
+  }
+
+  // 7. P3: NAV-STACK advisory — 'push-into-hub' (MED, never blocks). When the app
+  // has a shell/hub (P2's tab cluster), entering it from auth/onboarding/anywhere
+  // must CLEAR the stack (pushNamedAndRemoveUntil / pushReplacementNamed) — the
+  // Ping app plain-pushed Home onto the login form, so back-gesture returned to
+  // auth. Flag a plain `pushNamed` whose target is a tab-cluster route. Skipped
+  // silently when no shell exists (computeTabCluster null) — no cluster, no hub.
+  {
+    const cluster = computeTabCluster(canonical);
+    if (cluster) {
+      const hubConsts = new Set<string>();
+      const hubSlugs = new Set<string>();
+      for (const id of cluster.memberIds) {
+        const sem = plan.get(id);
+        if (sem) { hubConsts.add(sem.routeConst); hubSlugs.add(sem.routePath); }
+      }
+      const flagged = new Set<string>();
+      PUSH_NAMED_RE.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = PUSH_NAMED_RE.exec(text))) {
+        const args = m[1] ?? '';
+        const constRef = /\bAppRoutes\.([a-zA-Z_][a-zA-Z0-9_]*)/.exec(args)?.[1];
+        const litRef = /['"](\/[a-z0-9][a-z0-9/_-]*)['"]/i.exec(args)?.[1];
+        const target = (constRef && hubConsts.has(constRef)) ? `AppRoutes.${constRef}`
+          : (litRef && hubSlugs.has(litRef)) ? `"${litRef}"` : null;
+        if (target && !flagged.has(target)) {
+          flagged.add(target);
+          flags.push({ code: 'push-into-hub', severity: 'med',
+            message: `pushes the app shell/hub route ${target} with a plain pushNamed — entering the hub must clear the stack (pushNamedAndRemoveUntil(route, (r) => false) or pushReplacementNamed) so the back gesture cannot return to auth/onboarding.` });
+        }
+      }
     }
   }
 

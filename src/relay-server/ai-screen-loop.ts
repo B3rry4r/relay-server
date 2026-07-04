@@ -60,7 +60,8 @@ import { prepScreen, ensureIrComplete, getIrData, runAssetPass, type PrepConfig,
 import type { FigFrame, FlowGraph } from './agent-packet';
 import { computePreflight } from './preflight';
 import { reconcileScreen, reconcileSummary, type ReconcileResult } from './reconcile';
-import { finalizeApp } from './passes/finalize';
+import { finalizeApp, runAnalyzeGate, analyzeGateEnabled } from './passes/finalize';
+import { planFlowRequeue } from './passes/flow-requeue';
 import { repointAssetUsage, buildAssetInventory, renderAssetInventory } from './passes/asset-usage';
 import { ensureProjectGit, commitCheckpoint, snapshotBeforeMutation, rollbackTo } from './version-control';
 
@@ -230,6 +231,38 @@ async function flutterAnalyzeErrors(projectRoot: string, env: NodeJS.ProcessEnv)
     const m = out.match(/^\s*error\s+•/gm);
     return m ? m.length : 0;
   } catch { return null; }
+}
+
+// ── P3: flow-wiring REAL gaps requeue their FROM screens ─────────────────────
+// Reads the FRESH .uix/flow-wiring-report.json (verifyFlowWiring just wrote it in
+// this finalize execution), maps HIGH-class findings (unmapped REAL-gap /
+// tab-as-push / missing-step-presenter) back to their FROM screen's LEAD frame
+// via planFlowRequeue (see passes/flow-requeue.ts for the full idempotency
+// contract), and flips those screens to needs-review with the findings as the
+// review reason. Benign statuses (duplicate/wired/…) never requeue. Returns how
+// many screens were flipped. Exported for tests.
+export async function requeueFlowGaps(projectId: string, runId: string, projectRoot: string): Promise<number> {
+  let findings: Array<{ from: string; to: string; status: string; detail?: string }> = [];
+  try {
+    const raw = await fs.readFile(path.join(projectRoot, '.uix', 'flow-wiring-report.json'), 'utf8');
+    const rep = JSON.parse(raw);
+    findings = Array.isArray(rep?.findings) ? rep.findings : [];
+  } catch { return 0; }                       // no report → nothing to requeue
+  if (!findings.length) return 0;
+  const canonical = await readCanonical(projectRoot, runId);
+  if (!canonical) return 0;                    // non-canonical run → warn-only stays
+  const run = await getRun(projectId, runId);
+  if (!run) return 0;
+  const decisions = planFlowRequeue(findings, canonical.screens, run.screens);
+  for (const d of decisions) {
+    await updateRunScreen(projectId, runId, d.frameId, {
+      status: 'needs-review', matched: false,
+      review: { reason: `[flow-wiring] REAL navigation gap(s) from this screen: ${d.findings.join(' | ')}` },
+    });
+    await appendRunLog(projectId, runId,
+      `[finalize] flow-wiring REAL gap — requeued "${d.frameName ?? d.frameId}" (${d.canonicalId}) to needs-review (${d.findings.length} finding(s))`);
+  }
+  return decisions.length;
 }
 
 interface BuildScreenReq {
@@ -484,6 +517,17 @@ export function buildAppPlan(run: import('./build-run-store').BuildRun, canonica
       out.push(`- "${f}" --(${c.type}${c.label ? ` "${c.label}"` : ''})--> "${t}"`);
     }
   }
+  // P3: NAV STACK POLICY — deterministic back-stack rules for every transition.
+  // Prompt guidance only lived in one packet mapping line before, so agents pushed
+  // the hub onto the login form (back returned to auth) and push-looped cycles.
+  out.push([
+    `NAV STACK POLICY (apply to EVERY transition — back-stack correctness is graded):`,
+    `- Entering the app's hub/shell (the bottom-tab home) from entry/auth/onboarding CLEARS the stack: pushNamedAndRemoveUntil(route, (r) => false) or pushReplacementNamed — the back gesture must NEVER return to login/onboarding.`,
+    `- An edge marked (replace) REPLACES the current route (pushReplacementNamed) — never a plain push.`,
+    `- Returning to an EARLIER screen in a cycle POPS back to it (popUntil / pop) — never push a fresh copy of a screen already on the stack.`,
+    `- A modal/sheet dismisses with pop; NEVER push its base screen again to "close" it.`,
+    `- Tab destinations are hosted by the shell and switched by tab index — never pushed as routes.`,
+  ].join('\n'));
   out.push(`Register ALL these routes in the central router by name (a placeholder/empty screen is fine for ones not built yet). Build ONLY the current screen below; do not implement, overwrite, or duplicate the others.`);
   return out.join('\n');
 }
@@ -870,6 +914,7 @@ function verifyPrompt(refPath: string, candPath: string, frameName: string, prev
     notes ? `USER RULES / INTENT (authoritative) — respect these when judging; do NOT flag an INTENTIONAL omission as a discrepancy (e.g. if the user said no OS status bar / no default keyboard, then a missing status bar or keyboard is CORRECT, not a discrepancy):\n${notes}` : '',
     prevScore != null ? `The previous pass scored ${prevScore}/100 — judge whether this pass actually improved; if it's no better, another automated fix is unlikely to help (lean towards "stop").` : '',
     `If the reference shows a MODAL / OVERLAY / SHEET / POPUP over a base screen, the candidate should render that overlay ON TOP of the (reused) base screen — flag a discrepancy if the candidate rebuilt the whole screen or rendered the overlay as a standalone full page.`,
+    `Demo/mock data: judge the RENDERED text only. Text that matches the reference is correct regardless of how the code produces it — parameterized / fixture-driven demo values (names, emails, numbers) whose defaults render the reference text are NOT a discrepancy.`,
     `Respond with ONLY a single JSON object (no prose, no code fences):`,
     `{"match": <true|false>, "score": <0-100>, "recommendation": "accept|fix|stop", "discrepancies": [{"area":"<where>","issue":"<what's wrong vs the reference>","severity":"high|med|low"}]}`,
     `- "match": true ONLY if visually near-identical (no high/med discrepancies).`,
@@ -893,6 +938,7 @@ function tiledVerifyPrompt(refPath: string, candTilePaths: string[], frameName: 
     `Mentally stack the candidate tiles into the full screen and compare it to the reference: layout & hierarchy, spacing/proportions, colours, typography, text content, icons/illustrations, and overall fidelity across the ENTIRE height (the lower portion matters too).`,
     notes ? `USER RULES / INTENT (authoritative) — respect these; do NOT flag an INTENTIONAL omission as a discrepancy:\n${notes}` : '',
     prevScore != null ? `The previous pass scored ${prevScore}/100 — judge whether this pass actually improved; if it's no better, another automated fix is unlikely to help (lean towards "stop").` : '',
+    `Demo/mock data: judge the RENDERED text only. Text that matches the reference is correct regardless of how the code produces it — parameterized / fixture-driven demo values (names, emails, numbers) whose defaults render the reference text are NOT a discrepancy.`,
     `Respond with ONLY a single JSON object (no prose, no code fences):`,
     `{"match": <true|false>, "score": <0-100>, "recommendation": "accept|fix|stop", "discrepancies": [{"area":"<where, incl. which band>","issue":"<what's wrong vs the reference>","severity":"high|med|low"}]}`,
     `- "match": true ONLY if visually near-identical (no high/med discrepancies) across all bands.`,
@@ -2346,6 +2392,12 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
           await appendRunLog(projectId, runId, `[finalize] header re-stamp skipped (non-fatal): ${e?.message || 'unknown'}`);
         }
       }
+      // P3: whether finalizeApp ACTUALLY ran in THIS execution (fresh flow-wiring
+      // report) — the caller-level idempotency key for the flow-gap requeue below.
+      let finalizeRanNow = false;
+      // P3: the finalize report's finalErrors — the analyze gate's fallback
+      // measurement when the live analyzer is unavailable.
+      let reportFinalErrors: number | null = null;
       if (finalizeEnabled && !finalizeAlreadyRan) {
         try {
           setGenPhase(projectId, runId, 'Finalize', 'production passes');
@@ -2362,6 +2414,8 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
               return { text };
             },
           });
+          finalizeRanNow = true;
+          reportFinalErrors = report.finalErrors;
           const applied = report.passes.filter(p => p.status === 'applied').length;
           const reverted = report.passes.filter(p => p.status === 'reverted').length;
           await appendRunLog(projectId, runId, `[finalize] complete — ${applied} applied, ${reverted} reverted (analyze ${report.baselineAnalyze ?? 'n/a'} → ${report.finalAnalyze ?? 'n/a'})`);
@@ -2374,15 +2428,87 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
         }
       } else if (finalizeAlreadyRan) {
         await appendRunLog(projectId, runId, `[finalize] already ran for this run (finalize-report.json present) — skipping`);
+        try {
+          const persisted = JSON.parse(await fs.readFile(finalizeReportPath, 'utf8'));
+          reportFinalErrors = typeof persisted?.finalErrors === 'number' ? persisted.finalErrors : null;
+        } catch { /* unreadable report → no fallback measurement */ }
+      }
+
+      // ── P3 GATE A: flow-wiring REAL gaps requeue their FROM screens ──────────
+      // HIGH-class findings (unmapped REAL-gap / tab-as-push / missing-step-
+      // presenter) flip their FROM screen to needs-review so the run parks for
+      // human action instead of shipping known-missing modals. Runs ONLY when
+      // finalize actually ran in this execution (fresh report) — the idempotency
+      // rule documented in passes/flow-requeue.ts: a resumed/replayed finalize
+      // branch never re-flips screens a human has since accepted.
+      let requeued = 0;
+      if (finalizeRanNow) {
+        try {
+          requeued = await requeueFlowGaps(projectId, runId, projectRoot);
+        } catch (e: any) {
+          await appendRunLog(projectId, runId, `[finalize] flow-gap requeue skipped (non-fatal): ${e?.message || 'unknown'}`);
+        }
+      }
+
+      // ── P3 GATE B: analyzer ERRORS gate completion (warnings/infos never do) ──
+      // Default ON; RELAY_ANALYZE_GATE=off (or run.analyzeGate:false) restores the
+      // old measure-and-move-on behavior for emergencies.
+      let analyzeBlocked = false;
+      let analyzeErrs: number | null = null;
+      if (finalizeEnabled && analyzeGateEnabled(run)) {
+        try {
+          const g = await runAnalyzeGate({
+            projectRoot,
+            env: createTerminalEnv(resolveWorkspace()),
+            model: isAIModel(run.model) ? (run.model as AIModel) : undefined,
+            runModel: async (m, prompt, e, cwd, opts) => {
+              const { text } = await runModel(m, prompt, e, cwd, { format: opts?.format, projectId });
+              return { text };
+            },
+            log: (msg) => { void appendRunLog(projectId, runId, msg); },
+            initialErrors: reportFinalErrors,
+          });
+          analyzeErrs = g.errors;
+          analyzeBlocked = !g.ok;
+        } catch (e: any) {
+          // A broken gate must not block a finished build — log and pass.
+          await appendRunLog(projectId, runId, `[finalize] analyze gate errored (non-fatal, not blocking): ${e?.message || 'unknown'}`);
+        }
+      } else if (finalizeEnabled) {
+        await appendRunLog(projectId, runId, `[finalize] analyze gate OFF (env/run flag) — completing without the analyzer-error gate`);
       }
 
       // T31: mark the run finalized once the P7 phase has actually run (report on
       // disk) OR when finalize is disabled for this run (a no-finalize run is, by
       // definition, "done with no further finalize to do"). This drives the Runs UI
       // "Finalize" action and the resume/accept auto-finalize guard below — a done
-      // run that is NOT finalized still has finalize to run.
+      // run that is NOT finalized still has finalize to run. P3: the analyze gate
+      // holds `finalized` back — a run with analyzer ERRORS is NOT finalize-complete
+      // (a later resume re-enters this branch and re-measures).
       const finalizeDidRun = !finalizeEnabled || fsSync.existsSync(finalizeReportPath);
-      if (finalizeDidRun) { try { await setRunFinalized(projectId, runId, true); } catch { /* non-fatal */ } }
+      if (finalizeDidRun && !analyzeBlocked) { try { await setRunFinalized(projectId, runId, true); } catch { /* non-fatal */ } }
+
+      // ── P3: park instead of completing when a gate tripped ───────────────────
+      if (analyzeBlocked || requeued > 0) {
+        if (analyzeBlocked) {
+          await appendRunLog(projectId, runId, `[finalize] ${analyzeErrs ?? '?'} analyzer error(s) remain — run NOT complete`);
+        }
+        if (requeued > 0) {
+          await appendRunLog(projectId, runId, `[finalize] ${requeued} screen(s) requeued for REAL flow-wiring gaps — run NOT complete`);
+        }
+        const detail = [
+          analyzeBlocked ? `${analyzeErrs ?? '?'} analyzer error(s)` : '',
+          requeued > 0 ? `${requeued} flow-gap screen(s)` : '',
+        ].filter(Boolean).join(', ');
+        await setGenPhase(projectId, runId, 'Verify', `${detail} — held for review`, true);
+        try { await setRunResumable(projectId, runId, true); } catch { /* non-fatal */ }
+        await setRunStatus(projectId, runId, 'needs-review');
+        void notify({
+          kind: 'needs-review', projectId, runId,
+          detail: `Build parked at finalize — ${detail}`,
+        });
+        return;
+      }
 
       // Terminal completion: clear the resumable flag so a finished run is never
       // re-launched on a later boot (audit A.4). Also clear any rate-limit pause
