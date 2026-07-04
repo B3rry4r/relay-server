@@ -40,14 +40,14 @@ import {
   clampParallel,
   gateIsActive, pauseAtCheckpoint, approveCheckpoint, setRunResumable, setRunPrepDone, setRunFinalized,
   addAmendment, resolveAmendment, writeFrameMap, mutateRun,
-  type ScreenSpec, type CheckpointGate, type BuildRun, type AmendmentKind,
+  type ScreenSpec, type CheckpointGate, type BuildRun, type RunScreen, type AmendmentKind,
 } from './build-run-store';
 import { notify } from './notify';
 import { getProjectsRoot } from './runtime';
 import {
   canonicalizeRun, writeCanonical, readCanonical, generateFlutterSkeleton,
   restampCanonicalHeaders, cleanOrphanScreens, syncLiveCanonical,
-  nukeGeneratedAppSurface,
+  nukeGeneratedAppSurface, planSemanticScreens,
   type Canonical, type CanonicalScreen,
 } from './canonicalize';
 import { canonicalize as aiCanonicalize, type CanonicalizeOptions } from './canonicalize-ai/orchestrate';
@@ -55,7 +55,7 @@ import { aiModelToCanonical } from './canonicalize-ai/to-canonical';
 import type { DescribeFrameInput } from './canonicalize-ai/describe';
 import type { ReduceFlow } from './canonicalize-ai/reduce';
 import { AiStepError, runModelObserved, _emptyStreakConfig } from './ai-observability';
-import { generateDesignSystem, seedContextWithThemeApi, ensureMainWired, consolidateDesignTokens, ensureScreenPreviewEntry, type ThemeTokens } from './design-system';
+import { generateDesignSystem, seedContextWithThemeApi, ensureMainWired, consolidateDesignTokens, ensureScreenPreviewEntry, modalPresenterName, type ThemeTokens } from './design-system';
 import { prepScreen, ensureIrComplete, getIrData, runAssetPass, type PrepConfig, type LocalizedAsset } from './reference-render';
 import type { FigFrame, FlowGraph } from './agent-packet';
 import { computePreflight } from './preflight';
@@ -261,6 +261,24 @@ interface BuildScreenReq {
   // (existing per-frame behavior unchanged).
   canonical?: Canonical;
   canonicalId?: string;
+  // P1-core: the lead screen's folded states/modals, each verified INDIVIDUALLY
+  // against its own reference after the lead passes (replaces the up-front blanket
+  // mark-done that shipped 13/13 unbuilt modals on Ping). Absent → no variant pass.
+  variants?: ScreenVariant[];
+}
+
+/** P1-core: one folded state/modal of a canonical lead screen, carrying ITS OWN
+ *  reference + dims so the variant verify pass compares the right ground truth. */
+export interface ScreenVariant {
+  kind: 'state' | 'modal';
+  /** canonical state id ('success') or modal id ('m_313_9543'). */
+  id: string;
+  /** the folded frame this variant folds in (its run.screens[] identity). */
+  frameId: string;
+  frameName: string;
+  referenceImagePath?: string;
+  width?: number;
+  height?: number;
 }
 
 interface Discrepancy { area?: string; issue: string; severity?: string }
@@ -555,24 +573,135 @@ function buildWrittenContract(
   return parts.join('\n\n— — —\n');
 }
 
+// ── P1-core: folded-frame payloads in the lead screen's contract ──────────────
+// The old canonical context named each folded state/modal in ONE line (`- modal
+// "m_x" (frame N)`) — no reference image, no IR — although prep had ALREADY
+// rendered every folded frame's reference to .uix/refs/ and its run.screens[]
+// entry carries a full spec (tree + referenceImagePath). Result (Ping audit):
+// 13/13 folded modals shipped as invented placeholders. These helpers emit the
+// REAL payload per folded frame: its reference image path (with an explicit
+// "open it" instruction), its (hygiene'd, bounded) IR tree, a deterministic
+// presentation-kind hint from geometry, and the presenter contract the variant
+// preview harness calls.
+
+/** Bound a folded frame's IR so N variants can't blow the context window. */
+const FOLDED_IR_MAX = 8000;
+function boundFoldedIR(tree: string | undefined): string {
+  const h = hygieneIR(tree) ?? '';
+  return h.length > FOLDED_IR_MAX
+    ? `${h.slice(0, FOLDED_IR_MAX)}\n…(IR truncated — the reference image is the full ground truth)`
+    : h;
+}
+
+export type ModalPresentationKind = 'bottomSheet' | 'dialog' | 'fullOverlay';
+
+// A tree-notation node line: `container "Modal" [375×627] …` → name + W×H.
+const NODE_DIMS_RE = /"([^"]*)"\s*\[(\d+(?:\.\d+)?)×(\d+(?:\.\d+)?)\]/;
+const MODALISH_NAME = /modal|sheet|dialog|dialogue|popup|pop-?over|drawer|overlay|toast|alert/i;
+
+/**
+ * P1-core: deterministic presentation-kind hint from the folded modal frame's
+ * GEOMETRY (no LLM). The modal frame is authored at the base screen's full size;
+ * what varies is its dominant content node:
+ *   • narrow content (≪ frame width)                → centered DIALOG
+ *   • near-full width + tall (≥60% of frame height) → FULL-SCREEN SCRIM OVERLAY
+ *     (dimmed base + centered content — NOT a Material spinner dialog)
+ *   • near-full width + short                        → BOTTOM SHEET
+ * The content node is the largest modal-named (`Modal`/`Sheet`/`Dialog`/…) node in
+ * the IR; a frame much smaller than the base is itself dialog-sized. Pure + tested.
+ */
+export function modalPresentationHint(
+  tree: string | undefined, frameW?: number, frameH?: number, baseW?: number, baseH?: number,
+): { kind: ModalPresentationKind; hint: string } {
+  const hints: Record<ModalPresentationKind, string> = {
+    bottomSheet: `BOTTOM SHEET — present via showModalBottomSheet over the reused base (content anchored to the bottom edge, scrim above).`,
+    dialog: `centered DIALOG — present via showDialog over the reused base (small centered card, dimmed scrim around it).`,
+    fullOverlay: `FULL-SCREEN SCRIM OVERLAY — dim the (reused) base behind a scrim and center this content over it. Do NOT use a Material spinner dialog and do NOT rebuild the base as a new page.`,
+  };
+  const lines = (tree ?? '').split('\n');
+  // Root dims from the first node line when the caller has no frame dims.
+  const rootM = lines.length ? NODE_DIMS_RE.exec(lines[0]) : null;
+  const fw = frameW ?? (rootM ? parseFloat(rootM[2]) : undefined);
+  const fh = frameH ?? (rootM ? parseFloat(rootM[3]) : undefined);
+  // A frame authored much smaller than the base screen IS the dialog card itself.
+  if (fw && fh && baseW && baseH && fw < baseW * 0.8 && fh < baseH * 0.8) {
+    return { kind: 'dialog', hint: `${hints.dialog} (the modal frame is ${fw}×${fh}, well under the ${baseW}×${baseH} base — the frame itself is the card)` };
+  }
+  // Largest modal-named content node inside the frame decides the kind.
+  let best: { w: number; h: number; name: string } | null = null;
+  for (let i = 1; i < lines.length; i++) {
+    const m = NODE_DIMS_RE.exec(lines[i]);
+    if (!m || !MODALISH_NAME.test(m[1])) continue;
+    const w = parseFloat(m[2]), h = parseFloat(m[3]);
+    if (!best || w * h > best.w * best.h) best = { w, h, name: m[1] };
+  }
+  if (!best || !fw || !fh) {
+    return { kind: 'bottomSheet', hint: `${hints.bottomSheet} (no clearer geometry signal in the IR — default)` };
+  }
+  const wr = best.w / fw, hr = best.h / fh;
+  const evidence = `(content node "${best.name}" is ${best.w}×${best.h} in a ${fw}×${fh} frame)`;
+  if (wr < 0.85) return { kind: 'dialog', hint: `${hints.dialog} ${evidence}` };
+  if (hr >= 0.6) return { kind: 'fullOverlay', hint: `${hints.fullOverlay} ${evidence}` };
+  return { kind: 'bottomSheet', hint: `${hints.bottomSheet} ${evidence}` };
+}
+
 /**
  * P3 (RFC §4.1/§4.2): the CANONICAL context the server injects when a run is built
  * canonically. For the lead frame of a canonical screen it spells out the screen's
  * states, modals (rendered as overlays over THIS reused base, not standalone
  * pages), template siblings, and its write-locked route slot — so the agent builds
  * one widget with a state param instead of N near-duplicate routes/files.
+ *
+ * P1-core: when `runScreens` is provided (callers inside a durable run have it),
+ * each folded state/modal block carries its OWN reference image path + bounded IR
+ * + presentation hint + presenter contract — the payload the agent needs to build
+ * the variant for real instead of inventing a placeholder.
  */
-function buildCanonicalContext(canonical: Canonical, cs: CanonicalScreen): string {
+export function buildCanonicalContext(canonical: Canonical, cs: CanonicalScreen, runScreens?: RunScreen[]): string {
   const out: string[] = [
     `CANONICAL SCREEN — this is ONE screen (canonicalId ${cs.canonicalId}, route ${cs.route}); build a SINGLE widget, not one page per variant. Its write-locked route slot already exists in lib/app_router.dart; fill the widget body, keep the route.`,
   ];
+  const specOf = (frameId: string): ScreenSpec | undefined =>
+    runScreens?.find(s => s.frameId === frameId)?.spec;
+  const leadFrameId = cs.states[0]?.frameId ?? cs.frameIds[0];
+  const leadSpec = leadFrameId ? specOf(leadFrameId) : undefined;
+  const className = planSemanticScreens(canonical).get(cs.canonicalId)?.className ?? 'the screen widget';
+  let foldedPayloads = 0;
   if (cs.states.length > 1) {
     out.push(`States (one widget + a state param — NOT separate routes; each state is verified individually against its own reference):`);
-    for (const s of cs.states) out.push(`- state "${s.id}" (frame ${s.frameId})`);
+    for (const s of cs.states) {
+      const spec = s.frameId === leadFrameId ? undefined : specOf(s.frameId);
+      if (!spec?.referenceImagePath) { out.push(`- state "${s.id}" (frame ${s.frameId})${s.frameId === leadFrameId ? ' — the base/default state this packet builds' : ''}`); continue; }
+      foldedPayloads++;
+      out.push([
+        `- FOLDED STATE "${s.id}" (frame ${s.frameId}) — rendered by THIS widget as ${className}(state: '${s.id}'); NOT a separate route/file.`,
+        `  REFERENCE IMAGE (ground truth): ${spec.referenceImagePath} — OPEN this image with your file-reading tool and match it EXACTLY (layout, text, colours).`,
+        `  IR TREE of this state's frame:`,
+        boundFoldedIR(spec.tree),
+      ].join('\n'));
+    }
   }
   if (cs.modals.length) {
-    out.push(`Modals/sheets to present OVER this (reused) base screen via showModalBottomSheet / a dialog — do NOT rebuild the base or make these full standalone pages:`);
-    for (const m of cs.modals) out.push(`- modal "${m.id}" (frame ${m.frameId})`);
+    out.push(`Modals/sheets to present OVER this (reused) base screen — do NOT rebuild the base and do NOT make these full standalone pages:`);
+    for (const m of cs.modals) {
+      const spec = specOf(m.frameId);
+      if (!spec?.referenceImagePath) { out.push(`- modal "${m.id}" (frame ${m.frameId})`); continue; }
+      foldedPayloads++;
+      const p = modalPresentationHint(spec.tree, spec.width, spec.height, leadSpec?.width, leadSpec?.height);
+      out.push([
+        `- FOLDED MODAL "${m.id}" (frame ${m.frameId}) — part of THIS screen.`,
+        `  REFERENCE IMAGE (ground truth): ${spec.referenceImagePath} — OPEN this image with your file-reading tool and match it EXACTLY (layout, text, colours).`,
+        `  PRESENTATION (derived from the frame's geometry): ${p.hint}`,
+        `  PRESENTER CONTRACT: declare a top-level function \`Future<void> ${modalPresenterName(m.id)}(BuildContext context)\` in this screen's file that presents this modal. The name is FIXED — the automated preview harness calls it verbatim to screenshot the modal for verification.`,
+        `  IR TREE of the modal frame:`,
+        boundFoldedIR(spec.tree),
+      ].join('\n'));
+    }
+  }
+  if (foldedPayloads > 0) {
+    out.push(
+      `EVERY folded state/modal above is verified INDIVIDUALLY against its own reference image after the base screen passes — an unimplemented, missing, or wrong variant sends this screen back for fixes. Placeholder/deferred implementations are FORBIDDEN and will fail reconciliation: no "placeholder" sheets, no "real frames come later" comments, no empty onTap/onPressed handlers.`,
+    );
   }
   if (cs.templateRef) {
     const sibs = canonical.templates.find(t => t.id === cs.templateRef)?.memberCanonicalIds.filter(id => id !== cs.canonicalId) ?? [];
@@ -582,6 +711,34 @@ function buildCanonicalContext(canonical: Canonical, cs: CanonicalScreen): strin
     out.push(`Shared components available (import from lib/components/ — reuse, don't re-invent): ${canonical.components.map(c => c.name).join(', ')}.`);
   }
   return out.join('\n');
+}
+
+/**
+ * P1-core: the folded state/modal variants a canonical LEAD screen must realize —
+ * each becomes an individually-verified target in runScreenLoop (its own preview
+ * entry, screenshot, reference compare, fix loop, and terminal status). The lead
+ * (default) state is NOT a variant — the lead's own loop verifies it.
+ */
+export function variantsForCanonicalScreen(cs: CanonicalScreen, runScreens: RunScreen[]): ScreenVariant[] {
+  const lead = cs.states[0]?.frameId ?? cs.frameIds[0];
+  const byFrame = new Map(runScreens.map(s => [s.frameId, s]));
+  const out: ScreenVariant[] = [];
+  for (const st of cs.states) {
+    if (st.frameId === lead) continue;
+    const rs = byFrame.get(st.frameId);
+    out.push({
+      kind: 'state', id: st.id, frameId: st.frameId, frameName: rs?.frameName ?? st.id,
+      referenceImagePath: rs?.spec?.referenceImagePath, width: rs?.spec?.width, height: rs?.spec?.height,
+    });
+  }
+  for (const m of cs.modals) {
+    const rs = byFrame.get(m.frameId);
+    out.push({
+      kind: 'modal', id: m.id, frameId: m.frameId, frameName: rs?.frameName ?? m.id,
+      referenceImagePath: rs?.spec?.referenceImagePath, width: rs?.spec?.width, height: rs?.spec?.height,
+    });
+  }
+  return out;
 }
 
 // ── P4 (RFC §4.5): IR HYGIENE ────────────────────────────────────────────────
@@ -1164,7 +1321,10 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
   // screenshot's device viewport) for verify — NEVER fall back to main.dart, which
   // renders the app entry (a different/stub screen) and produces false "broken"
   // verdicts on good screens. Overrides the agent's last-gen entry (more reliable).
-  try { const pe = await ensureScreenPreviewEntry(projectRoot, screenFramework, frameId); if (pe) screenPreviewEntry = pe; }
+  // P1-core: canonicalId lets the entry resolve SEMANTIC-named screen files (the
+  // skeleton stamps `// canonicalId:` headers) — legacy `screen_<frameId>.dart`
+  // resolution alone silently missed them.
+  try { const pe = await ensureScreenPreviewEntry(projectRoot, screenFramework, frameId, { canonicalId: req.canonicalId }); if (pe) screenPreviewEntry = pe; }
   catch { /* non-fatal — falls back to last-gen/main.dart */ }
 
   // verify:false (or no reference render to compare against) → implement-only.
@@ -1179,6 +1339,11 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     await fs.writeFile(path.join(screenDir, 'result.json'), JSON.stringify(result, null, 2));
     if (req.runId) {
       try { await updateRunScreen(req.projectId, req.runId, frameId, { status: 'done', matched: false, sessionId: session }); } catch { /* non-fatal */ }
+      // P1-core: verify-off is implement-only for the folded variants too — resolve
+      // them so the run can complete (there is no verify pass to gate them on).
+      for (const v of req.variants ?? []) {
+        try { await updateRunScreen(req.projectId, req.runId, v.frameId, { status: 'done', matched: false, sessionId: session }); } catch { /* non-fatal */ }
+      }
       // T9 (RFC v2 §8.2): emit the explicit terminal ACCEPTED line on the verify-off
       // done path too, so the at-a-glance run log is complete (consistent with the
       // verified/matched path). The "(verify off)" tag flags it was implement-only.
@@ -1289,7 +1454,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     await snapshotLastGen();   // re-capture in case the fix moved/renamed the previewEntry (audit A.2)
     // Re-assert the deterministic per-screen entry (the screen file the agent just
     // edited still exists; keep verify pointed at THIS screen, not the app entry).
-    try { const pe = await ensureScreenPreviewEntry(projectRoot, screenFramework, frameId); if (pe) screenPreviewEntry = pe; }
+    try { const pe = await ensureScreenPreviewEntry(projectRoot, screenFramework, frameId, { canonicalId: req.canonicalId }); if (pe) screenPreviewEntry = pe; }
     catch { /* non-fatal */ }
   }
 
@@ -1311,6 +1476,175 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
   if (reconBlocked && matched) {
     matched = false;
     stopReason = `reconciliation failed (${recon!.flags.filter(f => f.severity === 'high').map(f => f.code).join(', ')})`;
+  }
+
+  // ── P1-core: PER-STATE / PER-MODAL visual verification ──────────────────────
+  // The prompt's old claim "each state is verified individually" was FALSE: only
+  // the lead's default-constructor preview was ever screenshot, and every folded
+  // state/modal frame was blanket-marked done up-front (13/13 of Ping's folded
+  // modals shipped broken, their prepped references opened ZERO times). Now, after
+  // the LEAD passes, each folded variant gets its OWN verify pass: a variant
+  // preview entry (`Screen(state:'x')` / auto-presented modal), screenshot vs ITS
+  // OWN reference, and the existing fix loop on mismatch (bounded by the same
+  // maxIterations). The folded frame is marked done ONLY when its verify passes;
+  // cap/stop/plateau → needs-review (same statuses/logging as the lead). Resume:
+  // an already-done folded frame skips. A rate-limited call pauses the run against
+  // the LEAD frame (consistent with the lead loop: the whole screen rebuilds).
+  let variantFixesApplied = 0;
+  const verifyVariant = async (v: ScreenVariant): Promise<'done' | 'needs-review' | 'paused'> => {
+    const vLabel = `${v.kind} "${v.id}"`;
+    const vFrameName = `${frameName} — ${v.kind} ${v.id}`;
+    const vDir = path.join(projectRoot, '.uix', 'screens', sanitizeId(v.frameId));
+    const vRelDir = path.join('.uix', 'screens', sanitizeId(v.frameId));
+    await fs.mkdir(vDir, { recursive: true });
+    const vW = v.width || width, vH = v.height || height;
+    let vMatched = false;
+    let vStop = 'reached iteration cap';
+    let vVerdict: Verdict | null = null;
+    let vCand: string | null = null;
+    let vPrev: number | null = null;
+    let vIters = 0;
+    for (let iter = 1; iter <= maxIterations; iter++) {
+      vIters = iter;
+      // (Re)generate the variant preview each pass — a fix may have renamed the
+      // screen class / presenter. A missing presenter surfaces as a COMPILE error
+      // naming the exact function (precise feedback for the fix pass below).
+      let vEntry: string | undefined;
+      try {
+        vEntry = await ensureScreenPreviewEntry(projectRoot, screenFramework, frameId,
+          { canonicalId: req.canonicalId, variant: { kind: v.kind, id: v.id } });
+      } catch { /* handled below */ }
+      if (!vEntry) { vStop = 'variant preview entry could not be generated (screen file not found)'; break; }
+      appendJobLog(jobId, `[loop] variant ${vLabel} verify ${iter}/${maxIterations}: building & screenshotting`);
+      const tall = vH > TALL_FRAME_THRESHOLD;
+      const shot = await withBuildLock(projectRoot, () =>
+        renderPreview(projectRoot, screenFramework, vEntry, vW, vH, env,
+          tall ? { deviceScale: REF_DEVICE_SCALE, tiles: true } : CAPTURE_SHOT_OPTS));
+      let verdict: Verdict;
+      const hasShot = !shot.error && (shot.png || (shot.tiles && shot.tiles.length));
+      if (!hasShot) {
+        verdict = { match: false, score: 0, discrepancies: [{ area: 'build', issue: shot.error || `the ${v.kind} variant preview failed to build/screenshot`, severity: 'high' }], recommendation: 'fix' };
+        appendJobLog(jobId, `[loop] variant ${vLabel} verify ${iter}: build/screenshot failed`);
+      } else if (shot.tiles && shot.tiles.length) {
+        const tileRels: string[] = [];
+        for (let t = 0; t < shot.tiles.length; t++) {
+          const rel = path.join(vRelDir, `cand-${iter}-tile${t + 1}.png`);
+          await fs.writeFile(path.join(projectRoot, rel), shot.tiles[t]);
+          tileRels.push(rel);
+        }
+        vCand = tileRels[0];
+        const r = await observedBuildCall('verify', tiledVerifyPrompt(v.referenceImagePath!, tileRels, vFrameName, vPrev, req.userNotes));
+        if (r.rateLimited) { await pauseRunRateLimited(req.projectId, req.runId!, frameId, session, r.stalled ? stallPauseReason : undefined, r.resetHint); return 'paused'; }
+        verdict = parseVerdict(r.text);
+      } else {
+        const rel = path.join(vRelDir, `cand-${iter}.png`);
+        await fs.writeFile(path.join(projectRoot, rel), shot.png!);
+        vCand = rel;
+        const r = await observedBuildCall('verify', verifyPrompt(v.referenceImagePath!, rel, vFrameName, vPrev, req.userNotes));
+        if (r.rateLimited) { await pauseRunRateLimited(req.projectId, req.runId!, frameId, session, r.stalled ? stallPauseReason : undefined, r.resetHint); return 'paused'; }
+        verdict = parseVerdict(r.text);
+      }
+      vVerdict = verdict;
+      await fs.writeFile(path.join(vDir, `iter-${iter}.json`), JSON.stringify({ iter, verdict, candidate: vCand, at: new Date().toISOString() }, null, 2));
+      appendJobLog(jobId, `[loop] variant ${vLabel} verify ${iter}: match=${verdict.match} score=${verdict.score ?? '?'} rec=${verdict.recommendation} issues=${verdict.discrepancies.length}`);
+      if (verdict.match || verdict.recommendation === 'accept') {
+        vMatched = verdict.match;
+        vStop = verdict.match ? 'matched the reference' : 'verify agent accepted (good enough)';
+        break;
+      }
+      if (verdict.recommendation === 'stop') { vStop = 'verify agent said stop (broken / not converging)'; break; }
+      const score = verdict.score ?? 0;
+      if (iter >= 2 && vPrev != null && score <= vPrev) { vStop = `score plateaued (${vPrev}→${score})`; break; }
+      vPrev = score;
+      if (iter === maxIterations) break;
+      appendJobLog(jobId, `[loop] variant ${vLabel} fix ${iter}: applying ${verdict.discrepancies.length} change(s)`);
+      const fix = await observedBuildCall('fix', fixPrompt(vFrameName, v.referenceImagePath!, vCand ?? '(build failed — no screenshot)', verdict, req.userNotes), { sessionId: session });
+      if (fix.rateLimited) { await pauseRunRateLimited(req.projectId, req.runId!, frameId, session, fix.stalled ? stallPauseReason : undefined, fix.resetHint); return 'paused'; }
+      if (fix.sessionId) session = fix.sessionId;
+      variantFixesApplied++;
+    }
+    // Journal the variant's own result.json (same shape as the lead's).
+    try {
+      await fs.writeFile(path.join(vDir, 'result.json'), JSON.stringify({
+        frameId: v.frameId, frameName: v.frameName, framework, variantOf: frameId,
+        variant: { kind: v.kind, id: v.id },
+        matched: vMatched, accepted: vMatched, stopReason: vStop,
+        iterations: vIters, maxIterations, finalVerdict: vVerdict, sessionId: session,
+        referenceImage: v.referenceImagePath, candidateImage: vCand ?? undefined,
+        at: new Date().toISOString(),
+      }, null, 2));
+    } catch { /* journaling is best-effort */ }
+    if (vMatched) {
+      await updateRunScreen(req.projectId, req.runId!, v.frameId, { status: 'done', matched: true, sessionId: session, review: undefined });
+      await appendRunLog(req.projectId, req.runId!, `[screen ${frameName}] ${vLabel} ACCEPTED${typeof vVerdict?.score === 'number' ? ` (score ${vVerdict.score})` : ''}`);
+      return 'done';
+    }
+    await updateRunScreen(req.projectId, req.runId!, v.frameId, {
+      status: 'needs-review', matched: false, sessionId: session,
+      review: {
+        candidateImagePath: vCand ?? undefined,
+        referenceImagePath: v.referenceImagePath,
+        score: vVerdict?.score,
+        reason: `${v.kind} "${v.id}": ${vStop}`,
+        discrepancies: vVerdict?.discrepancies ?? [],
+      },
+    });
+    await appendRunLog(req.projectId, req.runId!, `[screen ${frameName}] ${vLabel} NEEDS REVIEW (${vStop})`);
+    return 'needs-review';
+  };
+
+  if (req.runId && req.variants?.length) {
+    if (matched) {
+      for (const v of req.variants) {
+        // Resume semantics: an already-verified folded frame skips.
+        const live = await getRun(req.projectId, req.runId);
+        const cur = live?.screens.find(s => s.frameId === v.frameId);
+        if (cur?.status === 'done') continue;
+        if (!v.referenceImagePath) {
+          // No reference render exists for this folded frame — nothing to verify
+          // against; resolve it (implement-only, like verify-off) but say so.
+          try { await updateRunScreen(req.projectId, req.runId, v.frameId, { status: 'done', matched: false, sessionId: session }); } catch { /* non-fatal */ }
+          await appendRunLog(req.projectId, req.runId, `[screen ${frameName}] ${v.kind} "${v.id}" ACCEPTED (no reference render — variant verify skipped)`);
+          continue;
+        }
+        try { await updateRunScreen(req.projectId, req.runId, v.frameId, { status: 'building' }); } catch { /* non-fatal */ }
+        const outcome = await verifyVariant(v);
+        if (outcome === 'paused') return session;   // run parked resumably (lead rebuilds)
+      }
+      // A variant FIX pass edits the shared screen file — re-run the deterministic
+      // reconciliation gate so drift introduced by those fixes (placeholders, dead
+      // handlers, invented routes) still demotes the lead, exactly like the lead's
+      // own gate above.
+      if (variantFixesApplied > 0) {
+        try {
+          const recon2 = await reconcileScreen({
+            projectRoot, framework: screenFramework, canonical: req.canonical, canonicalId: req.canonicalId,
+            previewEntry: screenPreviewEntry,
+          });
+          if (recon2.flags.length) appendJobLog(jobId, `[loop] post-variant ${reconcileSummary(recon2)}`);
+          recon = recon2;
+          if (!recon2.ok && matched) {
+            matched = false;
+            stopReason = `reconciliation failed after variant fixes (${recon2.flags.filter(f => f.severity === 'high').map(f => f.code).join(', ')})`;
+          }
+        } catch { /* best-effort */ }
+      }
+    } else {
+      // The LEAD did not pass — its folded variants were never verified. Queue them
+      // for review (NOT done) so the run's rollup blocks honestly on them too.
+      for (const v of req.variants) {
+        const live = await getRun(req.projectId, req.runId);
+        const cur = live?.screens.find(s => s.frameId === v.frameId);
+        if (cur?.status === 'done') continue;
+        try {
+          await updateRunScreen(req.projectId, req.runId, v.frameId, {
+            status: 'needs-review', matched: false,
+            review: { referenceImagePath: v.referenceImagePath, reason: `lead screen "${frameName}" did not pass verification — folded ${v.kind} "${v.id}" was not verified` },
+          });
+          await appendRunLog(req.projectId, req.runId, `[screen ${frameName}] ${v.kind} "${v.id}" NEEDS REVIEW (lead did not pass — variant unverified)`);
+        } catch { /* non-fatal */ }
+      }
+    }
   }
 
   // P5 (RFC §4.8): AMENDMENT EMITTER. The packet instructs the agent to write
@@ -1419,7 +1753,9 @@ async function buildRunScreen(
   contract = `${await assetInventoryBlock(projectRoot)}${contract}`;
   // P3: when this is a canonical lead frame, prepend its states/modals/template +
   // route-slot context so the agent builds ONE widget instead of per-variant pages.
-  if (canonicalCtx) contract = `${buildCanonicalContext(canonicalCtx.canonical, canonicalCtx.screen)}\n\n— — —\n${contract}`;
+  // P1-core: run.screens rides along so each folded state/modal block carries its
+  // OWN reference image path + bounded IR + presentation hint (not just a name).
+  if (canonicalCtx) contract = `${buildCanonicalContext(canonicalCtx.canonical, canonicalCtx.screen, run.screens)}\n\n— — —\n${contract}`;
   // P4: strip [preview:…] + RLE repeated siblings from the agent-facing IR.
   const cleanPacket = hygieneIR(screen.spec.packet) ?? screen.spec.packet;
   const sreq: BuildScreenReq = {
@@ -1432,6 +1768,9 @@ async function buildRunScreen(
     userNotes: run.userNotes, verify: run.verify, freshSession: fresh,
     // P3 (RFC §4.5): canonical context for the reconciliation gate (no-op without it).
     canonical, canonicalId: canonicalCtx?.screen.canonicalId,
+    // P1-core: the folded states/modals this lead must realize — each is verified
+    // individually against its own reference after the lead passes.
+    variants: canonicalCtx ? variantsForCanonicalScreen(canonicalCtx.screen, run.screens) : undefined,
   };
   try {
     return await runScreenLoop(sreq, projectRoot, jobId);
@@ -1615,25 +1954,33 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
           // P5 (RFC §4.2/§4.9): persist frame-map.json — the SINGLE identity axis
           // (frameId → canonicalId). All durability + route derivation key on this.
           await writeFrameMap(projectId, runId, canonical.frameMap);
-          // Mark every NON-lead member (extra states, bound modals, components) done
-          // up-front so the run completes — they're built inside their lead screen.
-          // Only on the FIRST canonicalization; on resume these are already 'done'.
+          // P1-core: folded STATE/MODAL frames are NO LONGER blanket-marked done
+          // up-front — that shipped 13/13 unbuilt modals as "done" on Ping. Each is
+          // now verified INDIVIDUALLY inside its lead screen's loop (variant verify)
+          // and only reaches 'done' when ITS OWN verify passes. Frames folded as
+          // pure duplicates/components (members that are neither the lead, a
+          // non-default state, nor a modal) still auto-resolve here — they have no
+          // variant of their own to verify. Only on the FIRST canonicalization; on
+          // resume every frame keeps its persisted status.
           const memberToLead = new Map<string, string>();   // any member frameId → lead frameId
+          const variantFrames = new Set<string>();          // frames verified via the lead's variant pass
           for (const cs of canonical.screens) {
             const lead = cs.states[0]?.frameId ?? cs.frameIds[0];
             if (!lead) continue;
             for (const fid of cs.frameIds) memberToLead.set(fid, lead);
-            for (const m of cs.modals) memberToLead.set(m.frameId, lead);
+            for (const st of cs.states) if (st.frameId !== lead) variantFrames.add(st.frameId);
+            for (const m of cs.modals) { memberToLead.set(m.frameId, lead); variantFrames.add(m.frameId); }
           }
           const leadSet = new Set([...canonical.screens].map(cs => cs.states[0]?.frameId ?? cs.frameIds[0]).filter(Boolean) as string[]);
           let folded = 0;
           for (const s of run.screens) {
-            if (memberToLead.has(s.frameId) && !leadSet.has(s.frameId) && s.status !== 'done') {
+            if (memberToLead.has(s.frameId) && !leadSet.has(s.frameId) && !variantFrames.has(s.frameId) && s.status !== 'done') {
               await updateRunScreen(projectId, runId, s.frameId, { status: 'done', matched: true });
               folded++;
             }
           }
-          await appendRunLog(projectId, runId, `[canon] ${run.screens.length} frame(s) → ${canonical.screens.length} canonical screen(s), ${canonical.components.length} component(s)${folded ? `, ${folded} folded state/modal frame(s)` : ''}${canonical.warnings.length ? ` — ${canonical.warnings.length} warning(s)` : ''}`);
+          const deferredVariants = [...variantFrames].filter(fid => !leadSet.has(fid)).length;
+          await appendRunLog(projectId, runId, `[canon] ${run.screens.length} frame(s) → ${canonical.screens.length} canonical screen(s), ${canonical.components.length} component(s)${folded ? `, ${folded} folded duplicate/component frame(s)` : ''}${deferredVariants ? `, ${deferredVariants} state/modal frame(s) deferred to per-variant verify` : ''}${canonical.warnings.length ? ` — ${canonical.warnings.length} warning(s)` : ''}`);
           for (const w of canonical.warnings) await appendRunLog(projectId, runId, `[canon] WARNING: ${w}`);
           // RFC §9.2 — checkpoint after canonicalization (canonical.json + skeleton).
           await runCheckpoint(projectId, runId, projectRoot, 'phase canonicalize', `${canonical.screens.length} screen(s), ${canonical.components.length} component(s)`);
@@ -2050,33 +2397,64 @@ async function retryScreenLoop(projectId: string, runId: string, frameId: string
       await appendRunLog(projectId, runId, `[review] retry skipped "${frameId}" — no build spec`);
       return;
     }
-    await updateRunScreen(projectId, runId, frameId, { status: 'building' });
     // Audit A.3: reuse the canonical route scheme on a corrected-retry too (one
     // scheme), reading the persisted canonical.json when the run was canonicalized.
     const canonical = run.canonical ? (await readCanonical(projectRoot, runId)) ?? undefined : undefined;
+    // P1-core: a corrected-retry can now target a FOLDED state/modal frame (they
+    // land in needs-review individually). Rebuilding such a frame STANDALONE would
+    // recreate the exact defect canonicalization prevents (a modal as its own
+    // page) — REDIRECT the retry to the frame's LEAD screen, whose loop rebuilds
+    // and re-verifies every non-done folded variant in place.
+    let targetFrameId = frameId;
+    let canonScreen: CanonicalScreen | undefined;
+    if (canonical) {
+      const leadOf = (cs: CanonicalScreen): string | undefined => cs.states[0]?.frameId ?? cs.frameIds[0];
+      canonScreen = canonical.screens.find(cs => leadOf(cs) === frameId);
+      if (!canonScreen) {
+        const owner = canonical.screens.find(cs =>
+          cs.states.some(st => st.frameId === frameId) || cs.modals.some(m => m.frameId === frameId) || cs.frameIds.includes(frameId));
+        const ownerLead = owner ? leadOf(owner) : undefined;
+        if (owner && ownerLead) {
+          canonScreen = owner;
+          targetFrameId = ownerLead;
+          await appendRunLog(projectId, runId, `[review] "${screen.frameName}" is a folded state/modal of ${owner.canonicalId} — retrying its LEAD screen (the variant is rebuilt + verified inside the lead, never as a standalone page)`);
+        }
+      }
+    }
+    const target = run.screens.find(s => s.frameId === targetFrameId) ?? screen;
+    if (!target.spec) {
+      await appendRunLog(projectId, runId, `[review] retry skipped "${targetFrameId}" — no build spec on the lead screen`);
+      return;
+    }
+    await updateRunScreen(projectId, runId, targetFrameId, { status: 'building' });
     const appPlan = buildAppPlan(run, canonical);
     // P2: inject the same written contract (app plan + API surface + context.md) so a
     // corrected-retry builds against the established design system, not in a vacuum.
     const contextSlice = await readContextSlice(projectRoot);
     // T12: a corrected-retry must also see the AppAssets inventory (so a re-build
     // emits symbols, not raw paths).
-    const contract = `${await assetInventoryBlock(projectRoot)}${buildWrittenContract(run, appPlan, contextSlice, run.freshSessions === true, canonical)}`;
+    let contract = `${await assetInventoryBlock(projectRoot)}${buildWrittenContract(run, appPlan, contextSlice, run.freshSessions === true, canonical)}`;
+    // P1-core: a canonical lead's retry also carries its states/modals payload
+    // (reference paths + IR + presentation hints) — same contract as the build.
+    if (canonical && canonScreen) contract = `${buildCanonicalContext(canonical, canonScreen, run.screens)}\n\n— — —\n${contract}`;
     // The human correction is authoritative and injected up-front so the fresh pass
     // acts on it (the previous automated discrepancies didn't converge).
     const correction = `HUMAN CORRECTION (authoritative — the automated loop did NOT converge; apply this specific guidance):\n${note}`;
     const startJobId = jobKey;
-    startJobLog(startJobId, { projectId, firstLine: `[loop] corrected-retry "${screen.frameName}"` });
-    await appendRunLog(projectId, runId, `[review] corrected-retry "${screen.frameName}": ${note.replace(/\s+/g, ' ').trim()}`);
+    startJobLog(startJobId, { projectId, firstLine: `[loop] corrected-retry "${target.frameName}"` });
+    await appendRunLog(projectId, runId, `[review] corrected-retry "${target.frameName}": ${note.replace(/\s+/g, ' ').trim()}`);
     const sreq: BuildScreenReq = {
-      projectId, model: run.model as AIModel, modelId: run.modelId, sessionId: screen.sessionId || run.sessionId,
-      framework: run.framework || 'flutter', frameId, frameName: screen.frameName,
-      width: screen.spec.width, height: screen.spec.height,
-      referenceImagePath: screen.spec.referenceImagePath,
-      implementPrompt: `${contract}\n\n— — —\n${correction}\n\n— — —\nNOW REVISE THIS SCREEN:\n${hygieneIR(screen.spec.packet) ?? screen.spec.packet}`,
-      tree: hygieneIR(screen.spec.tree), maxIterations: run.maxIterations, jobId: startJobId, runId,
+      projectId, model: run.model as AIModel, modelId: run.modelId, sessionId: target.sessionId || run.sessionId,
+      framework: run.framework || 'flutter', frameId: targetFrameId, frameName: target.frameName,
+      width: target.spec.width, height: target.spec.height,
+      referenceImagePath: target.spec.referenceImagePath,
+      implementPrompt: `${contract}\n\n— — —\n${correction}\n\n— — —\nNOW REVISE THIS SCREEN:\n${hygieneIR(target.spec.packet) ?? target.spec.packet}`,
+      tree: hygieneIR(target.spec.tree), maxIterations: run.maxIterations, jobId: startJobId, runId,
       userNotes: [run.userNotes?.trim(), note.trim()].filter(Boolean).join('\n\n'), verify: run.verify,
       // P3 (RFC §4.5): reconciliation gate also applies to a corrected-retry.
-      canonical, canonicalId: canonical?.frameMap[frameId],
+      canonical, canonicalId: canonical?.frameMap[targetFrameId],
+      // P1-core: re-verify the lead's non-done folded variants too.
+      variants: canonScreen ? variantsForCanonicalScreen(canonScreen, run.screens) : undefined,
     };
     try {
       const sess = await runScreenLoop(sreq, projectRoot, startJobId);
@@ -2084,7 +2462,7 @@ async function retryScreenLoop(projectId: string, runId: string, frameId: string
     } catch (e: any) {
       appendJobLog(startJobId, `[loop] error: ${e?.message || 'unknown'}`);
       finishJobLog(startJobId, '[loop] failed');
-      await updateRunScreen(projectId, runId, frameId, { status: 'needs-review' });
+      await updateRunScreen(projectId, runId, targetFrameId, { status: 'needs-review' });
     }
     // Re-derive the run status: if this was the last needs-review screen and it now
     // matched, deriveStatus (via updateRunScreen) already flipped the run to 'done'.

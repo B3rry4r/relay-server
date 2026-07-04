@@ -199,21 +199,77 @@ export function hasGeneratedTheme(projectRoot: string, themeFile = path.join('li
 // lib/_preview/<screen>_preview.dart that renders ONLY the just-built screen, so
 // the screenshot is the target screen at the screenshot viewport's device size.
 // Returns the project-relative entry path (or undefined for non-flutter / no file).
+//
+// P1-core (folded modal/state verification): the entry can now render a VARIANT of
+// the screen instead of the bare default constructor —
+//   • { kind: 'state', id } → `home: <Screen>(state: '<id>')` so each canonical
+//     state is screenshot/verified against ITS OWN reference;
+//   • { kind: 'modal', id } → the base screen is rendered and the modal is
+//     AUTO-PRESENTED after the first frame by calling the deterministic presenter
+//     `modalPresenterName(id)` the build contract requires the screen to expose.
+//     (A missing presenter is a COMPILE error whose message names the exact
+//     function — precise, actionable feedback for the fix loop.)
+// Screen-file resolution: the legacy `screen_<frameId>.dart` name first; when a
+// `canonicalId` is supplied, fall back to scanning lib/screens/ for the
+// `// canonicalId:` header the skeleton stamps (semantic-named runs).
+
+export interface PreviewVariant { kind: 'state' | 'modal'; id: string }
+
+/** identifier-safe token from a canonical/frame id (`m_313_9543` → `313_9543`). */
+const idToken = (id: string): string =>
+  String(id).replace(/^[cm]_/, '').replace(/[^a-zA-Z0-9]+/g, '_').toLowerCase();
+
+/** The DETERMINISTIC presenter the build contract requires for each folded modal:
+ *  `showModal_<id-core>` (e.g. modal `m_313_9543` → `showModal_313_9543`). The
+ *  variant preview calls exactly this, so prompt + preview agree by construction. */
+export function modalPresenterName(modalId: string): string {
+  return `showModal_${idToken(modalId)}`;
+}
+
+/** Find a built screen file by the `// canonicalId: <id>` header the skeleton
+ *  stamps (semantic file names don't encode the frame id). Compares by the id core
+ *  so `c_290_3657` matches a `m_290_3657` header and vice versa. */
+async function findScreenByCanonicalHeader(
+  projectRoot: string, canonicalId: string,
+): Promise<{ base: string; src: string } | null> {
+  const dir = path.join(projectRoot, 'lib', 'screens');
+  let files: string[] = [];
+  try { files = (await fs.readdir(dir)).filter(f => f.endsWith('.dart')).sort(); } catch { return null; }
+  const core = String(canonicalId).replace(/^[cm]_/, '');
+  for (const f of files) {
+    let src: string;
+    try { src = await fs.readFile(path.join(dir, f), 'utf8'); } catch { continue; }
+    const hm = /^\/\/\s*canonicalId:\s*(\S+)/m.exec(src);
+    if (hm && hm[1].replace(/^[cm]_/, '') === core) return { base: f.replace(/\.dart$/, ''), src };
+  }
+  return null;
+}
+
 export async function ensureScreenPreviewEntry(
   projectRoot: string, framework: string, frameId: string,
+  opts?: { canonicalId?: string; variant?: PreviewVariant },
 ): Promise<string | undefined> {
   if ((framework || 'flutter').toLowerCase() !== 'flutter') return undefined;
-  const base = `screen_${frameId.replace(/[^a-zA-Z0-9]+/g, '_')}`.toLowerCase();
-  const screenAbs = path.join(projectRoot, 'lib', 'screens', `${base}.dart`);
-  let src: string;
-  try { src = await fs.readFile(screenAbs, 'utf8'); } catch { return undefined; }
+  let base = `screen_${frameId.replace(/[^a-zA-Z0-9]+/g, '_')}`.toLowerCase();
+  let src: string | undefined;
+  try { src = await fs.readFile(path.join(projectRoot, 'lib', 'screens', `${base}.dart`), 'utf8'); }
+  catch { /* legacy name absent — try the canonicalId header below */ }
+  if (src === undefined && opts?.canonicalId) {
+    const hit = await findScreenByCanonicalHeader(projectRoot, opts.canonicalId);
+    if (hit) { base = hit.base; src = hit.src; }
+  }
+  if (src === undefined) return undefined;
   // First PUBLIC widget class = the screen widget (skip private _Helper widgets).
   const m = src.match(/class\s+([A-Z]\w*)\s+extends\s+(?:StatelessWidget|StatefulWidget)/);
   if (!m) return undefined;
   const cls = m[1];
-  const previewRel = path.join('lib', '_preview', `${base}_preview.dart`);
+  const v = opts?.variant;
+  const suffix = v ? `_${v.kind}_${idToken(v.id)}` : '';
+  const previewRel = path.join('lib', '_preview', `${base}${suffix}_preview.dart`);
   const previewAbs = path.join(projectRoot, previewRel);
-  const code = `// GENERATED — device-framed preview entry: renders ONLY this screen for verify
+  let code: string;
+  if (!v) {
+    code = `// GENERATED — device-framed preview entry: renders ONLY this screen for verify
 // (instead of falling back to main.dart, which renders the app entry → wrong screen).
 import 'package:flutter/material.dart';
 import '../screens/${base}.dart';
@@ -223,6 +279,52 @@ void main() => runApp(MaterialApp(
       home: ${cls}(),
     ));
 `;
+  } else if (v.kind === 'state') {
+    const stateId = v.id.replace(/'/g, "\\'");
+    code = `// GENERATED — variant preview entry: renders this screen in state '${stateId}'
+// so the state is verified against ITS OWN reference (not just the default state).
+import 'package:flutter/material.dart';
+import '../screens/${base}.dart';
+
+void main() => runApp(MaterialApp(
+      debugShowCheckedModeBanner: false,
+      home: ${cls}(state: '${stateId}'),
+    ));
+`;
+  } else {
+    const presenter = modalPresenterName(v.id);
+    code = `// GENERATED — variant preview entry: renders the base screen and AUTO-PRESENTS
+// modal '${v.id}' after the first frame via the contract presenter ${presenter}(),
+// so the modal is screenshot/verified over its (reused) base against its reference.
+import 'package:flutter/material.dart';
+import '../screens/${base}.dart';
+
+void main() => runApp(const MaterialApp(
+      debugShowCheckedModeBanner: false,
+      home: _AutoPresentHost(),
+    ));
+
+class _AutoPresentHost extends StatefulWidget {
+  const _AutoPresentHost();
+  @override
+  State<_AutoPresentHost> createState() => _AutoPresentHostState();
+}
+
+class _AutoPresentHostState extends State<_AutoPresentHost> {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      // The build contract REQUIRES the screen file to expose this presenter.
+      ${presenter}(context);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) => ${cls}();
+}
+`;
+  }
   await fs.mkdir(path.dirname(previewAbs), { recursive: true });
   await fs.writeFile(previewAbs, code, 'utf8');
   return previewRel.split(path.sep).join('/');

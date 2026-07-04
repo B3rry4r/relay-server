@@ -53,7 +53,7 @@ class LoginScreen extends StatelessWidget {
     final t = Theme.of(context);
     return Scaffold(body: BalanceCardWidget());
   }
-  void go() => Navigator.pushNamed(context, AppRoutes.c12);
+  void go() => Navigator.pushNamed(context, AppRoutes.home);
 }`);
     const r = await reconcileScreen({ projectRoot: root, framework: 'flutter', canonical, canonicalId: 'c_1_1' });
     expect(r.ok).toBe(true);
@@ -117,5 +117,102 @@ class LoginScreen extends StatelessWidget {
     const r = await reconcileScreen({ projectRoot: root, framework: 'web', canonical, canonicalId: 'c_1_1' });
     expect(r.ok).toBe(true);
     expect(r.flags).toHaveLength(0);
+  });
+
+  // ── P1-core lints: placeholder/deferral markers + dead handlers ─────────────
+  // Agents were observed self-issuing untracked IOUs ("placeholder sheet — real
+  // frames come later") and shipping `onTap: () {}` — 13/13 of Ping's folded modals.
+  // Both are HIGH flags, so the existing gate demotes the screen to needs-review.
+
+  it('flags a deferral comment ("real frames come later") as HIGH deferred-placeholder', async () => {
+    await writeScreen('c_1_1', `
+import 'package:flutter/material.dart';
+import '../theme/app_theme.dart';
+class LoginScreen extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    // Placeholder sheet — the real frames come later in a later build.
+    return const Scaffold();
+  }
+}`);
+    const r = await reconcileScreen({ projectRoot: root, framework: 'flutter', canonical, canonicalId: 'c_1_1' });
+    expect(r.ok).toBe(false);
+    expect(r.flags.some(f => f.code === 'deferred-placeholder' && f.severity === 'high')).toBe(true);
+  });
+
+  it('flags a placeholder STRING literal as HIGH deferred-placeholder', async () => {
+    await writeScreen('c_1_1', `
+import 'package:flutter/material.dart';
+import '../theme/app_theme.dart';
+class LoginScreen extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) =>
+      const Scaffold(body: Text('This sheet is a placeholder, filled in by a later pass'));
+}`);
+    const r = await reconcileScreen({ projectRoot: root, framework: 'flutter', canonical, canonicalId: 'c_1_1' });
+    expect(r.ok).toBe(false);
+    expect(r.flags.some(f => f.code === 'deferred-placeholder')).toBe(true);
+  });
+
+  it('flags all three empty-handler forms as HIGH dead-handler (each listed)', async () => {
+    await writeScreen('c_1_1', `
+import 'package:flutter/material.dart';
+import '../theme/app_theme.dart';
+class LoginScreen extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) => Scaffold(body: Column(children: [
+    GestureDetector(onTap: () {}, child: const Text('a')),
+    TextButton(onPressed: ()  {  }, child: const Text('b')),
+    InkWell(onTap: () => {}, child: const Text('c')),
+  ]));
+}`);
+    const r = await reconcileScreen({ projectRoot: root, framework: 'flutter', canonical, canonicalId: 'c_1_1' });
+    expect(r.ok).toBe(false);
+    const flag = r.flags.find(f => f.code === 'dead-handler');
+    expect(flag).toBeTruthy();
+    expect(flag!.severity).toBe('high');
+    expect(flag!.message).toContain('3 empty interaction handler(s)');
+    expect(flag!.message).toContain('onTap');
+    expect(flag!.message).toContain('onPressed');
+  });
+
+  it('does NOT flag real handlers or the Placeholder WIDGET in code (negative case)', async () => {
+    await writeScreen('c_1_1', `
+import 'package:flutter/material.dart';
+import '../theme/app_theme.dart';
+class LoginScreen extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) => Scaffold(body: Column(children: [
+    // Real, wired handlers below — nothing deferred here.
+    GestureDetector(onTap: () => Navigator.pushNamed(context, AppRoutes.home), child: const Text('go')),
+    TextButton(onPressed: () { debugPrint('hi'); }, child: const Text('log')),
+    const Placeholder(),
+  ]));
+}`);
+    const r = await reconcileScreen({ projectRoot: root, framework: 'flutter', canonical, canonicalId: 'c_1_1' });
+    expect(r.flags.some(f => f.code === 'dead-handler')).toBe(false);
+    expect(r.flags.some(f => f.code === 'deferred-placeholder')).toBe(false);
+    expect(r.ok).toBe(true);
+  });
+
+  it('inspects the SEMANTIC screen file (planSemanticScreens fileBase), not just screen_<id>.dart', async () => {
+    // Write the screen under its semantic name (what the skeleton actually emits).
+    const rel = path.join('lib', 'screens', 'login_screen.dart');
+    await fs.mkdir(path.join(root, path.dirname(rel)), { recursive: true });
+    await fs.writeFile(path.join(root, rel), `
+// canonicalId: c_1_1  route: /login
+import 'package:flutter/material.dart';
+import '../theme/app_theme.dart';
+class LoginScreen extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    // real frames come later
+    return GestureDetector(onTap: () {}, child: const Scaffold());
+  }
+}`);
+    const r = await reconcileScreen({ projectRoot: root, framework: 'flutter', canonical, canonicalId: 'c_1_1' });
+    expect(r.inspected).toContain(rel);
+    expect(r.flags.some(f => f.code === 'deferred-placeholder')).toBe(true);
+    expect(r.flags.some(f => f.code === 'dead-handler')).toBe(true);
   });
 });

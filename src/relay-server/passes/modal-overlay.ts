@@ -123,8 +123,38 @@ export interface ModalOverlayResult {
 
 interface CanonModalTrigger { fromScreen: string; element?: string; edgeType: string }
 interface CanonModal { canonicalId: string; name: string; frameId: string; baseCanonicalId: string; trigger: CanonModalTrigger }
-interface CanonScreen { canonicalId: string; name: string; route: string; frameIds: string[] }
+/** A modal as it lives on disk in the AUTHORITATIVE schema: nested under its base
+ *  screen's `modals[]` (canonicalize.ts CanonicalModal). */
+interface CanonScreenModal { id: string; frameId: string; baseCanonicalId: string | null }
+interface CanonScreen { canonicalId: string; name: string; route: string; frameIds: string[]; modals?: CanonScreenModal[] }
 interface CanonModel { screens?: CanonScreen[]; modals?: CanonModal[] }
+
+/**
+ * P1-core (mirrors flow-wiring.ts collectModals): the pass used to read ONLY the
+ * top-level `canonical.modals` — which the authoritative canonicalize.ts schema
+ * DOESN'T emit (each modal nests under its base screen's `modals[]`) — so on every
+ * real AI-canonical run 8b examined ZERO modals and was a structural no-op (Ping:
+ * 13 folded modals, none inspected). Flatten BOTH sources into one list. A nested
+ * modal carries no trigger; its presenting screen is BY DEFINITION its base, so we
+ * synthesize `{ fromScreen: base, edgeType: 'overlay' }` (no element — the fuzzy
+ * trigger search still applies) rather than dropping it as an orphan.
+ */
+export function collectModals(canonical: CanonModel): CanonModal[] {
+  const out: CanonModal[] = [...(canonical.modals ?? [])];
+  const seen = new Set(out.map((m) => m.canonicalId));
+  for (const s of canonical.screens ?? []) {
+    for (const m of s.modals ?? []) {
+      if (!m?.id || seen.has(m.id)) continue;
+      seen.add(m.id);
+      const base = m.baseCanonicalId ?? s.canonicalId;
+      out.push({
+        canonicalId: m.id, name: m.id, frameId: m.frameId, baseCanonicalId: base,
+        trigger: { fromScreen: base, edgeType: 'overlay' },
+      });
+    }
+  }
+  return out;
+}
 
 async function readCanonical(projectRoot: string): Promise<CanonModel | null> {
   try {
@@ -186,14 +216,18 @@ export async function applyModalOverlays(projectId: string, opts: ModalOverlayOp
   const strategy = getStrategy(framework);
   const canonical = await readCanonical(opts.canonicalRoot ?? projectRoot);
 
-  if (!canonical || !Array.isArray(canonical.modals)) {
+  // P1-core: flatten nested screens[].modals + legacy top-level modals[] — the
+  // authoritative canonical nests modals, so reading only the top level made this
+  // pass a silent no-op on every AI-canonical run (zero modals examined).
+  const allModals = canonical ? collectModals(canonical) : [];
+  if (!canonical || allModals.length === 0) {
     return { framework, transformed: [], skipped: [], dryRun: !!opts.dryRun };
   }
   if (!strategy) {
     return {
       framework,
       transformed: [],
-      skipped: canonical.modals.map((m) => ({ canonicalId: m.canonicalId, name: m.name, reason: `no strategy for framework '${framework}'` })),
+      skipped: allModals.map((m) => ({ canonicalId: m.canonicalId, name: m.name, reason: `no strategy for framework '${framework}'` })),
       dryRun: !!opts.dryRun,
     };
   }
@@ -202,7 +236,7 @@ export async function applyModalOverlays(projectId: string, opts: ModalOverlayOp
   const transformed: ModalTransform[] = [];
   const skipped: ModalOverlaySkip[] = [];
 
-  let modals = canonical.modals;
+  let modals = allModals;
   if (opts.onlyModals?.length) modals = modals.filter((m) => opts.onlyModals!.includes(m.canonicalId));
 
   // T32: per-base-file tally of FOLDED modals so we can correlate them to the base's

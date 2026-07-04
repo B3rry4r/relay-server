@@ -23,6 +23,12 @@
 //      `TextStyle(...)` / `GoogleFonts.<x>` literals as a soft signal of bypassing
 //      the design tokens (the Ping audit found ~56 hardcoded colours + ~38 inline
 //      fonts across three screens that all passed visual verify).
+//   5. PLACEHOLDER / DEFERRAL markers (P1-core, HIGH) — "placeholder", "real frames
+//      come later", "filled in by a later build" in comments/strings. Agents were
+//      self-issuing untracked IOUs; a deferral marker fails the gate.
+//   6. DEAD HANDLERS (P1-core, HIGH) — empty `onTap: () {}` / `onPressed: () => {}`
+//      handlers: wired-looking controls that do nothing (13/13 of Ping's folded
+//      modals shipped exactly this way).
 //
 // Everything is grep/string-level (no AST dependency) so it stays cheap + has no
 // new deps. It is GUARDED: it only runs when a canonical skeleton exists (so the
@@ -49,6 +55,19 @@ export interface ReconcileResult {
   /** files the gate inspected (project-relative) — for traceability. */
   inspected: string[];
 }
+
+// P1-core: PLACEHOLDER / DEFERRAL markers. Agents were observed self-issuing
+// untracked IOUs ("placeholder sheet — real frames come later") and shipping the
+// stub as done. Any such marker in a COMMENT or STRING LITERAL of the built screen
+// is a HIGH flag ('deferred-placeholder') — deferral is forbidden, not trackable.
+const PLACEHOLDER_RE = /placeholder|come(?:s)? later|later build|filled in by a later/i;
+// P1-core: DEAD interaction handlers — `onTap: () {}`, `onPressed: () {}`,
+// `onTap: () => {}` (whitespace-tolerant, any on<Event> name). A wired-looking
+// control that does nothing is a shipped defect the visual verify can't see.
+const DEAD_HANDLER_RE = /\bon([A-Z][A-Za-z0-9]*)\s*:\s*\(\s*\)\s*(?:=>\s*)?\{\s*\}/g;
+// Comments (`// …`, `/* … */`) and string literals ('…', "…") — the surfaces the
+// placeholder lint scans, so `Placeholder()` the WIDGET (code) never false-fires.
+const COMMENT_OR_STRING_RE = /\/\/[^\n]*|\/\*[\s\S]*?\*\/|'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"/g;
 
 // Inline-literal detectors (Flutter). Color(0xFF…) / Colors.red / const Color.
 const INLINE_COLOR_RE = /\bColor\s*\(\s*0x[0-9a-fA-F]{6,8}\s*\)|\bColors\.[a-zA-Z]/g;
@@ -80,12 +99,16 @@ function collectGroup(re: RegExp, text: string, group = 1): Set<string> {
 
 /**
  * Resolve which files belong to a just-built canonical screen: the screen file
- * (lib/screens/screen_<id>.dart from the skeleton) plus any preview entry. We grep
- * those rather than the whole project so one screen's drift doesn't blame another.
+ * (legacy lib/screens/screen_<id>.dart, and — P1-core — the SEMANTIC file the
+ * skeleton actually writes, `<fileBase>.dart` from planSemanticScreens) plus any
+ * preview entry. We grep those rather than the whole project so one screen's
+ * drift doesn't blame another.
  */
-function screenFilesFor(canonical: Canonical, canonicalId: string): string[] {
+function screenFilesFor(canonical: Canonical, canonicalId: string, semanticFileBase?: string): string[] {
   const slug = `screen_${canonicalId.replace(/^c_/, '')}`.toLowerCase();
-  return [path.join('lib', 'screens', `${slug}.dart`)];
+  const out = [path.join('lib', 'screens', `${slug}.dart`)];
+  if (semanticFileBase) out.push(path.join('lib', 'screens', `${semanticFileBase}.dart`));
+  return out;
 }
 
 /**
@@ -122,10 +145,10 @@ export async function reconcileScreen(opts: {
   const legalRouteConsts = new Set([...plan.values()].map(p => p.routeConst));
   legalRouteConsts.add('entry');
 
-  const rel = [
-    ...screenFilesFor(canonical, canonicalId),
+  const rel = [...new Set([
+    ...screenFilesFor(canonical, canonicalId, plan.get(canonicalId)?.fileBase),
     ...(opts.previewEntry ? [opts.previewEntry] : []),
-  ];
+  ])];
   const flags: ReconcileFlag[] = [];
   const inspected: string[] = [];
   let text = '';
@@ -185,6 +208,38 @@ export async function reconcileScreen(opts: {
   if (nStyle >= INLINE_TEXTSTYLE_THRESHOLD) {
     flags.push({ code: 'inline-textstyle', severity: 'med',
       message: `${nStyle} inline text-style literal(s) (TextStyle(…)/GoogleFonts.*) — use the theme's text styles instead of inlining the type scale.` });
+  }
+
+  // 5. P1-core: PLACEHOLDER / DEFERRAL markers (HIGH — demotes to needs-review).
+  // Only comments + string literals are scanned, so `Placeholder()` the widget or a
+  // `placeholder:` named argument in CODE never false-fires; a comment/string that
+  // says "placeholder" / "real frames come later" is a self-issued, untracked IOU.
+  {
+    COMMENT_OR_STRING_RE.lastIndex = 0;
+    let m: RegExpExecArray | null;
+    let hit: string | null = null;
+    while ((m = COMMENT_OR_STRING_RE.exec(text))) {
+      if (PLACEHOLDER_RE.test(m[0])) { hit = m[0]; break; }
+    }
+    if (hit) {
+      const sample = hit.replace(/\s+/g, ' ').trim().slice(0, 120);
+      flags.push({ code: 'deferred-placeholder', severity: 'high',
+        message: `placeholder/deferral marker in the built screen (${JSON.stringify(sample)}) — deferred/placeholder implementations are forbidden; build the real content now.` });
+    }
+  }
+
+  // 6. P1-core: DEAD interaction handlers (HIGH). An `onTap: () {}` /
+  // `onPressed: () => {}` looks wired in the screenshot but does nothing at runtime
+  // — list each so the fix pass targets them precisely.
+  {
+    DEAD_HANDLER_RE.lastIndex = 0;
+    const dead: string[] = [];
+    let m: RegExpExecArray | null;
+    while ((m = DEAD_HANDLER_RE.exec(text))) dead.push(`on${m[1]}`);
+    if (dead.length) {
+      flags.push({ code: 'dead-handler', severity: 'high',
+        message: `${dead.length} empty interaction handler(s) (${dead.join(', ')}) — every visible control must do something real (navigate via AppRoutes, present its modal, or mutate state).` });
+    }
   }
 
   const ok = !flags.some(f => f.severity === 'high');
