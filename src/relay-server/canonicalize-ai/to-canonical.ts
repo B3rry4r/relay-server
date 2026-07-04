@@ -135,6 +135,9 @@ export function aiModelToCanonical(model: CanonicalModel): Canonical {
       fromCanonicalId: from,
       toCanonicalId: to,
       kind: e.kind,
+      // Step-modal provenance carries through verbatim (a viaModal edge only exists
+      // when the modal was BOUND to a base, so its m_ id is never in modalIdRemap).
+      ...(e.viaModalId ? { viaModalId: e.viaModalId } : {}),
       ...(e.label ? { label: e.label } : {}),
     });
   }

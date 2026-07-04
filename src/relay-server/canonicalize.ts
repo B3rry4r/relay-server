@@ -33,7 +33,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import type { RunFlow, RunScreen } from './build-run-store';
-import { deriveSemanticIdentifiers } from './semantic-names';
+import { deriveSemanticIdentifiers, tokenizeName } from './semantic-names';
 
 // ── canonical.json schema (RFC §4.1) ─────────────────────────────────────────
 export interface CanonicalState { id: string; frameId: string }
@@ -56,9 +56,15 @@ export interface CanonicalTemplate { id: string; memberCanonicalIds: string[] }
 export interface CanonicalFlowEdge {
   fromCanonicalId: string;
   toCanonicalId: string;
-  /** 'overlay' when the target is a modal/sheet, else the original edge type. */
-  kind: 'push' | 'tab' | 'overlay' | string;
+  /** 'overlay' when the target is a modal/sheet, else the original edge type
+   *  ('push' | 'replace' | 'tab' | …). 'replace' is preserved end-to-end so
+   *  flow-wiring can demand a replacement nav verb. */
+  kind: 'push' | 'replace' | 'tab' | 'overlay' | string;
   label?: string;
+  /** Step-modal provenance: the modal the raw edge originated FROM before it was
+   *  re-parented onto the modal's base screen. The base must present this modal —
+   *  the nav is triggered from inside it (see canonicalize-ai/reduce.ts). */
+  viaModalId?: string;
 }
 export interface CanonicalFlow {
   entryCanonicalId: string | null;
@@ -394,6 +400,11 @@ export function buildCanonical(frames: FrameInput[], flow?: RunFlow): Canonical 
     const modalFrameId = frames[i].frameId;
     const modalId = 'modal_' + modalFrameId.replace(/[^a-zA-Z0-9]+/g, '_');
     // Find an incoming edge whose type is modal/overlay/sheet, else any incoming edge.
+    // KNOWN LIMITATION: this deterministic path has NO vision data, so the edge-from
+    // screen is trusted as the base unconditionally. The AI path (canonicalize-ai/
+    // reduce.ts) prefers the describe descriptor's VISUAL backdrop (isModalGuess)
+    // when it names a different existing screen — the rendered backdrop, not the
+    // prototype edge topology, is what the modal is composited over.
     let baseCanonicalId: string | null = null;
     const incoming = (flow?.connections ?? []).filter(c => c.to === modalFrameId);
     const modalEdge = incoming.find(c => /modal|sheet|overlay/i.test(c.type)) ?? incoming[0];
@@ -750,6 +761,57 @@ export function planSemanticScreens(canonical: Canonical): Map<string, ScreenSem
 export interface SkeletonResult {
   files: string[];           // project-relative files written
   routes: Array<{ canonicalId: string; route: string; className: string; routeConst: string; file: string }>;
+  /** The tab cluster hosted by lib/screens/app_shell.dart (absent when no tabs). */
+  tabCluster?: { hubId: string; memberIds: string[] };
+}
+
+// ── P2: the app-shell tab cluster ─────────────────────────────────────────────
+// `kind:'tab'` edges describe ONE persistent bottom-nav shell, not N pushes: the
+// destinations live side-by-side in an IndexedStack behind a single shared bottom
+// nav. Without a shell every tab screen improvises its own raster navbar and
+// pushNamed's its siblings (Ping audit). The cluster = the HUB (the tab-edge
+// source that is not itself a tab destination — e.g. home) + the destinations of
+// the hub's own tab edges, hub-first then edge order. Tab edges that originate
+// from a non-hub screen (e.g. scan → a deeper scan mode) do NOT enlarge the shell.
+export function computeTabCluster(canonical: Canonical): { hubId: string; memberIds: string[] } | null {
+  const tabEdges = (canonical.flow?.edges ?? []).filter(e => e.kind === 'tab');
+  if (!tabEdges.length) return null;
+  const screenIds = new Set(canonical.screens.map(s => s.canonicalId));
+  const tabTargets = new Set(tabEdges.map(e => e.toCanonicalId));
+  const sources = [...new Set(tabEdges.map(e => e.fromCanonicalId))].filter(id => screenIds.has(id));
+  if (!sources.length) return null;
+  const outCount = (id: string) => tabEdges.filter(e => e.fromCanonicalId === id).length;
+  const hubCandidates = sources.filter(id => !tabTargets.has(id));
+  const hubId = (hubCandidates.length ? hubCandidates : sources)
+    .sort((a, b) => outCount(b) - outCount(a) || a.localeCompare(b))[0];
+  const memberIds = [hubId];
+  for (const e of tabEdges) {
+    if (e.fromCanonicalId !== hubId) continue;
+    if (screenIds.has(e.toCanonicalId) && !memberIds.includes(e.toCanonicalId)) memberIds.push(e.toCanonicalId);
+  }
+  return memberIds.length >= 2 ? { hubId, memberIds } : null;
+}
+
+/** A generic Material icon for a tab, keyed off the screen name (placeholder
+ *  visuals — per-screen builds refine them; taps only ever switch the index). */
+function tabIconFor(name: string): string {
+  const n = name.toLowerCase();
+  if (/home|dash/.test(n)) return 'Icons.home_outlined';
+  if (/scan|qr|camera/.test(n)) return 'Icons.qr_code_scanner';
+  if (/histor|transaction|activity/.test(n)) return 'Icons.receipt_long_outlined';
+  if (/setting|preference/.test(n)) return 'Icons.settings_outlined';
+  if (/profile|account|user|me\b/.test(n)) return 'Icons.person_outline';
+  if (/card|wallet|pay/.test(n)) return 'Icons.credit_card_outlined';
+  if (/chat|message|inbox|mail/.test(n)) return 'Icons.chat_bubble_outline';
+  if (/search|explore|discover/.test(n)) return 'Icons.search';
+  return 'Icons.circle_outlined';
+}
+
+/** Human tab label from a canonical screen name ("scanAndPayScreen" → "Scan And Pay"). */
+function tabLabelFor(name: string): string {
+  const words = tokenizeName(name).filter(w => w !== 'screen');
+  const label = words.map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+  return label || name;
 }
 
 /**
@@ -829,6 +891,90 @@ class ${className} extends StatelessWidget {
     catch { await fs.writeFile(path.join(projectRoot, rel), stub, 'utf-8'); files.push(rel); }
   }
 
+  // P2: APP SHELL for the tab cluster. `kind:'tab'` edges are ONE persistent
+  // bottom-nav shell: the tab screens live side-by-side in an IndexedStack behind
+  // a single shared bottom nav (taps only setState the index). Route names are
+  // UNCHANGED — the router returns AppShell(initialIndex: i) for each tab route,
+  // so non-tab screens still push those routes by name and land in the shell.
+  // Always regenerated + write-locked, like the router.
+  const tabCluster = computeTabCluster(canonical) ?? undefined;
+  const shellByCanonicalId = new Map<string, number>();   // tab canonicalId → index
+  if (tabCluster) {
+    const members = tabCluster.memberIds
+      .map(id => ({ id, sem: semantics.get(id)!, screen: canonical.screens.find(s => s.canonicalId === id)! }))
+      .filter(m => m.sem && m.screen);
+    members.forEach((m, i) => shellByCanonicalId.set(m.id, i));
+    const shellRel = path.join('lib', 'screens', 'app_shell.dart');
+    const shellImports = members.map(m => `import '${m.sem.fileBase}.dart';`).join('\n');
+    const navItems = members
+      .map(m => `          BottomNavigationBarItem(icon: Icon(${tabIconFor(m.screen.name)}), label: '${tabLabelFor(m.screen.name).replace(/'/g, "\\'")}'),`)
+      .join('\n');
+    const stackChildren = members.map(m => `          ${m.sem.className}(),`).join('\n');
+    await fs.writeFile(path.join(projectRoot, shellRel), `// GENERATED SKELETON — write-locked APP SHELL (tab cluster host).
+// Write-locked like the router: per-screen builds refine the hosted screens,
+// NOT this file. Tab screens are hosted in an IndexedStack behind ONE shared
+// bottom nav — a hosted screen must NOT render its own bottom navigation bar
+// and must NEVER Navigator.push a tab route; tab switching is this shell's job.
+// tabCluster: ${members.map(m => m.id).join(', ')}
+import 'package:flutter/material.dart';
+${shellImports}
+
+class AppShell extends StatefulWidget {
+  const AppShell({super.key, this.initialIndex = 0});
+  final int initialIndex;
+
+  @override
+  State<AppShell> createState() => _AppShellState();
+}
+
+class _AppShellState extends State<AppShell> {
+  late int _index = widget.initialIndex;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: IndexedStack(
+        index: _index,
+        children: <Widget>[
+${stackChildren}
+        ],
+      ),
+      bottomNavigationBar: AppShellBottomNav(
+        currentIndex: _index,
+        onTap: (i) => setState(() => _index = i),   // taps ONLY switch the index
+      ),
+    );
+  }
+}
+
+/// The ONE shared bottom nav for the whole tab cluster (themed via the app
+/// theme; generic icons + screen-name labels — per-screen builds refine visuals
+/// by restyling the app theme, never by adding their own navbars).
+class AppShellBottomNav extends StatelessWidget {
+  const AppShellBottomNav({super.key, required this.currentIndex, required this.onTap});
+  final int currentIndex;
+  final ValueChanged<int> onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return BottomNavigationBar(
+      currentIndex: currentIndex,
+      onTap: onTap,
+      type: BottomNavigationBarType.fixed,
+      backgroundColor: theme.colorScheme.surface,
+      selectedItemColor: theme.colorScheme.primary,
+      unselectedItemColor: theme.colorScheme.onSurface.withValues(alpha: 0.55),
+      items: const <BottomNavigationBarItem>[
+${navItems}
+      ],
+    );
+  }
+}
+`, 'utf-8');
+    files.push(shellRel);
+  }
+
   // Theme/token stub (the digest planner / first screen fills tokens in).
   const themeRel = path.join('lib', 'theme', 'app_theme.dart');
   try { await fs.access(path.join(projectRoot, themeRel)); }
@@ -857,8 +1003,17 @@ ${routeConsts || '  // (no routes)'}
   files.push(routesRel);
 
   const routerRel = path.join('lib', 'app_router.dart');
-  const imports = routes.map(r => `import 'screens/${path.basename(r.file, '.dart')}.dart';`).join('\n');
-  const cases = routes.map(r => `      case '${r.route}': return MaterialPageRoute(builder: (_) => const ${r.className}());`).join('\n');
+  // Tab-cluster routes return AppShell(initialIndex: i) — the SAME route names, so
+  // non-tab screens still push them by name and land inside the shell. Their screen
+  // imports move into app_shell.dart (the router would hold unused imports).
+  const isTab = (r: SkeletonResult['routes'][number]) => shellByCanonicalId.has(r.canonicalId);
+  const imports = [
+    ...(tabCluster ? [`import 'screens/app_shell.dart';`] : []),
+    ...routes.filter(r => !isTab(r)).map(r => `import 'screens/${path.basename(r.file, '.dart')}.dart';`),
+  ].join('\n');
+  const cases = routes.map(r => isTab(r)
+    ? `      case '${r.route}': return MaterialPageRoute(builder: (_) => const AppShell(initialIndex: ${shellByCanonicalId.get(r.canonicalId)!}));`
+    : `      case '${r.route}': return MaterialPageRoute(builder: (_) => const ${r.className}());`).join('\n');
   await fs.writeFile(path.join(projectRoot, routerRel), `// GENERATED SKELETON — central router (every canonical route registered).
 // Write-locked: per-screen builds fill the screen widgets, not this table.
 import 'package:flutter/material.dart';
@@ -886,7 +1041,7 @@ ${cases || '          // (no routes)'}
 `, 'utf-8');
   files.push(routerRel);
 
-  return { files, routes };
+  return { files, routes, ...(tabCluster ? { tabCluster } : {}) };
 }
 
 /** Convenience: run the pre-pass over a run's screens + flow. */

@@ -47,7 +47,7 @@ import { getProjectsRoot } from './runtime';
 import {
   canonicalizeRun, writeCanonical, readCanonical, generateFlutterSkeleton,
   restampCanonicalHeaders, cleanOrphanScreens, syncLiveCanonical,
-  nukeGeneratedAppSurface, planSemanticScreens,
+  nukeGeneratedAppSurface, planSemanticScreens, computeTabCluster,
   type Canonical, type CanonicalScreen,
 } from './canonicalize';
 import { canonicalize as aiCanonicalize, type CanonicalizeOptions } from './canonicalize-ai/orchestrate';
@@ -424,7 +424,7 @@ function canonicalRouteResolver(canonical?: Canonical): ((frameId: string) => st
   return (frameId: string) => routeByFrame.get(frameId) ?? routeNameFor(frameId);
 }
 
-function buildAppPlan(run: import('./build-run-store').BuildRun, canonical?: Canonical): string {
+export function buildAppPlan(run: import('./build-run-store').BuildRun, canonical?: Canonical): string {
   const nameById = new Map(run.screens.map(s => [s.frameId, s.frameName]));
   // ONE route scheme: canonical (canonicalId-derived) when canonicalized, else the
   // legacy frameName slug. Keyed on frameId so canonical + legacy agree (audit A.3).
@@ -451,7 +451,33 @@ function buildAppPlan(run: import('./build-run-store').BuildRun, canonical?: Can
   }
   out.push(`Screens (name → route):`);
   for (const s of run.screens) out.push(`- "${s.frameName}" → ${routeFor(s.frameId, s.frameName)}`);
-  if (run.flow?.connections?.length) {
+  // P2: nav graph. When canonicalized, render the CANONICAL edges — they carry the
+  // preserved 'replace' kind + the step-modal provenance (viaModalId: a nav that is
+  // triggered from INSIDE a sheet, which the base screen must present first, never
+  // skip). Legacy (non-canonical) runs keep the raw frame-level rendering.
+  const canonEdges = canonical?.flow?.edges;
+  if (canonEdges?.length) {
+    const screenById = new Map(canonical!.screens.map(s => [s.canonicalId, s]));
+    const modalById = new Map<string, { frameId: string; baseName: string }>();
+    for (const s of canonical!.screens) for (const m of s.modals) modalById.set(m.id, { frameId: m.frameId, baseName: s.name });
+    const nameOf = (id: string): string => {
+      const s = screenById.get(id);
+      if (s) return s.name;
+      const m = modalById.get(id);
+      if (m) return nameById.get(m.frameId) ?? id;
+      return id;
+    };
+    out.push(`Navigation graph (build these transitions, no dead ends):`);
+    for (const e of canonEdges) {
+      let line = `- "${nameOf(e.fromCanonicalId)}" --(${e.kind}${e.label ? ` "${e.label}"` : ''})--> "${nameOf(e.toCanonicalId)}"`;
+      if (e.viaModalId) {
+        const via = modalById.get(e.viaModalId);
+        const modalName = via ? (nameById.get(via.frameId) ?? e.viaModalId) : e.viaModalId;
+        line += `  [FROM INSIDE the '${modalName}' sheet — the sheet's confirm action navigates; the base screen must NOT skip the sheet]`;
+      }
+      out.push(line);
+    }
+  } else if (run.flow?.connections?.length) {
     out.push(`Navigation graph (build these transitions, no dead ends):`);
     for (const c of run.flow.connections) {
       const f = nameById.get(c.from) || c.from, t = nameById.get(c.to) || c.to;
@@ -666,6 +692,15 @@ export function buildCanonicalContext(canonical: Canonical, cs: CanonicalScreen,
   const leadFrameId = cs.states[0]?.frameId ?? cs.frameIds[0];
   const leadSpec = leadFrameId ? specOf(leadFrameId) : undefined;
   const className = planSemanticScreens(canonical).get(cs.canonicalId)?.className ?? 'the screen widget';
+  // P2: a TAB-cluster member is HOSTED — the shared AppShell owns the bottom nav
+  // and tab switching. Without this, every tab screen improvises its own raster
+  // navbar + pushNamed's its siblings (Ping audit).
+  const tabCluster = computeTabCluster(canonical);
+  if (tabCluster?.memberIds.includes(cs.canonicalId)) {
+    out.push(
+      `APP SHELL — this screen is a TAB destination hosted inside AppShell (lib/screens/app_shell.dart, an IndexedStack over the tab cluster). Do NOT render your own bottom navigation bar — the shell owns it (one shared bottom nav for all tabs). Never Navigator.push a tab route from inside a tab screen; tab switching is the shell's job (it only changes the IndexedStack index). Build this screen's body WITHOUT any bottom nav.`,
+    );
+  }
   let foldedPayloads = 0;
   if (cs.states.length > 1) {
     out.push(`States (one widget + a state param — NOT separate routes; each state is verified individually against its own reference):`);

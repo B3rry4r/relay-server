@@ -19,8 +19,11 @@
 //      only ever splits/merges AMBIGUOUS clusters the deterministic pass flagged.
 //   3. MODAL BINDING — a frame whose role is modal/sheet, OR that is the target of a
 //      flow edge of type 'modal', is a MODAL: bound to its BASE screen + a TRIGGER.
-//      The flow's modal edges are AUTHORITATIVE for base+trigger; the descriptor's
-//      isModalGuess is the FALLBACK. Modals are NOT standalone screens.
+//      The flow's modal edges give the TRIGGER; the descriptor's isModalGuess is the
+//      VISUAL-BACKDROP witness — when it names a DIFFERENT existing screen than the
+//      edge-from, the visual backdrop wins for the base (the modal is composited
+//      over those pixels) and a warning records the override. With no edge it is
+//      the fallback binder. Modals are NOT standalone screens.
 //   4. TEMPLATES — screens sharing a layout skeleton (matching section sequence /
 //      structural fingerprint) become a template + members.
 //   5. COMPONENTS — lexicon entries (base + learned) whose widgets recur across ≥2
@@ -55,6 +58,7 @@ import { resolveProjectRoot, createTerminalEnv, resolveWorkspace } from '../runt
 import { requireModel } from '../ai-observability';
 import type { AIModel } from '../ai-adapters';
 import { LEXICON_VERSION, WIDGET_KIND_SET } from './lexicon';
+import { tokenizeName } from '../semantic-names';
 import type { FrameDescriptor, DescriptorWidget } from './descriptor-schema';
 import type { FrozenLexicon } from './reconcile';
 
@@ -133,9 +137,18 @@ export interface CanonicalComponent {
 export interface CanonicalFlowEdge {
   from: string;
   to: string;
-  /** 'push' | 'tab' | 'overlay' (modal→overlay) | the original type. */
+  /** 'push' | 'replace' | 'tab' | 'overlay' (modal→overlay) | the original type.
+   *  'replace' is PRESERVED (not collapsed to push) so downstream verification can
+   *  demand a replacement nav verb (pushReplacementNamed / …AndRemoveUntil). */
   kind: string;
   label?: string;
+  /**
+   * PROVENANCE (step-modals): set when the RAW edge's `from` was a MODAL frame that
+   * got re-parented onto its base screen (edges must connect screens). The nav is
+   * triggered FROM INSIDE this modal (e.g. a sheet's Confirm button) — the base
+   * screen must present the sheet first, never navigate directly and skip the step.
+   */
+  viaModalId?: string;
 }
 export interface CanonicalFlow {
   entryCanonicalId: string | null;
@@ -567,8 +580,39 @@ export async function reduceToCanonical(
   // stable screen ordering by canonicalId.
   screens.sort((a, b) => a.canonicalId.localeCompare(b.canonicalId));
 
-  // 3. MODAL BINDING — flow modal edge AUTHORITATIVE for base+trigger; isModalGuess
-  // (then AI modalBase) is the fallback. Modals are NOT screens.
+  // 3. MODAL BINDING — the flow modal edge gives the TRIGGER (which screen opens
+  // the modal); the describe descriptor's isModalGuess (then the AI modalBase) is
+  // the VISUAL-BACKDROP witness. When the vision answer identifies a DIFFERENT
+  // existing screen than the edge-from, the VISUAL backdrop wins for
+  // baseCanonicalId — the modal is composited over that screen's pixels, so the
+  // presentation must match what the design actually renders (real failure: Ping
+  // frame 290:4323, a loading modal whose flow edge came FROM the OTP screen but
+  // whose rendered backdrop is the card list). The trigger keeps the edge-from
+  // screen. Modals are NOT screens.
+  //
+  // Resolve a visual-backdrop guess (a semanticName like "cardListScreen") onto a
+  // reduced screen: exact semKey match first, then a CONSERVATIVE token-containment
+  // match (guess tokens ⊆ screen-name tokens or vice versa, generic suffix words
+  // stripped) that must be UNIQUE — an ambiguous or unresolvable guess returns null
+  // (no guessing; the flow edge stands).
+  const GENERIC_NAME_TOKENS = new Set(['screen', 'sheet', 'modal', 'page', 'view', 'overlay', 'dialog', 'popup']);
+  const guessTokensOf = (name: string): Set<string> =>
+    new Set(tokenizeName(name).filter(t => !GENERIC_NAME_TOKENS.has(t)));
+  const isSubset = (a: Set<string>, b: Set<string>): boolean => {
+    if (!a.size) return false;
+    for (const t of a) if (!b.has(t)) return false;
+    return true;
+  };
+  const screenTokenIndex = screens.map(s => ({ id: s.canonicalId, tokens: guessTokensOf(s.name) }));
+  const resolveBackdropGuess = (guessName: string | undefined): string | null => {
+    if (!guessName) return null;
+    const exact = semKeyToScreenId.get(semKey(guessName));
+    if (exact) return exact;
+    const gt = guessTokensOf(guessName);
+    if (!gt.size) return null;
+    const hits = screenTokenIndex.filter(s => isSubset(gt, s.tokens) || isSubset(s.tokens, gt));
+    return hits.length === 1 ? hits[0].id : null;   // ambiguous → no guessing
+  };
   //
   // First CLUSTER + DEDUP modal frames the same way screens are: modal frames with the
   // same (fingerprint + sem + role) are the SAME modal in different states (e.g. an
@@ -588,7 +632,8 @@ export async function reduceToCanonical(
     let baseCanonicalId: string | null = null;
     let trigger: CanonicalModalTrigger | null = null;
     let edgeType = 'modal';
-    // (a) authoritative: a flow modal edge into ANY sibling frame of this modal.
+    // (a) a flow modal edge into ANY sibling frame of this modal gives the TRIGGER
+    // (fromScreen = edge-from) and the default base.
     for (const s of siblings) {
       const edge = flowModalEdgeFor(s.frameId);
       if (edge && screenByFrame.has(edge.from)) {
@@ -599,9 +644,30 @@ export async function reduceToCanonical(
       }
       if (edge) edgeType = edge.type;
     }
+    // (a') VISUAL-BACKDROP OVERRIDE: when the 1a describe descriptor (or the AI
+    // modalBase refinement) SAW a different existing screen as the rendered
+    // backdrop, prefer it for baseCanonicalId — presentation must match the pixels
+    // the modal is composited over. The trigger keeps the edge-from screen (that IS
+    // where the user navigates from). Unresolvable/ambiguous guesses change nothing.
+    if (baseCanonicalId && trigger) {
+      let visualBase = resolveBackdropGuess(lead.isModalGuess?.base);
+      if (!visualBase) {
+        for (const s of siblings) {
+          const bf = refinement?.modalBase?.[s.frameId];
+          const sid = bf ? screenByFrame.get(bf) : undefined;
+          if (sid) { visualBase = sid; break; }
+        }
+      }
+      if (visualBase && visualBase !== baseCanonicalId) {
+        warnings.push(
+          `modal "${lead.semanticName}" (${lead.frameId}): flow edge comes from "${baseCanonicalId}" but the described visual backdrop is "${lead.isModalGuess?.base ?? visualBase}" (${visualBase}) — base overridden to the VISUAL backdrop (the modal is composited over that screen's pixels); the trigger stays on the edge-from screen`,
+        );
+        baseCanonicalId = visualBase;
+      }
+    }
     // (b) fallback: the lead descriptor's isModalGuess.base (a semanticName).
     if (!baseCanonicalId && lead.isModalGuess?.base) {
-      const sid = semKeyToScreenId.get(semKey(lead.isModalGuess.base));
+      const sid = resolveBackdropGuess(lead.isModalGuess.base);
       if (sid) {
         baseCanonicalId = sid;
         trigger = { fromScreen: sid, edgeType: 'modal', ...(lead.isModalGuess.trigger ? { element: lead.isModalGuess.trigger } : {}) };
@@ -728,20 +794,29 @@ export async function reduceToCanonical(
   const seen = new Set<string>();
   const edges: CanonicalFlowEdge[] = [];
   for (const c of safeFlow.connections) {
+    // PROVENANCE: an edge FROM a modal frame is re-parented onto the modal's base
+    // screen (edges connect screens), but the step is NOT erased — viaModalId
+    // records the modal so prompts/verification keep the sheet in the flow (real
+    // failure: Ping "Selected Bank" sheet's Confirm→QR push read as base→QR and
+    // the sheet step became skippable).
+    const fromModal = modalForFrame(c.from);
     const from = resolveSource(c.from);
     const toR = resolveTarget(c.to);
     if (!from || !toR) continue;
     const to = toR.id;
     if (!from || !to) continue;
     if (from === to && !toR.overlay) continue;     // intra-screen → state transition (dropped)
-    const kind = toR.overlay ? 'overlay' : (c.type === 'replace' ? 'push' : c.type);
-    const key = `${from}|${to}|${kind}`;
+    // 'replace' is PRESERVED (previously collapsed to 'push', which let a plain
+    // pushNamed satisfy splash/welcome replace edges downstream).
+    const kind = toR.overlay ? 'overlay' : c.type;
+    const viaModalId = fromModal?.canonicalId;
+    const key = `${from}|${to}|${kind}|${viaModalId ?? ''}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    edges.push({ from, to, kind, ...(c.label ? { label: c.label } : {}) });
+    edges.push({ from, to, kind, ...(viaModalId ? { viaModalId } : {}), ...(c.label ? { label: c.label } : {}) });
   }
-  // stable edge ordering.
-  edges.sort((a, b) => (a.from.localeCompare(b.from)) || (a.to.localeCompare(b.to)) || a.kind.localeCompare(b.kind));
+  // stable edge ordering (viaModalId tiebreak keeps parallel provenance edges deterministic).
+  edges.sort((a, b) => (a.from.localeCompare(b.from)) || (a.to.localeCompare(b.to)) || a.kind.localeCompare(b.kind) || (a.viaModalId ?? '').localeCompare(b.viaModalId ?? ''));
 
   if (!safeFlow.connections.length) {
     warnings.push('flow has 0 edges — no navigation graph; nav + modal binding must be set manually (HITL checkpoint)');
@@ -813,7 +888,7 @@ function hashCanonical(c: CanonicalModel): string {
       .sort((a, b) => a.id.localeCompare(b.id)),
     templates: [...c.templates].map(t => ({ id: t.id, m: [...t.memberCanonicalIds].sort(), s: t.sharedSections })).sort((a, b) => a.id.localeCompare(b.id)),
     components: [...c.components].map(cm => ({ n: cm.canonicalName, k: cm.kind, u: [...cm.usedIn].sort(), c: cm.count })).sort((a, b) => a.n.localeCompare(b.n)),
-    flow: { entry: c.flow.entryCanonicalId, edges: [...c.flow.edges].map(e => `${e.from}>${e.to}:${e.kind}`).sort() },
+    flow: { entry: c.flow.entryCanonicalId, edges: [...c.flow.edges].map(e => `${e.from}>${e.to}:${e.kind}${e.viaModalId ? `@${e.viaModalId}` : ''}`).sort() },
   };
   return crypto.createHash('sha256').update(JSON.stringify(shape)).digest('hex').slice(0, 16);
 }

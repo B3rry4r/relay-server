@@ -282,12 +282,16 @@ const PASSES: PassDef[] = [
           wired: s.wired,
           autoFixesApplied: r.autoFixesApplied,
           wrongTarget: s.wrongTarget,
+          wrongVerb: s.wrongVerb,
+          tabAsPush: s.tabAsPush,
+          missingStepPresenter: s.missingStepPresenter,
           missing: s.missing,
           deadTrigger: s.deadTrigger,
           unmapped: s.unmapped,
         },
         warnings: r.report.findings
-          .filter((f) => f.status === 'wrong-target' || f.status === 'missing' || f.status === 'unmapped')
+          .filter((f) => f.status === 'wrong-target' || f.status === 'missing' || f.status === 'unmapped'
+            || f.status === 'wrong-verb' || f.status === 'tab-as-push' || f.status === 'missing-step-presenter')
           .map((f) => `${f.from}→${f.to} [${f.status}]: ${f.detail}`),
       };
     },

@@ -50,6 +50,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import type { AIModel } from '../ai-adapters';
 import { tokenizeName } from '../semantic-names';
+import { modalPresenterName } from '../design-system';
 
 // ── Public contract ──────────────────────────────────────────────────────────
 
@@ -58,6 +59,9 @@ export type Framework = 'flutter' | 'react' | 'unknown';
 export type EdgeStatus =
   | 'wired'         // a nav call from FROM lands on TO's route
   | 'wrong-target'  // a nav call exists on FROM but lands on a DIFFERENT route
+  | 'wrong-verb'    // P2 (med): a 'replace' edge lands on TO but via a plain push verb (stack keeps the old route) — NOT auto-fixed
+  | 'tab-as-push'   // P2 (high): a 'tab' edge implemented as a route push instead of being hosted in AppShell
+  | 'missing-step-presenter' // P2: a viaModal edge where FROM navigates directly but never presents the modal (the sheet step is skippable)
   | 'missing'       // no nav call on FROM reaches TO and no matching dead trigger
   | 'dead-trigger'  // the element exists on FROM but its handler is empty/TODO
   | 'duplicate'     // TO modal is the SAME UI as a standalone built screen (intentional dup, NOT a gap)
@@ -137,6 +141,12 @@ export interface FlowWiringReport {
     totalEdges: number;
     wired: number;
     wrongTarget: number;
+    /** P2 (med): replace edges landing on TO via a plain push verb. */
+    wrongVerb: number;
+    /** P2 (high): tab edges implemented as pushes instead of AppShell hosting. */
+    tabAsPush: number;
+    /** P2: viaModal edges where the base navigates directly, skipping the sheet. */
+    missingStepPresenter: number;
     missing: number;
     deadTrigger: number;
     /** modal edges that are an intentional duplicate of a standalone built screen (benign). */
@@ -161,8 +171,10 @@ export interface FlowWiringResult {
 
 // ── Canonical model (subset we read) ─────────────────────────────────────────
 
-// Internal normalized edge shape the pass reads (`.from`/`.to`).
-interface CanonFlowEdge { from: string; to: string; kind: string; label?: string }
+// Internal normalized edge shape the pass reads (`.from`/`.to`). `viaModalId` is
+// the step-modal provenance (the nav is triggered from INSIDE that modal — the
+// FROM screen must present it, not navigate directly).
+interface CanonFlowEdge { from: string; to: string; kind: string; label?: string; viaModalId?: string }
 interface CanonFlow { entryCanonicalId: string | null; edges: CanonFlowEdge[] }
 
 /**
@@ -177,6 +189,7 @@ interface RawCanonFlowEdge {
   to?: string;
   kind?: string;
   label?: string;
+  viaModalId?: string;
 }
 interface RawCanonFlow { entryCanonicalId?: string | null; edges?: RawCanonFlowEdge[] }
 /** A modal as it lives on disk: nested under its base screen's `modals[]`. */
@@ -224,6 +237,7 @@ function normalizeFlow(raw: RawCanonFlow | undefined): CanonFlow | undefined {
     to: e.toCanonicalId ?? e.to ?? '',
     kind: e.kind ?? '',
     ...(e.label != null ? { label: e.label } : {}),
+    ...(e.viaModalId != null ? { viaModalId: e.viaModalId } : {}),
   }));
   return { entryCanonicalId: raw.entryCanonicalId ?? null, edges };
 }
@@ -335,6 +349,9 @@ function summarize(findings: EdgeFinding[], autoFixes: number, mapped: number, r
     totalEdges: findings.length,
     wired: count('wired'),
     wrongTarget: count('wrong-target'),
+    wrongVerb: count('wrong-verb'),
+    tabAsPush: count('tab-as-push'),
+    missingStepPresenter: count('missing-step-presenter'),
     missing: count('missing'),
     deadTrigger: count('dead-trigger'),
     duplicate: count('duplicate'),
@@ -564,6 +581,17 @@ async function verifyFlutter(
   const findings: EdgeFinding[] = [];
   let autoFixes = 0;
 
+  // P2: the app-shell source (lib/screens/app_shell.dart), read once. A `tab` edge
+  // is wired ONLY when the destination screen class is hosted in the shell's
+  // IndexedStack — a pushNamed to a tab route is the `tab-as-push` defect.
+  let shellSrcCache: string | null | undefined;
+  const readShellSrc = async (): Promise<string | null> => {
+    if (shellSrcCache !== undefined) return shellSrcCache;
+    try { shellSrcCache = await fs.readFile(path.join(projectRoot, 'lib', 'screens', 'app_shell.dart'), 'utf8'); }
+    catch { shellSrcCache = null; }
+    return shellSrcCache;
+  };
+
   // Cache file sources so multiple edges from the same FROM screen reuse the scan
   // AND see prior auto-fixes within this run (idempotent same-run mutation).
   const srcCache = new Map<string, string>();
@@ -672,9 +700,55 @@ async function verifyFlutter(
 
     const landsOnTo = navTargets.some((t) => routeMatches(t.route, toRoute, toConst));
 
+    // P2 TAB CONFORMANCE: a `tab` edge is a shell-hosting relationship, not a nav
+    // call. Wired ONLY when the app has an AppShell hosting the destination class;
+    // a push to the tab route is `tab-as-push` (high). With neither, the edge falls
+    // through to the normal ladder (missing / dead-trigger) below.
+    if (edge.kind === 'tab') {
+      const shellSrc = await readShellSrc();
+      if (shellSrc && shellSrc.includes(toScreen.widgetClass)) {
+        base.status = 'wired';
+        base.detail = `tab destination ${toScreen.widgetClass} is hosted in AppShell (IndexedStack) — the shell owns tab switching`;
+        findings.push(base);
+        continue;
+      }
+      if (landsOnTo) {
+        base.status = 'tab-as-push';
+        base.detail = `HIGH: tab edge implemented as a route push to ${toRoute ?? toConst} — tab destinations must be hosted in AppShell (IndexedStack + ONE shared bottom nav)${shellSrc ? `, but ${toScreen.widgetClass} is not registered in app_shell.dart` : `; no lib/screens/app_shell.dart exists`} (NOT auto-fixed)`;
+        findings.push(base);
+        continue;
+      }
+    }
+
+    // P2 STEP-MODAL PROVENANCE: a viaModal edge's nav belongs INSIDE the modal (the
+    // sheet's confirm action). Wired requires BOTH the P1-core presenter call-site
+    // (`showModal_<idCore>`) in the FROM (base) screen AND the nav call — the base
+    // navigating directly with no presenter skips the sheet step.
+    const presenterName = edge.viaModalId ? modalPresenterName(edge.viaModalId) : null;
+    const hasPresenter = presenterName ? fromSrc.includes(presenterName) : true;
+
     if (landsOnTo) {
+      if (presenterName && !hasPresenter) {
+        base.status = 'missing-step-presenter';
+        base.detail = `FROM navigates to TO's route (${toRoute ?? toConst}) but has no ${presenterName}( call-site — this nav is triggered from INSIDE the '${edge.viaModalId}' sheet; navigating directly skips the sheet step (NOT auto-fixed)`;
+        findings.push(base);
+        continue;
+      }
+      // P2 VERB CONFORMANCE: a 'replace' edge must use a replacement verb —
+      // a plain pushNamed keeps the old route on the stack (splash/welcome leak).
+      // 'push' edges accept any push verb (don't over-tighten); a target reached
+      // only via an unattributable const reference stays lenient too.
+      if (edge.kind === 'replace') {
+        const verbs = verbsForTarget(fromSrc, toRoute, toConst);
+        if (verbs.size > 0 && ![...verbs].some((v) => REPLACE_VERBS.has(v))) {
+          base.status = 'wrong-verb';
+          base.detail = `MED: 'replace' edge to ${toRoute ?? toConst} navigates via ${[...verbs].join('/')} — the design REPLACES the current route; use pushReplacementNamed / pushNamedAndRemoveUntil (NOT auto-fixed)`;
+          findings.push(base);
+          continue;
+        }
+      }
       base.status = 'wired';
-      base.detail = `FROM navigates to TO's route (${toRoute ?? toConst})`;
+      base.detail = `FROM navigates to TO's route (${toRoute ?? toConst})${presenterName ? ` from inside its viaModal sheet (presenter ${presenterName} present)` : ''}`;
       findings.push(base);
       continue;
     }
@@ -704,8 +778,10 @@ async function verifyFlutter(
 
       // SAFE AUTO-FIX: only when the TO route UNAMBIGUOUSLY exists (a known route
       // const) AND we are not in dry-run / no-fix mode. Wire the empty handler to
-      // push that route. Never touch wired edges; never guess targets.
-      const canFix = !opts.dryRun && !opts.noAutoFix && !!toConst;
+      // push that route. Never touch wired edges; never guess targets. P2: a
+      // viaModal edge with NO presenter is never auto-wired — that would create the
+      // exact direct-nav-skips-the-sheet defect this pass grades.
+      const canFix = !opts.dryRun && !opts.noAutoFix && !!toConst && hasPresenter;
       if (canFix) {
         const newSrc = wireDeadTrigger(fromSrc, triggerLoc, toConst!);
         if (newSrc && newSrc !== fromSrc) {
@@ -823,6 +899,31 @@ function collectNavTargets(src: string, constToRoute: Map<string, string>): NavT
     add(m[1], m[1]);
   }
 
+  return out;
+}
+
+// ── P2 verb conformance (replace edges) ───────────────────────────────────────
+
+/** Verbs that REPLACE the current route (satisfy a canonical 'replace' edge). */
+const REPLACE_VERBS = new Set([
+  'pushReplacementNamed', 'pushReplacement',
+  'pushNamedAndRemoveUntil', 'pushAndRemoveUntil', 'popAndPushNamed',
+]);
+
+/**
+ * The Navigator verbs a source uses to reach a SPECIFIC target (an AppRoutes const
+ * or a literal route). Empty when the target is only referenced without an
+ * attributable verb (e.g. an AppRoutes const passed through a variable) — callers
+ * must stay LENIENT then (no wrong-verb without verb evidence).
+ */
+function verbsForTarget(src: string, toRoute: string | null, toConst: string | null): Set<string> {
+  const out = new Set<string>();
+  const re = /\b(pushNamedAndRemoveUntil|pushReplacementNamed|popAndPushNamed|pushAndRemoveUntil|pushReplacement|pushNamed|push)\s*(?:<[^>]*>)?\s*\(\s*(?:context\s*,\s*)?(?:AppRoutes\.([A-Za-z0-9_]+)|'([^']+)')/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(src)) !== null) {
+    const target = m[2] ?? m[3];
+    if ((toConst && target === toConst) || (toRoute && target === toRoute)) out.add(m[1]);
+  }
   return out;
 }
 
