@@ -14,6 +14,7 @@ import {
 import { exists, resolveProjectRoot } from './runtime';
 import { getActiveTerminals } from './socket';
 import { getTunnelUrl, closeTunnel, listTunnels } from './tunnel-manager';
+import { listFlutterPreviewServers, stopFlutterPreviewServer } from './flutter-preview-server';
 
 // Kept for flutter-routes compatibility — now delegates to closeTunnel.
 export function invalidatePortTargetCache(port: number): void {
@@ -125,6 +126,25 @@ export function registerCoreRoutes(app: Express): void {
     const ports = await listListeningPorts();
     const tunnel = listTunnels().find(t => t.port === port);
     res.json({ port, active: ports.includes(port), url: tunnel?.url ?? null, label: `Port ${port}` });
+  });
+
+  // Close a preview "port card". When the port is a relay-managed preview server
+  // (a served Flutter release build), the server is actually STOPPED (tunnel too).
+  // A user's own dev server (started in a terminal) is never killed from here —
+  // the client just hides the card locally until the next rescan.
+  app.delete('/api/previews/:port', requireAuth, async (req, res) => {
+    const port = Number(req.params.port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      res.status(400).json({ error: 'invalid_port', message: 'Port must be between 1 and 65535.' });
+      return;
+    }
+    const managed = listFlutterPreviewServers().find((s) => s.port === port);
+    if (managed) {
+      await stopFlutterPreviewServer(managed.projectId);
+      res.json({ ok: true, port, managed: true, message: 'Preview server stopped.' });
+      return;
+    }
+    res.json({ ok: true, port, managed: false, message: 'Not a relay-managed preview; hide the card client-side.' });
   });
 
   // Returns (or creates) a Cloudflare quick tunnel for a local port.
