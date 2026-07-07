@@ -21,6 +21,7 @@ import { ScrollbackBuffer } from './scrollback';
 import { subscribeJobLog } from './ai-job-log';
 import { subscribeRunEvents } from './run-events';
 import { watchProject, type ProjectWatcher } from './project-watcher';
+import { attachRemoteTerminalProxy, isRemotePtyEnabled } from './remote-pty';
 import fsSync from 'node:fs';
 
 const activeShells = new Map<string, PtyLike>();
@@ -280,6 +281,21 @@ export function registerSocketHandlers(
         () => socket.emit('git:changed', { projectId }),
       );
     });
+
+    // REMOTE PTY MODE (RELAY_PTY_MODE=remote): terminal sessions are owned by
+    // the standalone relay-pty service so they survive relay-server redeploys.
+    // All terminal events are proxied 1:1 upstream; the client protocol is
+    // unchanged. Non-terminal plumbing above (watch:project, ai/run pushes)
+    // stays local. The embedded code below never runs in this mode.
+    if (isRemotePtyEnabled()) {
+      const remoteProxy = attachRemoteTerminalProxy(socket);
+      socket.on('disconnect', () => {
+        projectWatcher?.stop();
+        projectWatcher = null;
+        remoteProxy.dispose();
+      });
+      return;
+    }
 
     const getShell = (): PtyLike | null => {
       const fallbackId =

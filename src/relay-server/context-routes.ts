@@ -2,6 +2,7 @@ import type { Express } from 'express';
 import { getWorkspaceHealth } from './monitoring';
 import { getGitBranches, getGitStatus } from './git';
 import { getActiveTerminals } from './socket';
+import { fetchRemoteTerminals, isRemotePtyEnabled } from './remote-pty';
 import { listListeningPorts, listProjects } from './projects';
 import { exists, requireAuth, resolveProjectRoot, resolveWorkspace } from './runtime';
 
@@ -88,7 +89,17 @@ export function registerContextRoutes(app: Express): void {
       getWorkspaceHealth(),
       listProjects(),
       listListeningPorts(),
-      Promise.resolve(getActiveTerminals()),
+      // Remote PTY mode: sessions live in the relay-pty service. Best-effort
+      // here (empty list on failure) — a context snapshot should not 502 just
+      // because the PTY service is briefly unreachable.
+      isRemotePtyEnabled()
+        ? fetchRemoteTerminals()
+            .then((remote) => remote.map((t) => ({ ...t, scrollback: '' })))
+            .catch((error) => {
+              console.error('[relay] context snapshot: remote PTY service unreachable:', error);
+              return [];
+            })
+        : Promise.resolve(getActiveTerminals()),
     ]);
 
     const activeProjectId = request.activeProjectId ?? null;

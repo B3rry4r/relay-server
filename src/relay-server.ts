@@ -27,6 +27,7 @@ import {
   createPtyBridgeFactory,
   isPtyBridgeEnabled,
 } from './relay-server/pty-bridge-factory';
+import { getRemotePtyUrl, isRemotePtyEnabled } from './relay-server/remote-pty';
 import type { PtyFactory, PtyLike, RelayServer } from './relay-server/types';
 
 export type { PtyFactory, PtyLike, RelayServer } from './relay-server/types';
@@ -150,7 +151,13 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
     async start() {
       const port = Number.parseInt(process.env.PORT || '3000', 10);
       await ensureRelayRuntimeAssets(resolveWorkspace());
-      await restoreTerminalSessions(ptyFactory);
+      if (isRemotePtyEnabled()) {
+        // Remote PTY mode: sessions are owned by the relay-pty service and
+        // survive this process's restarts — nothing to restore locally.
+        console.log(`[relay] remote PTY mode — terminal sessions owned by ${getRemotePtyUrl() || '(RELAY_PTY_URL NOT SET!)'}`);
+      } else {
+        await restoreTerminalSessions(ptyFactory);
+      }
 
       await new Promise<void>((resolve, reject) => {
         const onError = (error: Error) => {
@@ -214,11 +221,15 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
       return address && typeof address === 'object' ? address.port : port;
     },
     async stop() {
-      await persistTerminalState();
-      setTerminalPersistenceSuppressed(true);
-      closeAllTerminalSessions(true);
-      setTerminalPersistenceSuppressed(false);
-      resetTerminalPersistenceRuntime();
+      if (!isRemotePtyEnabled()) {
+        // Embedded mode only — in remote mode the relay-pty service owns the
+        // sessions and MUST NOT have them persisted/closed from here.
+        await persistTerminalState();
+        setTerminalPersistenceSuppressed(true);
+        closeAllTerminalSessions(true);
+        setTerminalPersistenceSuppressed(false);
+        resetTerminalPersistenceRuntime();
+      }
 
       if (!httpServer.listening) {
         io.close();

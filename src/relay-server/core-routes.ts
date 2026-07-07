@@ -13,6 +13,7 @@ import {
 } from './projects';
 import { exists, resolveProjectRoot } from './runtime';
 import { getActiveTerminals } from './socket';
+import { fetchRemoteTerminals, isRemotePtyEnabled } from './remote-pty';
 import { getTunnelUrl, closeTunnel, listTunnels } from './tunnel-manager';
 import { listFlutterPreviewServers, stopFlutterPreviewServer } from './flutter-preview-server';
 
@@ -206,7 +207,22 @@ export function registerCoreRoutes(app: Express): void {
     res.json(await getWorkspaceHealth());
   });
 
-  app.get('/api/terminals', requireAuth, (_req, res) => {
+  app.get('/api/terminals', requireAuth, async (_req, res) => {
+    // Remote PTY mode: the standalone relay-pty service owns the sessions —
+    // report ITS list. No silent fallback to the (empty) embedded map: an
+    // unreachable service is surfaced as an explicit 502.
+    if (isRemotePtyEnabled()) {
+      try {
+        res.json({ terminals: await fetchRemoteTerminals() });
+      } catch (error) {
+        console.error('[relay] /api/terminals: remote PTY service unreachable:', error);
+        res.status(502).json({
+          error: 'pty_service_unreachable',
+          message: `Remote PTY service unreachable: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+      return;
+    }
     const terminals = getActiveTerminals();
     res.json({
       terminals: terminals.map((t) => ({ id: t.id, cwd: t.cwd, pid: t.pid, createdAt: t.createdAt })),
