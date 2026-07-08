@@ -1357,11 +1357,26 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
   let screenFramework = framework;
   const snapshotLastGen = async (): Promise<void> => {
     const lastGen = await readLastGen(projectRoot);
-    // Only adopt a previewEntry that exists on disk for THIS screen (a stale/sibling
-    // entry is rejected so we don't capture the wrong screen). Falls back to the
-    // previous snapshot (or main.dart in renderPreview) when absent.
-    if (lastGen.previewEntry && fsSync.existsSync(path.join(projectRoot, lastGen.previewEntry))) {
-      screenPreviewEntry = lastGen.previewEntry;
+    // Only adopt a previewEntry that addresses THIS screen (a stale/sibling entry is
+    // rejected so we don't capture the wrong screen). Falls back to the previous
+    // snapshot (or main.dart in renderPreview) when absent.
+    //
+    // Two entry shapes:
+    //  - WEB (react/next): a client ROUTE, e.g. "/_preview/71-1622". It NEVER exists as
+    //    a file on disk, so the old existsSync() guard rejected EVERY web entry →
+    //    previewEntry stayed undefined → renderPreview fell back to route '' →
+    //    index.html → the app's catch-all route → EVERY screen was captured as the
+    //    default screen and scored ~0 against its own reference. Validate by frame id
+    //    instead (the route embeds it), which still rejects a sibling worker's entry.
+    //  - FLUTTER: a real file path, e.g. "lib/main_preview.dart" → existsSync as before.
+    const pe = lastGen.previewEntry;
+    if (pe) {
+      if (pe.startsWith('/')) {
+        const norm = (s: string): string => s.replace(/[^0-9a-zA-Z]/g, '');
+        if (norm(pe).includes(norm(frameId))) screenPreviewEntry = pe;
+      } else if (fsSync.existsSync(path.join(projectRoot, pe))) {
+        screenPreviewEntry = pe;
+      }
     }
     if (lastGen.framework) screenFramework = lastGen.framework;
   };
