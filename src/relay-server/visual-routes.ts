@@ -309,11 +309,50 @@ export async function serveDir(dir: string): Promise<{ url: string; close: () =>
     '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css',
     '.json': 'application/json', '.png': 'image/png', '.wasm': 'application/wasm',
     '.ttf': 'font/ttf', '.otf': 'font/otf', '.ico': 'image/x-icon',
+    // SVG icons are painted via CSS mask-image; served as octet-stream (the old
+    // default here) the browser can refuse them as a mask source. This omission
+    // was part of why generated icons came out blank in candidate screenshots.
+    '.svg': 'image/svg+xml', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif', '.webp': 'image/webp', '.woff': 'font/woff', '.woff2': 'font/woff2',
   };
+  // CAPTURE READINESS GATE. A React SPA applies CSS mask-image / background-image
+  // styles AFTER hydration, which kicks off LATE asset fetches that headless
+  // Chrome's --virtual-time-budget screenshot races past → every mask-based icon
+  // (nav, section headers, KYC cards …) renders BLANK in the candidate, tanking
+  // verify and making screens "not converge" on a non-bug. Fix: the gate script
+  // injected into the app HTML opens a pending image request to /__hold — which
+  // keeps Chrome's virtual clock paused while in-flight — and only releases it
+  // once document.fonts.ready AND every CSS-referenced image has decoded, so the
+  // shot is taken with icons painted. Hard-capped on BOTH sides (9s server, 8s
+  // client) so a missing release can never hang a capture — it then behaves
+  // exactly as before this change.
+  const TINY_GIF = Buffer.from('R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==', 'base64');
+  let holdRes: import('node:http').ServerResponse | null = null;
+  let holdTimer: ReturnType<typeof setTimeout> | null = null;
+  const releaseHold = () => {
+    if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
+    if (holdRes) { try { holdRes.setHeader('Content-Type', 'image/gif'); holdRes.end(TINY_GIF); } catch { /* ignore */ } holdRes = null; }
+  };
+  const READY_GATE = `<script>(function(){try{`
+    + `var g=new Image();g.src='/__hold';`
+    + `function rel(){try{var r=new Image();r.src='/__release?t='+Date.now();}catch(e){}}`
+    + `function grab(v,bag){if(!v||v==='none')return;var i=0;while(true){var s=v.indexOf('url(',i);if(s<0)break;var e=v.indexOf(')',s);if(e<0)break;var u=v.substring(s+4,e).trim();var c=u.charAt(0);if(c==='"'||c===String.fromCharCode(39))u=u.substring(1,u.length-1);if(u&&u.substring(0,5)!=='data:')bag[u]=1;i=e+1;}}`
+    + `function settle(){var proms=[];try{if(document.fonts&&document.fonts.ready)proms.push(document.fonts.ready);}catch(e){}`
+    + `try{var bag={};var els=document.querySelectorAll('*');for(var i=0;i<els.length;i++){var cs=getComputedStyle(els[i]);grab(cs.webkitMaskImage,bag);grab(cs.maskImage,bag);grab(cs.backgroundImage,bag);}`
+    + `Object.keys(bag).forEach(function(u){var im=new Image();im.src=u;if(im.decode)proms.push(im.decode().catch(function(){}));});}catch(e){}`
+    + `Promise.all(proms).then(function(){requestAnimationFrame(function(){requestAnimationFrame(rel);});});}`
+    + `function kick(){setTimeout(settle,250);}`
+    + `if(document.readyState==='complete')kick();else window.addEventListener('load',kick);`
+    + `setTimeout(rel,8000);`
+    + `}catch(e){try{var r2=new Image();r2.src='/__release';}catch(_){}}})();</script>`;
   const server = createServer(async (req, res) => {
     try {
       const rawPath = (req.url || '/').split('?')[0];
       const rel = decodeURIComponent(rawPath);
+      // Readiness-gate endpoints (see READY_GATE above). /__hold stays pending
+      // (pausing Chrome's virtual time) until the page hits /__release.
+      if (rel === '/__hold') { releaseHold(); holdRes = res; holdTimer = setTimeout(releaseHold, 9000); return; }
+      if (rel === '/__release') { releaseHold(); res.setHeader('Content-Type', 'text/plain'); res.end('ok'); return; }
       // Virtual SAME-ORIGIN tiling wrapper (RFC §4.6): iframes /index.html and is
       // scrolled to a query offset (?top=<logicalPx>&w=&h=) so a viewport-clipped
       // screenshot captures exactly one vertical band of a tall screen. Same-origin
@@ -336,6 +375,18 @@ export async function serveDir(dir: string): Promise<{ url: string; close: () =>
       }
       const file = path.join(dir, rel === '/' ? 'index.html' : rel);
       if (!file.startsWith(dir) || !fsSync.existsSync(file)) { res.statusCode = 404; res.end(); return; }
+      // Inject the readiness gate into the generated app's HTML entry — but ONLY
+      // when it ships localized assets (assets/icons|images). The reference-render
+      // harness has none, so it is served untouched and its capture path is
+      // unchanged.
+      if ((rel === '/' || rel === '/index.html') &&
+          (fsSync.existsSync(path.join(dir, 'assets', 'icons')) || fsSync.existsSync(path.join(dir, 'assets', 'images')))) {
+        let html = await fs.readFile(file, 'utf8');
+        html = html.includes('</head>') ? html.replace('</head>', `${READY_GATE}</head>`) : READY_GATE + html;
+        res.setHeader('Content-Type', 'text/html');
+        res.end(html);
+        return;
+      }
       res.setHeader('Content-Type', types[path.extname(file)] || 'application/octet-stream');
       res.end(await fs.readFile(file));
     } catch { res.statusCode = 500; res.end(); }
