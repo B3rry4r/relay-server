@@ -91,6 +91,13 @@ COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/native/pty-bridge /app/native/pty-bridge
 COPY package.json package-lock.json .
 RUN npm ci --omit=dev --ignore-scripts
+# Guard: remote-pty.ts imports socket.io-client at module top-level and is
+# loaded during boot (relay-server.ts). If it's ever mis-scoped as a
+# devDependency, `npm ci --omit=dev` silently drops it and the container
+# crash-loops at startup (Cannot find module) — which reads as a total
+# outage, not a build error. Fail the BUILD loudly instead.
+RUN node -e "require.resolve('socket.io-client')" \
+  || (echo "FATAL: socket.io-client missing from prod deps — remote PTY would crash-loop at boot" && exit 1)
 COPY setup-workspace.sh .
 
 # Non-root user. Claude Code and Flutter refuse to run as root, and the root
