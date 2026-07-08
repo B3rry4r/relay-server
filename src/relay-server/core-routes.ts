@@ -1,7 +1,7 @@
 import type { Express } from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
-import { requireAuth, extractRequestToken, isValidToken, readStringParam, resolveWorkspace } from './runtime';
+import { createTerminalEnv, requireAuth, extractRequestToken, isValidToken, readStringParam, resolveWorkspace } from './runtime';
 import { getWorkspaceHealth } from './monitoring';
 import {
   buildQuickSwitchProjects,
@@ -15,7 +15,8 @@ import { exists, resolveProjectRoot } from './runtime';
 import { getActiveTerminals } from './socket';
 import { fetchRemoteTerminals, isRemotePtyEnabled } from './remote-pty';
 import { getTunnelUrl, closeTunnel, listTunnels } from './tunnel-manager';
-import { listFlutterPreviewServers, stopFlutterPreviewServer } from './flutter-preview-server';
+import { listFlutterPreviewServers, stopFlutterPreviewServer, startStaticPreviewServer } from './flutter-preview-server';
+import { buildWebOutput, detectProjectKind, readWebPreviewRoute } from './web-preview';
 
 // Kept for flutter-routes compatibility — now delegates to closeTunnel.
 export function invalidatePortTargetCache(port: number): void {
@@ -146,6 +147,61 @@ export function registerCoreRoutes(app: Express): void {
       return;
     }
     res.json({ ok: true, port, managed: false, message: 'Not a relay-managed preview; hide the card client-side.' });
+  });
+
+  // ── Web live preview ─────────────────────────────────────────────────────
+  // One-tap live preview for GENERATED WEB (Vite/React, Next static-export)
+  // projects — the web counterpart of Flutter's "Build release → Release
+  // preview". Builds the project if the output is missing/stale (build-once
+  // fingerprint cache; concurrent calls coalesce), serves the static output on
+  // a relay-managed preview server (same map as Flutter previews, so the port
+  // card + DELETE /api/previews/:port close behavior work for free) and exposes
+  // it via a cloudflared tunnel.
+  app.post('/api/previews/web/:projectId', requireAuth, async (req, res) => {
+    const projectId = readStringParam(req.params.projectId);
+    const projectRoot = resolveProjectRoot(projectId);
+    if (!projectRoot || !await exists(projectRoot)) {
+      res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+      return;
+    }
+    const kind = await detectProjectKind(projectRoot);
+    if (kind === 'flutter') {
+      res.status(400).json({
+        error: 'flutter_project',
+        message: 'This is a Flutter project — use the Flutter Release preview (POST /api/projects/:projectId/flutter/build).',
+      });
+      return;
+    }
+    if (kind !== 'web') {
+      res.status(400).json({
+        error: 'not_web_project',
+        message: 'Not a web project: package.json with a "build" script is required.',
+      });
+      return;
+    }
+    const env = createTerminalEnv(resolveWorkspace());
+    const built = await buildWebOutput(projectRoot, env);
+    if (built.error !== undefined) {
+      res.status(502).json({ error: 'build_failed', message: built.error });
+      return;
+    }
+    try {
+      const port = await startStaticPreviewServer(projectId, built.outDir);
+      // Tunnel exposure is best-effort — the localhost port alone is enough for
+      // the client (openPreview re-resolves a tunnel via /api/previews/:port/tunnel).
+      let url: string | null = null;
+      try { url = await getTunnelUrl(port); }
+      catch (tunnelErr) {
+        console.warn('[web-preview] tunnel setup failed:', tunnelErr instanceof Error ? tunnelErr.message : tunnelErr);
+      }
+      const route = await readWebPreviewRoute(projectRoot);
+      res.json({ ok: true, projectId, port, url, route, outDir: built.outDir });
+    } catch (error) {
+      res.status(500).json({
+        error: 'preview_start_failed',
+        message: error instanceof Error ? error.message : 'Failed to start the preview server.',
+      });
+    }
   });
 
   // Returns (or creates) a Cloudflare quick tunnel for a local port.

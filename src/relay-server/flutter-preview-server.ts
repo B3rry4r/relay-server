@@ -208,3 +208,12 @@ export function listFlutterPreviewServers(): Array<{ projectId: string; port: nu
     projectId, port: e.port, buildDir: e.buildDir, startedAt: e.startedAt,
   }));
 }
+
+// ── Generic aliases ──────────────────────────────────────────────────────────
+// This server was born for Flutter's build/web but it is a plain static-dir
+// server (SPA fallback, full MIME table, iframe headers) — a Vite dist/ or a
+// Next static export serve identically. Web live-preview code uses these names;
+// the Flutter callers keep the original exports.
+export const startStaticPreviewServer = startFlutterPreviewServer;
+export const stopStaticPreviewServer  = stopFlutterPreviewServer;
+export const listStaticPreviewServers = listFlutterPreviewServers;

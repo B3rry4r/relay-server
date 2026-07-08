@@ -30,6 +30,7 @@ import { resolveProjectRoot, resolveWorkspace, createTerminalEnv, getFlutterRoot
 import { runModel } from './ai-routes';
 import { startJobLog, appendJobLog, finishJobLog, subscribeJobLog } from './ai-job-log';
 import { captureUrlScreenshot, captureUrlTiles, serveDir } from './visual-routes';
+import { buildWebOutput } from './web-preview';
 import { isAIModel, type AIModel } from './ai-adapters';
 import {
   createRun, getRun, listRuns, updateRunScreen, setRunStatus, setRunSession,
@@ -1083,25 +1084,15 @@ async function renderPreview(
       try { return await capture(srv.url); } finally { srv.close(); }
     }
 
-    // Web (Vite/React/Next static export). Best-effort: build, serve the output
-    // dir, navigate to the preview route if one was provided.
-    const target = previewEntry && previewEntry.startsWith('/') ? previewEntry : 'lib/main.dart';
-    const fp = sourceFingerprint(projectRoot, fw, target);
-    const cached = lastBuild.get(projectRoot);
-    let outDir = cached && cached.fingerprint === fp && fsSync.existsSync(path.join(cached.outDir, 'index.html'))
-      ? cached.outDir : '';
-    if (!outDir) {
-      try {
-        await execFile('npm', ['run', 'build'], { cwd: projectRoot, env, timeout: 360000, maxBuffer: 10 * 1024 * 1024 });
-      } catch (e: any) {
-        lastBuild.delete(projectRoot);
-        return { error: `web build (npm run build) failed:\n${`${e?.stdout || ''}\n${e?.stderr || e?.message || ''}`.trim().slice(-1500)}` };
-      }
-      const found = ['dist', 'out', 'build'].map(d => path.join(projectRoot, d)).find(d => fsSync.existsSync(path.join(d, 'index.html')));
-      if (!found) { lastBuild.delete(projectRoot); return { error: 'web build produced no servable output (dist/ out/ build/)' }; }
-      outDir = found;
-      lastBuild.set(projectRoot, { fingerprint: fp, outDir });
-    }
+    // Web (Vite/React/Next static export). Build+locate via the SHARED helper
+    // (web-preview.ts) — the same build-once fingerprint cache the "Preview
+    // live" endpoint (POST /api/previews/web/:projectId) uses, so a verify
+    // build and a live preview reuse each other's output instead of double-
+    // building. (The route string never feeds the fingerprint: it's a client-
+    // side path that doesn't change `npm run build` output.)
+    const built = await buildWebOutput(projectRoot, env);
+    if (built.error !== undefined) return { error: built.error };
+    const outDir = built.outDir;
     const srv = await serveDir(outDir);
     try {
       const route = previewEntry && previewEntry.startsWith('/') ? previewEntry : '';
