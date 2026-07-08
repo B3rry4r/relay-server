@@ -373,22 +373,32 @@ export async function serveDir(dir: string): Promise<{ url: string; close: () =>
         );
         return;
       }
-      const file = path.join(dir, rel === '/' ? 'index.html' : rel);
-      if (!file.startsWith(dir) || !fsSync.existsSync(file)) { res.statusCode = 404; res.end(); return; }
-      // Inject the readiness gate into the generated app's HTML entry — but ONLY
-      // when it ships localized assets (assets/icons|images). The reference-render
-      // harness has none, so it is served untouched and its capture path is
-      // unchanged.
-      if ((rel === '/' || rel === '/index.html') &&
-          (fsSync.existsSync(path.join(dir, 'assets', 'icons')) || fsSync.existsSync(path.join(dir, 'assets', 'images')))) {
-        let html = await fs.readFile(file, 'utf8');
-        html = html.includes('</head>') ? html.replace('</head>', `${READY_GATE}</head>`) : READY_GATE + html;
+      // SPA FALLBACK. A client-side route (no file on disk AND no extension —
+      // e.g. /_preview/<id>, /users) must serve index.html so the app's router can
+      // render that screen. Without this, per-screen verify deep-links 404'd, the
+      // SPA never reached the target screen, and its catch-all route (`* → default`)
+      // captured EVERY non-default screen AS the default one — so every screen but
+      // the entry scored ~0 against its own reference and churned to needs-review.
+      const diskFile = path.join(dir, rel === '/' ? 'index.html' : rel);
+      if (!diskFile.startsWith(dir)) { res.statusCode = 404; res.end(); return; }
+      const isClientRoute = rel !== '/' && rel !== '/index.html' && !path.extname(rel);
+      const serveIndex = rel === '/' || rel === '/index.html' || (isClientRoute && !fsSync.existsSync(diskFile));
+      if (serveIndex) {
+        const indexFile = path.join(dir, 'index.html');
+        if (!fsSync.existsSync(indexFile)) { res.statusCode = 404; res.end(); return; }
+        let html = await fs.readFile(indexFile, 'utf8');
+        // Inject the readiness gate only for generated apps that ship localized
+        // assets; the reference-render harness has none and is left untouched.
+        if (fsSync.existsSync(path.join(dir, 'assets', 'icons')) || fsSync.existsSync(path.join(dir, 'assets', 'images'))) {
+          html = html.includes('</head>') ? html.replace('</head>', `${READY_GATE}</head>`) : READY_GATE + html;
+        }
         res.setHeader('Content-Type', 'text/html');
         res.end(html);
         return;
       }
-      res.setHeader('Content-Type', types[path.extname(file)] || 'application/octet-stream');
-      res.end(await fs.readFile(file));
+      if (!fsSync.existsSync(diskFile)) { res.statusCode = 404; res.end(); return; }
+      res.setHeader('Content-Type', types[path.extname(diskFile)] || 'application/octet-stream');
+      res.end(await fs.readFile(diskFile));
     } catch { res.statusCode = 500; res.end(); }
   });
   // Reject on bind failures instead of hanging forever waiting for 'listening'.
