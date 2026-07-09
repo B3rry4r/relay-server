@@ -290,16 +290,26 @@ export async function captureUrlTiles(
   const viewportH = Math.max(opts.viewportH ?? 852, 200);
   const overlap = Math.max(opts.overlap ?? 120, 0);
   const step = Math.max(viewportH - overlap, 1);
+  const full = Math.max(Math.round(totalHeight), viewportH);
   const nTiles = Math.max(1, Math.ceil((totalHeight - overlap) / step));
   const scale = opts.deviceScale && opts.deviceScale > 0 ? opts.deviceScale : 1;
   const base = serverUrl.replace(/\/index\.html$/, '');
   const W = Math.round(width), H = Math.round(viewportH);
   const routeQ = opts.route && opts.route.startsWith('/') ? `&route=${encodeURIComponent(opts.route)}` : '';
 
-  const tiles: Buffer[] = [];
+  // Band offsets, clamped so the last one ENDS at the content bottom instead of
+  // hanging off into blank space, and de-duplicated (a clamp can collide with the
+  // previous offset on short pages).
+  const tops: number[] = [];
+  const maxTop = Math.max(0, full - viewportH);
   for (let i = 0; i < nTiles; i++) {
-    const top = Math.round(i * step);
-    const tileUrl = `${base}/__tile.html?top=${top}&w=${W}&h=${H}${routeQ}`;
+    const top = Math.min(Math.round(i * step), maxTop);
+    if (tops.length === 0 || top > tops[tops.length - 1]) tops.push(top);
+  }
+
+  const tiles: Buffer[] = [];
+  for (const top of tops) {
+    const tileUrl = `${base}/__tile.html?top=${top}&w=${W}&h=${H}&full=${full}${routeQ}`;
     // Viewport-clipped (NOT full-page) → exactly one band at full resolution.
     const png = await captureUrlScreenshot(tileUrl, width, viewportH, timeoutMs, { deviceScale: scale });
     if (png) tiles.push(png);
@@ -385,14 +395,25 @@ export async function serveDir(dir: string): Promise<{ url: string; close: () =>
         // iframe. Same-origin, and only ever a local path.
         const qRoute = q.get('route') || '';
         const frameSrc = qRoute.startsWith('/') && !qRoute.startsWith('//') ? qRoute : '/index.html';
+        const full = Math.max(h, parseInt(q.get('full') || '0', 10) || h);
+        // Do NOT scroll the iframe. `contentWindow.scrollTo()` only moves the iframe's
+        // DOCUMENT, and real apps put the scroll on an inner container (a dashboard
+        // shell with `overflowY:auto` beside a fixed sidebar) — the document never
+        // scrolls, so every tile came back byte-identical to tile 1 and a tall screen
+        // could never be verified. Instead give the iframe a viewport as tall as the
+        // whole artboard (nothing overflows, nothing needs to scroll) and translate it
+        // under a viewport-sized clipping window. This also makes `100vh` and sticky
+        // headers resolve against the full design height, which is what the Figma
+        // reference depicts.
         res.setHeader('Content-Type', 'text/html');
         res.end(
           `<!doctype html><html><head><meta charset="utf-8"/>` +
-          `<style>html,body{margin:0;padding:0;overflow:hidden;background:#fff}iframe{border:0;width:${w}px;height:${h}px;display:block}</style>` +
-          `</head><body><iframe id="f" src="${frameSrc.replace(/"/g, '&quot;')}"></iframe>` +
-          `<script>var f=document.getElementById('f');` +
-          `f.addEventListener('load',function(){setTimeout(function(){try{f.contentWindow.scrollTo(0,${top});}catch(e){}},400);});` +
-          `</script></body></html>`,
+          `<style>html,body{margin:0;padding:0;overflow:hidden;background:#fff}` +
+          `#vp{position:relative;width:${w}px;height:${h}px;overflow:hidden}` +
+          `#f{position:absolute;left:0;top:${-top}px;width:${w}px;height:${full}px;border:0;display:block}</style>` +
+          `</head><body><div id="vp">` +
+          `<iframe id="f" src="${frameSrc.replace(/"/g, '&quot;')}"></iframe>` +
+          `</div></body></html>`,
         );
         return;
       }
