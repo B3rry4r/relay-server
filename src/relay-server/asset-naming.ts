@@ -108,11 +108,18 @@ const isShapeish = (hint: string): boolean => {
   return toks.every(t => SHAPE_TOKENS.has(t.toLowerCase()) || /^\d+$/.test(t));
 };
 
-/** Opaque = empty, shape-ish (generic shape words / layer-indexed), or
- *  node-id-ish garbage. Opaque hints are the ones the AI MUST name (and the
+/** True when the whole hint is one long hex blob — a Figma imageRef sha1 used as the
+ *  filename (`be658ee6be8a420fab0c5f470dd93e31a417b46c`). It is neither shape-ish nor
+ *  node-id-ish, so without this it read as ALREADY-SEMANTIC and the renamer skipped it:
+ *  every localized image fill landed in the resources file as `a<40 hex>`, which tells
+ *  the build agent nothing about what the image depicts. */
+const isHexBlob = (hint: string): boolean => /^[0-9a-f]{16,}$/i.test(hint.replace(/_/g, ''));
+
+/** Opaque = empty, shape-ish (generic shape words / layer-indexed), a raw hex blob,
+ *  or node-id-ish garbage. Opaque hints are the ones the AI MUST name (and the
  *  validator MUST reject if unnamed). */
 const isOpaque = (hint: string): boolean =>
-  !hint || isShapeish(hint) || isNodeIdish(hint);
+  !hint || isShapeish(hint) || isHexBlob(hint) || isNodeIdish(hint);
 
 /** True when a name CONTAINS Figma node-id residue in ANY token — a `i<digits>`
  *  instance id or a `<3+ digits>` node-id-sized number — even when other tokens

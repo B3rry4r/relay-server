@@ -101,17 +101,47 @@ export interface VcOptions {
 // a real `git add -A` on a large tree finishes well inside this.
 const STALE_LOCK_MS = 60_000;
 
-/** Remove `.git/index.lock` iff it is provably stale. Returns whether it removed one. */
+/**
+ * Is ANY `git` process alive on this box? `index.lock` is empty, so it names no owner —
+ * the only honest way to tell a live writer from a corpse is to look for one. Unknown
+ * (no /proc, read error) → assume LIVE, so we never delete a lock we can't reason about.
+ */
+async function anyGitProcessAlive(): Promise<boolean> {
+  try {
+    const entries = await fs.readdir('/proc');
+    for (const p of entries) {
+      if (!/^\d+$/.test(p)) continue;
+      const comm = await fs.readFile(`/proc/${p}/comm`, 'utf8').catch(() => '');
+      if (comm.trim() === 'git') return true;
+    }
+    return false;
+  } catch { return true; }
+}
+
+/**
+ * Remove `.git/index.lock` iff it is provably abandoned. Returns whether it removed one.
+ * Abandoned means: the lock survives a short settle, AND (it is old enough that no real
+ * git command would still hold it, OR no git process is alive at all). Age alone was too
+ * blunt — a corpse left by a killed `git stash` blocked the very next checkpoint for a
+ * full minute, and 'run start' was dropped exactly that way.
+ */
 async function clearStaleIndexLock(projectRoot: string): Promise<boolean> {
   const lock = path.join(projectRoot, '.git', 'index.lock');
   try {
-    const st = await fs.stat(lock);
-    // Young lock → a live git probably owns it. Never touch it; let the caller fail.
-    if (Date.now() - st.mtimeMs < STALE_LOCK_MS) return false;
+    let st = await fs.stat(lock);
+    // Settle: a live git holding the index usually releases within a moment.
+    await new Promise(r => setTimeout(r, 750));
+    st = await fs.stat(lock).catch(() => null as any);
+    if (!st) return true;   // released on its own — just retry the command
+
+    const ageMs = Date.now() - st.mtimeMs;
+    const old = ageMs >= STALE_LOCK_MS;
+    if (!old && await anyGitProcessAlive()) return false;   // a real writer owns it
+
     await fs.rm(lock, { force: true });
     // Loud, never silent: removing another process's lock is worth a line in the log.
     // eslint-disable-next-line no-console
-    console.log(`[vc] removed STALE ${lock} (age ${Math.round((Date.now() - st.mtimeMs) / 1000)}s, no live owner) — retrying git once`);
+    console.log(`[vc] removed ABANDONED ${lock} (age ${Math.round(ageMs / 1000)}s, ${old ? 'past stale threshold' : 'no git process alive'}) — retrying git once`);
     return true;
   } catch { return false; }
 }
