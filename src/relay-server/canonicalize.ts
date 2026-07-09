@@ -320,6 +320,29 @@ export function buildCanonical(frames: FrameInput[], flow?: RunFlow): Canonical 
   const parsed = frames.map(f => parseFrame(f.tree));
   const roles = parsed.map((p, i) => classifyRole(p, frames[i].width, frames[i].height));
 
+  // ── FLOW OVERRIDES THE VISUAL GUESS ──────────────────────────────────────────
+  // classifyRole only sees pixels: a scrim or a bottom-sheet radius. A designer's
+  // side panel / inline detail pane has neither, so it was classified 'component'
+  // and DROPPED before clustering — it never reached frameMap, was never built, and
+  // sat 'pending' forever. But the flow graph is HUMAN-AUTHORED ground truth: if a
+  // frame is reached by a `modal` edge and by nothing else, it IS a modal of its
+  // source screen, whatever it looks like. Promote it before the roles are used.
+  // (Same rule the agent packet already applies when it tells the agent "this frame
+  // is only ever reached as a modal — do not build it as a standalone route".)
+  const conns = flow?.connections ?? [];
+  for (let i = 0; i < frames.length; i++) {
+    if (roles[i] === 'modal') continue;
+    const id = frames[i].frameId;
+    const incoming = conns.filter(c => c.to === id);
+    if (!incoming.length) continue;
+    const viaModal = incoming.some(c => /modal|sheet|overlay/i.test(c.type));
+    const reachedOtherwise = incoming.some(c => !/modal|sheet|overlay/i.test(c.type));
+    if (viaModal && !reachedOtherwise) {
+      warnings.push(`frame "${frames[i].frameName}" (${id}) looked like a ${roles[i]} but the flow reaches it ONLY via a modal edge — treating it as a modal of "${conns.find(c => c.to === id)?.from}"`);
+      roles[i] = 'modal';
+    }
+  }
+
   // Frames that are modals / components are pulled out before clustering screens.
   const screenIdx = frames.map((_, i) => i).filter(i => roles[i] === 'screen');
   const modalIdx = frames.map((_, i) => i).filter(i => roles[i] === 'modal');

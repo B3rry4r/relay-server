@@ -464,7 +464,22 @@ export async function saveRun(projectId: string, run: BuildRun): Promise<void> {
   const root = rootFor(projectId);
   if (!root) return;
   run.updatedAt = new Date().toISOString();
-  await fs.writeFile(runFile(root, run.id), JSON.stringify(run, null, 2), 'utf-8');
+  // ATOMIC write. A plain writeFile of a multi-MB run leaves the file TRUNCATED for a
+  // moment, and getRun's JSON.parse of that torn read throws → it returns null → the
+  // build loop reads `cur?.status === 'done'` as false and REBUILDS a finished screen.
+  // (Observed: "Users" re-implemented from scratch while it was already done.) Write to
+  // a sibling temp file and rename — rename is atomic on POSIX, so a reader sees either
+  // the whole old file or the whole new one, never a prefix.
+  const dest = runFile(root, run.id);
+  const tmp = `${dest}.${process.pid}.tmp`;
+  const body = JSON.stringify(run, null, 2);
+  try {
+    await fs.writeFile(tmp, body, 'utf-8');
+    await fs.rename(tmp, dest);
+  } catch (e) {
+    await fs.rm(tmp, { force: true }).catch(() => { /* best-effort */ });
+    throw e;
+  }
 }
 
 /** Reset every screen to pending + status running (for a restart). Routed through

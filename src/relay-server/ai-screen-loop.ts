@@ -243,6 +243,53 @@ async function flutterAnalyzeErrors(projectRoot: string, env: NodeJS.ProcessEnv)
 // contract), and flips those screens to needs-review with the findings as the
 // review reason. Benign statuses (duplicate/wired/…) never requeue. Returns how
 // many screens were flipped. Exported for tests.
+/**
+ * Resolve every run frame that is NOT its canonical screen's lead, so the build loop
+ * (which only builds leads) can never leave one stranded. Two kinds:
+ *   - a member/duplicate frame folded INTO a lead → 'done' (it ships as part of that
+ *     screen);
+ *   - a frame canonicalization dropped entirely (role 'component': an inline card,
+ *     a nav bar) → 'done', logged, because it is built as part of the screens that
+ *     contain it and will never be a build target of its own.
+ * State/modal VARIANTS are deliberately left alone — they are verified per-variant
+ * inside their lead's loop.
+ *
+ * Idempotent, and now run on the canon-REUSE path too. It used to run only on a fresh
+ * canonicalization, so a resumed run left dropped frames 'pending' forever.
+ */
+async function foldNonLeadFrames(
+  projectId: string, runId: string, run: import('./build-run-store').BuildRun, canonical: Canonical,
+): Promise<{ folded: number; dropped: number; deferredVariants: number }> {
+  const memberToLead = new Map<string, string>();
+  const variantFrames = new Set<string>();
+  for (const cs of canonical.screens) {
+    const lead = cs.states[0]?.frameId ?? cs.frameIds[0];
+    if (!lead) continue;
+    for (const fid of cs.frameIds) memberToLead.set(fid, lead);
+    for (const st of cs.states) if (st.frameId !== lead) variantFrames.add(st.frameId);
+    for (const m of cs.modals) { memberToLead.set(m.frameId, lead); variantFrames.add(m.frameId); }
+  }
+  const leadSet = new Set(canonical.screens.map(cs => cs.states[0]?.frameId ?? cs.frameIds[0]).filter(Boolean) as string[]);
+
+  let folded = 0, dropped = 0;
+  for (const s of run.screens) {
+    if (s.status === 'done' || leadSet.has(s.frameId) || variantFrames.has(s.frameId)) continue;
+    if (memberToLead.has(s.frameId)) {
+      await updateRunScreen(projectId, runId, s.frameId, { status: 'done', matched: true });
+      folded++;
+    } else {
+      // Absent from canonical altogether. Now that `unbuilt` blocks finalize, leaving
+      // it 'pending' would park the run forever on a frame nothing will ever build.
+      await updateRunScreen(projectId, runId, s.frameId, { status: 'done', matched: true });
+      await appendRunLog(projectId, runId,
+        `[canon] frame "${s.frameName}" (${s.frameId}) is not a canonical screen (classified a component) — folded into the screens that embed it; it is never built standalone`);
+      dropped++;
+    }
+  }
+  const deferredVariants = [...variantFrames].filter(fid => !leadSet.has(fid)).length;
+  return { folded, dropped, deferredVariants };
+}
+
 export async function requeueFlowGaps(projectId: string, runId: string, projectRoot: string): Promise<number> {
   let findings: Array<{ from: string; to: string; status: string; detail?: string }> = [];
   try {
@@ -1197,7 +1244,13 @@ export function resolveRollupVerdict(resolved: BuildRun | null | undefined, expe
   // Audit A.1: a 'failed' screen ALSO blocks completion (never silently ship a run
   // with an errored screen). Both needs-review and failed hold the run open.
   const failed = screens.filter(s => s.status === 'failed').length;
-  const blocking = needsReview + failed;
+  // A screen that NEVER RAN is not a pass. `pending`/`building` used to be excluded
+  // here, so a run whose loop skipped a screen (a frame canonicalization dropped, or
+  // a requeued non-lead frame whose lead was already done) reported "complete" with
+  // that screen silently unbuilt and unverified. Unbuilt holds the run open, exactly
+  // like needs-review: an unfinished screen must be VISIBLE, never a green tick.
+  const unbuilt = screens.filter(s => s.status === 'pending' || s.status === 'building').length;
+  const blocking = needsReview + failed + unbuilt;
   if (blocking > 0) return { verdict: 'park-needs-review', total, built, needsReview, failed, blocking };
   // blocking === 0, but a ZERO-built run is never "complete" — that is itself a fault
   // (e.g. every screen was skipped/never ran). Only a positive built count finalizes.
@@ -1997,7 +2050,12 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
         // DIFFERENT run may have written it since. Keyed to THIS run so the finalize
         // passes (which read the live file) always reconcile against the built app.
         await syncLiveCanonical(projectRoot, runId, canonical);
-        await appendRunLog(projectId, runId, `[canon] reusing persisted canonicalization (${canonical.screens.length} screen(s), ${canonical.components.length} component(s)) — prep already done, skipping re-canonicalize + skeleton + fold; re-synced live canonical.json to this run`);
+        // Re-fold on REUSE too. Skipping the fold here left every non-lead frame the
+        // build loop never touches (dropped components, folded duplicates) stuck
+        // 'pending' across resumes — which, now that unbuilt blocks finalize, would
+        // park the run forever. Idempotent: already-done frames are untouched.
+        const refold = await foldNonLeadFrames(projectId, runId, run, canonical);
+        await appendRunLog(projectId, runId, `[canon] reusing persisted canonicalization (${canonical.screens.length} screen(s), ${canonical.components.length} component(s)) — prep already done, skipping re-canonicalize + skeleton; re-synced live canonical.json to this run${refold.folded || refold.dropped ? `, re-folded ${refold.folded + refold.dropped} non-lead frame(s)` : ''}`);
       } else {
         // RFC v2 §4.2: the HEAVY-AI chain is THE canonicalization. The deterministic
         // clusterer is ONLY reachable as an EXPLICIT, logged `degraded` mode
@@ -2090,27 +2148,9 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
           // and only reaches 'done' when ITS OWN verify passes. Frames folded as
           // pure duplicates/components (members that are neither the lead, a
           // non-default state, nor a modal) still auto-resolve here — they have no
-          // variant of their own to verify. Only on the FIRST canonicalization; on
-          // resume every frame keeps its persisted status.
-          const memberToLead = new Map<string, string>();   // any member frameId → lead frameId
-          const variantFrames = new Set<string>();          // frames verified via the lead's variant pass
-          for (const cs of canonical.screens) {
-            const lead = cs.states[0]?.frameId ?? cs.frameIds[0];
-            if (!lead) continue;
-            for (const fid of cs.frameIds) memberToLead.set(fid, lead);
-            for (const st of cs.states) if (st.frameId !== lead) variantFrames.add(st.frameId);
-            for (const m of cs.modals) { memberToLead.set(m.frameId, lead); variantFrames.add(m.frameId); }
-          }
-          const leadSet = new Set([...canonical.screens].map(cs => cs.states[0]?.frameId ?? cs.frameIds[0]).filter(Boolean) as string[]);
-          let folded = 0;
-          for (const s of run.screens) {
-            if (memberToLead.has(s.frameId) && !leadSet.has(s.frameId) && !variantFrames.has(s.frameId) && s.status !== 'done') {
-              await updateRunScreen(projectId, runId, s.frameId, { status: 'done', matched: true });
-              folded++;
-            }
-          }
-          const deferredVariants = [...variantFrames].filter(fid => !leadSet.has(fid)).length;
-          await appendRunLog(projectId, runId, `[canon] ${run.screens.length} frame(s) → ${canonical.screens.length} canonical screen(s), ${canonical.components.length} component(s)${folded ? `, ${folded} folded duplicate/component frame(s)` : ''}${deferredVariants ? `, ${deferredVariants} state/modal frame(s) deferred to per-variant verify` : ''}${canonical.warnings.length ? ` — ${canonical.warnings.length} warning(s)` : ''}`);
+          // variant of their own to verify.
+          const { folded, dropped, deferredVariants } = await foldNonLeadFrames(projectId, runId, run, canonical);
+          await appendRunLog(projectId, runId, `[canon] ${run.screens.length} frame(s) → ${canonical.screens.length} canonical screen(s), ${canonical.components.length} component(s)${folded + dropped ? `, ${folded + dropped} folded duplicate/component frame(s)` : ''}${deferredVariants ? `, ${deferredVariants} state/modal frame(s) deferred to per-variant verify` : ''}${canonical.warnings.length ? ` — ${canonical.warnings.length} warning(s)` : ''}`);
           for (const w of canonical.warnings) await appendRunLog(projectId, runId, `[canon] WARNING: ${w}`);
           // RFC §9.2 — checkpoint after canonicalization (canonical.json + skeleton).
           await runCheckpoint(projectId, runId, projectRoot, 'phase canonicalize', `${canonical.screens.length} screen(s), ${canonical.components.length} component(s)`);
@@ -2232,10 +2272,14 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
     };
     await emitBuildProgress();
 
+    // Skip already-built (resume). A live read that FAILS (getRun swallows a torn-read
+    // JSON.parse and returns null) must never be interpreted as "not done" — that
+    // silently re-implements a finished screen. Fall back to the loop's snapshot.
     const stillNeeded = async (frameId: string): Promise<boolean> => {
       const live = await getRun(projectId, runId);
-      const cur = live?.screens.find(s => s.frameId === frameId);
-      return cur?.status !== 'done';   // skip already-built (resume)
+      const cur = live?.screens.find(s => s.frameId === frameId)
+        ?? run.screens.find(s => s.frameId === frameId);
+      return cur?.status !== 'done';
     };
 
     // ── T31: all-done fast-path — skip the WHOLE build loop on resume/finalize ────
@@ -2295,10 +2339,11 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
           return;
         }
         if (!isBuildTarget(screen.frameId)) continue;   // P3: non-lead frame folded into its canonical lead
-        // Skip screens already built (resume): re-read live status each time.
+        // Skip screens already built (resume): re-read live status each time. A failed
+        // live read falls back to the snapshot — never treat "unknown" as "not done".
         const live = await getRun(projectId, runId);
-        const cur = live?.screens.find(s => s.frameId === screen.frameId);
-        if (cur?.status === 'done') { session = run.freshSessions ? undefined : (cur.sessionId || session); continue; }
+        const cur = live?.screens.find(s => s.frameId === screen.frameId) ?? screen;
+        if (cur.status === 'done') { session = run.freshSessions ? undefined : (cur.sessionId || session); continue; }
         await emitBuilding(screen.frameName);   // show the screen as it STARTS (not just on completion)
         const sess = await buildRunScreen(run, screen, projectRoot, appPlan, session, canonCtxFor(screen.frameId));
         // In fresh-session mode there is no cross-screen thread to carry forward.

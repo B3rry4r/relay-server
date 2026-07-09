@@ -477,7 +477,17 @@ export async function reduceToCanonical(
   for (const c of safeFlow.connections) if (/modal|sheet|overlay/i.test(c.type)) modalByFlow.add(c.to);
   const isModalFrame = (n: NormalizedDescriptor): boolean => isModalRole(n.role) || modalByFlow.has(n.frameId);
 
-  const componentFrames = norm.filter(n => n.role === 'component').map(n => n.frameId);
+  // FLOW BEATS THE MODEL'S ROLE GUESS. The flow graph is human-authored: if the
+  // designer wired `X --modal--> Y`, Y is a modal of X, whatever 1a thought it looked
+  // like. Previously `componentSet` was built from the role ALONE and then subtracted
+  // from the modal set, so a side panel the model called a 'component' was dropped
+  // before clustering: it never entered frameMap, was never built, and sat 'pending'
+  // forever while its flow edge was silently ignored. (Observed: the Users screen's
+  // "Aside – Right Side: Detail Panel", wired `72:1072 --modal--> 76:2873`.) A modal
+  // edge into a frame disqualifies it from being treated as a bare component.
+  const componentFrames = norm
+    .filter(n => n.role === 'component' && !modalByFlow.has(n.frameId))
+    .map(n => n.frameId);
   const componentSet = new Set(componentFrames);
   const modalFrames = norm.filter(n => isModalFrame(n) && !componentSet.has(n.frameId));
   const modalFrameSet = new Set(modalFrames.map(n => n.frameId));
