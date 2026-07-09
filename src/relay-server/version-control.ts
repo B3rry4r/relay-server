@@ -94,6 +94,28 @@ export interface VcOptions {
  * and the global identity is never mutated). Resolves stdout/stderr; rejects on a
  * non-zero exit (the caller decides whether that is fatal — here, never).
  */
+// A lock this old is not held by a live git command — the owner died (killed mid-run,
+// container swap) or never existed. `withRepoLock` only serializes OUR writers; the
+// build AGENT runs its own `git stash` / `git commit` in a shell we don't gate, so a
+// collision (or its corpse) is reachable from outside the mutex. Generous on purpose:
+// a real `git add -A` on a large tree finishes well inside this.
+const STALE_LOCK_MS = 60_000;
+
+/** Remove `.git/index.lock` iff it is provably stale. Returns whether it removed one. */
+async function clearStaleIndexLock(projectRoot: string): Promise<boolean> {
+  const lock = path.join(projectRoot, '.git', 'index.lock');
+  try {
+    const st = await fs.stat(lock);
+    // Young lock → a live git probably owns it. Never touch it; let the caller fail.
+    if (Date.now() - st.mtimeMs < STALE_LOCK_MS) return false;
+    await fs.rm(lock, { force: true });
+    // Loud, never silent: removing another process's lock is worth a line in the log.
+    // eslint-disable-next-line no-console
+    console.log(`[vc] removed STALE ${lock} (age ${Math.round((Date.now() - st.mtimeMs) / 1000)}s, no live owner) — retrying git once`);
+    return true;
+  } catch { return false; }
+}
+
 async function git(
   projectRoot: string,
   args: string[],
@@ -106,11 +128,22 @@ async function git(
     '-c', 'commit.gpgsign=false',
     '-c', 'core.hooksPath=/dev/null',
   ];
-  return execFile('git', [...identity, ...args], {
+  const run = () => execFile('git', [...identity, ...args], {
     cwd: projectRoot,
     env: env ?? process.env,
     maxBuffer: 32 * 1024 * 1024,
   });
+  try {
+    return await run();
+  } catch (e: any) {
+    // A stale index.lock silently disabled EVERY checkpoint commit for the rest of a
+    // run (observed: 'run start' and 'screen 71:1622 accepted' both dropped, taking
+    // the restart safety net with them). Clear it once, if stale, and retry.
+    const msg = `${e?.stderr ?? ''}${e?.message ?? ''}`;
+    if (!msg.includes('index.lock')) throw e;
+    if (!(await clearStaleIndexLock(projectRoot))) throw e;
+    return run();
+  }
 }
 
 /** True when `git` is on PATH and runnable. Cached per-process. */

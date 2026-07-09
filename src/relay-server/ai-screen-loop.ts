@@ -734,7 +734,8 @@ export function modalPresentationHint(
  * + presentation hint + presenter contract — the payload the agent needs to build
  * the variant for real instead of inventing a placeholder.
  */
-export function buildCanonicalContext(canonical: Canonical, cs: CanonicalScreen, runScreens?: RunScreen[]): string {
+export function buildCanonicalContext(canonical: Canonical, cs: CanonicalScreen, runScreens?: RunScreen[], framework = 'flutter'): string {
+  const web = isWebFramework(framework);
   const out: string[] = [
     `CANONICAL SCREEN — this is ONE screen (canonicalId ${cs.canonicalId}, route ${cs.route}); build a SINGLE widget, not one page per variant. Its write-locked route slot already exists in lib/app_router.dart; fill the widget body, keep the route.`,
   ];
@@ -762,6 +763,7 @@ export function buildCanonicalContext(canonical: Canonical, cs: CanonicalScreen,
       out.push([
         `- FOLDED STATE "${s.id}" (frame ${s.frameId}) — rendered by THIS widget as ${className}(state: '${s.id}'); NOT a separate route/file.`,
         `  REFERENCE IMAGE (ground truth): ${spec.referenceImagePath} — OPEN this image with your file-reading tool and match it EXACTLY (layout, text, colours).`,
+        ...(web ? [`  PREVIEW ROUTE CONTRACT: register a route at EXACTLY \`${webPreviewRoute(s.frameId)}\` that mounts THIS screen in state '${s.id}'. The verify harness screenshots that exact route to check this state against the reference above; do NOT rename it. This is a verify-only entrypoint, not a user-facing page.`] : []),
         `  IR TREE of this state's frame:`,
         boundFoldedIR(spec.tree),
       ].join('\n'));
@@ -778,7 +780,13 @@ export function buildCanonicalContext(canonical: Canonical, cs: CanonicalScreen,
         `- FOLDED MODAL "${m.id}" (frame ${m.frameId}) — part of THIS screen.`,
         `  REFERENCE IMAGE (ground truth): ${spec.referenceImagePath} — OPEN this image with your file-reading tool and match it EXACTLY (layout, text, colours).`,
         `  PRESENTATION (derived from the frame's geometry): ${p.hint}`,
-        `  PRESENTER CONTRACT: declare a top-level function \`Future<void> ${modalPresenterName(m.id)}(BuildContext context)\` in this screen's file that presents this modal. The name is FIXED — the automated preview harness calls it verbatim to screenshot the modal for verification.`,
+        web
+          // Web has no presenter to call — the harness screenshots a ROUTE. Give the
+          // agent the exact route so producer and consumer cannot disagree, and say
+          // plainly that the BASE route renders closed (an earlier build force-opened
+          // modals on the base route to match a reference that was itself wrong).
+          ? `  PREVIEW ROUTE CONTRACT: register a route at EXACTLY \`${webPreviewRoute(m.frameId)}\` that mounts THIS base screen with this modal ALREADY OPEN. The verify harness screenshots that exact route to check the modal against the reference above; do NOT rename it. The base screen's own route \`${webPreviewRoute(leadFrameId)}\` MUST render with NO modal open — never force a modal open on the base route.`
+          : `  PRESENTER CONTRACT: declare a top-level function \`Future<void> ${modalPresenterName(m.id)}(BuildContext context)\` in this screen's file that presents this modal. The name is FIXED — the automated preview harness calls it verbatim to screenshot the modal for verification.`,
         `  IR TREE of the modal frame:`,
         boundFoldedIR(spec.tree),
       ].join('\n'));
@@ -1634,7 +1642,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
       let vEntry: string | undefined;
       try {
         vEntry = await ensureScreenPreviewEntry(projectRoot, screenFramework, frameId,
-          { canonicalId: req.canonicalId, variant: { kind: v.kind, id: v.id } });
+          { canonicalId: req.canonicalId, variant: { kind: v.kind, id: v.id, frameId: v.frameId } });
       } catch { /* handled below */ }
       if (!vEntry) { vStop = 'variant preview entry could not be generated (screen file not found)'; break; }
       appendJobLog(jobId, `[loop] variant ${vLabel} verify ${iter}/${maxIterations}: building & screenshotting`);
@@ -1877,7 +1885,7 @@ async function buildRunScreen(
   // route-slot context so the agent builds ONE widget instead of per-variant pages.
   // P1-core: run.screens rides along so each folded state/modal block carries its
   // OWN reference image path + bounded IR + presentation hint (not just a name).
-  if (canonicalCtx) contract = `${buildCanonicalContext(canonicalCtx.canonical, canonicalCtx.screen, run.screens)}\n\n— — —\n${contract}`;
+  if (canonicalCtx) contract = `${buildCanonicalContext(canonicalCtx.canonical, canonicalCtx.screen, run.screens, run.framework)}\n\n— — —\n${contract}`;
   // P4: strip [preview:…] + RLE repeated siblings from the agent-facing IR.
   const cleanPacket = hygieneIR(screen.spec.packet) ?? screen.spec.packet;
   const sreq: BuildScreenReq = {
@@ -2638,7 +2646,7 @@ async function retryScreenLoop(projectId: string, runId: string, frameId: string
     let contract = `${await assetInventoryBlock(projectRoot)}${buildWrittenContract(run, appPlan, contextSlice, run.freshSessions === true, canonical)}`;
     // P1-core: a canonical lead's retry also carries its states/modals payload
     // (reference paths + IR + presentation hints) — same contract as the build.
-    if (canonical && canonScreen) contract = `${buildCanonicalContext(canonical, canonScreen, run.screens)}\n\n— — —\n${contract}`;
+    if (canonical && canonScreen) contract = `${buildCanonicalContext(canonical, canonScreen, run.screens, run.framework)}\n\n— — —\n${contract}`;
     // The human correction is authoritative and injected up-front so the fresh pass
     // acts on it (the previous automated discrepancies didn't converge).
     const correction = `HUMAN CORRECTION (authoritative — the automated loop did NOT converge; apply this specific guidance):\n${note}`;

@@ -19,7 +19,7 @@ import fsSync from 'node:fs';
 import path from 'node:path';
 import type { AIModel } from './ai-adapters';
 import type { LocalizedAsset } from './reference-render';
-import { requireModel, AiNotFiredError } from './ai-observability';
+import { requireModel, AiNotFiredError, AiUnusableError } from './ai-observability';
 
 export interface RenamedAsset {
   /** original dir-relative path (e.g. assets/icons/vector_290_4399.svg). */
@@ -267,12 +267,16 @@ export async function renameAssetsSemantic(
           }
           return usable;
         };
-        // Retry (with backoff) on a transient model error/timeout. Running ~11
-        // heavy image-open calls back-to-back intermittently trips API overload /
-        // a brief rate-limit, surfacing as a CLI "Command failed". This is NOT a
-        // silent fallback — an AiUnusableError (fired but garbage) is NOT retried,
-        // and if ALL attempts fail the loud error propagates and the whole atomic
-        // unit rolls back. The backoff only rides out transient infra blips.
+        // Retry (with backoff) on a transient model error/timeout AND on an unusable
+        // response. Running ~11 heavy image-open calls back-to-back intermittently
+        // trips API overload / a brief rate-limit, surfacing as a CLI "Command
+        // failed"; separately, a batch occasionally returns a malformed/oversized
+        // body that parses to zero usable names (observed: batch 11/12 of a 20-screen
+        // run returned ~114 tokens of garbage, then a clean 47-token map on retry —
+        // and the single failure HALTED the whole run at the design-system gate).
+        // Re-asking is NOT a silent fallback: nothing is accepted that the validator
+        // rejects, and if ALL attempts fail the loud error still propagates and the
+        // whole atomic unit rolls back. The backoff only rides out transient blips.
         const callBatch = () => requireModel<Record<string, string>>(
           model, buildPrompt(items), env, projectRoot,
           { format: 'json', validate, log: { projectId: opts.projectId, runId: opts.runId, step: `asset-rename:${b + 1}/${batches}` } },
@@ -284,11 +288,13 @@ export async function renameAssetsSemantic(
             res = await callBatch();
             break;
           } catch (e) {
-            const transient = e instanceof AiNotFiredError && (e.reason === 'error' || e.reason === 'timeout');
+            const transient = (e instanceof AiNotFiredError && (e.reason === 'error' || e.reason === 'timeout'))
+              || e instanceof AiUnusableError;
             if (!transient || attempt === MAX_ATTEMPTS) throw e;
+            const why = e instanceof AiUnusableError ? 'unusable output' : (e as AiNotFiredError).reason;
             const backoffMs = 3000 * attempt;
             // eslint-disable-next-line no-console
-            console.log(`[ai:asset-rename] batch ${b + 1}/${batches}: transient model failure (${(e as AiNotFiredError).reason}) attempt ${attempt}/${MAX_ATTEMPTS} — backing off ${backoffMs}ms`);
+            console.log(`[ai:asset-rename] batch ${b + 1}/${batches}: retryable model failure (${why}) attempt ${attempt}/${MAX_ATTEMPTS} — backing off ${backoffMs}ms`);
             await new Promise(r => setTimeout(r, backoffMs));
           }
         }

@@ -19,6 +19,7 @@
 import * as fs from 'fs/promises';
 import * as fsSync from 'fs';
 import * as path from 'path';
+import { webPreviewRoute } from './agent-packet';
 
 export interface DesignDigestInput {
   colors: string[];   // dominant hex colors, most-used first (e.g. "#12ae89")
@@ -213,7 +214,13 @@ export function hasGeneratedTheme(projectRoot: string, themeFile = path.join('li
 // `canonicalId` is supplied, fall back to scanning lib/screens/ for the
 // `// canonicalId:` header the skeleton stamps (semantic-named runs).
 
-export interface PreviewVariant { kind: 'state' | 'modal'; id: string }
+export interface PreviewVariant {
+  kind: 'state' | 'modal';
+  id: string;
+  /** The folded frame this variant renders. On web it selects the preview ROUTE, so
+   *  a modal is screenshotted at its own route rather than the base screen's. */
+  frameId?: string;
+}
 
 /** identifier-safe token from a canonical/frame id (`m_313_9543` → `313_9543`). */
 const idToken = (id: string): string =>
@@ -249,7 +256,15 @@ export async function ensureScreenPreviewEntry(
   projectRoot: string, framework: string, frameId: string,
   opts?: { canonicalId?: string; variant?: PreviewVariant },
 ): Promise<string | undefined> {
-  if ((framework || 'flutter').toLowerCase() !== 'flutter') return undefined;
+  // WEB: there is no generated entrypoint FILE — the preview entry is a ROUTE the
+  // pipeline derives and the agent is contractually required to register. Returning
+  // undefined here (the old behavior for every non-Flutter framework) made the
+  // variant loop read it as "screen file not found" and park EVERY folded modal /
+  // state variant of a web build as needs-review, however correct the code was.
+  // A variant renders at ITS OWN frame's route; the base screen at the base route.
+  if ((framework || 'flutter').toLowerCase() !== 'flutter') {
+    return webPreviewRoute(opts?.variant?.frameId || frameId);
+  }
   let base = `screen_${frameId.replace(/[^a-zA-Z0-9]+/g, '_')}`.toLowerCase();
   let src: string | undefined;
   try { src = await fs.readFile(path.join(projectRoot, 'lib', 'screens', `${base}.dart`), 'utf8'); }

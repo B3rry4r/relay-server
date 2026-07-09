@@ -423,12 +423,24 @@ export async function requireModel<T = string>(
   }
   let value: unknown = r.text;
   if (opts.validate) {
+    // The success line logs only an 80-char preview. When the validator REJECTS the
+    // output that preview is useless — it shows a plausible head and hides whatever
+    // actually broke (truncated JSON, trailing prose, a wrong shape). Dump a bounded
+    // copy of the raw body on the failure path, where the volume is bounded by how
+    // rarely it happens and the diagnostic value is the whole point.
+    const dumpRaw = (why: string): void => {
+      if (!opts.log) return;
+      const raw = (r.text || '').replace(/\s+/g, ' ');
+      logAiLine(opts.log, `model=${model} call=${r.callId} status=unusable :: ${why} :: RAW[${raw.length} chars]: ${raw.slice(0, 1200)}${raw.length > 1200 ? ' …[truncated]' : ''}`);
+    };
     try {
       value = opts.validate(r.text);
     } catch (e) {
+      dumpRaw((e as Error).message);
       throw new AiUnusableError(model, r.callId, (e as Error).message);
     }
     if (value === undefined || value === null) {
+      dumpRaw('validator returned no usable value');
       throw new AiUnusableError(model, r.callId, 'validator returned no usable value');
     }
   }
