@@ -244,6 +244,52 @@ async function flutterAnalyzeErrors(projectRoot: string, env: NodeJS.ProcessEnv)
 // review reason. Benign statuses (duplicate/wired/…) never requeue. Returns how
 // many screens were flipped. Exported for tests.
 /**
+ * Delete a screen's per-iteration verify evidence (candidates, tiles, per-iter verdicts,
+ * result.json) so a rebuild starts from an empty slate. `ir.txt` and `last-gen.json` are
+ * kept: the loop rewrites the first and the agent owns the second.
+ */
+async function clearScreenArtifacts(screenDir: string): Promise<void> {
+  try {
+    for (const name of await fs.readdir(screenDir)) {
+      if (/^cand-.*\.png$/.test(name) || /^iter-\d+\.json$/.test(name) || name === 'result.json') {
+        await fs.rm(path.join(screenDir, name), { force: true });
+      }
+    }
+  } catch { /* nothing to clear */ }
+}
+
+/**
+ * Is an "asset defect" verdict SUPPORTED by the assets on disk? The fast-fail below is
+ * an unappealable stop, and it fires on a text pattern ("icon" + "missing") that a
+ * layout complaint can trip — a verify agent claiming a nav item is missing halted a
+ * screen at 68 whose icon symbol, file (2KB of real SVG) and rendered pixels were all
+ * present. An upstream asset defect means a FILE is broken; check the files. Returns
+ * the broken ones (empty ⇒ the claim is not supported by evidence).
+ */
+export async function findBrokenAssets(projectRoot: string): Promise<string[]> {
+  const broken: string[] = [];
+  for (const rel of ['assets/icons', 'assets/images']) {
+    const dir = path.join(projectRoot, rel);
+    let names: string[];
+    try { names = await fs.readdir(dir); } catch { continue; }
+    for (const name of names) {
+      const abs = path.join(dir, name);
+      let buf: Buffer;
+      try { buf = await fs.readFile(abs); } catch { broken.push(`${rel}/${name} (unreadable)`); continue; }
+      if (buf.length === 0) { broken.push(`${rel}/${name} (empty)`); continue; }
+      if (/\.svg$/i.test(name)) {
+        if (!buf.toString('utf8', 0, Math.min(buf.length, 512)).includes('<svg')) broken.push(`${rel}/${name} (not an SVG)`);
+      } else if (/\.png$/i.test(name)) {
+        if (!(buf[0] === 0x89 && buf[1] === 0x50)) broken.push(`${rel}/${name} (not a PNG)`);
+      } else if (/\.jpe?g$/i.test(name)) {
+        if (!(buf[0] === 0xFF && buf[1] === 0xD8)) broken.push(`${rel}/${name} (not a JPEG)`);
+      }
+    }
+  }
+  return broken;
+}
+
+/**
  * Resolve every run frame that is NOT its canonical screen's lead, so the build loop
  * (which only builds leads) can never leave one stranded. Two kinds:
  *   - a member/duplicate frame folded INTO a lead → 'done' (it ships as part of that
@@ -1430,6 +1476,12 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
   const stallPauseReason = `[run] PAUSED — ${_emptyStreakConfig.EMPTY_STREAK_THRESHOLD}+ consecutive zero-output/timeout agent calls (likely throttle/agent stall); resume after the API recovers — built screens are skipped, this one rebuilds.`;
   const screenDir = path.join(projectRoot, '.uix', 'screens', sanitizeId(frameId));
   await fs.mkdir(screenDir, { recursive: true });
+  // A rebuild must not inherit the PREVIOUS run's evidence. Stale cand-N/iter-N/
+  // result.json linger in the screen dir, so `iter-3.json` could say "93 accept" from
+  // an old run while this run recorded 68 — anyone (human or agent) reading the dir is
+  // shown a candidate that was never scored. Clear the per-iteration artifacts; keep
+  // ir.txt / last-gen.json (rewritten below / owned by the agent).
+  await clearScreenArtifacts(screenDir);
   const relScreenDir = path.join('.uix', 'screens', sanitizeId(frameId));
   // Snapshot the IR tree so a future session has this screen's design context
   // (exact colours/text/layout) without re-fetching from the design source.
@@ -1616,9 +1668,19 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     // a build failure to retry, NOT an upstream asset defect. (Screens 61/64 were
     // mislabeled exactly this way.)
     if (assetDefect && implBuilt && hasShot) {
-      stopReason = `asset defect — ${assetDefect.area ?? 'illustration'}: broken/incomplete upstream asset; needs an ASSET fix (the build agent cannot repair it)`;
-      appendJobLog(jobId, `[loop] asset defect detected — stopping early (no agent fix can repair a broken upstream asset): ${assetDefect.area ?? ''}`);
-      break;
+      // EVIDENCE GATE. This stop is unappealable, so never take the verdict's word for
+      // it: an upstream asset defect means a FILE on disk is broken. The regex fires on
+      // "icon" + "missing", which a pure LAYOUT complaint trips ("the Fleet nav item
+      // (icon + label) is missing") — that halted a screen at 68 whose icon file was a
+      // valid 2KB SVG and whose sidebar rendered the item correctly. If nothing on disk
+      // is broken, the claim is unsupported: log it and keep iterating like any other fix.
+      const brokenAssets = await findBrokenAssets(projectRoot);
+      if (brokenAssets.length) {
+        stopReason = `asset defect — ${assetDefect.area ?? 'illustration'}: broken/incomplete upstream asset; needs an ASSET fix (the build agent cannot repair it). Broken: ${brokenAssets.slice(0, 5).join(', ')}${brokenAssets.length > 5 ? ` (+${brokenAssets.length - 5} more)` : ''}`;
+        appendJobLog(jobId, `[loop] asset defect CONFIRMED (${brokenAssets.length} broken file(s)) — stopping early: ${brokenAssets.slice(0, 3).join(', ')}`);
+        break;
+      }
+      appendJobLog(jobId, `[loop] asset-defect claim NOT supported — every asset file on disk is valid; treating "${(assetDefect.area ?? '').slice(0, 60)}" as an ordinary fix and continuing`);
     }
     // Plateau guard: after a real attempt, if the score didn't improve, more
     // automated passes are unlikely to help — stop rather than waste calls.
@@ -1680,6 +1742,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     const vDir = path.join(projectRoot, '.uix', 'screens', sanitizeId(v.frameId));
     const vRelDir = path.join('.uix', 'screens', sanitizeId(v.frameId));
     await fs.mkdir(vDir, { recursive: true });
+    await clearScreenArtifacts(vDir);   // a variant rebuild must not inherit stale tiles/verdicts
     const vW = v.width || width, vH = v.height || height;
     let vMatched = false;
     let vStop = 'reached iteration cap';
