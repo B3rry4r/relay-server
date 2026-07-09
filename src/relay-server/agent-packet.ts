@@ -34,6 +34,22 @@ export interface FlowGraph {
   connections: FlowConnection[];
 }
 
+/**
+ * SINGLE SOURCE OF TRUTH for the two pipeline-owned, per-screen paths. Both the agent
+ * CONTRACT (below) and the verify pipeline (ai-screen-loop) derive them from the
+ * frameId, so neither side can disagree about them.
+ *
+ * Previously the contract only *suggested* a shape ("e.g. /_preview/<screen>"), the
+ * agent invented one, wrote it into a SHARED .uix/last-gen.json, and the pipeline read
+ * it back and validated it with existsSync() — which is never true for a route. The
+ * entry was silently dropped, every web screen was screenshotted at the app's
+ * catch-all route, and the fix loop rewrote correct code forever. Derive, don't
+ * read back.
+ */
+export const screenDirName = (frameId: string): string => frameId.replace(/[^a-zA-Z0-9._-]+/g, '_');
+export const webPreviewRoute = (frameId: string): string => `/_preview/${frameId.replace(/[^0-9a-zA-Z]+/g, '-')}`;
+export const screenManifestPath = (frameId: string): string => `.uix/screens/${screenDirName(frameId)}/last-gen.json`;
+
 export interface AgentPacketInput {
   frame: { id: string; name: string; width: number; height: number };
   tree: string;
@@ -181,9 +197,18 @@ export function buildAgentPacket(input: AgentPacketInput): string {
     ...setupSteps,
     `- Create this screen as a well-named, idiomatic file — YOU choose the path/name per the framework's conventions. Reuse shared components/theme where sensible.`,
     `- Install any packages you need; ensure it builds / analyzes cleanly.`,
-    `- Create a PREVIEW ENTRYPOINT that renders JUST this screen inside the app's real theme/providers (so it can be screenshot in isolation and compared to the reference). For Flutter, a small entrypoint file with its own main() that runs the screen widget wrapped in the app's MaterialApp/theme (e.g. lib/_preview/<screen>.dart). For web, a dedicated preview route (e.g. /_preview/<screen>) that mounts only this screen. Keep it in sync on every revision.`,
+    ...(framework === 'flutter'
+      ? [`- Create a PREVIEW ENTRYPOINT that renders JUST this screen inside the app's real theme/providers (so it can be screenshot in isolation and compared to the reference): a small entrypoint file with its own main() that runs the screen widget wrapped in the app's MaterialApp/theme (e.g. lib/_preview/<screen>.dart). Keep it in sync on every revision.`]
+      : [
+          // The route is PIPELINE-OWNED: the verify harness screenshots exactly this
+          // path. It is not a suggestion and must not be renamed — a missing route
+          // makes the app's catch-all render a DIFFERENT screen and the build fails
+          // loudly with "preview route ... is not registered".
+          `- Register a PREVIEW ROUTE at EXACTLY this path: \`${webPreviewRoute(frame.id)}\` — it must mount ONLY this screen, inside the app's real theme/providers/router. The verify harness screenshots this exact route; do NOT rename it, and keep it registered on every revision. If it is missing, the app's catch-all route will render a different screen and the build will fail.`,
+        ]),
     `- Update .uix/context.md: add this screen to its index (screen name → source file) and note any new shared components/tokens/decisions, so the next session can resume with full context.`,
-    `- Write a JSON manifest to .uix/last-gen.json: {"screen":"${frame.name}","framework":"${framework}","entry":"<relative path to the screen file>","previewEntry":"<flutter: relative path to the preview entrypoint .dart file | web: the preview route path starting with />","files":["<relative paths created/edited>"],"commands":["<cmds you ran>"],"notes":"<short>"}.`,
+    // Per-screen manifest: parallel workers must never share one mutable file.
+    `- Write a JSON manifest to \`${screenManifestPath(frame.id)}\` (this screen's OWN file — never a shared one): {"screen":"${frame.name}","framework":"${framework}","entry":"<relative path to the screen file>",${framework === 'flutter' ? `"previewEntry":"<relative path to the preview entrypoint .dart file>",` : ''}"files":["<relative paths created/edited>"],"commands":["<cmds you ran>"],"notes":"<short>"}.`,
     ...(changeNote ? ['', `This screen was generated before — REVISE the existing file(s), applying: ${changeNote}`] : []),
     ``,
     `Output a brief summary (a few lines) of what you created/changed. Do not paste the full code.`,

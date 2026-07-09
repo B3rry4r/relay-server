@@ -304,7 +304,7 @@ export async function captureUrlTiles(
 // Serve a directory over an ephemeral localhost port; returns { url, close }.
 // Exported for the screen-build loop, which serves a real project's build/web
 // output to screenshot a generated screen against its reference render.
-export async function serveDir(dir: string): Promise<{ url: string; close: () => void }> {
+export async function serveDir(dir: string): Promise<{ url: string; close: () => void; observedPath: () => string | null }> {
   const types: Record<string, string> = {
     '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css',
     '.json': 'application/json', '.png': 'image/png', '.wasm': 'application/wasm',
@@ -329,13 +329,19 @@ export async function serveDir(dir: string): Promise<{ url: string; close: () =>
   const TINY_GIF = Buffer.from('R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==', 'base64');
   let holdRes: import('node:http').ServerResponse | null = null;
   let holdTimer: ReturnType<typeof setTimeout> | null = null;
+  // IDENTITY ASSERTION. The gate beacons the path the app ACTUALLY rendered (after
+  // any client-side redirect) just before it releases the shot. Callers compare it
+  // to the route they requested: if a catch-all/`<Navigate>` bounced us to another
+  // screen, the screenshot is of the WRONG screen and must fail LOUD rather than be
+  // scored — a plausible-but-wrong capture makes the harness blame the model's code.
+  let observedPath: string | null = null;
   const releaseHold = () => {
     if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
     if (holdRes) { try { holdRes.setHeader('Content-Type', 'image/gif'); holdRes.end(TINY_GIF); } catch { /* ignore */ } holdRes = null; }
   };
   const READY_GATE = `<script>(function(){try{`
     + `var g=new Image();g.src='/__hold';`
-    + `function rel(){try{var r=new Image();r.src='/__release?t='+Date.now();}catch(e){}}`
+    + `function rel(){try{var l=new Image();l.src='/__loc?p='+encodeURIComponent(location.pathname);}catch(e){}try{var r=new Image();r.src='/__release?t='+Date.now();}catch(e){}}`
     + `function grab(v,bag){if(!v||v==='none')return;var i=0;while(true){var s=v.indexOf('url(',i);if(s<0)break;var e=v.indexOf(')',s);if(e<0)break;var u=v.substring(s+4,e).trim();var c=u.charAt(0);if(c==='"'||c===String.fromCharCode(39))u=u.substring(1,u.length-1);if(u&&u.substring(0,5)!=='data:')bag[u]=1;i=e+1;}}`
     + `function settle(){var proms=[];try{if(document.fonts&&document.fonts.ready)proms.push(document.fonts.ready);}catch(e){}`
     + `try{var bag={};var els=document.querySelectorAll('*');for(var i=0;i<els.length;i++){var cs=getComputedStyle(els[i]);grab(cs.webkitMaskImage,bag);grab(cs.maskImage,bag);grab(cs.backgroundImage,bag);}`
@@ -352,6 +358,11 @@ export async function serveDir(dir: string): Promise<{ url: string; close: () =>
       // Readiness-gate endpoints (see READY_GATE above). /__hold stays pending
       // (pausing Chrome's virtual time) until the page hits /__release.
       if (rel === '/__hold') { releaseHold(); holdRes = res; holdTimer = setTimeout(releaseHold, 9000); return; }
+      if (rel === '/__loc') {
+        const q = new URLSearchParams((req.url || '').split('?')[1] || '');
+        observedPath = q.get('p');
+        res.setHeader('Content-Type', 'image/gif'); res.end(TINY_GIF); return;
+      }
       if (rel === '/__release') { releaseHold(); res.setHeader('Content-Type', 'text/plain'); res.end('ok'); return; }
       // Virtual SAME-ORIGIN tiling wrapper (RFC §4.6): iframes /index.html and is
       // scrolled to a query offset (?top=<logicalPx>&w=&h=) so a viewport-clipped
@@ -407,7 +418,7 @@ export async function serveDir(dir: string): Promise<{ url: string; close: () =>
     server.listen(0, '127.0.0.1', () => { server.removeListener('error', reject); resolve(); });
   });
   const port = (server.address() as { port: number }).port;
-  return { url: `http://127.0.0.1:${port}/index.html`, close: () => server.close() };
+  return { url: `http://127.0.0.1:${port}/index.html`, close: () => server.close(), observedPath: () => observedPath };
 }
 
 // ── Web (React + Vite) scratch-build screenshot ──────────────────────────────

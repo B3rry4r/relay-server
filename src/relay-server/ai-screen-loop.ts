@@ -58,6 +58,7 @@ import type { ReduceFlow } from './canonicalize-ai/reduce';
 import { AiStepError, runModelObserved, _emptyStreakConfig } from './ai-observability';
 import { generateDesignSystem, seedContextWithThemeApi, ensureMainWired, consolidateDesignTokens, ensureScreenPreviewEntry, modalPresenterName, type ThemeTokens } from './design-system';
 import { prepScreen, ensureIrComplete, getIrData, runAssetPass, type PrepConfig, type LocalizedAsset } from './reference-render';
+import { screenDirName, screenManifestPath, webPreviewRoute } from './agent-packet';
 import type { FigFrame, FlowGraph } from './agent-packet';
 import { computePreflight } from './preflight';
 import { reconcileScreen, reconcileSummary, type ReconcileResult } from './reconcile';
@@ -331,7 +332,12 @@ interface LastGen {
   files?: string[];
 }
 
-const sanitizeId = (id: string) => id.replace(/[^a-zA-Z0-9._-]+/g, '_');
+// Pipeline-owned per-screen paths come from agent-packet — the SAME module that
+// writes the agent contract — so the producer and the consumer of the contract can
+// never disagree about them again (that disagreement is the whole bug class here).
+const sanitizeId = screenDirName;
+
+const isWebFramework = (fw: string): boolean => fw !== 'flutter';
 
 // P2: per-project BUILD mutex. With parallel workers the expensive LLM agent calls
 // (implement/verify/fix) run concurrently, but the build+screenshot step writes to
@@ -895,11 +901,22 @@ export function hygieneIR(ir: string | undefined): string | undefined {
   return rleRepeatedSiblings(stripChromeNodes(stripPreviewAnnotations(ir)));
 }
 
-async function readLastGen(projectRoot: string): Promise<LastGen> {
-  try {
-    const raw = await fs.readFile(path.join(projectRoot, '.uix', 'last-gen.json'), 'utf8');
-    return JSON.parse(raw) as LastGen;
-  } catch { return {}; }
+async function readLastGen(projectRoot: string, frameId?: string): Promise<LastGen> {
+  // Screen-scoped manifest FIRST: parallel workers each own
+  // .uix/screens/<frameId>/last-gen.json and physically cannot clobber one another.
+  // The legacy shared .uix/last-gen.json is a compat fallback only (older projects,
+  // and agents that haven't adopted the per-screen path yet) — it is the file whose
+  // cross-worker overwrites made a worker screenshot a sibling's screen.
+  const candidates = frameId
+    ? [
+        path.join(projectRoot, '.uix', 'screens', sanitizeId(frameId), 'last-gen.json'),
+        path.join(projectRoot, '.uix', 'last-gen.json'),
+      ]
+    : [path.join(projectRoot, '.uix', 'last-gen.json')];
+  for (const p of candidates) {
+    try { return JSON.parse(await fs.readFile(p, 'utf8')) as LastGen; } catch { /* try next */ }
+  }
+  return {};
 }
 
 // ── prompt builders ───────────────────────────────────────────────────────────
@@ -948,7 +965,7 @@ function tiledVerifyPrompt(refPath: string, candTilePaths: string[], frameName: 
   ].filter(Boolean).join('\n');
 }
 
-function fixPrompt(frameName: string, refPath: string, candPath: string, v: Verdict, userNotes?: string): string {
+function fixPrompt(frameId: string, frameName: string, refPath: string, candPath: string, v: Verdict, userNotes?: string): string {
   const items = v.discrepancies.map((d, i) => `  ${i + 1}. [${d.severity ?? 'med'}] ${d.area ? d.area + ': ' : ''}${d.issue}`).join('\n');
   const notes = (userNotes ?? '').trim();
   return [
@@ -959,7 +976,7 @@ function fixPrompt(frameName: string, refPath: string, candPath: string, v: Verd
     `Open BOTH images, then revise the EXISTING screen file(s) to fix these specific discrepancies — but skip any that contradict the user rules above:`,
     items || '  (general fidelity — bring it closer to the reference)',
     `Reuse the project's existing design system / theme / shared components — do not restyle inline.`,
-    `Keep the preview entrypoint working and keep .uix/last-gen.json accurate (including "previewEntry"). Output a one-line summary.`,
+    `Keep the preview entrypoint working and keep ${screenManifestPath(frameId)} accurate (this screen's OWN manifest — never a shared one). Output a one-line summary.`,
   ].filter(Boolean).join('\n');
 }
 
@@ -1097,7 +1114,21 @@ async function renderPreview(
     try {
       const route = previewEntry && previewEntry.startsWith('/') ? previewEntry : '';
       const url = route ? `${srv.url.replace(/\/index\.html$/, '')}${route}` : srv.url;
-      return await capture(url);
+      const out = await capture(url);
+      // IDENTITY ASSERTION — never SCORE a plausible-but-wrong screen. If the app's
+      // catch-all / <Navigate> bounced us off the requested route we just photographed
+      // a DIFFERENT screen; scoring that makes the verify agent report false diffs and
+      // the fix loop rewrite CORRECT code until it gives up. Fail loud instead, with a
+      // message the fix agent can act on.
+      if (route && !out.error) {
+        const seen = srv.observedPath();
+        if (seen && seen !== route) {
+          return {
+            error: `preview route ${route} is not registered — the app rendered ${seen} instead (catch-all/redirect), so the screenshot would be of the WRONG screen. Register a route at EXACTLY ${route} that mounts ONLY this screen inside the app's real theme/providers.`,
+          };
+        }
+      }
+      return out;
     } finally { srv.close(); }
   } catch (e: any) {
     return { error: e?.message || 'preview render failed' };
@@ -1353,32 +1384,26 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
   // previewEntry/framework right after its OWN agent call returns (when last-gen still
   // reflects this screen) and pass that snapshot into the build — never re-reading the
   // shared file inside the lock. So parallel>1 verifies the right screen.
-  let screenPreviewEntry: string | undefined;
+  // WEB: the preview route is DERIVED from the frameId (pipeline-owned, see
+  // webPreviewRoute) and NEVER read back from the agent-written manifest — so a
+  // sibling worker's manifest write cannot change which screen we photograph.
+  // FLUTTER: the entry is a real file the agent authors, so we do read it — but from
+  // THIS screen's own manifest, not a shared project-root one.
+  let screenPreviewEntry: string | undefined = isWebFramework(framework) ? webPreviewRoute(frameId) : undefined;
   let screenFramework = framework;
   const snapshotLastGen = async (): Promise<void> => {
-    const lastGen = await readLastGen(projectRoot);
-    // Only adopt a previewEntry that addresses THIS screen (a stale/sibling entry is
-    // rejected so we don't capture the wrong screen). Falls back to the previous
-    // snapshot (or main.dart in renderPreview) when absent.
-    //
-    // Two entry shapes:
-    //  - WEB (react/next): a client ROUTE, e.g. "/_preview/71-1622". It NEVER exists as
-    //    a file on disk, so the old existsSync() guard rejected EVERY web entry →
-    //    previewEntry stayed undefined → renderPreview fell back to route '' →
-    //    index.html → the app's catch-all route → EVERY screen was captured as the
-    //    default screen and scored ~0 against its own reference. Validate by frame id
-    //    instead (the route embeds it), which still rejects a sibling worker's entry.
-    //  - FLUTTER: a real file path, e.g. "lib/main_preview.dart" → existsSync as before.
-    const pe = lastGen.previewEntry;
-    if (pe) {
-      if (pe.startsWith('/')) {
-        const norm = (s: string): string => s.replace(/[^0-9a-zA-Z]/g, '');
-        if (norm(pe).includes(norm(frameId))) screenPreviewEntry = pe;
-      } else if (fsSync.existsSync(path.join(projectRoot, pe))) {
-        screenPreviewEntry = pe;
-      }
-    }
+    const lastGen = await readLastGen(projectRoot, frameId);
     if (lastGen.framework) screenFramework = lastGen.framework;
+    if (isWebFramework(screenFramework)) {
+      screenPreviewEntry = webPreviewRoute(frameId);
+      return;
+    }
+    // Flutter: only adopt an entrypoint that exists on disk (a stale/sibling entry is
+    // rejected so we never screenshot another screen).
+    const pe = lastGen.previewEntry;
+    if (pe && !pe.startsWith('/') && fsSync.existsSync(path.join(projectRoot, pe))) {
+      screenPreviewEntry = pe;
+    }
   };
 
   // 1. IMPLEMENT
@@ -1533,7 +1558,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
 
     // FIX (resume the implementation session so the agent keeps full context).
     appendJobLog(jobId, `[loop] fix ${iter}: applying ${verdict.discrepancies.length} change(s)`);
-    const fix = await observedBuildCall('fix', fixPrompt(frameName, referenceImagePath, candRel ?? '(build failed — no screenshot)', verdict, req.userNotes), { sessionId: session });
+    const fix = await observedBuildCall('fix', fixPrompt(frameId, frameName, referenceImagePath, candRel ?? '(build failed — no screenshot)', verdict, req.userNotes), { sessionId: session });
     // T29: a rate-limited (incl. empty-streak soft-limit) fix → pause resumably rather
     // than burning the remaining iterations on empty calls + ending in needs-review.
     if (fix.rateLimited && req.runId) { await pauseRunRateLimited(req.projectId, req.runId, frameId, session, fix.stalled ? stallPauseReason : undefined, fix.resetHint); return session; }
@@ -1645,7 +1670,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
       vPrev = score;
       if (iter === maxIterations) break;
       appendJobLog(jobId, `[loop] variant ${vLabel} fix ${iter}: applying ${verdict.discrepancies.length} change(s)`);
-      const fix = await observedBuildCall('fix', fixPrompt(vFrameName, v.referenceImagePath!, vCand ?? '(build failed — no screenshot)', verdict, req.userNotes), { sessionId: session });
+      const fix = await observedBuildCall('fix', fixPrompt(v.frameId, vFrameName, v.referenceImagePath!, vCand ?? '(build failed — no screenshot)', verdict, req.userNotes), { sessionId: session });
       if (fix.rateLimited) { await pauseRunRateLimited(req.projectId, req.runId!, frameId, session, fix.stalled ? stallPauseReason : undefined, fix.resetHint); return 'paused'; }
       if (fix.sessionId) session = fix.sessionId;
       variantFixesApplied++;
