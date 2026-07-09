@@ -3271,6 +3271,35 @@ export function registerScreenLoopRoutes(app: Express): void {
         }
       }
     }
+    // REQUEUE a subset of screens (targeted rebuild without a clean-slate restart).
+    // Used when a HARNESS fault — not the model — invalidated specific screens: their
+    // verdicts were reached against wrong inputs, so status/review must be discarded
+    // rather than trusted. Screens not named here keep their state.
+    const requeue: string[] = Array.isArray(b.requeue) ? b.requeue.map((f: any) => String(f)) : [];
+    if (requeue.length) {
+      const hit: string[] = [];
+      for (const sc of run.screens) {
+        if (!requeue.includes(sc.frameId)) continue;
+        sc.status = 'pending'; sc.matched = undefined; sc.review = undefined; sc.at = undefined;
+        hit.push(sc.frameId);
+      }
+      if (run.finalized) run.finalized = undefined;
+      await saveRun(projectId, run);
+      await appendRunLog(projectId, runId, `[run] requeued ${hit.length} screen(s) for rebuild: ${hit.join(', ')}`);
+    }
+
+    // REPREP: re-run prep before the loop. Prep is what OWNS the reference renders and
+    // each screen's spec; when the harness's artifact naming or packet contract changes,
+    // the specs stored on the run are stale and every downstream verdict is suspect.
+    // Prep is idempotent (per-frame cache + content-addressed assets), so this is cheap
+    // when nothing changed and correct when it did.
+    const reprep = b.reprep === true;
+    if (reprep) {
+      run.prepDone = false;
+      await saveRun(projectId, run);
+      await appendRunLog(projectId, runId, `[run] reprep requested — re-rendering references + rebuilding screen specs before the loop`);
+    }
+
     const steer = typeof b.steerNotes === 'string' ? b.steerNotes.trim() : '';
     if (steer) {
       run.userNotes = [run.userNotes?.trim(), steer].filter(Boolean).join('\n\n');
@@ -3280,7 +3309,7 @@ export function registerScreenLoopRoutes(app: Express): void {
     } else if (run.status === 'stopped') {
       await setRunStatus(projectId, runId, 'running');
       run.status = 'running';
-    } else if ((run.status === 'done' || run.status === 'needs-review') && !b.restart) {
+    } else if ((run.status === 'done' || run.status === 'needs-review') && !b.restart && !requeue.length) {
       // T31: resume a done-but-unfinalized run (or one whose last needs-review screen
       // was just Accepted) to RUN FINALIZE through the run. runAppLoop's all-done
       // fast-path skips the build loop and goes straight to the finalize branch — no
@@ -3291,7 +3320,21 @@ export function registerScreenLoopRoutes(app: Express): void {
       run.status = 'running';
       await appendRunLog(projectId, runId, `[run] resume → finalize (no rebuilds; all screens already done)`);
     }
-    void runAppLoop(projectId, runId).catch(() => {});
+    // A requeue reopens a parked run: nothing else in the chain above flips it back to
+    // 'running' when the caller passes no steerNotes.
+    if (requeue.length && run.status !== 'running') {
+      await setRunStatus(projectId, runId, 'running');
+      run.status = 'running';
+    }
+    // reprep → prep first (re-render refs, rewrite specs), then prepAndRun hands off
+    // to runAppLoop itself. Otherwise resume straight into the build loop.
+    if (reprep) {
+      void prepAndRun(projectId, runId).catch((e: any) => {
+        void appendRunLog(projectId, runId, `[prep] reprep error: ${e?.message || 'unknown'}`);
+      });
+    } else {
+      void runAppLoop(projectId, runId).catch(() => {});
+    }
     res.json({ run, started: true });
   });
 
