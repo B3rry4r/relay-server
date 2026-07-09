@@ -21,7 +21,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { resolveProjectRoot } from './runtime';
 import { captureUrlScreenshot, serveDir } from './visual-routes';
-import { buildAgentPacket, type FigFrame, type FlowGraph } from './agent-packet';
+import { buildAgentPacket, screenDirName, type FigFrame, type FlowGraph } from './agent-packet';
 import type { ScreenSpec } from './build-run-store';
 import { emitResources, canEmitResources } from './resources-emit';
 import { renameAssetsSemantic } from './asset-naming';
@@ -784,13 +784,20 @@ export async function prepScreen(
     flow: cfg.flow,
     frameName: frame.name,
   });
+  // frameId is part of the key: the packet embeds THIS frame's preview route, so two
+  // frames with the same name/dims/tree must never share a cached packet.
   const prepHash = crypto.createHash('sha256').update(JSON.stringify({
+    frameId: frame.id,
     treeNotation: tree, width: frame.width, height: frame.height, scale,
     packetFingerprint, harnessVersion: HARNESS_VERSION,
   })).digest('hex').slice(0, 32);
 
   const cacheDir = prepCacheDir(root, prepHash);
-  const refName = `${screenFileBase(frame.name)}.png`;
+  // The reference filename is keyed by frameId, NEVER by name alone. Figma names are
+  // not unique (a screen and its modal, or three order views, all read "Orders"), and
+  // a name-only path made later frames OVERWRITE earlier ones — every colliding screen
+  // then verified against another screen's render and could never converge.
+  const refName = `${screenFileBase(frame.name)}_${screenDirName(frame.id)}.png`;
   const refRel = path.join(UIX_REFS_DIR, refName);
   const refAbs = path.join(root, refRel);
 
