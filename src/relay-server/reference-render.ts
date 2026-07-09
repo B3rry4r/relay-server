@@ -588,18 +588,40 @@ export async function localizeFrameAssets(
   const tasks: Array<() => Promise<void>> = [];
   // 1. Raster image fills referenced by THIS frame. Fetch first; repair via harness
   //    only when the bytes look broken (most photo fills are fine).
+  //
+  // KEYING: an IR node carries the Figma **imageRef** in `ih` (a 40-char sha1). UIX
+  // exposes that imageRef as the upload asset's `originalName`; the asset's `hash`
+  // field is a DIFFERENT (content) hash. Matching `usedHashes.has(a.hash)` therefore
+  // NEVER hit — every image fill in every design was silently dropped, on every
+  // build, and the agent hand-drew SVG stand-ins for photos that shipped in the .fig.
+  // Match on the imageRef; keep `a.hash` as a fallback in case UIX ever keys it that way.
+  const imageRefOf = (a: ExtractedAsset): string =>
+    String(a.originalName || '').replace(/\.[a-z0-9]+$/i, '');
+  const usesAsset = (a: ExtractedAsset): boolean =>
+    usedHashes.has(imageRefOf(a)) || usedHashes.has(a.hash);
   const uploadAssets = await getUploadAssets(figStorageKey);
   for (const a of uploadAssets) {
     if (/svg/i.test(a.format)) continue;
-    if (!usedHashes.has(a.hash)) continue;
+    if (!usesAsset(a)) continue;
     let name = safeName(a.originalName || `${a.hash}.${a.format || 'png'}`);
     if (!/\.[a-z0-9]+$/i.test(name)) name += `.${a.format || 'png'}`;
     const suspect = typeof a.sizeBytes === 'number' && a.sizeBytes > 0 && a.sizeBytes < SUSPECT_PNG_BYTES;
     if (suspect) {
-      // Find a node carrying this hash so the harness can render it.
-      const nodeId = Object.keys(irData?.nodes ?? {}).find(id => irData!.nodes[id]?.ih === a.hash);
-      if (nodeId) { tasks.push(() => repairRaster(nodeId, 'assets/images', name, a.url)); continue; }
+      // Find a node carrying this imageRef so the harness can re-render it.
+      const ref = imageRefOf(a);
+      const nodeId = Object.keys(irData?.nodes ?? {}).find(id => {
+        const ih = irData!.nodes[id]?.ih;
+        return ih === ref || ih === a.hash;
+      });
+      // A harness repair returns PNG bytes — never leave them under a .jpg name.
+      if (nodeId) {
+        const pngName = name.replace(/\.[a-z0-9]+$/i, '.png');
+        tasks.push(() => repairRaster(nodeId, 'assets/images', pngName, a.url));
+        continue;
+      }
     }
+    // `format` is the LocalizedAsset raster/vector discriminator ('svg' | 'png'),
+    // not the file extension — a .jpg fill is still a raster.
     tasks.push(() => upload(a.url, 'assets/images', name, { format: 'png', kind: 'image' }));
   }
   // 2. Icon + illustration assets under THIS frame. SIMPLE flat icons come back as
