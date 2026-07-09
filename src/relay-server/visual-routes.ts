@@ -280,7 +280,12 @@ export async function captureUrlTiles(
   width: number,
   totalHeight: number,
   timeoutMs = 60000,
-  opts: { deviceScale?: number; viewportH?: number; overlap?: number } = {},
+  // `route`: the per-screen client route to tile (e.g. /_preview/133-1133). It is
+  // passed THROUGH to the wrapper (which iframes it) — it must NOT be baked into
+  // serverUrl, or `${base}/__tile.html` resolves to `/_preview/<id>/__tile.html`,
+  // which is a .html path with no file on disk → 404 tiles. Tall screens were the
+  // last place still capturing the app's default route.
+  opts: { deviceScale?: number; viewportH?: number; overlap?: number; route?: string } = {},
 ): Promise<Buffer[] | null> {
   const viewportH = Math.max(opts.viewportH ?? 852, 200);
   const overlap = Math.max(opts.overlap ?? 120, 0);
@@ -289,11 +294,12 @@ export async function captureUrlTiles(
   const scale = opts.deviceScale && opts.deviceScale > 0 ? opts.deviceScale : 1;
   const base = serverUrl.replace(/\/index\.html$/, '');
   const W = Math.round(width), H = Math.round(viewportH);
+  const routeQ = opts.route && opts.route.startsWith('/') ? `&route=${encodeURIComponent(opts.route)}` : '';
 
   const tiles: Buffer[] = [];
   for (let i = 0; i < nTiles; i++) {
     const top = Math.round(i * step);
-    const tileUrl = `${base}/__tile.html?top=${top}&w=${W}&h=${H}`;
+    const tileUrl = `${base}/__tile.html?top=${top}&w=${W}&h=${H}${routeQ}`;
     // Viewport-clipped (NOT full-page) → exactly one band at full resolution.
     const png = await captureUrlScreenshot(tileUrl, width, viewportH, timeoutMs, { deviceScale: scale });
     if (png) tiles.push(png);
@@ -373,11 +379,17 @@ export async function serveDir(dir: string): Promise<{ url: string; close: () =>
         const top = Math.max(0, parseInt(q.get('top') || '0', 10) || 0);
         const w = Math.max(1, parseInt(q.get('w') || '393', 10) || 393);
         const h = Math.max(1, parseInt(q.get('h') || '852', 10) || 852);
+        // Tile the SCREEN UNDER TEST, not the app's default route. `route` is the
+        // per-screen client route; it hits the SPA fallback above (serving index.html
+        // + the readiness gate) so the app's router renders that screen inside the
+        // iframe. Same-origin, and only ever a local path.
+        const qRoute = q.get('route') || '';
+        const frameSrc = qRoute.startsWith('/') && !qRoute.startsWith('//') ? qRoute : '/index.html';
         res.setHeader('Content-Type', 'text/html');
         res.end(
           `<!doctype html><html><head><meta charset="utf-8"/>` +
           `<style>html,body{margin:0;padding:0;overflow:hidden;background:#fff}iframe{border:0;width:${w}px;height:${h}px;display:block}</style>` +
-          `</head><body><iframe id="f" src="/index.html"></iframe>` +
+          `</head><body><iframe id="f" src="${frameSrc.replace(/"/g, '&quot;')}"></iframe>` +
           `<script>var f=document.getElementById('f');` +
           `f.addEventListener('load',function(){setTimeout(function(){try{f.contentWindow.scrollTo(0,${top});}catch(e){}},400);});` +
           `</script></body></html>`,

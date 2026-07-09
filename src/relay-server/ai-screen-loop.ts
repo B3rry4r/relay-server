@@ -1064,9 +1064,19 @@ async function renderPreview(
   const fw = framework.toLowerCase();
   // Capture the screenshot (or vertical tiles for a tall reference) from a served
   // dir, shared by the cached + freshly-built paths.
-  const capture = async (url: string): Promise<{ png?: Buffer; tiles?: Buffer[]; error?: string }> => {
+  // `tiling` carries the SERVER BASE + the screen's route separately: the tile wrapper
+  // lives at the server root (/__tile.html) and iframes the route. Joining them first
+  // yields /_preview/<id>/__tile.html → 404 tiles (and the wrapper would iframe the
+  // app's default route anyway).
+  const capture = async (
+    url: string,
+    tiling?: { base: string; route?: string },
+  ): Promise<{ png?: Buffer; tiles?: Buffer[]; error?: string }> => {
     if (shot.tiles) {
-      const tiles = await captureUrlTiles(url, width, height, 60000, { deviceScale: shot.deviceScale });
+      const tiles = await captureUrlTiles(tiling?.base ?? url, width, height, 60000, {
+        deviceScale: shot.deviceScale,
+        route: tiling?.route,
+      });
       return tiles?.length ? { tiles } : { error: 'tiled screenshot of built app failed' };
     }
     const png = await captureUrlScreenshot(url, width, height, 60000, shot);
@@ -1114,7 +1124,7 @@ async function renderPreview(
     try {
       const route = previewEntry && previewEntry.startsWith('/') ? previewEntry : '';
       const url = route ? `${srv.url.replace(/\/index\.html$/, '')}${route}` : srv.url;
-      const out = await capture(url);
+      const out = await capture(url, { base: srv.url, route: route || undefined });
       // IDENTITY ASSERTION — never SCORE a plausible-but-wrong screen. If the app's
       // catch-all / <Navigate> bounced us off the requested route we just photographed
       // a DIFFERENT screen; scoring that makes the verify agent report false diffs and
