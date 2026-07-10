@@ -64,6 +64,7 @@ import { computePreflight } from './preflight';
 import { reconcileScreen, reconcileSummary, type ReconcileResult } from './reconcile';
 import { finalizeApp, runAnalyzeGate, analyzeGateEnabled } from './passes/finalize';
 import { planFlowRequeue } from './passes/flow-requeue';
+import { planInteractionRequeue } from './passes/interaction-audit';
 import { repointAssetUsage, buildAssetInventory, renderAssetInventory } from './passes/asset-usage';
 import { ensureProjectGit, commitCheckpoint, snapshotBeforeMutation, rollbackTo } from './version-control';
 
@@ -356,6 +357,34 @@ export async function requeueFlowGaps(projectId: string, runId: string, projectR
     });
     await appendRunLog(projectId, runId,
       `[finalize] flow-wiring REAL gap — requeued "${d.frameName ?? d.frameId}" (${d.canonicalId}) to needs-review (${d.findings.length} finding(s))`);
+  }
+  return decisions.length;
+}
+
+// ── Interaction-audit REAL findings requeue their screens ────────────────────
+// A HIGH dead-control finding (a labelled button wired to a no-op handler) flips
+// its screen to needs-review so the build agent wires the real behaviour. Reads
+// the report finalize wrote; mirrors requeueFlowGaps exactly (same idempotency —
+// only runs when finalize ran fresh, so a human accept is never re-flipped).
+export async function requeueDeadControls(projectId: string, runId: string, projectRoot: string): Promise<number> {
+  let report: { findings?: unknown[] } | null = null;
+  try {
+    report = JSON.parse(await fs.readFile(path.join(projectRoot, '.uix', 'interaction-audit-report.json'), 'utf8'));
+  } catch { return 0; }
+  const findings = (report?.findings ?? []) as Parameters<typeof planInteractionRequeue>[0];
+  if (!findings.length) return 0;
+  const canonical = await readCanonical(projectRoot, runId);
+  if (!canonical) return 0;
+  const run = await getRun(projectId, runId);
+  if (!run) return 0;
+  const decisions = planInteractionRequeue(findings, canonical.screens ?? [], run.screens);
+  for (const d of decisions) {
+    await updateRunScreen(projectId, runId, d.frameId, {
+      status: 'needs-review', matched: false,
+      review: { reason: `[interaction-audit] control(s) that render but do nothing — wire the real handler: ${d.findings.join(' | ')}` },
+    });
+    await appendRunLog(projectId, runId,
+      `[finalize] interaction-audit — requeued "${d.frameName ?? d.frameId}" (${d.canonicalId}) to needs-review (${d.findings.length} dead control(s))`);
   }
   return decisions.length;
 }
@@ -2604,6 +2633,13 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
           requeued = await requeueFlowGaps(projectId, runId, projectRoot);
         } catch (e: any) {
           await appendRunLog(projectId, runId, `[finalize] flow-gap requeue skipped (non-fatal): ${e?.message || 'unknown'}`);
+        }
+        // Dead controls the interaction audit flagged HIGH → requeue too. Separate
+        // count so the completion gate sees the sum of both requeue sources.
+        try {
+          requeued += await requeueDeadControls(projectId, runId, projectRoot);
+        } catch (e: any) {
+          await appendRunLog(projectId, runId, `[finalize] interaction-audit requeue skipped (non-fatal): ${e?.message || 'unknown'}`);
         }
       }
 

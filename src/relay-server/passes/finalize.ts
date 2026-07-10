@@ -11,6 +11,8 @@
 //   4. verifyFlowWiring        (7d) — verify + safe auto-fix the canonical flow
 //   5. renameSemantic          (7e) — machine names → semantic file/class/route
 //   6. deepenTokensAndCleanup  (7f) — token deepening + dead-code cleanup
+//   7. auditInteractions       (7g) — flag controls that render but do nothing
+//   8. productionHygiene       (7h) — strip verify scaffolding → clean deliverable
 //
 // BUILD-SAFE ORCHESTRATION (critical): each pass mutates real source. A pass that
 // leaves the app un-buildable (or throws mid-write) would crash the preview / the
@@ -44,6 +46,8 @@ import { extractComponents, type ExtractGroupGuard } from './component-extractio
 import { applyModalOverlays } from './modal-overlay';
 import { repointAssetUsage } from './asset-usage';
 import { verifyFlowWiring } from './flow-wiring';
+import { auditInteractions } from './interaction-audit';
+import { runProductionHygiene } from './production-hygiene';
 import { renameSemantic } from './semantic-rename';
 import { deepenTokensAndCleanup, detectFramework, type Framework } from './token-cleanup';
 import { ensureProjectGit, snapshotBeforeMutation, rollbackTo, commitCheckpoint } from '../version-control';
@@ -65,7 +69,9 @@ export type PassName =
   | 'repointAssetUsage'
   | 'verifyFlowWiring'
   | 'renameSemantic'
-  | 'deepenTokensAndCleanup';
+  | 'deepenTokensAndCleanup'
+  | 'auditInteractions'
+  | 'productionHygiene';
 
 export interface FinalizeOptions {
   /** Resolved absolute project root. */
@@ -338,6 +344,41 @@ const PASSES: PassDef[] = [
           removedClasses: rem.methods,
         },
         warnings: r.report.rejected.map((rej) => `${rej.file}: ${rej.kind} ${rej.literal} — ${rej.reason}`),
+      };
+    },
+  },
+  {
+    name: 'auditInteractions',
+    run: async (projectId, opts) => {
+      // Report-only: it never mutates source, so it is not build-gated. The loop
+      // requeues HIGH findings to needs-review (planInteractionRequeue) so the
+      // build agent wires the real behaviour — a dead control is not something a
+      // deterministic pass can safely guess.
+      const r = await auditInteractions(projectId, {
+        projectRoot: opts.projectRoot,
+        noReport: opts.dryRun,
+      });
+      const s = r.report.summary;
+      return {
+        counts: { total: s.total, high: s.high, med: s.med, screensAffected: s.screensAffected },
+        warnings: r.report.findings
+          .filter((f) => f.severity === 'high')
+          .map((f) => `${f.file}:${f.line} — dead ${f.handler} on "${f.element ?? '<unlabelled>'}" (${f.kind})`),
+      };
+    },
+  },
+  {
+    name: 'productionHygiene',
+    run: async (_projectId, opts) => {
+      const r = await runProductionHygiene({ projectRoot: opts.projectRoot, dryRun: opts.dryRun });
+      return {
+        counts: {
+          previewRoutesRemoved: r.previewRoutesRemoved,
+          previewFilesRemoved: r.previewFilesRemoved,
+          placeholderRemoved: r.placeholderRemoved ? 1 : 0,
+          unreferencedAssets: r.unreferencedAssets,
+        },
+        warnings: r.warnings,
       };
     },
   },
