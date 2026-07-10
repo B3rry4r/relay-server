@@ -600,7 +600,10 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
     reportPath: null,
   };
 
-  if (!opts.noReport) {
+  // A dry run must not persist a report. `.uix/finalize-report.json` is the marker
+  // the P7 gate skips on and the record of what the app contains — a dry run wrote
+  // over the real one with a report describing a build that was never applied.
+  if (!opts.noReport && !opts.dryRun) {
     try {
       const abs = path.join(projectRoot, '.uix', 'finalize-report.json');
       await fs.mkdir(path.dirname(abs), { recursive: true });
