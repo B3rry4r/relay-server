@@ -121,10 +121,10 @@ async function surfaceForScreen(
 
 /** Presenter call-sites across every file in the surface. */
 async function presenterCallsInSurface(
-  surface: NavSurface, presenter: string, read: (f: string) => Promise<string>,
+  surface: NavSurface, presenter: string, modalId: string, read: (f: string) => Promise<string>,
 ): Promise<number> {
   let n = 0;
-  for (const f of surface.sources) n += countPresenterCalls(await read(f), presenter);
+  for (const f of surface.sources) n += countPresenterCalls(await read(f), presenter, modalId);
   return n;
 }
 
@@ -214,7 +214,7 @@ export async function verifyWeb(
     // ── Folded modal: TO has no standalone route, presented from its base ─────
     if (toModal && (!toScreen || toScreen.placeholder)) {
       const presenter = modalPresenterName(toModal.canonicalId);
-      const calls = await presenterCallsInSurface(surface, presenter, readSrc);
+      const calls = await presenterCallsInSurface(surface, presenter, toModal.canonicalId, readSrc);
       const key = `${fromScreen.file}::${presenter}`;
       const used = presenterBudget.get(key) ?? 0;
       if (calls > used) {
@@ -229,8 +229,8 @@ export async function verifyWeb(
       findings.push({
         ...base, status: 'unmapped',
         detail: `REAL gap, not folded: modal ${edge.to} has no built screen, and neither ${rel(projectRoot, fromScreen.file)} `
-          + `nor anything it imports calls ${presenter}() (preview harness files are not counted — a modal only the `
-          + `preview presents is unreachable in the app)`,
+          + `nor anything it imports calls ${presenter}() or modalController.open('${toModal.canonicalId}', …) `
+          + '(preview harness files are not counted — a modal only the preview presents is unreachable in the app)',
       });
       continue;
     }
@@ -292,7 +292,7 @@ export async function verifyWeb(
     // ── Step modal: the edge passes through a modal that must be presented ────
     if (edge.viaModalId) {
       const presenter = modalPresenterName(edge.viaModalId);
-      if (landsOnTo && countPresenterCalls(fromSrc, presenter) === 0) {
+      if (landsOnTo && countPresenterCalls(fromSrc, presenter, edge.viaModalId) === 0) {
         findings.push({
           ...base, status: 'missing-step-presenter',
           detail: `FROM navigates to ${toRoute} but never calls ${presenter}() — the intermediate modal is skipped`,

@@ -52,14 +52,14 @@ const isPreviewFile = (f: string): boolean => /Preview\.(tsx|jsx)$/.test(f);
 
 /** Presenter call-sites in the base screen and every local module it imports,
  *  excluding preview harness files. */
-async function presenterCalls(baseFile: string, presenter: string): Promise<number> {
+async function presenterCalls(baseFile: string, presenter: string, modalId: string): Promise<number> {
   const src = await fs.readFile(baseFile, 'utf-8').catch(() => '');
   if (!src) return 0;
-  let n = countPresenterCalls(src, presenter);
+  let n = countPresenterCalls(src, presenter, modalId);
   for (const [, target] of parseImports(src, baseFile)) {
     if (isPreviewFile(target)) continue;
     const dep = await fs.readFile(target, 'utf-8').catch(() => '');
-    if (dep) n += countPresenterCalls(dep, presenter);
+    if (dep) n += countPresenterCalls(dep, presenter, modalId);
   }
   return n;
 }
@@ -130,13 +130,13 @@ export async function convertWebModal(
   if (!baseScreen) return { skip: `base screen ${modal.baseCanonicalId} has no built file — REAL gap` };
 
   const presenter = modalPresenterName(modal.canonicalId);
-  const calls = await presenterCalls(baseScreen.file, presenter);
+  const calls = await presenterCalls(baseScreen.file, presenter, modal.canonicalId);
   if (calls === 0) {
     // The modal file may exist and still be unreachable. Never credit that.
     return {
       skip: `REAL gap — ${rel(projectRoot, baseScreen.file)} (and everything it imports) never calls `
-        + `${presenter}(); preview harness files are excluded, so a modal only *Preview.tsx opens is `
-        + 'unreachable in the shipped app',
+        + `${presenter}() nor modalController.open('${modal.canonicalId}', …); preview harness files are `
+        + 'excluded, so a modal only *Preview.tsx opens is unreachable in the shipped app',
     };
   }
 

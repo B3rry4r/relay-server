@@ -399,10 +399,23 @@ export function collectRouteConstRefs(src: string): Set<string> {
   return out;
 }
 
-/** Presenter call-sites for a folded modal: `showModal_88_6412(` . */
-export function countPresenterCalls(src: string, presenter: string): number {
-  const re = new RegExp(`\\b${escapeRe(presenter)}\\s*\\(`, 'g');
-  return (src.match(re) ?? []).length;
+/** Presenter call-sites for a folded modal.
+ *
+ *  Two shapes are equally valid, and counting only the first reports a working modal
+ *  as unreachable:
+ *    1. `showModal_88_6412()` — the presenter the packet contract asks for;
+ *    2. `modalController.open('m_135_2685', <Content onSubmit={…}/>)` — opened
+ *       directly, which is what a screen does when the modal needs a prefill or a
+ *       submit callback the fixed-signature presenter cannot carry.
+ *
+ *  The modal id in (2) is a literal, so it identifies the modal exactly. */
+export function countPresenterCalls(src: string, presenter: string, modalId?: string): number {
+  const byPresenter = (src.match(new RegExp(`\\b${escapeRe(presenter)}\\s*\\(`, 'g')) ?? []).length;
+  if (!modalId) return byPresenter;
+  const direct = (src.match(
+    new RegExp(`\\bmodalController\\s*\\.\\s*open\\s*\\(\\s*['"\`]${escapeRe(modalId)}['"\`]`, 'g'),
+  ) ?? []).length;
+  return byPresenter + direct;
 }
 
 /** Any modal presenter at all — the React analogue of `showModalBottomSheet|showDialog`. */
