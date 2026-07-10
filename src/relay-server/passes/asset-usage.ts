@@ -35,6 +35,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import type { AIModel } from '../ai-adapters';
+import { repointWeb, findWebResourcesFile, parseDeclaredWebSymbols, WEB_RESOURCES_SYMBOL } from './asset-usage-web';
 
 // ── Public contract ──────────────────────────────────────────────────────────
 
@@ -199,7 +200,7 @@ export async function repointAssetUsage(projectId: string, opts: RepointOptions)
 
 function getStrategy(fw: Framework): AssetUsageStrategy | null {
   if (fw === 'flutter') return flutterStrategy;
-  if (fw === 'react') return reactStrategy;
+  if (fw === 'react' || fw === 'next') return webStrategy(fw);
   return null;
 }
 
@@ -853,16 +854,27 @@ async function readFileOrNull(abs: string): Promise<string | null> {
 // React strategy (seam only — Phase 7c ships flutter; react contract is stubbed)
 // =============================================================================
 
-const reactStrategy: AssetUsageStrategy = {
-  framework: 'react',
-  // TODO(7c-react): scan src/screens|pages for (a) icon-font/lucide/heroicon
-  // substitutions that have an exported asset counterpart and (b) raw string
-  // asset paths; rewrite to `import { assets } from '../resources/assets'` +
-  // <img src={assets.x}/> / an <Svg> component, AI-matching ambiguous icons.
-  async repoint() {
-    return { repointed: [], skipped: [], warnings: ['react strategy not implemented (7c ships flutter)'] };
+const webStrategy = (framework: Framework): AssetUsageStrategy => ({
+  framework,
+  async repoint(projectRoot, index, opts) {
+    const r = await repointWeb(
+      projectRoot,
+      index.assets.map((a) => ({
+        symbolKey: a.symbolKey, name: a.name, newPath: a.newPath, format: a.format, kind: a.kind,
+      })),
+      { dryRun: opts.dryRun, onlyFiles: opts.onlyFiles },
+    );
+    return {
+      repointed: r.repointed.map((x) => ({
+        file: x.file, from: x.from === 'raw-path' ? 'raw-path' as const : 'material-icon' as const,
+        original: x.original, symbol: `assets.${x.symbol}`,
+        widget: 'Image.asset' as const, how: x.how,
+      })),
+      skipped: r.skipped,
+      warnings: r.warnings,
+    };
   },
-};
+});
 
 // =============================================================================
 // AppAssets symbol inventory (T12 — Phase 5/6 packet injection)
@@ -881,7 +893,9 @@ const reactStrategy: AssetUsageStrategy = {
 // NOTHING (guard for absence), so a project without assets is unaffected.
 
 export interface AssetInventory {
-  /** Resources class, e.g. `AppAssets`. */
+  /** Which framework's usage contract the inventory should describe. */
+  framework: Framework;
+  /** Resources class or module symbol, e.g. `AppAssets` (dart) / `assets` (web). */
   className: string;
   /** Resources file path relative to project root, e.g. `lib/resources/app_assets.dart`. */
   resourcesRel: string;
@@ -898,17 +912,41 @@ export interface AssetInventory {
  */
 export async function buildAssetInventory(projectRoot: string): Promise<AssetInventory | null> {
   const framework = await detectFramework(projectRoot);
-  if (framework !== 'flutter') return null;
   const map = await readAssetMap(projectRoot);
   if (!map || !Array.isArray(map.assets) || map.assets.length === 0) return null;
-  const resourcesSrc = await readFileOrNull(path.join(projectRoot, FLUTTER_RESOURCES_REL));
-  if (!resourcesSrc) return null;
-  const declared = parseDeclaredSymbols(resourcesSrc);
-  if (declared.size === 0) return null;
   const index = buildAssetIndex(map);
-  const symbols = index.assets.filter((a) => declared.has(a.symbolKey));
-  if (symbols.length === 0) return null;
-  return { className: FLUTTER_RESOURCES_CLASS, resourcesRel: FLUTTER_RESOURCES_REL, symbols };
+
+  if (framework === 'flutter') {
+    const resourcesSrc = await readFileOrNull(path.join(projectRoot, FLUTTER_RESOURCES_REL));
+    if (!resourcesSrc) return null;
+    const declared = parseDeclaredSymbols(resourcesSrc);
+    if (declared.size === 0) return null;
+    const symbols = index.assets.filter((a) => declared.has(a.symbolKey));
+    if (symbols.length === 0) return null;
+    return { framework, className: FLUTTER_RESOURCES_CLASS, resourcesRel: FLUTTER_RESOURCES_REL, symbols };
+  }
+
+  // T12-web: the inventory was flutter-only, so on react/next the build agent got NO
+  // asset block at all — which is why it hand-drew photos and avatars that shipped in
+  // the .fig. Same contract, web symbols.
+  if (framework === 'react' || framework === 'next') {
+    const resourcesFile = findWebResourcesFile(projectRoot);
+    if (!resourcesFile) return null;
+    const resourcesSrc = await readFileOrNull(resourcesFile);
+    if (!resourcesSrc) return null;
+    const declared = parseDeclaredWebSymbols(resourcesSrc);
+    if (declared.size === 0) return null;
+    const symbols = index.assets.filter((a) => declared.has(a.symbolKey));
+    if (symbols.length === 0) return null;
+    return {
+      framework,
+      className: WEB_RESOURCES_SYMBOL,
+      resourcesRel: path.relative(projectRoot, resourcesFile).split(path.sep).join('/'),
+      symbols,
+    };
+  }
+
+  return null;
 }
 
 /**
@@ -920,15 +958,20 @@ export async function buildAssetInventory(projectRoot: string): Promise<AssetInv
 export function renderAssetInventory(inv: AssetInventory, cap = 120): string {
   const icons = inv.symbols.filter((a) => a.kind === 'icon');
   const images = inv.symbols.filter((a) => a.kind === 'image');
-  const fmt = (a: IndexedAsset) =>
-    `${inv.className}.${a.symbolKey} (${a.name}, ${a.format})`;
+  const ref = (key: string) => (inv.framework === 'flutter' ? `${inv.className}.${key}` : `${inv.className}.${key}`);
+  const fmt = (a: IndexedAsset) => `${ref(a.symbolKey)} (${a.name}, ${a.format})`;
   const ordered = [...icons, ...images];
   const shown = ordered.slice(0, cap);
+
   const lines: string[] = [
-    `AVAILABLE DESIGN ASSETS (${inv.symbols.length}) — the asset pipeline exported the design's real icons/images into ${inv.resourcesRel} as the \`${inv.className}\` class.`,
-    `USE \`${inv.className}.<symbol>\` for every icon/image — NEVER a raw 'assets/...' path string literal and NEVER a substitute Material icon. The raw 'assets/...' paths in the IR tree are OPAQUE pre-rename names; the files have been renamed/deduped, so a raw path literal will FAIL at runtime. Reference the symbol instead.`,
-    `Import it with a relative path to ${inv.resourcesRel}. SVG symbols → \`SvgPicture.asset(${inv.className}.x, width:.., height:.., colorFilter: ColorFilter.mode(color, BlendMode.srcIn))\` (needs \`flutter_svg\`); raster symbols → \`Image.asset(${inv.className}.x)\`.`,
+    `AVAILABLE DESIGN ASSETS (${inv.symbols.length}) — the asset pipeline exported the design's real icons/images into ${inv.resourcesRel}.`,
+    `USE \`${inv.className}.<symbol>\` for every icon/image — NEVER a raw 'assets/...' path string literal, NEVER a substitute icon, and NEVER a hand-drawn inline drawing. The raw 'assets/...' paths in the IR tree are OPAQUE pre-rename names; the files have been renamed/deduped, so a raw path literal will FAIL at runtime. Reference the symbol instead.`,
   ];
+  if (inv.framework === 'flutter') {
+    lines.push(`Import it with a relative path to ${inv.resourcesRel}. SVG symbols → \`SvgPicture.asset(${inv.className}.x, width:.., height:.., colorFilter: ColorFilter.mode(color, BlendMode.srcIn))\` (needs \`flutter_svg\`); raster symbols → \`Image.asset(${inv.className}.x)\`.`);
+  } else {
+    lines.push(`Import it: \`import { ${inv.className} } from '<relative path to ${inv.resourcesRel}>'\`. Raster symbols → \`<img src={\`/\${${inv.className}.x}\`} alt="" />\`. Monochrome icon symbols → the project's \`<Icon name="x" />\` component when one exists, else \`<img src={\`/\${${inv.className}.x}\`} />\`. A photo, avatar, map or illustration in the design is a REAL exported image — do NOT draw it with inline <svg>.`);
+  }
   if (icons.length) lines.push(`Icons: ${shown.filter(a => a.kind === 'icon').map(fmt).join('; ')}`);
   if (images.length) lines.push(`Images: ${shown.filter(a => a.kind === 'image').map(fmt).join('; ')}`);
   if (ordered.length > cap) lines.push(`…and ${ordered.length - cap} more symbols declared in ${inv.resourcesRel} — open that file for the full list.`);
