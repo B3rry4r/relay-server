@@ -58,6 +58,23 @@ unimplemented phase into a green build.
    Anything that resolves a canonical id to a file goes through the shared
    resolver, never a bespoke regex.
 
+## A complete build is a clean deliverable
+
+Finalizing is not only transforming what exists — it is removing what should not
+ship and flagging what renders but does not work. A build handed to a frontend team
+must not contain the pipeline's own scaffolding or controls that do nothing.
+
+- **No dead controls.** A button wired to a no-op handler (`onClick={() => {}}`,
+  `onPressed: () {}`) is pixel-identical to a working one, so verify scores it green.
+  `auditInteractions` (7g) finds them deterministically and requeues the screen so
+  the agent wires real behaviour. It never guesses the behaviour itself.
+- **No verify scaffolding in the deliverable.** `/_preview` routes, `*Preview` files
+  and `PlaceholderScreen` exist for verification, which serves the production build.
+  `productionHygiene` (7h) strips them during finalize (post-verify); a requeue
+  re-creates exactly what it needs, so the operation is idempotent.
+- **No silent deletions.** An asset reached via `assets[computedKey]` looks
+  unreferenced to a static scan. Report it; never delete on that evidence.
+
 ## What "runnable end to end" means
 
 Phase 7 must be invocable against **any** project that reached Phase 5, whether or
