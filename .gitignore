@@ -12,3 +12,6 @@ acli
 .local/
 .relay/
 .claude/
+# …but project skills are shared contracts, not local settings.
+!.claude/skills/
+!.claude/skills/**
