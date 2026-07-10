@@ -47,10 +47,11 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import type { AIModel } from '../ai-adapters';
+import { convertWebModal, type WebCanonModal, type WebCanonScreen } from './modal-overlay-web';
 
 // ── Public contract ──────────────────────────────────────────────────────────
 
-export type Framework = 'flutter' | 'react' | 'unknown';
+export type Framework = 'flutter' | 'react' | 'next' | 'unknown';
 
 export type PresentationKind = 'bottomSheet' | 'dialog' | 'fullOverlay';
 
@@ -176,7 +177,8 @@ export async function detectFramework(projectRoot: string): Promise<Framework> {
     try {
       const pkg = JSON.parse(await fs.readFile(path.join(projectRoot, 'package.json'), 'utf8'));
       const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
-      if (deps.react || deps.next) return 'react';
+      if (deps.next) return 'next';
+      if (deps.react) return 'react';
     } catch { /* fall through */ }
   }
   return 'unknown';
@@ -281,7 +283,7 @@ export async function applyModalOverlays(projectId: string, opts: ModalOverlayOp
 
 function getStrategy(fw: Framework): ModalStrategy | null {
   if (fw === 'flutter') return flutterStrategy;
-  if (fw === 'react') return reactStrategy;
+  if (fw === 'react' || fw === 'next') return webStrategy(fw);
   return null;
 }
 
@@ -1221,16 +1223,33 @@ function importPathBetween(fromFile: string, toFile: string): string {
 function escapeRe(s: string): string { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
 // =============================================================================
-// React strategy (seam only — Phase 7b ships flutter; react contract is stubbed)
+// React / Next strategy — Phase 7b. See modal-overlay-web.ts.
 // =============================================================================
 
-const reactStrategy: ModalStrategy = {
-  framework: 'react',
-  async convert(_projectRoot, _modal, _screens, _opts) {
-    // TODO(7c): map a routed modal (a <Route> rendering a full-page modal) to a
-    // portal/overlay (Radix Dialog / a barrier <div> + content), rewrite the
-    // trigger's onClick from navigate(route) to setOpen(true)/<Dialog open>, and
-    // drop the dead route. React shape detection mirrors the flutter strategy.
-    return { skip: 'react strategy not implemented (7b ships flutter only)' };
+const webStrategy = (framework: Framework): ModalStrategy => ({
+  framework,
+  async convert(projectRoot, modal, screens, opts) {
+    const out = await convertWebModal(
+      projectRoot,
+      modal as WebCanonModal,
+      screens as WebCanonScreen[],
+      { dryRun: opts.dryRun },
+    );
+    if ('skip' in out) return { skip: out.skip };
+    const t = out.transform;
+    return {
+      transform: {
+        canonicalId: t.canonicalId,
+        name: t.name,
+        frameId: t.frameId,
+        baseCanonicalId: t.baseCanonicalId,
+        presentation: 'dialog',
+        presentationSource: 'structure',
+        modalFile: t.modalFile ?? '(folded — presenter not located)',
+        baseFile: t.baseFile,
+        trigger: { wired: 'rewrote-push', how: 'deterministic' },
+        ...(t.removedRoute ? { removedRoute: t.removedRoute } : {}),
+      },
+    };
   },
-};
+});

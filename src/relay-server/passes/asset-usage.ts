@@ -38,7 +38,7 @@ import type { AIModel } from '../ai-adapters';
 
 // ── Public contract ──────────────────────────────────────────────────────────
 
-export type Framework = 'flutter' | 'react' | 'unknown';
+export type Framework = 'flutter' | 'react' | 'next' | 'unknown';
 
 export interface RepointOptions {
   /** Resolved absolute project root. */
@@ -138,7 +138,8 @@ export async function detectFramework(projectRoot: string): Promise<Framework> {
     try {
       const pkg = JSON.parse(await fs.readFile(path.join(projectRoot, 'package.json'), 'utf8'));
       const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
-      if (deps.react || deps.next) return 'react';
+      if (deps.next) return 'next';
+      if (deps.react) return 'react';
     } catch { /* fall through */ }
   }
   return 'unknown';

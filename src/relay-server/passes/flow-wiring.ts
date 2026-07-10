@@ -50,11 +50,12 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import type { AIModel } from '../ai-adapters';
 import { tokenizeName } from '../semantic-names';
+import { verifyWeb, type WebFlow, type WebCanonScreen, type WebCanonModal } from './flow-wiring-web';
 import { modalPresenterName } from '../design-system';
 
 // ── Public contract ──────────────────────────────────────────────────────────
 
-export type Framework = 'flutter' | 'react' | 'unknown';
+export type Framework = 'flutter' | 'react' | 'next' | 'unknown';
 
 export type EdgeStatus =
   | 'wired'         // a nav call from FROM lands on TO's route
@@ -264,7 +265,8 @@ export async function detectFramework(projectRoot: string): Promise<Framework> {
     try {
       const pkg = JSON.parse(await fs.readFile(path.join(projectRoot, 'package.json'), 'utf8'));
       const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
-      if (deps.react || deps.next) return 'react';
+      if (deps.next) return 'next';
+      if (deps.react) return 'react';
     } catch { /* fall through */ }
   }
   return 'unknown';
@@ -339,7 +341,7 @@ export async function verifyFlowWiring(projectId: string, opts: FlowWiringOption
 
 function getStrategy(fw: Framework): FlowStrategy | null {
   if (fw === 'flutter') return flutterStrategy;
-  if (fw === 'react') return reactStrategy;
+  if (fw === 'react' || fw === 'next') return webStrategy(fw);
   return null;
 }
 
@@ -1292,23 +1294,24 @@ function matchParen(s: string, open: number): number {
 function rel(root: string, abs: string): string { return path.relative(root, abs); }
 
 // =============================================================================
-// React strategy (seam only — Phase 7d ships flutter; react contract is stubbed)
+// React / Next strategy — Phase 7d. See flow-wiring-web.ts.
 // =============================================================================
 
-const reactStrategy: FlowStrategy = {
-  framework: 'react',
-  async verify(_projectRoot, flow, _screens, _modals, _opts) {
-    // TODO(7d-react): resolve each canonical screen → its built page/route
-    // component (file-based router or a <Routes> table), scan the FROM page (and
-    // imported components) for navigation (useNavigate()/navigate('/x'),
-    // <Link to>, router.push) landing on the TO route, classify each edge, and
-    // auto-wire dead onClick handlers (`onClick={() => {}}`) to navigate(toRoute)
-    // when the target route unambiguously exists. Mirrors the flutter strategy.
-    const findings: EdgeFinding[] = flow.edges.map((e) => ({
-      from: e.from, to: e.to, kind: e.kind, ...(e.label ? { element: e.label } : {}),
-      status: 'unmapped' as EdgeStatus,
-      detail: 'react flow-wiring strategy not implemented (7d ships flutter only)',
-    }));
-    return { findings, autoFixes: 0, screensMapped: 0, screensReferenced: new Set(flow.edges.flatMap((e) => [e.from, e.to])).size };
+const webStrategy = (framework: Framework): FlowStrategy => ({
+  framework,
+  async verify(projectRoot, flow, screens, modals, opts) {
+    const r = await verifyWeb(
+      projectRoot,
+      flow as WebFlow,
+      screens as WebCanonScreen[],
+      modals as WebCanonModal[],
+      { dryRun: opts.dryRun, noAutoFix: opts.noAutoFix },
+    );
+    return {
+      findings: r.findings as EdgeFinding[],
+      autoFixes: r.autoFixes,
+      screensMapped: r.screensMapped,
+      screensReferenced: r.screensReferenced,
+    };
   },
-};
+});
