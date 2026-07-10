@@ -3401,6 +3401,15 @@ export function registerScreenLoopRoutes(app: Express): void {
       }
       if (run.finalized) run.finalized = undefined;
       await saveRun(projectId, run);
+      // Clearing `finalized` is not enough: the P7 gate ALSO skips on the mere
+      // presence of .uix/finalize-report.json, so a requeue re-ran the screens and
+      // then silently skipped finalize over the new code, re-flagging the run
+      // finalized off a report describing the OLD build. restartRun drops the file;
+      // a requeue must too — it is the same invalidation, narrower in scope.
+      const requeueRoot = resolveProjectRoot(projectId);
+      if (requeueRoot) {
+        await fs.rm(path.join(requeueRoot, '.uix', 'finalize-report.json'), { force: true }).catch(() => {});
+      }
       await appendRunLog(projectId, runId, `[run] requeued ${hit.length} screen(s) for rebuild: ${hit.join(', ')}`);
     }
 
