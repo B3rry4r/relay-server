@@ -121,7 +121,16 @@ function duplicateHint(frame: { id: string; name: string }, frames: Array<{ id: 
 }
 
 /** One-time bootstrap steps run only on the first build into a project. */
-function bootstrapSteps(fwLabel: string, flow: FlowGraph, assetCount: number, fname: (id: string) => string): string[] {
+function bootstrapSteps(framework: string, fwLabel: string, flow: FlowGraph, assetCount: number, fname: (id: string) => string): string[] {
+  // The generated web app is previewed by exposing its dev/preview server through
+  // the relay Cloudflare tunnel (*.trycloudflare.com). Vite ≥5 rejects any request
+  // whose Host header isn't allow-listed ("Blocked request … is not allowed"), so a
+  // fresh scaffold with the default config is unpreviewable until this is set. Bake
+  // the allow-list in at bootstrap so it never has to be hand-patched per session.
+  const isWeb = framework === 'react' || framework === 'next';
+  const webHostStep = isWeb ? [
+    `1b. This project is previewed through a Cloudflare tunnel, so the dev/preview server MUST accept tunnel + platform Host headers. In vite.config (or the framework's server config), set BOTH \`server.allowedHosts\` and \`preview.allowedHosts\` to include \`.trycloudflare.com\`, \`.up.railway.app\`, \`localhost\` and \`127.0.0.1\` (leading-dot entries are subdomain wildcards), and set \`server.host\`/\`preview.host\` to \`true\`. Without this the live preview fails with "Blocked request … is not allowed".`,
+  ] : [];
   const hasNav = flow.connections.length > 0;
   const tabDests = flow.connections.filter(c => c.type === 'tab')
     .sort((a, b) => (a.tabIndex ?? 0) - (b.tabIndex ?? 0)).map(c => fname(c.to));
@@ -136,6 +145,7 @@ function bootstrapSteps(fwLabel: string, flow: FlowGraph, assetCount: number, fn
   ] : [];
   return [
     `1. Inspect the project. If it is empty or a bare scaffold, set it up idiomatically for ${fwLabel} (initialise, add dependencies, entry point).`,
+    ...webHostStep,
     `2. Establish a real DESIGN SYSTEM you'll reuse for every later screen: derive the colour palette, typography scale (families/sizes/weights) and spacing from this screen's IR and centralise them as theme tokens; factor recurring UI (buttons, inputs, cards, nav/app bars) into shared components. Later screens MUST reuse these, not re-style inline.`,
     `3. Create .uix/context.md — a durable hand-off for future build sessions: record where the design-system tokens & shared components live, the routing/navigation structure, and a screens index (screen name → source file). You will read and extend this on every later screen.`,
     ...navStep,
@@ -167,7 +177,7 @@ export function buildAgentPacket(input: AgentPacketInput): string {
   ] : [];
   const setupSteps = bootstrapped
     ? [`The project is already set up for ${frameworkLabel} (including its navigation/router and assets/). READ .uix/context.md first for the established design system, routing and screens already built; reuse its theme, router, assets and shared components. Only add this screen and register it into the existing navigation.`]
-    : bootstrapSteps(frameworkLabel, flowGraph, assetCount, fname);
+    : bootstrapSteps(framework, frameworkLabel, flowGraph, assetCount, fname);
 
   return [
     `You are an autonomous coding agent working in the CURRENT project directory. Build ONE screen from a Figma design into this project — you own file creation, naming, and project setup.`,
