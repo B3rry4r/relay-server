@@ -54,6 +54,7 @@ import * as path from 'path';
 import { spawn } from 'child_process';
 import type { AIModel } from '../ai-adapters';
 import { detectFramework, type Framework } from './component-extraction';
+import { deepenWebTokens } from './token-cleanup-web';
 
 export { detectFramework };
 export type { Framework };
@@ -219,7 +220,7 @@ export async function deepenTokensAndCleanup(
 
 function getStrategy(fw: Framework): DeepenStrategy | null {
   if (fw === 'flutter') return flutterStrategy;
-  if (fw === 'react') return reactStrategy;
+  if (fw === 'react' || fw === 'next') return webStrategy(fw);
   return null;
 }
 
@@ -1093,28 +1094,23 @@ function runCmd(cmd: string, args: string[], cwd: string): Promise<string> {
 // React strategy (seam only — Phase 7f ships flutter; react contract is stubbed)
 // =============================================================================
 
-const reactStrategy: DeepenStrategy = {
-  framework: 'react',
-  async run() {
-    // TODO(7f-react): parse the design-system module (e.g. src/theme/tokens.ts /
-    // a Tailwind config / CSS custom properties) for color/spacing/radius/text
-    // tokens; across src/** replace literal hex colors, px spacing, borderRadius,
-    // and inline style objects / className utilities that EXACTLY equal a token
-    // with the token reference (the same exact-match discipline as flutter). Then
-    // drive unused-import / dead-export removal from `eslint --rule
-    // no-unused-vars` + `tsc --noEmit` (the analyzer equivalents), verifying the
-    // build + a render-tree snapshot are unchanged. AI is used ONLY to confirm an
-    // inline style object is semantically the same as a named token.
+const webStrategy = (framework: Framework): DeepenStrategy => ({
+  framework,
+  async run(projectRoot, opts) {
+    const r = await deepenWebTokens(projectRoot, { dryRun: opts.dryRun, onlyFiles: opts.onlyFiles });
     return {
       report: {
-        themeFile: null,
-        tokensAvailable: { colors: [], spacing: [], radius: [], textStyles: [] },
-        substitutions: { colors: 0, textStyles: 0, spacing: 0, radius: 0 },
-        removals: { imports: 0, consts: 0, methods: 0 },
-        changes: [],
-        rejected: [],
+        themeFile: r.themeFile,
+        tokensAvailable: r.tokensAvailable,
+        substitutions: r.substitutions,
+        removals: r.removals,
+        changes: r.changes,
+        rejected: r.rejected,
+        // The finalize orchestrator owns the typecheck gate for web; this pass does
+        // not shell out a second time.
         analyze: { before: null, after: null, skipped: true },
       },
     };
   },
-};
+});
+

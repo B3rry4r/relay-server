@@ -3465,6 +3465,89 @@ export function registerScreenLoopRoutes(app: Express): void {
 
   // POST /api/ai/runs/:runId/stop { projectId } — request a graceful stop after
   // the in-flight screen finishes. Marks the run 'stopped' (resumable later).
+  /**
+   * POST /api/ai/runs/:runId/finalize — run Phase 7 ALONE against a run's project.
+   *
+   * A run that stopped at Phase 5 or 6 (rate-limited, cancelled, redeployed, or
+   * parked on needs-review) has a fully built app that never saw the production
+   * passes. This re-enters Phase 7 on it: no screen rebuilds, no agent, no canonical
+   * re-derivation. The report is dropped first, because a finalize report describes
+   * the build that produced it — and this is a different build.
+   *
+   * Body: { projectId, dryRun?, force?, onlyPasses? }.
+   *   force: finalize even while screens are still needs-review/failed. Without it a
+   *   run with blocking screens is refused, since finalize would be measuring an app
+   *   that is not finished. The run is only MARKED finalized when blocking === 0.
+   */
+  app.post('/api/ai/runs/:runId/finalize', async (req, res) => {
+    const b = req.body ?? {};
+    const projectId = b.projectId as string;
+    if (!projectId) { res.status(400).json({ error: 'projectId is required' }); return; }
+    const runId = req.params.runId;
+    const run = await getRun(projectId, runId);
+    if (!run) { res.status(404).json({ error: 'run not found' }); return; }
+    if (isRunActive(runId)) { res.status(409).json({ error: 'run is active — stop it before finalizing' }); return; }
+
+    const projectRoot = resolveProjectRoot(projectId);
+    if (!projectRoot || !fsSync.existsSync(projectRoot)) { res.status(400).json({ error: 'project root missing' }); return; }
+
+    const blocking = run.screens.filter(s =>
+      s.status === 'needs-review' || s.status === 'failed' || s.status === 'pending' || s.status === 'building').length;
+    const force = b.force === true;
+    if (blocking > 0 && !force) {
+      res.status(409).json({
+        error: `${blocking} screen(s) still blocking (needs-review/failed/pending/building). `
+          + 'Pass force:true to finalize the app as it stands — the run will NOT be marked finalized.',
+        blocking,
+      });
+      return;
+    }
+
+    const dryRun = b.dryRun === true;
+    const onlyPasses = Array.isArray(b.onlyPasses) ? b.onlyPasses : undefined;
+
+    // A stale report makes the loop's P7 gate skip. It describes the previous build.
+    if (!dryRun) await fs.rm(path.join(projectRoot, '.uix', 'finalize-report.json'), { force: true }).catch(() => {});
+
+    try {
+      setGenPhase(projectId, runId, 'Finalize', dryRun ? 'production passes (dry-run)' : 'production passes');
+      const model = isAIModel(run.model) ? (run.model as AIModel) : undefined;
+      const env = createTerminalEnv(resolveWorkspace());
+      await appendRunLog(projectId, runId, `[finalize] standalone P7 (framework=${run.framework}, model=${model ?? 'none'}${dryRun ? ', dry-run' : ''}${force && blocking ? `, forced over ${blocking} blocking screen(s)` : ''})`);
+
+      const report = await finalizeApp(projectId, {
+        projectRoot,
+        model,
+        env,
+        dryRun,
+        ...(onlyPasses ? { onlyPasses } : {}),
+        log: (msg) => { void appendRunLog(projectId, runId, msg); },
+        runModel: async (m, prompt, e, cwd, opts) => {
+          const { text } = await runModel(m, prompt, e, cwd, { format: opts?.format, projectId });
+          return { text };
+        },
+      });
+
+      const applied = report.passes.filter(p => p.status === 'applied').length;
+      const reverted = report.passes.filter(p => p.status === 'reverted').length;
+      const skippedPasses = report.passes.filter(p => p.status === 'skipped').length;
+      await appendRunLog(projectId, runId,
+        `[finalize] complete — ${applied} applied, ${skippedPasses} skipped, ${reverted} reverted (analyze ${report.baselineAnalyze ?? 'n/a'} → ${report.finalAnalyze ?? 'n/a'})`);
+
+      if (!dryRun) {
+        await runCheckpoint(projectId, runId, projectRoot, 'phase finalize (standalone)', `${applied} applied, ${reverted} reverted`);
+        // Only a run with nothing blocking is genuinely finalized. A forced run got
+        // its passes, but the build is not complete and must not claim to be.
+        if (blocking === 0) await setRunFinalized(projectId, runId, true);
+      }
+      setGenPhase(projectId, runId, 'Finalize', `${applied} applied, ${reverted} reverted`);
+      res.json({ report, blocking, forced: force && blocking > 0, finalized: !dryRun && blocking === 0 });
+    } catch (err: any) {
+      await appendRunLog(projectId, runId, `[finalize] standalone P7 FAILED: ${err?.message ?? err}`);
+      res.status(500).json({ error: `finalize failed: ${err?.message ?? err}` });
+    }
+  });
+
   app.post('/api/ai/runs/:runId/stop', async (req, res) => {
     const projectId = (req.body?.projectId ?? req.query.projectId) as string;
     if (!projectId) { res.status(400).json({ error: 'projectId is required' }); return; }

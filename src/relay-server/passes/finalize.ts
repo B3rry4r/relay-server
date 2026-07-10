@@ -365,18 +365,21 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
   // Build-safety setup. Only flutter (with a lib/) gets the analyze/build gate; any
   // other shape degrades to "thrown-pass-only rollback" (skipBuildCheck behaviour).
   const sourceDirs = sourceDirsFor(framework, projectRoot);
+  const isWeb = framework === 'react' || framework === 'next';
   const buildCheckable =
     !opts.dryRun &&
     !opts.skipBuildCheck &&
-    framework === 'flutter' &&
-    fsSync.existsSync(path.join(projectRoot, 'lib'));
+    ((framework === 'flutter' && fsSync.existsSync(path.join(projectRoot, 'lib')))
+      // 7b/7c REWRITE web sources (dead routes, asset symbols). Without a gate here a
+      // broken pass shipped silently, since only a THROWN pass was ever rolled back.
+      || (isWeb && fsSync.existsSync(path.join(projectRoot, 'package.json'))));
 
   // Baseline analyze (best-effort). On a non-buildable project this is null and the
   // gate uses thrown-pass detection only.
   let baselineAnalyze: number | null = null;
   let baselineErrors: number | null = null;
   if (buildCheckable) {
-    const a = await flutterAnalyze(projectRoot, opts.env);
+    const a = await analyzeErrorsFor(framework, projectRoot, opts.env);
     baselineAnalyze = a?.total ?? null;
     baselineErrors = a?.errors ?? null;
     log(`[finalize] baseline analyze: ${baselineAnalyze ?? 'n/a'} issue(s), ${baselineErrors ?? 'n/a'} error(s)`);
@@ -470,13 +473,13 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
           snapshot: () => snapshotBeforeMutation(projectRoot, `${def.name} group (P8 per-group)`, vc),
           restore: (token: string) => rollbackTo(projectRoot, token, vc),
           buildOk: async () => {
-            const a = await flutterAnalyze(projectRoot, opts.env);
+            const a = await analyzeErrorsFor(framework, projectRoot, opts.env);
             const afterErrors = a?.errors ?? null;
             if (afterErrors != null && budgetAtPassStart != null && afterErrors > budgetAtPassStart) {
               return { ok: false, reason: `analyze errors ${budgetAtPassStart} → ${afterErrors}` };
             }
-            const built = await flutterBuildWebOk(projectRoot, opts.env);
-            return built.ok ? { ok: true } : { ok: false, reason: `build web failed: ${built.error}` };
+            const built = await buildOkFor(framework, projectRoot, opts.env);
+            return built.ok ? { ok: true } : { ok: false, reason: `build failed: ${built.error}` };
           },
         };
       },
@@ -518,13 +521,13 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
     // a pass that introduces a real error or breaks the build is reverted; a pass
     // that only churns cosmetic info/warning lints is allowed (matches asset-phase).
     if (!failure && buildCheckable) {
-      const a = await flutterAnalyze(projectRoot, opts.env);
+      const a = await analyzeErrorsFor(framework, projectRoot, opts.env);
       const afterErrors = a?.errors ?? null;
       if (afterErrors != null && lastGoodErrors != null && afterErrors > lastGoodErrors) {
-        failure = `flutter analyze errors regressed (${lastGoodErrors} → ${afterErrors} error(s))`;
+        failure = `${framework} typecheck errors regressed (${lastGoodErrors} → ${afterErrors} error(s))`;
       } else {
-        const built = await flutterBuildWebOk(projectRoot, opts.env);
-        if (!built.ok) failure = `flutter build web failed: ${built.error}`;
+        const built = await buildOkFor(framework, projectRoot, opts.env);
+        if (!built.ok) failure = `${framework} build failed: ${built.error}`;
         else {
           // Pass is good: advance the error bar to this pass's error count.
           lastGoodErrors = afterErrors ?? lastGoodErrors;
@@ -572,7 +575,7 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
   let finalAnalyze: number | null = null;
   let finalErrors: number | null = null;
   if (buildCheckable) {
-    const fa = await flutterAnalyze(projectRoot, opts.env);
+    const fa = await analyzeErrorsFor(framework, projectRoot, opts.env);
     finalAnalyze = fa?.total ?? null;
     finalErrors = fa?.errors ?? null;
     log(`[finalize] final analyze: ${finalAnalyze ?? 'n/a'} issue(s), ${finalErrors ?? 'n/a'} error(s) (baseline ${baselineAnalyze ?? 'n/a'} issue(s), ${baselineErrors ?? 'n/a'} error(s))`);
@@ -622,11 +625,69 @@ function sourceDirsFor(framework: Framework, projectRoot: string): string[] {
       const abs = path.join(projectRoot, d);
       if (fsSync.existsSync(abs)) dirs.push(abs);
     }
-  } else if (framework === 'react') {
-    const abs = path.join(projectRoot, 'src');
-    if (fsSync.existsSync(abs)) dirs.push(abs);
+  } else if (framework === 'react' || framework === 'next') {
+    for (const d of ['src', 'app', 'pages', 'components']) {
+      const abs = path.join(projectRoot, d);
+      if (fsSync.existsSync(abs)) dirs.push(abs);
+    }
   }
   return dirs;
+}
+
+// ── Build-safety checks (framework-agnostic seam) ────────────────────────────
+
+/** ERROR count for the framework. Flutter: `flutter analyze`. Web: `tsc --noEmit`
+ *  diagnostics. Null when the toolchain is unavailable → the gate degrades to
+ *  build-only, never to silently-pass. */
+async function analyzeErrorsFor(
+  framework: Framework, projectRoot: string, env?: NodeJS.ProcessEnv,
+): Promise<{ total: number; errors: number } | null> {
+  if (framework === 'flutter') {
+    const a = await flutterAnalyze(projectRoot, env);
+    return a ? { total: a.total, errors: a.errors } : null;
+  }
+  if (framework === 'react' || framework === 'next') return tscErrors(projectRoot, env);
+  return null;
+}
+
+async function buildOkFor(
+  framework: Framework, projectRoot: string, env?: NodeJS.ProcessEnv,
+): Promise<{ ok: boolean; error?: string }> {
+  if (framework === 'flutter') return flutterBuildWebOk(projectRoot, env);
+  if (framework === 'react' || framework === 'next') return webBuildOk(projectRoot, env);
+  return { ok: true };
+}
+
+/** `tsc --noEmit` error count. A generated app has a plain tsconfig (no project
+ *  references), so this really does typecheck the sources. */
+async function tscErrors(projectRoot: string, env?: NodeJS.ProcessEnv): Promise<{ total: number; errors: number } | null> {
+  if (!fsSync.existsSync(path.join(projectRoot, 'tsconfig.json'))) return null;
+  // runCmd resolves with combined output on a non-zero exit, which is exactly what
+  // tsc does when it finds errors. A spawn failure (no npx) must degrade to null —
+  // returning 0 there would report a clean typecheck that never ran.
+  const raw = await runCmd('npx', ['tsc', '--noEmit', '--pretty', 'false'], projectRoot, env).catch(() => null);
+  if (raw == null) return null;
+  const errors = (raw.match(/^\S.*\berror TS\d+:/gm) ?? []).length;
+  return { total: errors, errors };
+}
+
+/** The project's real build. `npm run build` when the script exists — the only
+ *  check that catches what `tsc --noEmit` cannot (bundler resolution, missing
+ *  imports behind path aliases). */
+async function webBuildOk(projectRoot: string, env?: NodeJS.ProcessEnv): Promise<{ ok: boolean; error?: string }> {
+  let hasBuild = false;
+  try {
+    const pkg = JSON.parse(fsSync.readFileSync(path.join(projectRoot, 'package.json'), 'utf8')) as { scripts?: Record<string, string> };
+    hasBuild = !!pkg.scripts?.build;
+  } catch { return { ok: true }; }
+  if (!hasBuild) return { ok: true };
+  if (!fsSync.existsSync(path.join(projectRoot, 'node_modules'))) return { ok: true }; // deps not installed → can't verify, don't block
+  try {
+    await runCmd('npm', ['run', 'build'], projectRoot, env, true);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String((e as Error)?.message ?? e).slice(0, 400) };
+  }
 }
 
 // ── Build-safety checks (flutter) ─────────────────────────────────────────────

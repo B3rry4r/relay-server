@@ -44,6 +44,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import type { AIModel } from '../ai-adapters';
 import { deriveSemanticIdentifiers } from '../semantic-names';
+import { renameWeb } from './semantic-rename-web';
 
 // ── Public contract ──────────────────────────────────────────────────────────
 
@@ -237,7 +238,7 @@ export async function renameSemantic(projectId: string, opts: RenameSemanticOpti
 
 function getStrategy(fw: Framework): RenameStrategy | null {
   if (fw === 'flutter') return flutterStrategy;
-  if (fw === 'react') return reactStrategy;
+  if (fw === 'react' || fw === 'next') return webStrategy(fw);
   return null;
 }
 
@@ -696,21 +697,31 @@ function rel(root: string, abs: string): string { return path.relative(root, abs
 // React strategy (seam only — Phase 7e ships flutter; react contract is stubbed)
 // =============================================================================
 
-const reactStrategy: RenameStrategy = {
-  framework: 'react',
-  async rename(_projectRoot, screens, _opts) {
-    // TODO(7e-react): for each canonical screen mapped to a built page/route
-    // component, rename the FILE (src/pages/Page290_3657.tsx →
-    // src/pages/LinkBanks.tsx / link-banks.tsx per the project's convention),
-    // the exported component (Page290_3657 → LinkBanks), and the route path/const
-    // in the router table (createBrowserRouter / <Routes> / file-based router),
-    // then rewrite every import, <Link to>/navigate() reference, and lazy() call
-    // across src/**. Identifier replacement must be word-boundary exact; collisions
-    // disambiguated via the same AI seam. Mirrors the flutter strategy.
-    const skipped: SkippedScreen[] = screens.map((s) => ({
-      canonicalId: s.canonicalId,
-      reason: 'react semantic-rename strategy not implemented (7e ships flutter only)',
-    }));
-    return { renames: [], skipped, builtScreens: 0, filesTouched: 0 };
+const webStrategy = (framework: Framework): RenameStrategy => ({
+  framework,
+  async rename(projectRoot, screens, opts) {
+    const r = await renameWeb(
+      projectRoot,
+      screens.map((s) => ({ canonicalId: s.canonicalId, name: s.name, route: s.route, frameIds: s.frameIds })),
+      { dryRun: opts.dryRun, only: opts.only },
+    );
+    return {
+      renames: r.renames.map((x) => ({
+        canonicalId: x.canonicalId,
+        canonicalName: x.canonicalName,
+        oldFile: x.file,
+        newFile: x.file,
+        oldClass: '',
+        newClass: '',
+        ...(x.routeConst ? { oldRouteConst: x.routeConst, newRouteConst: x.routeConst } : {}),
+        oldRoutePath: x.oldRoutePath,
+        newRoutePath: x.newRoutePath,
+        identifierHow: 'deterministic' as const,
+      })),
+      skipped: r.skipped,
+      builtScreens: r.builtScreens,
+      filesTouched: r.filesTouched,
+    };
   },
-};
+});
+

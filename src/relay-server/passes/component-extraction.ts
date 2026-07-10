@@ -32,6 +32,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import type { AIModel } from '../ai-adapters';
+import { collectWebWidgets, extractWebGroup } from './component-extraction-web';
 
 // ── Public contract ──────────────────────────────────────────────────────────
 
@@ -279,7 +280,7 @@ export async function extractComponents(projectId: string, opts: ExtractOptions)
 
 function getStrategy(fw: Framework): ExtractorStrategy | null {
   if (fw === 'flutter') return flutterStrategy;
-  if (fw === 'react') return reactStrategy;
+  if (fw === 'react' || fw === 'next') return webStrategy(fw);
   return null;
 }
 
@@ -1267,15 +1268,22 @@ function escapeRe(s: string): string { return s.replace(/[.*+?^${}()|[\]\\]/g, '
 // React strategy (seam only — Phase 7a ships flutter; react contract is stubbed)
 // =============================================================================
 
-const reactStrategy: ExtractorStrategy = {
-  framework: 'react',
+const webStrategy = (framework: Framework): ExtractorStrategy => ({
+  framework,
   componentsDirName: path.join('src', 'components'),
-  async collectWidgets() {
-    // TODO(7b): parse function components / JSX subtrees in src/screens|pages,
-    // normalize props/strings, emit WidgetUnits keyed by JSX structural sig.
-    return [];
+  collectWidgets: (projectRoot, onlyFiles) => collectWebWidgets(projectRoot, onlyFiles),
+  extractGroup: async (projectRoot, group, chosenName, kind, dryRun) => {
+    const r = await extractWebGroup(projectRoot, group, chosenName, kind, dryRun);
+    if (!r) return null;
+    return {
+      name: r.name,
+      kind: r.kind,
+      fromPrivateNames: r.fromLocalNames,
+      usedIn: r.usedIn,
+      componentPath: r.componentPath,
+      parameterizedFields: [],
+      occurrences: r.occurrences,
+    };
   },
-  async extractGroup() {
-    return null;
-  },
-};
+});
+
