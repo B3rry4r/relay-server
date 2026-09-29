@@ -761,7 +761,7 @@ function planParameterization(projectRoot: string, group: WidgetUnit[]): ParamPl
 
   // 2) expand each diff token to its enclosing argument-expression span (token
   //    index range), then merge overlapping ranges.
-  let ranges: Array<[number, number]> = diffIdx.map((i) => enclosingArgRange(base, i));
+  let ranges: Array<[number, number]> = diffIdx.map((i) => widenToValueWrapper(base, enclosingArgRange(base, i)));
   ranges = mergeRanges(ranges);
 
   // 3) Skip ranges that are exactly an existing ctor param reference (already a
@@ -783,7 +783,14 @@ function planParameterization(projectRoot: string, group: WidgetUnit[]): ParamPl
       perFile.set(unitKey(group[gi]), txt);
     }
     const ptype = dartTypeForSpan([...perFile.values()]);
-    spanParams.push({ name: `p${pidx++}`, type: ptype, baseSpan: [base[lo].start, base[hi].end], perFile });
+    // CONTRACTS §5: the parameter is named after the named argument it feeds
+    // (`color:` → `color`), never `p0`. Collisions get a numeric suffix.
+    const taken = new Set([...existingParamNames, ...spanParams.map((x) => x.name)]);
+    const stem = paramNameFor(base, lo, ptype);
+    let pname = stem;
+    for (let k = 2; taken.has(pname) || DART_RESERVED.has(pname); k++) pname = `${stem}${k}`;
+    pidx++;
+    spanParams.push({ name: pname, type: ptype, baseSpan: [base[lo].start, base[hi].end], perFile });
   }
 
   return makePlan(group, base, bodies[0], ctors[0], spanParams);
@@ -847,6 +854,65 @@ function enclosingArgRange(toks: Tok[], i: number): [number, number] {
   return [lo, hi];
 }
 
+/** A differing value that is the sole argument of a value wrapper
+ *  (`const Color(0xFF12AE89)`, `BorderRadius.circular(12)`, `EdgeInsets.all(16)`,
+ *  `Radius.circular(8)`) is parameterized as the WHOLE wrapper expression, so the
+ *  parameter is a typed `Color` / `BorderRadius` / `EdgeInsets` rather than an `int`
+ *  the body re-wraps. Identical token shape across the group guarantees every
+ *  occurrence has the same wrapper. */
+const VALUE_WRAPPERS = new Set(['Color', 'Color.fromARGB', 'BorderRadius.circular', 'Radius.circular', 'EdgeInsets.all', 'EdgeInsets.symmetric', 'EdgeInsets.only', 'EdgeInsets.fromLTRB']);
+function widenToValueWrapper(toks: Tok[], [lo, hi]: [number, number]): [number, number] {
+  if (toks[lo - 1]?.text !== '(') return [lo, hi];
+  // the matching close must sit right after the span
+  let depth = 0;
+  let close = -1;
+  for (let j = lo - 1; j < toks.length; j++) {
+    const t = toks[j].text;
+    if (t === '(') depth++;
+    else if (t === ')') { depth--; if (depth === 0) { close = j; break; } }
+  }
+  if (close !== hi + 1) return [lo, hi];
+  let start = lo - 2;
+  let callee = toks[start]?.text ?? '';
+  if (toks[start - 1]?.text === '.' && toks[start - 2]?.kind === 'id') { callee = `${toks[start - 2].text}.${callee}`; start -= 2; }
+  if (!VALUE_WRAPPERS.has(callee)) return [lo, hi];
+  if (toks[start - 1]?.text === 'const') start--;
+  return [start, close];
+}
+
+const DART_RESERVED = new Set(['key', 'default', 'class', 'const', 'final', 'new', 'this', 'super', 'switch', 'case', 'if', 'else', 'for', 'in', 'is', 'return', 'var', 'void', 'null', 'true', 'false', 'with', 'extends', 'build', 'context']);
+
+/** Name a parameter after the named argument its span feeds: walk out from the span
+ *  through enclosing brackets until a `key:` at that level (`color: Color(p)` →
+ *  `color`, `style: TextStyle(fontSize: p)` → `fontSize`). No named key anywhere
+ *  (a positional `Text('…')`) → the callee (`text`) or the type (`value`). */
+function paramNameFor(toks: Tok[], lo: number, ptype: string): string {
+  let depth = 0;
+  let positional = false;
+  let firstCallee: string | null = null;
+  for (let j = lo - 1; j >= 0; j--) {
+    const t = toks[j].text;
+    if (t === ')' || t === ']' || t === '}') { depth++; continue; }
+    if (t === '(' || t === '[' || t === '{') {
+      if (depth > 0) { depth--; continue; }
+      if (t === '(' && toks[j - 1]?.kind === 'id' && !firstCallee) firstCallee = toks[j - 1].text;
+      positional = false;   // leaving this level; look for the key one level up
+      continue;
+    }
+    if (depth !== 0) continue;
+    if (t === ',') { positional = true; continue; }
+    if (t === ':' && !positional && toks[j - 1]?.kind === 'id' && toks[j - 2]?.text !== '?') {
+      const key = toks[j - 1].text;
+      if (key !== 'child' && key !== 'children') return key;
+      break;
+    }
+    if (t === ';' || t === '=>') break;
+  }
+  if (firstCallee && /^[A-Z]/.test(firstCallee)) return firstCallee.charAt(0).toLowerCase() + firstCallee.slice(1);
+  if (ptype !== 'dynamic') return ptype.charAt(0).toLowerCase() + ptype.slice(1).replace(/Geometry$/, '');
+  return 'value';
+}
+
 function mergeRanges(ranges: Array<[number, number]>): Array<[number, number]> {
   const sorted = [...ranges].sort((a, b) => a[0] - b[0]);
   const out: Array<[number, number]> = [];
@@ -859,7 +925,7 @@ function mergeRanges(ranges: Array<[number, number]>): Array<[number, number]> {
 }
 
 function dartTypeForSpan(values: string[]): string {
-  const v0 = values.map((v) => v.trim());
+  const v0 = values.map((v) => v.trim().replace(/^const\s+/, ''));
   if (v0.every((v) => /^['"]/.test(v))) return 'String';
   // Bare hex literal (e.g. `0xFFf5f5f5` inside an outer `Color(...)`): the call
   // site supplies the int and the body wraps it (`Color(p0)`).
@@ -876,6 +942,8 @@ function dartTypeForSpan(values: string[]): string {
   if (v0.every((v) => /^Icons\./.test(v))) return 'IconData';
   if (/^Color\(/.test(v0[0]) || v0.every((v) => /\.(brand|ink\d?|surface|hint|muted|neutral\d?|helper|success|error|warning)\b/.test(v)) || /Fill\b|fill\b/.test(joined)) return 'Color';
   if (v0.every((v) => /^EdgeInsets/.test(v))) return 'EdgeInsetsGeometry';
+  if (v0.every((v) => /^BorderRadius\./.test(v))) return 'BorderRadius';
+  if (v0.every((v) => /^Radius\./.test(v))) return 'Radius';
   return 'dynamic';
 }
 

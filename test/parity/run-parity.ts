@@ -332,6 +332,11 @@ const CHECKS: Record<PassName, CheckFn> = {
         ? chk('x.near-dup-param', !pillMerged || pillValuesKept, 'lie', 'near-duplicate PillButton merged only with each call site keeping its own colour', pillMerged ? `merged; call-site colours kept: ${pillValuesKept}` : 'not merged')
         : chk('x.near-dup-kept', !pillMerged, 'lie', 'near-duplicate PillButton (differing colour literal) is NOT merged blind', pillMerged ? 'a PillButton component was extracted' : 'PillButton left in place'),
       chk('x.syntax', syn.length === 0, 'lie', 'every file the pass wrote parses', syn.length ? syn.join(' | ') : 'all written TS/TSX files parse'),
+      ...(fw === 'flutter' ? [(() => {
+        // CONTRACTS §5: a parameterized field is named after the named argument it feeds, never `p0`.
+        const machine = added.filter((f) => f.endsWith('.dart')).flatMap((f) => [...read(r.root, f).matchAll(/\bthis\.(p\d+)\b/g)].map((m) => `${f}: ${m[1]}`));
+        return chk('x.param-names', machine.length === 0, 'lie', 'a lifted parameter is named after its named-argument key (color, fontSize), never p0', machine.join(' | ') || 'no pN parameters');
+      })()] : []),
       chk('x.deps-carried', depsMissing.length === 0, 'lie', 'a hoisted component carries the imports its body uses (SearchGlyph uses `assets`)', depsMissing.join(' | ') || 'every hoisted component imports what it uses'),
       honestSkip('x.skip-reason-honest', r, 'SectionHeading is declared locally in two screens'),
     ];

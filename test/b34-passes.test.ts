@@ -152,3 +152,26 @@ describe('7a web extraction writes self-sufficient modules (PG-07, PG-08)', () =
     expect(xweb.dropImportBindings("import React, { useState as uS } from \"react\";\nconst a = 1;\n", new Set(['uS']))).toBe("import React from \"react\";\nconst a = 1;\n");
   });
 });
+
+describe('7a flutter parameters are named after their named-argument key (CONTRACTS §5)', () => {
+  it('colour inside BoxDecoration(color: const Color(…)) → a typed `Color color`, call sites pass the whole value', async () => {
+    const root = await fixture('flutter');
+    await extractComponents('p', { projectRoot: root, noAiConfirm: true });
+    const pill = await fs.readFile(path.join(root, 'lib', 'components', 'pill_button.dart'), 'utf8');
+    expect(pill).toMatch(/final Color color;/);
+    expect(pill).toMatch(/BoxDecoration\(color: color,/);
+    expect(pill).not.toMatch(/\bp\d+\b/);
+    expect(await fs.readFile(path.join(root, 'lib', 'screens', 'login_screen.dart'), 'utf8')).toMatch(/PillButton\(label: 'Sign in', color: const Color\(0xFF12AE89\)\)/);
+  });
+  it('a differing fontSize → `fontSize`; a positional Text value → `text`', async () => {
+    const root = await fixture('flutter');
+    const tile = (size: number, t: string) => `\nclass _Tile extends StatelessWidget {\n  const _Tile();\n  @override\n  Widget build(BuildContext context) {\n    return Padding(padding: const EdgeInsets.all(4), child: Text('${t}', style: TextStyle(fontSize: ${size})));\n  }\n}\n`;
+    await fs.appendFile(path.join(root, 'lib', 'screens', 'login_screen.dart'), tile(14, 'A'));
+    await fs.appendFile(path.join(root, 'lib', 'screens', 'screen_10_4.dart'), tile(18, 'B'));
+    await extractComponents('p', { projectRoot: root, noAiConfirm: true });
+    const src = await fs.readFile(path.join(root, 'lib', 'components', 'tile.dart'), 'utf8');
+    expect(src).toMatch(/final String text;/);
+    expect(src).toMatch(/final double fontSize;/);
+    expect(src).not.toMatch(/\bp\d+\b/);
+  });
+});
