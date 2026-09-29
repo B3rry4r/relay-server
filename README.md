@@ -65,7 +65,26 @@ Run tests:
 npm test
 ```
 
-## Railway deployment
+## Deploy (Fly.io)
+
+On Fly, relay-server is not an app of its own. It is a **release** that the relay host
+(relay-pty repo, Fly app `relay-host`) installs on its volume and hot-swaps.
+Terminals live in the host and survive every relay-server deploy.
+
+- `npm run pack:release` → `release.tgz` + `manifest.json`: the release contract
+  (relay-pty README, "Release contract").
+- CI: `.github/workflows/release.yml` runs `tsc`, vitest (with the parity
+  ratchet), `npm run build`, `pack:release` and uploads the artifact on every push/PR. On `main`
+  (or a manual run) it `POST`s the tarball to `$RELAY_HOST_URL/__host/releases`
+  and follows the deploy until `ACTIVE`, failing with the host's deploy log. It is
+  **skipped** until the repo secrets `RELAY_HOST_URL` and `RELAY_DEPLOY_TOKEN` exist.
+- By hand: `relay-host deploy release.tgz --id <id>`; roll back with `relay-host rollback`.
+- Runbook (setup, secrets, the Railway→Fly migration, and the CLAUDE.md rule-2 text for
+  after the cutover): relay-pty `docs/DEPLOY-FLY.md`.
+
+Until the cutover, production still runs on Railway as described below.
+
+## Railway deployment (until the Fly cutover)
 
 1. Create a Railway project for the backend.
 2. Add a persistent volume and mount it at `/workspace`.
