@@ -216,3 +216,35 @@ describe('live web preview server on a Next static export (PG-33, same defect)',
     } finally { await stopFlutterPreviewServer('b56-live2'); }
   });
 });
+
+describe('POST /api/ai/resolve-app on web (PG-27, through the route)', () => {
+  it('next: resolves from code, records framework next on its run; an app with no screens is `skipped` and canonical.json survives', async () => {
+    const express = (await import('express')).default;
+    const request = (await import('supertest')).default;
+    const { registerAIRoutes } = await import('../src/relay-server/ai-routes');
+    const { listRuns } = await import('../src/relay-server/build-run-store');
+    const ws = root;
+    process.env.WORKSPACE = ws;
+    const proj = path.join(ws, 'projects', 'webres');
+    await fs.cp(path.join(FIXTURES, 'next'), proj, { recursive: true });
+    const app = express();
+    app.use(express.json());
+    registerAIRoutes(app);
+
+    const ok = await request(app).post('/api/ai/resolve-app').send({ projectId: 'webres', noAi: true, assets: false, finalize: false });
+    expect(ok.status).toBe(200);
+    expect(ok.body.canonical.screens).toBe(5);
+    expect(ok.body.canonical.modalsWithBase).toBeGreaterThanOrEqual(1);
+    const runs = await listRuns('webres');
+    expect(runs.find((r) => r.id === ok.body.runId)?.framework).toBe('next');
+
+    const before = await fs.readFile(path.join(proj, '.uix', 'canonical.json'), 'utf8');
+    for (const d of ['app', 'components', 'src']) await fs.rm(path.join(proj, d), { recursive: true, force: true });
+    const sk = await request(app).post('/api/ai/resolve-app').send({ projectId: 'webres', noAi: true });
+    expect(sk.status).toBe(200);
+    expect(sk.body.status).toBe('skipped');
+    expect(sk.body.reason).toMatch(/0 screens/);
+    expect(sk.body.finalizeReport).toBeUndefined();              // never finalized against nothing
+    expect(await fs.readFile(path.join(proj, '.uix', 'canonical.json'), 'utf8')).toBe(before);
+  }, 60000);
+});
