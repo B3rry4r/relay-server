@@ -32,16 +32,18 @@ async function copyFixture(fw: 'flutter' | 'react' | 'next'): Promise<string> {
 }
 
 describe('#1 auditInteractions never reports `applied` on a Next app whose pages it did not read', () => {
-  it('app/ + src/resources/assets.ts (the resources-emit layout): skipped, naming the unread app dir', async () => {
+  // B1 verify #1 was fixed first by an honest skip (B12); PG-24 (B34) now audits every
+  // resolver source root, so the same layout is AUDITED — `applied` is grounded in the
+  // planted control being found in app/, never in a src/resources/assets.ts read.
+  it('app/ + src/resources/assets.ts (the resources-emit layout): the pages under app/ are audited', async () => {
     const root = await copyFixture('next');
     await fs.mkdir(path.join(root, 'src', 'resources'), { recursive: true });
     await fs.writeFile(path.join(root, 'src', 'resources', 'assets.ts'), "export const assets = { logo: '/assets/logo.svg' } as const;\n");
     const r = await auditInteractions('p', { projectRoot: root, noReport: true });
-    expect(r.report.summary.filesScanned).toBe(0);
-    expect(r.skippedReason).toMatch(/pages under app\/ were not read/);
-    expect(r.skippedReason).toMatch(/PG-24/);
-    // The planted dead control really is there — the skip is not "nothing to audit".
-    expect(await fs.readFile(path.join(root, 'app', '10-3', 'page.tsx'), 'utf8')).toMatch(/onClick=\{\(\) => \{\}\}.*Resolve/);
+    expect(r.skippedReason).toBeUndefined();
+    const resolve = r.report.findings.find((f) => f.file === 'app/10-3/page.tsx' && f.element === 'Resolve');
+    expect(resolve).toMatchObject({ screenCanonicalId: 'c_10_3', severity: 'high' });
+    expect(r.report.summary.filesScanned).toBeGreaterThan(1);
   });
 
   it('a src/app Next app is audited through src/ (the router is inside the walked root)', async () => {
@@ -62,13 +64,12 @@ describe('#1 auditInteractions never reports `applied` on a Next app whose pages
 });
 
 describe('#2 a skip names the unsupported layout, never absent input', () => {
-  it('flutter audit with .dart screens on disk: says the Dart files were not read (PG-22), counts them', async () => {
+  it('flutter audit with .dart screens on disk: the Dart files are read (PG-22), never "0 files matched"', async () => {
     const root = await copyFixture('flutter');
     const r = await auditInteractions('p', { projectRoot: root, noReport: true });
-    expect(r.skippedReason).toMatch(/none of the \d+ \.dart file\(s\) under lib\/screens\/ was read/);
-    expect(r.skippedReason).toMatch(/PG-22/);
-    expect(r.skippedReason).not.toMatch(/0 files matched/);
-    expect(honestSkipReason(r.skippedReason!)).toBe(true);
+    expect(r.skippedReason).toBeUndefined();
+    expect(r.report.summary.filesScanned).toBeGreaterThanOrEqual(7);
+    expect(r.report.findings.find((f) => f.file === 'lib/screens/screen_10_3.dart' && f.element === 'Resolve')).toMatchObject({ screenCanonicalId: 'c_10_3', severity: 'high' });
   });
 
   it('extractComponents on Next with locally-declared components: names PG-07, not "no declarations found"', async () => {

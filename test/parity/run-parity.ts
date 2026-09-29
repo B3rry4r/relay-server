@@ -1092,15 +1092,20 @@ async function phaseFinalizeTwice(): Promise<Cell[]> {
     // applied interaction audit must have found the dead 'Resolve' control planted in
     // the settings screen (B1 verify #3).
     const auditApplied = r1.passes.find((p) => p.name === 'auditInteractions')?.status === 'applied';
-    const plantedLine = read(root, SCREEN[fw].settings).split('\n').findIndex((l) => (fw === 'flutter' ? /onPressed:\s*\(\)\s*\{\}.*Resolve/ : /onClick=\{\(\) => \{\}\}.*Resolve/).test(l)) + 1;
-    const auditHit = audit1?.findings.some((f) => f.file === SCREEN[fw].settings && f.line === plantedLine) ?? false;
+    // 7e renames the settings screen's file (screen_10_3.dart → settings_screen.dart,
+    // app/10-3/ → app/settings/) BEFORE 7g runs, so the planted control is located in
+    // whichever file carries the settings screen's canonical header after run 1 — the
+    // same identity every pass resolves by — falling back to the fixture path.
+    const settingsFile = (await appSources(root, fw)).find((f) => /^\/\/\s*canonicalId:\s*c_10_3\b/m.test(read(root, f))) ?? SCREEN[fw].settings;
+    const plantedLine = read(root, settingsFile).split('\n').findIndex((l) => (fw === 'flutter' ? /onPressed:\s*\(\)\s*\{\}.*Resolve/ : /onClick=\{\(\) => \{\}\}.*Resolve/).test(l)) + 1;
+    const auditHit = plantedLine > 0 && (audit1?.findings.some((f) => f.file === settingsFile && f.line === plantedLine) ?? false);
     const reasonless = r1.passes.filter((p) => p.status === 'skipped' && !p.reason?.trim()).map((p) => p.name);
     const skippedWithReason = r1.passes.filter((p) => p.status === 'skipped' && p.reason).map((p) => `${p.name}: ${p.reason}`);
     const checks = [
       chk('fz.idempotent-files', d2.length === 0, 'lie', 'finalize run 2 changes no source file', d2.map((d) => `${d.change}:${d.file}`).slice(0, 10).join(', ') || 'no changes'),
       chk('fz.idempotent-verdicts', flowDelta.length === 0, 'lie', 'finalize run 2 grades every flow edge the same as run 1', flowDelta.join(' | ') || 'identical'),
       chk('fz.no-zero-applied', zeroApplied.length === 0, 'lie', "no pass is recorded `applied` with all-zero counts, and no pass leaves it to finalize's safety net to turn its all-zero `applied` into a skip (a stub or a no-input run must say `skipped` + its own reason)", zeroApplied.join(', ') || 'none'),
-      chk('fz.applied-grounded', !auditApplied || auditHit, 'lie', "an `applied` interaction audit's report contains the dead 'Resolve' control planted in the settings screen (applied means it read the screens)", auditApplied ? (auditHit ? `found at ${SCREEN[fw].settings}:${plantedLine}` : `applied, but .uix/interaction-audit-report.json has no finding at ${SCREEN[fw].settings}:${plantedLine} (${audit1?.findings.length ?? 'no'} finding(s))`) : 'auditInteractions not applied'),
+      chk('fz.applied-grounded', !auditApplied || auditHit, 'lie', "an `applied` interaction audit's report contains the dead 'Resolve' control planted in the settings screen (applied means it read the screens)", auditApplied ? (auditHit ? `found at ${settingsFile}:${plantedLine}` : `applied, but .uix/interaction-audit-report.json has no finding at ${settingsFile}:${plantedLine} (${audit1?.findings.length ?? 'no'} finding(s))`) : 'auditInteractions not applied'),
       chk('fz.skip-reasons', reasonless.length === 0, 'lie', 'every `skipped` pass carries its reason', reasonless.join(', ') || skippedWithReason.join(' | ') || 'no pass skipped'),
     ];
     const summary = (r: typeof r1) => r.passes.map((p) => `${p.name}:${p.status}`).join(', ');
