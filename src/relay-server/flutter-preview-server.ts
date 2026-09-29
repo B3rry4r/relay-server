@@ -199,6 +199,18 @@ export async function stopFlutterPreviewServer(projectId: string): Promise<void>
   await new Promise<void>(resolve => entry.server.close(() => resolve()));
 }
 
+/** Stop every preview server (graceful shutdown). */
+export async function stopAllFlutterPreviewServers(): Promise<number> {
+  const ids = [...servers.keys()];
+  await Promise.all(ids.map((id) => {
+    const entry = servers.get(id);
+    // Open keep-alive connections would hold server.close() forever.
+    (entry?.server as { closeAllConnections?: () => void } | undefined)?.closeAllConnections?.();
+    return stopFlutterPreviewServer(id).catch(() => undefined);
+  }));
+  return ids.length;
+}
+
 export function getFlutterPreviewPort(projectId: string): number | null {
   return servers.get(projectId)?.port ?? null;
 }

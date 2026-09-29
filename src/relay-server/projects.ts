@@ -193,6 +193,14 @@ export async function duplicateItem(
 export async function listListeningPorts(): Promise<number[]> {
   const excludedPorts: number[] = [22, 80, 443, 8080, 8443];
 
+  // Under the host, the front door, the PTY service and the release ports are
+  // listening on this machine too: they are never user dev servers (preview
+  // "port cards"). The host passes them in RELAY_HOST_PORTS.
+  for (const raw of (process.env.RELAY_HOST_PORTS || '').split(',')) {
+    const p = Number.parseInt(raw.trim(), 10);
+    if (Number.isInteger(p) && p > 0) excludedPorts.push(p);
+  }
+
   function isNotExcluded(p: number): boolean {
     return p > 0 && !excludedPorts.includes(p);
   }

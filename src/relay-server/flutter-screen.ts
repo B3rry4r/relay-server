@@ -308,6 +308,13 @@ export async function stopScreenSession(projectId: string): Promise<void> {
   await fs.unlink(`/tmp/.X${session.display}-lock`).catch(() => undefined);
 }
 
+/** Stop every Flutter screen session (graceful shutdown). */
+export async function stopAllScreenSessions(): Promise<number> {
+  const ids = [...sessions.keys()];
+  await Promise.all(ids.map((id) => stopScreenSession(id).catch(() => undefined)));
+  return ids.length;
+}
+
 export function getScreenSession(projectId: string): ScreenSession | null {
   const session = sessions.get(projectId);
   return session && session.flutter.exitCode === null ? session : null;

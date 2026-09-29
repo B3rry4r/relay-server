@@ -4,6 +4,7 @@ import path from 'node:path';
 import { createTerminalEnv, requireAuth, readStringParam, resolveWorkspace, getProjectsRoot } from './runtime';
 import { childProcessEnv } from './auth/secrets';
 import { isProtectedPort, protectedPortReason } from './protected-ports';
+import { getReleaseId, healthSnapshot } from './lifecycle';
 import { getWorkspaceHealth } from './monitoring';
 import {
   buildQuickSwitchProjects,
@@ -101,8 +102,11 @@ export function registerCoreRoutes(app: Express): void {
     });
   });
 
+  // CONTRACTS §3: {ok, releaseId, mode, ptyMode, uptimeMs} (+ draining). The host's
+  // readiness probe checks releaseId / mode / ptyMode before switching traffic.
   app.get('/health', (_req, res) => {
-    res.json({ ok: true });
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(healthSnapshot());
   });
 
   app.get('/api/version', (_req, res) => {
@@ -112,7 +116,7 @@ export function registerCoreRoutes(app: Express): void {
       const packageJson = JSON.parse(fs.readFileSync(packagePath, 'utf-8'));
       version = packageJson.version || 'unknown';
     } catch { /* keep default */ }
-    res.json({ version });
+    res.json({ version, releaseId: getReleaseId() });
   });
 
   // /api/auth/* (login, session, sessions, logout, rotate, login-link) live in

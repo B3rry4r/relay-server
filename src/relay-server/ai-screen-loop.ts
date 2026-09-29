@@ -41,6 +41,7 @@ import {
   clampParallel,
   gateIsActive, pauseAtCheckpoint, approveCheckpoint, setRunResumable, setRunPrepDone, setRunFinalized,
   addAmendment, resolveAmendment, writeFrameMap, mutateRun,
+  acquireRunLease, releaseRunLease, isForeignLeaseLive,
   type ScreenSpec, type CheckpointGate, type BuildRun, type RunScreen, type AmendmentKind,
 } from './build-run-store';
 import { notify } from './notify';
@@ -2101,6 +2102,11 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
   void mutateRun(projectId, runId, (run) => { run.rateLimitPaused = false; run.resumeAt = undefined; });
   const projectRoot = resolveProjectRoot(projectId);
   if (!projectRoot || !fsSync.existsSync(projectRoot)) { clearRunActive(runId); return; }
+  // Host (CONTRACTS §3): lease the run to this process for as long as it
+  // orchestrates, so another release never resumes it concurrently. Taken
+  // synchronously (before the first await) so prepAndRun's hand-off never leaves
+  // a gap with no holder.
+  void acquireRunLease(projectId, runId);
 
   // RFC §9 — version-control harness. Ensure the managed project is a git repo
   // (auto-init + .gitignore) and checkpoint at run start, so no run ever mutates an
@@ -2740,6 +2746,7 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
     unsub();
     clearRunActive(runId);
     clearRunCancelled(runId);
+    await releaseRunLease(projectId, runId);
   }
 }
 
@@ -2856,6 +2863,18 @@ async function retryScreenLoop(projectId: string, runId: string, frameId: string
  * mid-prep resume that re-runs prep is safe.
  */
 async function prepAndRun(projectId: string, runId: string): Promise<void> {
+  // Lease the run for the whole prep (see runAppLoop); the hand-off to runAppLoop
+  // re-enters the lease before this hold is dropped.
+  const lease = acquireRunLease(projectId, runId);
+  try {
+    await lease;
+    await prepAndRunInner(projectId, runId);
+  } finally {
+    await releaseRunLease(projectId, runId);
+  }
+}
+
+async function prepAndRunInner(projectId: string, runId: string): Promise<void> {
   const run = await getRun(projectId, runId);
   if (!run) return;
   const projectRoot = resolveProjectRoot(projectId);
@@ -3073,6 +3092,12 @@ export async function resumeInterruptedRuns(): Promise<void> {
         // human restarts / approves those from the Runs UI. 'done'/'needs-review' runs
         // are terminal-for-orchestration and likewise left alone.
         const resumable = r.resumable === true && r.status === 'running';
+        if (resumable && !isRunActive(r.id) && isForeignLeaseLive(r)) {
+          // Host (CONTRACTS §3): another live relay-server process is orchestrating
+          // this run right now (fresh lease) — resuming it here would double-run it.
+          console.warn(`[run] ${r.id}: not resuming — leased by live pid ${r.lease?.pid} (release ${r.lease?.releaseId})`);
+          continue;
+        }
         if (resumable && !isRunActive(r.id)) {
           // T15: a generation run (has figStorageKey) interrupted BEFORE prep
           // finished (prepDone falsy) re-enters via prepAndRun so PREP + the asset
@@ -3125,6 +3150,8 @@ export async function sweepRateLimitedRuns(now: number = Date.now()): Promise<vo
       const runs = await listRuns(projectId, 50);
       for (const r of runs) {
         if (!shouldAutoResume(r, now) || isRunActive(r.id)) continue;
+        // Host (CONTRACTS §3): never auto-resume a run another live process holds.
+        if (isForeignLeaseLive(r, now)) continue;
         const attempt = (r.autoResumeCount ?? 0) + 1;
         // Bump the counter + clear the pause flag + flip to running ATOMICALLY before
         // kicking the loop, so a concurrent sweep tick can't double-resume the run.
@@ -3152,6 +3179,14 @@ export function startAutoResumeSweep(): void {
   if (sweepTimer) return;
   sweepTimer = setInterval(() => { void sweepRateLimitedRuns(); }, AUTO_RESUME_SWEEP_MS);
   if (typeof sweepTimer.unref === 'function') sweepTimer.unref();
+}
+/** Stop the periodic sweep (graceful shutdown / tests). Idempotent. */
+export function stopAutoResumeSweep(): void {
+  if (sweepTimer) clearInterval(sweepTimer);
+  sweepTimer = null;
+}
+export function isAutoResumeSweepRunning(): boolean {
+  return sweepTimer !== null;
 }
 
 /**

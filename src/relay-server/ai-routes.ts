@@ -68,13 +68,52 @@ const runningJobs = new Map<string, RunningJob>();
 // Live progress lines per job live in ai-job-log.ts (seeded by the route
 // BEFORE the CLI spawns so the first poll already sees a running job).
 
-function killJob(job: RunningJob): void {
+// EVERY live agent CLI child, keyed or not (a job without a jobId/projectId is
+// never in runningJobs, and two jobs sharing a key overwrite each other there).
+// Graceful shutdown (lifecycle.ts) kills all of them: they are detached process-
+// group leaders, so they would otherwise OUTLIVE this release and keep editing the
+// project while the next release resumes the same run.
+const liveAgentChildren = new Set<ChildProcess>();
+
+function killJob(job: RunningJob, graceMs = 2500): void {
   const pid = job.child.pid;
   if (!pid) return;
   // The CLI is its own process-group leader (spawned detached), so a negative
   // pid signals the whole group — kills npm/install/build descendants too.
   try { process.kill(-pid, 'SIGTERM'); } catch { try { job.child.kill('SIGTERM'); } catch { /* gone */ } }
-  setTimeout(() => { try { process.kill(-pid, 'SIGKILL'); } catch { /* already dead */ } }, 2500);
+  const timer = setTimeout(() => { try { process.kill(-pid, 'SIGKILL'); } catch { /* already dead */ } }, graceMs);
+  timer.unref?.();
+}
+
+/** Number of agent CLI jobs currently running in this process. */
+export function runningJobCount(): number {
+  return liveAgentChildren.size;
+}
+
+/**
+ * Kill every running agent CLI process group (SIGTERM, then SIGKILL after
+ * `graceMs`). Resolves once every group leader has exited or `graceMs + 1s` has
+ * passed. Returns how many groups were signalled.
+ */
+export async function killAllJobs(graceMs = 2500): Promise<number> {
+  const children = Array.from(liveAgentChildren);
+  const exits = children.map((child) => new Promise<void>((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) { resolve(); return; }
+    child.once('exit', () => resolve());
+  }));
+  for (const child of children) killJob({ child, startedAt: 0 }, graceMs);
+  runningJobs.clear();
+  if (children.length > 0) {
+    await Promise.race([
+      Promise.all(exits),
+      new Promise<void>((resolve) => { const t = setTimeout(resolve, graceMs + 1000); t.unref?.(); }),
+    ]);
+    // A group leader that exited on SIGTERM can leave members behind: make sure.
+    for (const child of children) {
+      if (child.pid) { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* group gone */ } }
+    }
+  }
+  return children.length;
 }
 
 // Timeout for non-agent AI generation calls. Was 2 min, but the heavy-AI canon
@@ -194,6 +233,11 @@ export async function runModel(
   // 3s" and that warning was surfacing to the user as an error. EOF → proceed now.
   try { promise.child?.stdin?.end(); } catch { /* no stdin pipe */ }
   const jobKey = opts.jobId || opts.projectId;
+  if (promise.child) {
+    const child = promise.child;
+    liveAgentChildren.add(child);
+    child.once('exit', () => { liveAgentChildren.delete(child); });
+  }
   if (jobKey && promise.child) {
     runningJobs.set(jobKey, { child: promise.child, projectId: opts.projectId, startedAt: Date.now() });
   }

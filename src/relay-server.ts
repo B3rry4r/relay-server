@@ -9,7 +9,8 @@ import { registerContextRoutes } from './relay-server/context-routes';
 import { registerFlutterRoutes } from './relay-server/flutter-routes';
 import { registerGitRoutes } from './relay-server/git-routes';
 import { registerVisualRoutes } from './relay-server/visual-routes';
-import { registerScreenLoopRoutes, resumeInterruptedRuns, startAutoResumeSweep } from './relay-server/ai-screen-loop';
+import { registerScreenLoopRoutes, stopAutoResumeSweep } from './relay-server/ai-screen-loop';
+import { busySnapshot, isUnderHost, lifecycleGuard, startLifecycle } from './relay-server/lifecycle';
 import { registerProjectRoutes } from './relay-server/project-routes';
 import {
   closeAllTerminalSessions,
@@ -22,7 +23,9 @@ import {
 import { registerToolRoutes } from './relay-server/tool-routes';
 import { ensureRelayRuntimeAssets } from './relay-server/tooling';
 import { resolveWorkspace, setRelayApiUrl } from './relay-server/runtime';
-import { clearLegacyCookie, createAuthRuntime } from './relay-server/auth';
+import { clearLegacyCookie, createAuthRuntime, extractCredential, isLocalRequest } from './relay-server/auth';
+import { getSecret } from './relay-server/auth/secrets';
+import { timingSafeEqual, createHash } from 'node:crypto';
 import { buildCorsOptions, logOriginPolicy } from './relay-server/auth/cors';
 import { registerAuthRoutes } from './relay-server/auth/routes';
 import { authStatePaths, writeFileAtomic } from './relay-server/auth/state';
@@ -155,10 +158,28 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
   //     unless the route is on the public allowlist (auth/index.ts).
   //  4. /api/uix/* streaming proxy (before any body parser).
   //  5. Body parsers (a tiny limit for the public login endpoints).
+  // Host-internal (CONTRACTS §3): GET /__relay/busy → {runningJobs, activeRuns}
+  // for an opt-in `waitIdle` deploy. Loopback only, no forwarding headers, and
+  // `Authorization: Bearer <RELAY_PTY_TOKEN>` (the host's internal token). It is
+  // registered BEFORE the session middleware because the host holds no session.
+  app.get('/__relay/busy', (req, res) => {
+    const expected = getSecret('RELAY_PTY_TOKEN');
+    const presented = extractCredential(req.headers);
+    const digest = (v: string) => createHash('sha256').update(v).digest();
+    if (!expected || !presented || !isLocalRequest(req) || !timingSafeEqual(digest(presented), digest(expected))) {
+      res.status(401).json({ error: 'unauthorized' });
+      return;
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(busySnapshot());
+  });
+
   app.options('*', cors(corsOptions));
   app.use(cors(corsOptions));
   app.use(clearLegacyCookie);
   app.use(auth.authenticate);
+  // Standby / draining release: run-mutating routes answer 503 (lifecycle.ts).
+  app.use(lifecycleGuard);
   app.use('/api/uix', uixProxyMiddleware);
   app.use(['/api/auth/login', '/api/auth/login-link/exchange'], express.json({ limit: '16kb' }));
   app.use(express.json({ limit: '50mb' }));
@@ -205,7 +226,11 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
 
         httpServer.once('error', onError);
         httpServer.once('listening', onListening);
-        httpServer.listen(port);
+        // Under the host (RELAY_START_MODE set) only the front door is public:
+        // a release listens on loopback. RELAY_LISTEN_HOST overrides.
+        const listenHost = (process.env.RELAY_LISTEN_HOST || '').trim() || (isUnderHost() ? '127.0.0.1' : '');
+        if (listenHost) httpServer.listen(port, listenHost);
+        else httpServer.listen(port);
 
         // Railway's upstream proxy has a 60 s idle timeout. Node's default
         // keepAliveTimeout is 5 s, which means the proxy kills keep-alive
@@ -230,18 +255,17 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
         writeFileAtomic(authStatePaths().apiUrl, `http://127.0.0.1:${listeningPort}\n`, 0o644);
       } catch { /* the relay-auth CLI falls back to RELAY_API_URL / PORT */ }
 
-      // Resume any full-app build run that was interrupted by this restart
-      // (e.g. a redeploy) so it keeps building server-side. Best-effort.
-      void resumeInterruptedRuns();
-      // Start the periodic auto-resume sweep: a run paused by a rate limit is
-      // re-launched once its parsed reset window reopens (survives redeploys via the
-      // persisted resumeAt + a poll, not a long in-process timer). Best-effort.
-      startAutoResumeSweep();
+      // Activate now, or (RELAY_START_MODE=standby, under the host) wait for the
+      // host's IPC {type:'activate'}. Activation resumes interrupted runs and
+      // starts the rate-limit auto-resume sweep — work only the ACTIVE release may
+      // do (lifecycle.ts).
+      startLifecycle();
 
       return listeningPort;
     },
     async stop() {
       auth.dispose();
+      stopAutoResumeSweep();
       if (listeningPort) unregisterProtectedPort(listeningPort);
       if (!isRemotePtyEnabled()) {
         // Embedded mode only — in remote mode the relay-pty service owns the
@@ -267,6 +291,10 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
           }
           resolve();
         });
+        // Keep-alive connections (65 s) would otherwise hold close() open.
+        httpServer.closeIdleConnections?.();
+        const closeAll = setTimeout(() => httpServer.closeAllConnections?.(), 1000);
+        closeAll.unref?.();
       });
     },
   };

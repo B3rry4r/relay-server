@@ -146,6 +146,16 @@ export function closeTunnel(port: number): void {
   inFlight.delete(port);
 }
 
+/** Stop every tunnel (graceful shutdown). cloudflared is not in our process
+ *  group's lifetime: without this it outlives the release, pointing at a dead
+ *  port, and the next release starts a second tunnel for the same port. */
+export function closeAllTunnels(): number {
+  const ports = [...tunnels.keys()];
+  for (const port of ports) closeTunnel(port);
+  inFlight.clear();
+  return ports.length;
+}
+
 /** Returns all currently active tunnel entries (for status/debug). */
 export function listTunnels(): Array<{ port: number; url: string; startedAt: number }> {
   return [...tunnels.values()]
