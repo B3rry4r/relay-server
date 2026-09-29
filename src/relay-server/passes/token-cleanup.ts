@@ -225,7 +225,9 @@ function getStrategy(fw: Framework): DeepenStrategy | null {
 }
 
 async function maybeWriteReport(projectRoot: string, report: TokenCleanupReport, opts: DeepenTokensOptions): Promise<string | null> {
-  if (opts.noReport) return null;
+  // A dry run describes a build that was never applied: it must not leave a
+  // report next to the real ones (PG-38).
+  if (opts.noReport || opts.dryRun) return null;
   const abs = opts.reportPath ?? path.join(projectRoot, '.uix', 'token-cleanup-report.json');
   try {
     await fs.mkdir(path.dirname(abs), { recursive: true });

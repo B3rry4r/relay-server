@@ -70,7 +70,7 @@
   "finalize (standalone ×2) | flutter": "LIES",
   "finalize (standalone ×2) | react": "LIES",
   "finalize (standalone ×2) | next": "LIES",
-  "finalize dryRun | flutter": "LIES",
-  "finalize dryRun | react": "LIES",
-  "finalize dryRun | next": "LIES"
+  "finalize dryRun | flutter": "IMPLEMENTED",
+  "finalize dryRun | react": "IMPLEMENTED",
+  "finalize dryRun | next": "IMPLEMENTED"
 }
