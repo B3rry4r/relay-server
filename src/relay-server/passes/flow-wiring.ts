@@ -52,6 +52,7 @@ import type { AIModel } from '../ai-adapters';
 import { tokenizeName } from '../semantic-names';
 import { verifyWeb, type WebFlow, type WebCanonScreen, type WebCanonModal } from './flow-wiring-web';
 import { modalPresenterName } from '../design-system';
+import { dartPresentation, dartPresenterName } from './dart-presenters';
 import { detectFramework, type Framework } from './framework';
 
 // ── Public contract ──────────────────────────────────────────────────────────
@@ -383,6 +384,15 @@ interface ResolvedScreen {
   widgetClass: string;
   /** route string the screen is registered under (from its header). */
   route: string | null;
+  /** Still the skeleton's write-locked stub (`TODO(build)`): a route slot, not a
+   *  built screen (PG-12). The web resolver's `placeholder` flag, on Dart. */
+  placeholder?: boolean;
+}
+
+/** A Dart screen file the per-screen build never replaced: the skeleton writes
+ *  `// GENERATED SKELETON — write-locked route slot` and a `TODO(build)` body. */
+export function isDartSkeletonStub(src: string): boolean {
+  return /GENERATED SKELETON\s*—\s*write-locked route slot/.test(src) || /\bTODO\(build\)/.test(src);
 }
 
 const flutterStrategy: FlowStrategy = {
@@ -414,7 +424,7 @@ async function verifyFlutter(
     if (!cls) continue;
     const headerId = hm?.[1];
     const route = hm?.[2] ?? null;
-    const resolved: ResolvedScreen = { canonicalId: headerId ?? '', file: abs, widgetClass: cls, route };
+    const resolved: ResolvedScreen = { canonicalId: headerId ?? '', file: abs, widgetClass: cls, route, placeholder: isDartSkeletonStub(src) };
     if (headerId) builtById.set(idCore(headerId), resolved);
     if (route) builtByRoute.set(route, resolved);
   }
@@ -457,6 +467,9 @@ async function verifyFlutter(
   // reported `unmapped` (that mislabels correct folded-modal handling as drift).
   // Resolve a modal id → {its base's built file, the presenter} when folded.
   const foldedModalCache = new Map<string, { baseFile: string; presenter: string; presenterCount: number } | null>();
+  // A modal whose base DECLARES its presenter but never calls it (only the verify
+  // preview does) — kept so the gap is worded as what it is (PG-11).
+  const declaredOnly = new Map<string, { baseFile: string; presenter: string }>();
   const resolveFoldedModal = async (toId: string): Promise<{ baseFile: string; presenter: string; presenterCount: number } | null> => {
     if (foldedModalCache.has(toId)) return foldedModalCache.get(toId)!;
     const modal = modals.find((m) => m.canonicalId === toId);
@@ -467,13 +480,18 @@ async function verifyFlutter(
       if (baseScreen) {
         try {
           const baseSrc = await readSrc(baseScreen.file);
-          // T32: COUNT presenter call-sites — one showModal*/showDialog folds in ONE
-          // modal. A base hosting several folded modals must present each; the count
-          // gates the over-credit check below so an unpresented sibling isn't wired.
-          const calls = baseSrc.match(/\b(?:showModalBottomSheet|showDialog|showGeneralDialog)\s*[<(]/g);
-          if (calls && calls.length) {
-            const presenter = /\b(showModalBottomSheet|showDialog|showGeneralDialog)\b/.exec(calls[0])?.[1] ?? 'showModalBottomSheet';
-            result = { baseFile: baseScreen.file, presenter, presenterCount: calls.length };
+          // PG-11: a presentation is a CALL site — this modal's presenter called from
+          // the base's UI, or an inline showModalBottomSheet/showDialog outside every
+          // presenter declaration. The contract's `void showModal_<core>(ctx) {
+          // showDialog(…) }` declaration (called only by lib/_preview) is not one.
+          // T32: COUNT call-sites; the count gates the over-credit check below.
+          const own = dartPresentation(baseSrc, toId);
+          const all = dartPresentation(baseSrc);
+          if (own.presenterCalls > 0 || own.inlineCalls > 0) {
+            const presenter = own.presenterCalls > 0 ? dartPresenterName(toId) : own.inlineApi ?? 'showModalBottomSheet';
+            result = { baseFile: baseScreen.file, presenter, presenterCount: all.presenterCalls + all.inlineCalls };
+          } else if (own.declared) {
+            declaredOnly.set(toId, { baseFile: baseScreen.file, presenter: dartPresenterName(toId) });
           }
         } catch { /* unreadable base → not folded */ }
       }
@@ -673,6 +691,32 @@ async function verifyFlutter(
       }
     }
 
+    // A canonical MODAL of the FROM screen with no built file and no presentation:
+    // say what the gap is — never credit it, never call it drift (PG-11).
+    const toModal = modals.find((m) => m.canonicalId === edge.to);
+    if (fromScreen && !toScreen && toModal) {
+      const d = declaredOnly.get(edge.to);
+      base.status = 'unmapped';
+      base.detail = `REAL gap, not folded: modal ${edge.to} has no built screen, and ${path.basename(fromScreen.file)} never calls ${dartPresenterName(edge.to)}() nor presents a dialog/sheet outside a presenter declaration`
+        + `${d ? ` (it DECLARES ${d.presenter}() — only the verify preview in lib/_preview calls it)` : ''}; a modal only the preview presents is unreachable in the app`;
+      findings.push(base);
+      continue;
+    }
+
+    // A canonical screen FROM navigates to, with no built file at all: the same
+    // verdict as a stub target (web parity — the user lands nowhere).
+    const toCanonRoute = screens.find((x) => x.canonicalId === edge.to)?.route ?? null;
+    if (fromScreen && !toScreen && toCanonRoute) {
+      const reaches = collectNavTargets(await readSrc(fromScreen.file), constToRoute).some((t) => t.route === toCanonRoute);
+      if (reaches) {
+        base.status = 'missing';
+        base.toRoute = toCanonRoute;
+        base.detail = `HIGH: FROM navigates to ${toCanonRoute}, but no built screen serves TO ${edge.to} — the screen was never built`;
+        findings.push(base);
+        continue;
+      }
+    }
+
     // UNMAPPED: a screen has no built file (true design/build drift).
     if (!fromScreen || !toScreen) {
       const which = !fromScreen && !toScreen ? 'both FROM and TO have' : !fromScreen ? 'FROM has' : 'TO has';
@@ -685,6 +729,16 @@ async function verifyFlutter(
     const { route: toRoute, constName: toConst } = routeForCanon(toScreen);
     if (toRoute) base.toRoute = toRoute;
     if (toConst) base.toRouteConst = toConst;
+
+    // PG-12: TO is still the skeleton's write-locked stub — a route slot the build
+    // never filled. Pushing its route lands on a placeholder: never `wired` (same
+    // verdict and wording as a web route mounting <PlaceholderScreen>).
+    if (toScreen.placeholder) {
+      base.status = 'missing';
+      base.detail = `HIGH: TO route ${toRoute ?? toConst ?? '?'} mounts <${toScreen.widgetClass}> — still the skeleton stub (TODO(build)); the screen was never built`;
+      findings.push(base);
+      continue;
+    }
 
     const fromSrc = await readSrc(fromScreen.file);
 

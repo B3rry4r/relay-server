@@ -156,6 +156,20 @@ export function isSkeletonStub(src: string): boolean {
   return /\bTODO\(build\)/.test(src) || /<PlaceholderScreen\b/.test(src);
 }
 
+/** A page/route module whose only JSX element is `<PlaceholderScreen …/>` (imports,
+ *  comments and fragments aside) — a slot nothing was ever built into. */
+export function isPlaceholderOnlyPage(src: string): boolean {
+  const code = src.replace(/^import\s.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const tags = [...code.matchAll(/<([A-Za-z][A-Za-z0-9_.$]*)/g)].map((m) => m[1]);
+  return tags.length > 0 && tags.every((t) => t === 'PlaceholderScreen');
+}
+
+/** Does `src` navigate/link to `route` (as a string literal) or its ROUTES constant? */
+export function sourceLinksTo(src: string, route: string, routeConst: string | null): boolean {
+  const lit = new RegExp(`['"\`]${escapeRe(route)}['"\`]`);
+  return lit.test(src) || (!!routeConst && new RegExp(`\\bROUTES\\s*\\.\\s*${escapeRe(routeConst)}\\b`).test(src));
+}
+
 // ── Route table (react) ──────────────────────────────────────────────────────
 
 /** Parse `export const ROUTES = { escrow: '/88-4361', … }`. */
@@ -668,9 +682,18 @@ export function collectNavTargets(src: string, constToRoute: Map<string, string>
     push(m[1] ?? null, m[2] ?? null, replaces ? 'navigate.replace' : 'navigate');
   }
 
-  // <Link to={ROUTES.x}> / <Link to="/x"> / <Navigate to=…>
-  const link = /<(Link|Navigate)\s+[^>]*?to=(?:\{ROUTES\.([A-Za-z0-9_$]+)\}|["']([^"']+)["'])/g;
-  while ((m = link.exec(src)) !== null) push(m[2] ?? null, m[3] ?? null, m[1]);
+  // <Link to={ROUTES.x}> / <Link to="/x"> / <Navigate to=…> — and Next's
+  // <Link href="/x"> / <Link href={ROUTES.x}> (also a plain <a href="/x">).
+  const link = /<(Link|Navigate|a)\s+[^>]*?(?:to|href)=(?:\{\s*ROUTES\.([A-Za-z0-9_$]+)\s*\}|["'](\/[^"']*)["']|\{\s*['"`](\/[^'"`]*)['"`]\s*\})/g;
+  while ((m = link.exec(src)) !== null) push(m[2] ?? null, m[3] ?? m[4] ?? null, m[1] === 'a' ? 'Link' : m[1]);
+
+  // A nav bar built from a data array (`{ href: '/10-4', label: 'Profile' }` mapped
+  // into <Link href={t.href}>): the literal lives in the item, not at the call site.
+  // Counted only in a file that renders a Link/anchor/navigate at all.
+  if (/<(?:Link|a)\b|\bnavigate\s*\(|router\s*\.\s*push/.test(src)) {
+    const item = /\b(?:href|to|path)\s*:\s*['"`](\/[^'"`]*)['"`]/g;
+    while ((m = item.exec(src)) !== null) push(null, m[1], 'Link');
+  }
 
   // next/navigation + next/router: router.push('/x') / router.replace(…) / redirect(…)
   const next = /\b(?:router\s*\.\s*(push|replace)|(redirect))\s*\(\s*(?:ROUTES\.([A-Za-z0-9_$]+)|['"]([^'"]+)['"])/g;

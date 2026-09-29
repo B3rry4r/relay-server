@@ -34,7 +34,8 @@ import path from 'node:path';
 
 import { detectFramework, type Framework } from './framework';
 import {
-  loadWebApp, listSourceFiles, listWebSources, stillReferenced, escapeRe, readHeader, nextAppRoute, type WebAppIndex,
+  loadWebApp, listSourceFiles, listWebSources, stillReferenced, readHeader, nextAppRoute,
+  isPlaceholderOnlyPage, sourceLinksTo, type WebAppIndex,
 } from './web-app';
 
 export interface HygieneResult {
@@ -194,9 +195,9 @@ async function hygieneNext(ix: WebAppIndex, dryRun: boolean, result: HygieneResu
   const pageRe = /^page\.(tsx|jsx|ts|js)$/;
   for (const [f, src] of sources) {
     if (!pageRe.test(path.basename(f)) || !isInside(routerDir, f)) continue;
-    if (readHeader(src) || !isPlaceholderOnly(src)) continue;
+    if (readHeader(src) || !isPlaceholderOnlyPage(src)) continue;
     const route = ix.appDir && isInside(ix.appDir, f) ? nextAppRoute(ix.appDir, f) : null;
-    const linkers = route ? [...sources].filter(([g, s]) => g !== f && linksTo(s, route, ix.routeToConst.get(route) ?? null)).map(([g]) => rel(g)) : [];
+    const linkers = route ? [...sources].filter(([g, s]) => g !== f && sourceLinksTo(s, route, ix.routeToConst.get(route) ?? null)).map(([g]) => rel(g)) : [];
     if (linkers.length) warnings.push(`removed placeholder-only page ${rel(f)} (${route}) — still linked from ${linkers.join(', ')}; that link now 404s until the screen is built (7d reports the edge)`);
     result.previewRoutesRemoved++;
     result.placeholderRemoved = true;
@@ -215,19 +216,6 @@ async function hygieneNext(ix: WebAppIndex, dryRun: boolean, result: HygieneResu
 }
 
 const isInside = (dir: string, f: string): boolean => f === dir || f.startsWith(dir + path.sep);
-
-/** A page whose only JSX element is `<PlaceholderScreen …/>` (fragments aside). */
-function isPlaceholderOnly(src: string): boolean {
-  const code = src.replace(/^import\s.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
-  const tags = [...code.matchAll(/<([A-Za-z][A-Za-z0-9_.$]*)/g)].map((m) => m[1]);
-  return tags.length > 0 && tags.every((t) => t === 'PlaceholderScreen');
-}
-
-/** Does `src` navigate/link to `route` (literal) or its ROUTES constant? */
-function linksTo(src: string, route: string, routeConst: string | null): boolean {
-  const lit = new RegExp(`['"\`]${escapeRe(route)}['"\`]`);
-  return lit.test(src) || (!!routeConst && new RegExp(`\\bROUTES\\s*\\.\\s*${escapeRe(routeConst)}\\b`).test(src));
-}
 
 async function listAllFiles(dir: string, out: string[] = []): Promise<string[]> {
   for (const e of await fs.readdir(dir, { withFileTypes: true }).catch(() => [] as fsSync.Dirent[])) {
@@ -397,4 +385,4 @@ export async function runProductionHygiene(opts: HygieneOptions): Promise<Hygien
   };
 }
 
-export const __test = { stripPreviewRoutes, stripImports, isPlaceholderOnly, linksTo };
+export const __test = { stripPreviewRoutes, stripImports };

@@ -9,8 +9,9 @@
  *
  *   • confirm the modal really is presented from its base (not only from the
  *     verify harness's *Preview.tsx, which does not ship);
- *   • strip the dead `<Route>` the skeleton minted for the modal's own frame,
- *     which otherwise mounts a <PlaceholderScreen> at a real URL;
+ *   • strip the dead route minted for the modal's own frame, which otherwise mounts
+ *     a <PlaceholderScreen> at a real URL — the react `<Route>` line, or on Next the
+ *     frame's `app/<route>/` directory (the route IS the directory, PG-09);
  *   • report an unpresented modal as a REAL gap rather than crediting it.
  *
  * It never invents a presenter. A modal with no presenter is a gap for the build
@@ -21,8 +22,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 
 import {
-  loadWebApp, resolveScreen, parseImports, countPresenterCalls,
-  modalPresenterName, idCore, escapeRe, stillReferenced,
+  loadWebApp, listWebSources, resolveScreen, parseImports, countPresenterCalls,
+  modalPresenterName, idCore, escapeRe, stillReferenced, isPlaceholderOnlyPage, sourceLinksTo,
 } from './web-app';
 
 export interface WebModalTransform {
@@ -35,6 +36,26 @@ export interface WebModalTransform {
   modalFile: string | null;
   removedRoute: string | null;
   presenterCalls: number;
+  /** Read from the modal content's own markup (PG-10), never assumed. */
+  presentation: WebPresentation;
+}
+
+export type WebPresentation = 'bottomSheet' | 'dialog' | 'fullOverlay' | 'unknown';
+
+/** What the presented content looks like, from the component the presenter opens:
+ *  anchored to the bottom → bottomSheet; covering the viewport → fullOverlay;
+ *  `role="dialog"`/`aria-modal` or centred → dialog; otherwise unknown. */
+export function detectWebPresentation(src: string, presenter: string): WebPresentation {
+  const call = new RegExp(`function\\s+${escapeRe(presenter)}\\s*\\([^)]*\\)\\s*\\{[\\s\\S]*?open\\s*\\(\\s*['"\`][^'"\`]+['"\`]\\s*,\\s*<\\s*([A-Z][A-Za-z0-9_$]*)`).exec(src);
+  let markup = src;
+  if (call) {
+    const decl = new RegExp(`(?:function\\s+${escapeRe(call[1])}\\b|const\\s+${escapeRe(call[1])}\\s*=)[\\s\\S]*?(?=\\n(?:export\\s+)?(?:function|const)\\s|$)`).exec(src);
+    if (decl) markup = decl[0];
+  }
+  if (/\bbottom\s*:\s*0\b/.test(markup) || /data-presentation=["']bottom-?sheet/i.test(markup)) return 'bottomSheet';
+  if (/\binset\s*:\s*0\b/.test(markup) || /height\s*:\s*['"]100(?:vh|%)['"]/.test(markup)) return 'fullOverlay';
+  if (/role=["']dialog["']|aria-modal|<dialog\b/.test(markup) || /translate\(-50%/.test(markup)) return 'dialog';
+  return 'unknown';
 }
 
 export interface WebModalSkip { canonicalId: string; name: string; reason: string }
@@ -146,7 +167,34 @@ export async function convertWebModal(
   const presenterFile = await findPresenterFile(baseScreen.file, presenter);
   let removedRoute: string | null = null;
 
-  if (modalScreen?.routeConst && ix.routerFile) {
+  if (ix.kind === 'next') {
+    // Next: the modal frame's route IS a directory (app/10-9/page.tsx). Remove it when
+    // the page only mounts a placeholder and nothing links to it; an absent page is
+    // already applied (idempotent). A real page there, or a linked one, stays.
+    const page = modalScreen && ix.appDir && modalScreen.file.startsWith(ix.appDir + path.sep)
+      && /^page\.(tsx|jsx|ts|js)$/.test(path.basename(modalScreen.file)) ? modalScreen.file : null;
+    if (page && modalScreen?.route) {
+      const pageSrc = await fs.readFile(page, 'utf-8').catch(() => '');
+      if (pageSrc && isPlaceholderOnlyPage(pageSrc)) {
+        let linked = false;
+        for (const f of await listWebSources(ix)) {
+          if (f === page) continue;
+          if (sourceLinksTo(await fs.readFile(f, 'utf-8').catch(() => ''), modalScreen.route, modalScreen.routeConst)) { linked = true; break; }
+        }
+        if (!linked) {
+          removedRoute = modalScreen.route;
+          if (!opts.dryRun) {
+            await fs.rm(page, { force: true });
+            let d = path.dirname(page);
+            while (d !== ix.appDir && d.startsWith(ix.appDir! + path.sep) && (await fs.readdir(d).catch(() => ['?'])).length === 0) {
+              await fs.rmdir(d).catch(() => {});
+              d = path.dirname(d);
+            }
+          }
+        }
+      }
+    }
+  } else if (modalScreen?.routeConst && ix.routerFile) {
     const appSrc = await fs.readFile(ix.routerFile, 'utf-8');
     const removal = removeRoute(appSrc, modalScreen.routeConst);
     if (removal) {
@@ -162,8 +210,11 @@ export async function convertWebModal(
     }
   }
 
+  const presentation = presenterFile ? detectWebPresentation(await fs.readFile(presenterFile, 'utf-8').catch(() => ''), presenter) : 'unknown';
+
   return {
     transform: {
+      presentation,
       canonicalId: modal.canonicalId,
       name: modal.name,
       frameId: modal.frameId,

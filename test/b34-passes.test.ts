@@ -175,3 +175,79 @@ describe('7a flutter parameters are named after their named-argument key (CONTRA
     expect(src).not.toMatch(/\bp\d+\b/);
   });
 });
+
+// ── 7b / 7d ───────────────────────────────────────────────────────────────────
+import { dartPresentation, stripDartPresenterDeclarations } from '../src/relay-server/passes/dart-presenters';
+import { detectWebPresentation } from '../src/relay-server/passes/modal-overlay-web';
+import { applyModalOverlays } from '../src/relay-server/passes/modal-overlay';
+import { verifyFlowWiring } from '../src/relay-server/passes/flow-wiring';
+
+describe('7b/7d: a presenter DECLARATION is not a presentation (PG-11)', () => {
+  it('dart: the showDialog inside `void showModal_10_8(ctx) {…}` does not count; a call from a control does', () => {
+    const decl = "void showModal_10_8(BuildContext context) {\n  showDialog<void>(context: context, builder: (_) => const AlertDialog());\n}\n";
+    expect(dartPresentation(decl, 'm_10_8')).toMatchObject({ presenterCalls: 0, inlineCalls: 0, declared: true });
+    const called = `${decl}Widget b(BuildContext context) => TextButton(onPressed: () => showModal_10_8(context), child: const Text('Log out'));\n`;
+    expect(dartPresentation(called, 'm_10_8')).toMatchObject({ presenterCalls: 1, inlineCalls: 0 });
+    const arrow = "Future<void> showModal_1_2(BuildContext c) async => showModalBottomSheet(context: c, builder: (_) => const SizedBox());\n";
+    expect(stripDartPresenterDeclarations(arrow).trim()).toBe('');
+    const inline = "onPressed: () => showModalBottomSheet(context: context, builder: (_) => const Sheet()),";
+    expect(dartPresentation(inline, 'm_9_9')).toMatchObject({ presenterCalls: 0, inlineCalls: 1, inlineApi: 'showModalBottomSheet' });
+  });
+
+  it('flutter 7b reports the preview-only modal as a REAL gap naming the declaration', async () => {
+    const root = await fixture('flutter');
+    const r = await applyModalOverlays('p', { projectRoot: root, noAi: true, dryRun: true });
+    expect(r.transformed.find((t) => t.canonicalId === 'm_10_8')).toBeUndefined();
+    expect(r.skipped.find((s) => s.canonicalId === 'm_10_8')?.reason).toMatch(/REAL gap — base screen screen_10_3\.dart declares showModal_10_8\(\) but no control on it calls it/);
+  });
+});
+
+describe('7b web: presentation is read from the markup; Next strips the modal frame dir (PG-09, PG-10)', () => {
+  it('detects bottomSheet / fullOverlay / dialog / unknown', () => {
+    const mk = (style: string) => `export function Sheet() { return <div ${style}>x</div>; }\nexport function showModal_1_2() {\n  modalController.open('m_1_2', <Sheet />);\n}\n`;
+    expect(detectWebPresentation(mk("style={{ position: 'absolute', bottom: 0 }}"), 'showModal_1_2')).toBe('bottomSheet');
+    expect(detectWebPresentation(mk("style={{ position: 'fixed', inset: 0 }}"), 'showModal_1_2')).toBe('fullOverlay');
+    expect(detectWebPresentation(mk('role="dialog"'), 'showModal_1_2')).toBe('dialog');
+    expect(detectWebPresentation(mk('className="x"'), 'showModal_1_2')).toBe('unknown');
+  });
+  it('next: app/10-9 (placeholder-only, unlinked) is removed; a linked one is kept; run 2 is a no-op', async () => {
+    const root = await fixture('next');
+    const r = await applyModalOverlays('p', { projectRoot: root, noAi: true });
+    const t = r.transformed.find((x) => x.canonicalId === 'm_10_9');
+    expect(t).toMatchObject({ presentation: 'dialog', removedRoute: '/10-9', trigger: { wired: 'none' } });
+    expect(fsSync.existsSync(path.join(root, 'app', '10-9'))).toBe(false);
+    const again = await applyModalOverlays('p', { projectRoot: root, noAi: true });
+    expect(again.transformed.find((x) => x.canonicalId === 'm_10_9')?.removedRoute).toBeUndefined();
+
+    const root2 = await fixture('next');
+    await fs.appendFile(path.join(root2, 'app', '10-1', 'page.tsx'), "\nexport const LINK = '/10-9';\n");
+    await applyModalOverlays('p', { projectRoot: root2, noAi: true });
+    expect(fsSync.existsSync(path.join(root2, 'app', '10-9', 'page.tsx'))).toBe(true);
+  });
+});
+
+describe('7d next: layout-hosted tabs and the useRouter auto-fix (PG-13, PG-14); flutter stubs (PG-12)', () => {
+  it('next: the (tabs) layout hosts the tab; the dead Settings button is wired with router.push', async () => {
+    const root = await fixture('next');
+    const r = await verifyFlowWiring('p', { projectRoot: root, noAi: true });
+    const f = (to: string) => r.report.findings.find((x) => x.to === to)!;
+    expect(f('c_10_4')).toMatchObject({ status: 'wired' });
+    expect(f('c_10_4').detail).toMatch(/app\/\(tabs\)\/layout\.tsx hosts/);
+    expect(f('c_10_3')).toMatchObject({ status: 'wired', autoFixed: true });
+    expect(await fs.readFile(path.join(root, 'app', '(tabs)', '10-2', 'page.tsx'), 'utf8')).toMatch(/<button onClick=\{\(\) => router\.push\('\/10-3'\)\}>Settings<\/button>/);
+  });
+  it('next: no useRouter in scope → reported, not wired', async () => {
+    const root = await fixture('next');
+    const p = path.join(root, 'app', '(tabs)', '10-2', 'page.tsx');
+    await fs.writeFile(p, (await fs.readFile(p, 'utf8')).replace('const router = useRouter();', '').replace("router.push('/10-5')", "location.assign('/10-5')"));
+    const r = await verifyFlowWiring('p', { projectRoot: root, noAi: true });
+    expect(r.report.findings.find((x) => x.to === 'c_10_3')?.detail).toMatch(/no `const router = useRouter\(\)`/);
+  });
+  it('flutter: an edge to a skeleton stub is missing (HIGH), not wired', async () => {
+    const root = await fixture('flutter');
+    const r = await verifyFlowWiring('p', { projectRoot: root, noAi: true, dryRun: true });
+    const e3 = r.report.findings.find((x) => x.to === 'c_10_5')!;
+    expect(e3.status).toBe('missing');
+    expect(e3.detail).toMatch(/^HIGH: .*still the skeleton stub/);
+  });
+});
