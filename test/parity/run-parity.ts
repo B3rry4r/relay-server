@@ -1123,6 +1123,10 @@ async function phaseFinalizeTwice(): Promise<Cell[]> {
       chk('fz.idempotent-verdicts', flowDelta.length === 0, 'lie', 'finalize run 2 grades every flow edge the same as run 1', flowDelta.join(' | ') || 'identical'),
       chk('fz.no-zero-applied', zeroApplied.length === 0, 'lie', "no pass is recorded `applied` with all-zero counts, and no pass leaves it to finalize's safety net to turn its all-zero `applied` into a skip (a stub or a no-input run must say `skipped` + its own reason)", zeroApplied.join(', ') || 'none'),
       chk('fz.applied-grounded', !auditApplied || auditHit, 'lie', "an `applied` interaction audit's report contains the dead 'Resolve' control planted in the settings screen (applied means it read the screens)", auditApplied ? (auditHit ? `found at ${settingsFile}:${plantedLine}` : `applied, but .uix/interaction-audit-report.json has no finding at ${settingsFile}:${plantedLine} (${audit1?.findings.length ?? 'no'} finding(s))`) : 'auditInteractions not applied'),
+      // In a FULL finalize 7b runs before 7d: the bound modal m_10_9 it converts/credits
+      // must still grade `wired` (its trigger now calls the overlay presenter, not the
+      // removed route) — the single-pass 7d cell never sees 7b's output.
+      chk('fz.modal-after-7b', flow1?.findings.find((x) => x.from === 'c_10_2' && x.to === 'm_10_9')?.status === 'wired', 'lie', 'after 7b converts the bound modal, 7d still grades home→m_10_9 wired', (() => { const e = flow1?.findings.find((x) => x.from === 'c_10_2' && x.to === 'm_10_9'); return e ? `${e.status} — ${e.detail}` : 'no finding'; })()),
       chk('fz.skip-reasons', reasonless.length === 0, 'lie', 'every `skipped` pass carries its reason', reasonless.join(', ') || skippedWithReason.join(' | ') || 'no pass skipped'),
     ];
     const summary = (r: typeof r1) => r.passes.map((p) => `${p.name}:${p.status}`).join(', ');

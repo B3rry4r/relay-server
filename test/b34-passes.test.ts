@@ -317,3 +317,15 @@ describe('ensureNamedImport keeps a directive prologue first (found by the real 
     expect(ensureNamedImport('const a = 1;\n', 'X', './x')).toBe("import { X } from './x';\nconst a = 1;\n");
   });
 });
+
+describe('7d after 7b on flutter: a converted overlay trigger is the edge (found by the real finalize proof)', () => {
+  it('FilterSheetScreen.present(context) grades home→m_10_9 wired, not wrong-target', async () => {
+    const root = await fixture('flutter');
+    await applyModalOverlays('p', { projectRoot: root, noAi: true });
+    expect(await fs.readFile(path.join(root, 'lib', 'screens', 'home_screen.dart'), 'utf8')).toMatch(/FilterSheetScreen\.present\(context\)/);
+    const r = await verifyFlowWiring('p', { projectRoot: root, noAi: true, dryRun: true });
+    const e4 = r.report.findings.find((x) => x.to === 'm_10_9')!;
+    expect(e4.status).toBe('wired');
+    expect(e4.detail).toMatch(/FilterSheetScreen\.present/);
+  });
+});

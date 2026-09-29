@@ -52,7 +52,7 @@ import type { AIModel } from '../ai-adapters';
 import { tokenizeName } from '../semantic-names';
 import { verifyWeb, type WebFlow, type WebCanonScreen, type WebCanonModal } from './flow-wiring-web';
 import { modalPresenterName } from '../design-system';
-import { dartPresentation, dartPresenterName } from './dart-presenters';
+import { dartPresentation, dartPresenterName, stripDartPresenterDeclarations } from './dart-presenters';
 import { detectFramework, type Framework } from './framework';
 
 // ── Public contract ──────────────────────────────────────────────────────────
@@ -751,6 +751,21 @@ async function verifyFlutter(
 
     const landsOnTo = navTargets.some((t) => routeMatches(t.route, toRoute, toConst));
 
+    // A modal 7b already converted to an overlay: its route is gone and its trigger
+    // now calls `<ModalScreen>.present(context)`. That call IS the edge — grading it
+    // by the (removed) route reported every converted modal `wrong-target` on the
+    // finalize that converted it.
+    if (toModal && !landsOnTo) {
+      const toSrc = await readSrc(toScreen.file).catch(() => '');
+      const presentRe = new RegExp(`\\b${escapeRe(toScreen.widgetClass)}\\s*\\.\\s*present\\s*(?:<[^>]*>)?\\s*\\(`);
+      if (/\bstatic\s+(?:Future<[^>]*>|void)\s+present\s*(?:<[^>]*>)?\s*\(/.test(toSrc) && presentRe.test(stripDartPresenterDeclarations(fromSrc))) {
+        base.status = 'wired';
+        base.detail = `TO is a modal presented as an overlay — FROM calls ${toScreen.widgetClass}.present(context) (converted by 7b)`;
+        findings.push(base);
+        continue;
+      }
+    }
+
     // P2 TAB CONFORMANCE: a `tab` edge is a shell-hosting relationship, not a nav
     // call. Wired ONLY when the app has an AppShell hosting the destination class;
     // a push to the tab route is `tab-as-push` (high). With neither, the edge falls
@@ -1364,3 +1379,5 @@ const webStrategy = (framework: Framework): FlowStrategy => ({
     };
   },
 });
+
+function escapeRe(s: string): string { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }

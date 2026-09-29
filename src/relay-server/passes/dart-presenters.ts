@@ -18,7 +18,7 @@ export const dartPresenterName = (modalId: string): string => `showModal_${Strin
  *  overlay's `static Future<void> present(BuildContext context) {…}`), body included,
  *  so neither its name nor the dialog call inside it counts as a presentation. */
 export function stripDartPresenterDeclarations(src: string): string {
-  const decl = /(?:^|\n)[ \t]*(?:static\s+)?(?:(?:Future<[^>\n]*>|void|dynamic|Future)\s+)?(showModal_[0-9_]+|present)\s*\(/g;
+  const decl = /(?:^|\n)[ \t]*(?:static\s+)?(?:(?:Future<[^>\n]*>|void|dynamic|Future)\s+)?(showModal_[0-9_]+|present)\s*(?:<[^>()]*>)?\s*\(/g;
   let out = '';
   let last = 0;
   let m: RegExpExecArray | null;
