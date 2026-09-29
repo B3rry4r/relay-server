@@ -188,10 +188,14 @@ export class AgentTracker extends EventEmitter {
         seen.add(info.id);
         const existing = this.terminals.get(info.id);
         if (existing) {
-          if (info.pid && existing.info.pid !== info.pid) {
-            existing.info = { ...info };
-            existing.limited = this.computeLimited(info);
-            existing.timeline.limited = existing.limited;
+          const pidChanged = Boolean(info.pid) && existing.info.pid !== info.pid;
+          if (pidChanged) existing.info = { ...info };
+          // re-check while limited: a shell's environ reads empty right after fork
+          if (pidChanged || existing.limited) {
+            const limited = this.computeLimited(existing.info);
+            if (existing.limited && !limited) this.log(`terminal ${info.id}: /proc is shared with the PTY host — full mode`);
+            existing.limited = limited;
+            existing.timeline.limited = limited;
           }
           continue;
         }

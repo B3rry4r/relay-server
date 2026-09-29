@@ -154,7 +154,11 @@ describe.skipIf(SKIP !== null)('Agent view E2E: remote PTY (relay-pty on loopbac
     const app = await open(url, { token: 'test-token' });
     clients.push(app.client);
     const created = await app.waitFor('terminal:created');
-    const env = fs.readFileSync(`/proc/${created.pid}/environ`, 'utf8').split('\0');
+    let env: string[] = [];
+    for (let i = 0; i < 50 && !env.some((kv) => kv.startsWith('RELAY_TERMINAL_ID=')); i += 1) {
+      env = fs.readFileSync(`/proc/${created.pid}/environ`, 'utf8').split('\0');
+      if (!env.some((kv) => kv.startsWith('RELAY_TERMINAL_ID='))) await sleep(100);
+    }
     expect(env).toContain(`RELAY_TERMINAL_ID=${created.id}`);
     expect(await app.emitAck('agent:subscribe', { terminalId: created.id })).toEqual({ ok: true });
     const dir = path.join(workspace, 'bridge');

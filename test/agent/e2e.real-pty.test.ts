@@ -106,7 +106,12 @@ describe.skipIf(PTY_UNAVAILABLE !== null)('Agent view E2E: fake agent in a real 
     const created = await rec.waitFor('terminal:created');
     const terminalId: string = created.id;
     // the shell env carries the terminal id (spec §5.1) — read it back from the kernel
-    const env = fs.readFileSync(`/proc/${created.pid}/environ`, 'utf8').split('\0');
+    // (right after fork, before exec, environ can read empty under load: poll)
+    let env: string[] = [];
+    for (let i = 0; i < 50 && !env.some((kv) => kv.startsWith('RELAY_TERMINAL_ID=')); i += 1) {
+      env = fs.readFileSync(`/proc/${created.pid}/environ`, 'utf8').split('\0');
+      if (!env.some((kv) => kv.startsWith('RELAY_TERMINAL_ID='))) await sleep(100);
+    }
     expect(env).toContain(`RELAY_TERMINAL_ID=${terminalId}`);
     expect(env).toContain(`RELAY_AGENT_SPOOL=${path.join(workspace, '.relay/state/agent-events')}`);
     const sessions = await rec.waitFor('agent:sessions');
