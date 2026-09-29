@@ -76,6 +76,18 @@ export function locateWebTheme(projectRoot: string, resolverThemeFile?: string |
   return THEME_RELS.map((r) => path.join(projectRoot, r)).find((p) => fsSync.existsSync(p)) ?? null;
 }
 
+/** Why 7f did not run on a web app — worded so it can never claim an absent theme
+ *  when one exists (B12 fix round: on Next the old reason named only src/theme/ and
+ *  said "no web theme module" beside a real lib/theme/theme.ts). A theme module that
+ *  exists but whose token object the parser does not understand is "not read", with
+ *  its path; only a project with no theme file anywhere gets "no theme module". */
+export function webThemeSkipReason(projectRoot: string, themeFile: string | null): string {
+  if (themeFile) {
+    return `the token pass does not support the shape of this app's theme module: ${rel(projectRoot, themeFile)} was not read (it has no \`export const <Name> = { color: {…}, … }\` token object the parser understands) — PG-18`;
+  }
+  return `no web theme module in this app (looked in ${DESIGN_SYSTEM_RECORD}, the resolver's theme locations — lib/theme/theme.ts and src/lib/theme/theme.ts on Next — and ${THEME_RELS.join(', ')})`;
+}
+
 /** Parse the nested `export const AppTheme = { color: {...}, radius: {...} }` object. */
 export function parseWebTheme(projectRoot: string, resolverThemeFile?: string | null): WebThemeModel | null {
   const themeFile = locateWebTheme(projectRoot, resolverThemeFile);
@@ -209,8 +221,9 @@ export async function deepenWebTokens(projectRoot: string, opts: WebTokenOptions
   };
 
   const ix = await loadWebApp(projectRoot);
-  const theme = parseWebTheme(projectRoot, ix?.themeFile ?? null);
-  if (!theme) return { ...empty, skippedReason: `no web theme module with an exported token object (looked in ${DESIGN_SYSTEM_RECORD}, the resolver's theme locations and ${THEME_RELS.join(', ')})` };
+  const themeAt = locateWebTheme(projectRoot, ix?.themeFile ?? null);
+  const theme = themeAt ? parseWebThemeSource(fsSync.readFileSync(themeAt, 'utf-8'), themeAt) : null;
+  if (!theme) return { ...empty, skippedReason: webThemeSkipReason(projectRoot, themeAt) };
 
   const result: WebTokenResult = {
     ...empty,

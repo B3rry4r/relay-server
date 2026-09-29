@@ -59,6 +59,7 @@ import type { Canonical, CanonicalScreen, SkeletonResult } from './canonicalize'
 import { planSemanticScreens, computeTabCluster } from './canonicalize';
 import { tokenizeName, meaningfulTokens } from './semantic-names';
 import { webPreviewRoute, webPreviewDir } from './agent-packet';
+import { aliasSpecifierFor } from './passes/web-app';
 
 export type WebFramework = 'react' | 'next';
 
@@ -109,15 +110,23 @@ export function webPipelineRootRel(projectRoot: string, framework: string): stri
   return '.';
 }
 
-/** The theme module + stylesheet paths for a web framework (project-relative, POSIX). */
-export function webThemePaths(projectRoot: string, framework: string): { themeFile: string; cssFile: string; importSpecifier: string } {
+/** The theme module + stylesheet paths for a web framework (project-relative, POSIX).
+ *  `importSpecifier` is how a screen imports the theme: on Next the tsconfig alias
+ *  ONLY when the project's tsconfig/jsconfig maps one onto the theme module
+ *  (create-next-app's default `@/*`), else the relative path from a screen page
+ *  (`importFrom`) — `create-next-app --no-import-alias` has no `@/` and an unmapped
+ *  `@/lib/theme/theme` is TS2307 (B12 fix round). */
+export function webThemePaths(projectRoot: string, framework: string): { themeFile: string; cssFile: string; importSpecifier: string; importFrom: string } {
   if ((framework || '').toLowerCase() === 'next') {
     const pr = webPipelineRootRel(projectRoot, 'next');
     const base = pr === '.' ? 'lib/theme' : `${pr}/lib/theme`;
-    // create-next-app maps `@/*` to the pipeline root (./* or ./src/*).
-    return { themeFile: `${base}/theme.ts`, cssFile: `${base}/theme.css`, importSpecifier: '@/lib/theme/theme' };
+    const themeFile = `${base}/theme.ts`;
+    const importFrom = `${pr === '.' ? 'app' : `${pr}/app`}/<route>/page.tsx`;
+    const pageRel = importFrom.replace('<route>', 'route');
+    const alias = aliasSpecifierFor(path.join(projectRoot, pageRel), path.join(projectRoot, themeFile));
+    return { themeFile, cssFile: `${base}/theme.css`, importSpecifier: alias ?? importSpec(pageRel, themeFile), importFrom };
   }
-  return { themeFile: 'src/theme/theme.ts', cssFile: 'src/theme/theme.css', importSpecifier: '../theme/theme' };
+  return { themeFile: 'src/theme/theme.ts', cssFile: 'src/theme/theme.css', importSpecifier: '../theme/theme', importFrom: 'src/screens/<Screen>.tsx' };
 }
 
 const posix = (p: string): string => p.split(path.sep).join('/');

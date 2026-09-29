@@ -849,6 +849,40 @@ export function importSpecFor(fromFile: string, toFile: string, src: string): st
   return relative;
 }
 
+/** The tsconfig/jsconfig alias specifier that reaches `toFile` from a module at
+ *  `fromFile` — WITHOUT requiring `toFile` to exist yet (the design-system contract
+ *  names the theme import before the module is written). Resolution mirrors tsc: the
+ *  longest matching pattern wins and its first target is taken. Null when the project
+ *  maps no alias onto `toFile` (create-next-app --no-import-alias, a hand-made app):
+ *  callers then use a relative specifier, never an unmapped `@/…` (B12 fix round). */
+export function aliasSpecifierFor(fromFile: string, toFile: string): string | null {
+  const cfg = pathConfigFor(fromFile);
+  if (!cfg) return null;
+  const bare = toFile.replace(/\.(tsx|ts|jsx|js)$/, '');
+  const target = (a: PathAlias, spec: string): string | null => {
+    const t = a.targets[0];
+    if (!t) return null;
+    if (!a.hasStar) return spec === a.prefix ? t : null;
+    if (spec.length < a.prefix.length + a.suffix.length || !spec.startsWith(a.prefix) || !spec.endsWith(a.suffix)) return null;
+    return t.replace('*', spec.slice(a.prefix.length, spec.length - a.suffix.length));
+  };
+  for (const a of cfg.aliases) {
+    if (!a.hasStar) continue;
+    const t = a.targets[0];
+    if (!t) continue;
+    const [head, tail = ''] = t.split('*');
+    if (!bare.startsWith(head) || !bare.endsWith(tail) || bare.length < head.length + tail.length) continue;
+    const star = bare.slice(head.length, bare.length - tail.length).split(path.sep).join('/');
+    const spec = `${a.prefix}${star}${a.suffix}`;
+    // tsc resolves `spec` with the most specific pattern that matches it — which may
+    // be another alias; the spec is ours only if that pattern lands on `toFile`.
+    const winner = cfg.aliases.find((b) => target(b, spec) !== null);
+    const landed = winner ? target(winner, spec) : null;
+    if (landed && path.resolve(landed).replace(/\.(tsx|ts|jsx|js)$/, '') === path.resolve(bare)) return spec;
+  }
+  return null;
+}
+
 /** Add `import { name } from 'spec'` when absent; merge into an existing brace import. */
 export function ensureNamedImport(src: string, name: string, spec: string): string {
   const existing = new RegExp(`import\\s*\\{([^}]*)\\}\\s*from\\s*['"]${escapeRe(spec)}['"]`).exec(src);

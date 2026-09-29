@@ -36,8 +36,11 @@ export interface ThemeTokens {
   className: string;          // e.g. "AppTheme"
   /** Web only: the CSS custom-property stylesheet beside the TS theme module. */
   cssFile?: string;
-  /** Web only: how a screen imports the theme module (`@/lib/theme/theme`). */
+  /** Web only: how a screen imports the theme module (`@/lib/theme/theme` when the
+   *  project's tsconfig maps that alias, else a path relative to `importFrom`). */
   importSpecifier?: string;
+  /** Web only: the file a relative `importSpecifier` is relative to (`app/<route>/page.tsx`). */
+  importFrom?: string;
 }
 
 // ── Color role classification (deterministic, no LLM) ─────────────────────────
@@ -119,7 +122,7 @@ const WEB_RADIUS = [8, 12, 16, 24];
 export function webThemeApiDescription(tokens: ThemeTokens): string {
   const t = tokens.className;
   const out: string[] = [
-    `DESIGN SYSTEM — already generated: \`${tokens.themeFile}\` exports the typed token object \`${t}\` (import { ${t} } from '${tokens.importSpecifier ?? tokens.themeFile.replace(/\.ts$/, '')}'${tokens.importSpecifier?.startsWith('.') ? ' in a file under src/screens/ — adjust the relative path elsewhere' : ''}), and \`${tokens.cssFile ?? ''}\` declares the same tokens as CSS custom properties (already imported once by the app entry). IMPORT and USE these tokens; do NOT hardcode hex colours, px spacing or radii that duplicate them in style props or CSS — inline literals that match a token are a defect the review will flag.`,
+    `DESIGN SYSTEM — already generated: \`${tokens.themeFile}\` exports the typed token object \`${t}\` (import { ${t} } from '${tokens.importSpecifier ?? tokens.themeFile.replace(/\.ts$/, '')}'${tokens.importSpecifier?.startsWith('.') ? ` in \`${tokens.importFrom ?? 'src/screens/<Screen>.tsx'}\` — a relative path: adjust it for each importing file (one more \`../\` per extra directory level)` : ''}), and \`${tokens.cssFile ?? ''}\` declares the same tokens as CSS custom properties (already imported once by the app entry). IMPORT and USE these tokens; do NOT hardcode hex colours, px spacing or radii that duplicate them in style props or CSS — inline literals that match a token are a defect the review will flag.`,
     `Colour tokens (\`${t}.color.<name>\` in style props / \`var(--color-<name>)\` in CSS):`,
   ];
   for (const c of tokens.colors) out.push(`- ${t}.color.${c.name} = ${c.hex}  (var(--color-${c.name}))`);
@@ -257,7 +260,7 @@ async function generateWebDesignSystem(
   projectRoot: string, framework: 'react' | 'next', digest: DesignDigestInput,
 ): Promise<GenerateResult> {
   const where = webThemePaths(projectRoot, framework);
-  const tokens: ThemeTokens = { ...planThemeTokens(digest, { themeFile: where.themeFile }), cssFile: where.cssFile, importSpecifier: where.importSpecifier };
+  const tokens: ThemeTokens = { ...planThemeTokens(digest, { themeFile: where.themeFile }), cssFile: where.cssFile, importSpecifier: where.importSpecifier, importFrom: where.importFrom };
   const api = webThemeApiDescription(tokens);
   const tsAbs = path.join(projectRoot, where.themeFile);
   const cssAbs = path.join(projectRoot, where.cssFile);
@@ -280,7 +283,7 @@ async function generateWebDesignSystem(
   }
   try {
     const rec = {
-      framework, themeFile: where.themeFile, cssFile: where.cssFile, importSpecifier: where.importSpecifier,
+      framework, themeFile: where.themeFile, cssFile: where.cssFile, importSpecifier: where.importSpecifier, importFrom: where.importFrom,
       symbol: tokens.className, groups: { color: 'color', spacing: 'spacing', radius: 'radius', font: 'font' },
       colors: tokens.colors.map(c => ({ name: c.name, hex: c.hex })), fontFamily: tokens.fontFamily ?? null,
     };

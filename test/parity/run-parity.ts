@@ -505,6 +505,10 @@ const CHECKS: Record<PassName, CheckFn> = {
       chk('t.radius', radiusOk, 'stub', 'borderRadius 12 → the r12 radius token', radiusOk ? 'ok' : line(/[Rr]adius/)),
       chk('t.import', !colorOk || importOk, 'lie', 'a file that now uses the theme imports it', importOk ? 'import present' : 'token used without import'),
       chk('t.syntax', syn.length === 0, 'lie', 'every file the pass wrote parses', syn.join(' | ') || 'ok'),
+      // The fixture HAS a theme module (flutter lib/theme/app_theme.dart, react
+      // src/theme/theme.ts, next <root>/lib/theme/theme.ts per CONTRACTS §5): a 7f skip
+      // claiming "no web theme module" is the B12 lie (the Next theme was never read).
+      honestSkip('t.skip-reason-honest', r, 'the fixture ships a theme module with an exported token object'),
     ];
   },
 
