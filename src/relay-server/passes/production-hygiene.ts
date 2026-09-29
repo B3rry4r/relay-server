@@ -23,8 +23,8 @@ import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import path from 'node:path';
 
-import { detectFramework, type Framework } from './component-extraction';
-import { loadWebApp, listSourceFiles, stillReferenced, escapeRe } from './web-app';
+import { detectFramework, type Framework } from './framework';
+import { loadWebApp, listSourceFiles, listWebSources, stillReferenced, escapeRe, type WebAppIndex } from './web-app';
 
 export interface HygieneResult {
   framework: Framework;
@@ -101,6 +101,8 @@ async function hygieneWeb(projectRoot: string, dryRun: boolean): Promise<Hygiene
   if (app !== before && !dryRun) await fs.writeFile(ix.routerFile, app, 'utf-8');
 
   // ── Delete the preview + placeholder source files ───────────────────────────
+  // Deletion stays scoped to the primary screen root (hygiene's own scope — PG-25);
+  // only the read-only reference scan below walks every root.
   const files = await listSourceFiles(ix.srcDir);
   for (const f of files) {
     if (/Preview\.(tsx|jsx)$/.test(f) || /PlaceholderScreen\.(tsx|jsx)$/.test(f)) {
@@ -110,7 +112,7 @@ async function hygieneWeb(projectRoot: string, dryRun: boolean): Promise<Hygiene
   }
 
   // ── Report (never delete) unreferenced asset symbols ────────────────────────
-  result.unreferencedAssets = await countUnreferencedAssets(projectRoot, ix.srcDir, ix.resourcesFile, warnings);
+  result.unreferencedAssets = await countUnreferencedAssets(ix, ix.resourcesFile, warnings);
 
   return result;
 }
@@ -120,7 +122,7 @@ async function hygieneWeb(projectRoot: string, dryRun: boolean): Promise<Hygiene
  *  say-so would break a runtime image. When any dynamic access exists we say so and
  *  do not even imply the count is prunable. */
 async function countUnreferencedAssets(
-  projectRoot: string, srcDir: string, resourcesFile: string | null, warnings: string[],
+  ix: Pick<WebAppIndex, 'sourceRoots'>, resourcesFile: string | null, warnings: string[],
 ): Promise<number> {
   if (!resourcesFile || !fsSync.existsSync(resourcesFile)) return 0;
   const decl = [...fsSync.readFileSync(resourcesFile, 'utf-8').matchAll(/^\s*([A-Za-z0-9_$]+)\s*:/gm)].map((m) => m[1]);
@@ -128,7 +130,7 @@ async function countUnreferencedAssets(
 
   let code = '';
   let dynamic = false;
-  for (const f of await listSourceFiles(srcDir)) {
+  for (const f of await listWebSources(ix)) {
     if (f === resourcesFile) continue;
     const s = await fs.readFile(f, 'utf-8').catch(() => '');
     code += s + '\n';

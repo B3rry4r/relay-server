@@ -19,7 +19,7 @@ import path from 'node:path';
 
 import { deriveSemanticIdentifiers } from '../semantic-names';
 import {
-  loadWebApp, resolveScreen, listSourceFiles, stampHeader, readHeader, escapeRe, idCore,
+  loadWebApp, resolveScreen, listWebSources, stampHeader, readHeader, escapeRe, idCore,
 } from './web-app';
 
 export interface WebRename {
@@ -104,7 +104,7 @@ export async function renameWeb(
   if (opts.dryRun) return { renames: planned, skipped, builtScreens, filesTouched: 0 };
 
   // Apply. Load every source once so multiple rewrites compose, then write the delta.
-  const files = await listSourceFiles(ix.srcDir);
+  const files = await listWebSources(ix);
   const contents = new Map<string, string>();
   for (const f of files) contents.set(f, await fs.readFile(f, 'utf-8').catch(() => ''));
 

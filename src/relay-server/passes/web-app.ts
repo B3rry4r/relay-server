@@ -12,7 +12,14 @@
  *      screens (the same marker Dart carries);
  *   2. the route table (`src/router/routes.ts`) + the router element map parsed
  *      out of `App.tsx` — data the pipeline itself emitted;
- *   3. Next's file-system router (`app/<segment>/page.tsx`).
+ *   3. Next's file-system router — the App Router (`app/` or `src/app/`, route
+ *      groups, private folders, `%5F` escapes, dynamic segments) and the Pages
+ *      Router (`pages/` or `src/pages/`).
+ *
+ * Every source root that exists is walked (`src/`, `app/`, `components/`, `lib/`,
+ * `pages/`), and imports resolve through tsconfig/jsconfig `paths` + `baseUrl`
+ * (Next's default `@/…` alias), so a pipeline-written file such as the asset
+ * pass's `src/resources/assets.ts` can never hide a Next `app/` directory.
  *
  * Nothing here guesses from a file name.
  */
@@ -54,7 +61,20 @@ export interface WebScreenFile {
 export interface WebAppIndex {
   kind: WebKind;
   projectRoot: string;
+  /** The primary screen root: react → `src/`; next → the App Router dir (`app/` or
+   *  `src/app/`), else the Pages Router dir. Walk `sourceRoots` (listWebSources) for
+   *  "every file of the app" — this is ONE root, not all of them. */
   srcDir: string;
+  /** Every existing source root of the app, outermost only (a root nested inside
+   *  another is not repeated): some of `src/`, `app/`, `pages/`, `components/`, `lib/`. */
+  sourceRoots: string[];
+  /** Next App Router dir (`app/` wins over `src/app/`, as in Next), else null. */
+  appDir: string | null;
+  /** Next Pages Router dir (`pages/` wins over `src/pages/`), else null. */
+  pagesDir: string | null;
+  /** Where pipeline-owned files live (CONTRACTS §5): next → the app dir's parent
+   *  (`.` or `src`); react (Vite) → `src/`. */
+  pipelineRoot: string;
   screensDir: string;
   componentsDir: string;
   /** `src/router/routes.ts` (react) — null on next, whose routes are directories. */
@@ -96,7 +116,10 @@ export async function listSourceFiles(dir: string, out: string[] = []): Promise<
   for (const e of entries) {
     const p = path.join(dir, e.name);
     if (e.isDirectory()) {
-      if (e.name === 'node_modules' || e.name === 'dist' || e.name === '.next' || e.name === '_preview') continue;
+      // Verify-harness previews are never shipped UI: `_preview` (react + flutter) and
+      // Next's routable escape `%5Fpreview` (a bare `_preview` is a private folder).
+      if (e.name === 'node_modules' || e.name === 'dist' || e.name === '.next' || e.name === '.git'
+        || e.name === '_preview' || /^%5Fpreview$/i.test(e.name)) continue;
       await listSourceFiles(p, out);
     } else if (CODE_RE.test(e.name)) {
       out.push(p);
@@ -156,34 +179,243 @@ export function parseRouteElements(src: string): Map<string, string> {
   return out;
 }
 
-/** Map an imported symbol to the file that exports it: `import { X } from './a/b'`. */
+/** Map an imported symbol to the file that exports it: `import { X } from './a/b'`,
+ *  and — through the nearest tsconfig/jsconfig `paths` + `baseUrl` — aliased
+ *  specifiers such as Next's default `import { X } from '@/components/X'`. Bare
+ *  package specifiers (`react`, `next/navigation`) resolve to nothing and are skipped. */
 export function parseImports(src: string, fromFile: string): Map<string, string> {
   const out = new Map<string, string>();
   const re = /import\s+(?:([A-Za-z0-9_$]+)\s*,\s*)?(?:\{([^}]*)\}\s*)?from\s*['"]([^'"]+)['"]/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(src)) !== null) {
     const spec = m[3];
-    if (!spec.startsWith('.')) continue;
     const names: string[] = [];
     if (m[1]) names.push(m[1]);
     if (m[2]) for (const raw of m[2].split(',')) {
       const n = raw.trim().split(/\s+as\s+/).pop()?.trim();
       if (n) names.push(n);
     }
-    const resolved = resolveImport(fromFile, spec);
+    if (!names.length) continue;
+    const resolved = resolveSpecifier(fromFile, spec);
     if (!resolved) continue;
     for (const n of names) out.set(n, resolved);
   }
   return out;
 }
 
+/** Resolve an import specifier from `fromFile` to a source file on disk: relative
+ *  paths directly; anything else through the tsconfig/jsconfig that governs
+ *  `fromFile` (`paths` patterns, then `baseUrl`). Null when it is a package or does
+ *  not exist. */
+export function resolveSpecifier(fromFile: string, spec: string): string | null {
+  if (spec.startsWith('.') || path.isAbsolute(spec)) {
+    return resolveImport(fromFile, spec);
+  }
+  const cfg = pathConfigFor(fromFile);
+  if (!cfg) return null;
+  for (const a of cfg.aliases) {
+    let star: string | null = null;
+    if (a.hasStar) {
+      if (spec.length < a.prefix.length + a.suffix.length || !spec.startsWith(a.prefix) || !spec.endsWith(a.suffix)) continue;
+      star = spec.slice(a.prefix.length, spec.length - a.suffix.length);
+    } else if (spec !== a.prefix) continue;
+    for (const t of a.targets) {
+      const hit = fileCandidate(star == null ? t : t.replace('*', star));
+      if (hit) return hit;
+    }
+  }
+  // TS resolves a non-relative name against baseUrl too (`components/X` with baseUrl '.').
+  if (cfg.baseUrl) return fileCandidate(path.join(cfg.baseUrl, spec));
+  return null;
+}
+
 function resolveImport(fromFile: string, spec: string): string | null {
-  const base = path.resolve(path.dirname(fromFile), spec);
+  return fileCandidate(path.resolve(path.dirname(fromFile), spec));
+}
+
+function fileCandidate(base: string): string | null {
   for (const cand of [base, `${base}.tsx`, `${base}.ts`, `${base}.jsx`, `${base}.js`,
-    path.join(base, 'index.tsx'), path.join(base, 'index.ts')]) {
+    path.join(base, 'index.tsx'), path.join(base, 'index.ts'), path.join(base, 'index.jsx'), path.join(base, 'index.js')]) {
     if (fsSync.existsSync(cand) && fsSync.statSync(cand).isFile()) return cand;
   }
   return null;
+}
+
+// ── tsconfig / jsconfig path aliases ─────────────────────────────────────────
+
+export interface PathAlias {
+  /** Pattern text before `*` (or the whole pattern when there is no `*`). */
+  prefix: string;
+  suffix: string;
+  hasStar: boolean;
+  /** Absolute target patterns (may contain one `*`). */
+  targets: string[];
+}
+
+export interface PathConfig {
+  /** The config file the aliases came from (tsconfig.json / jsconfig.json). */
+  configFile: string;
+  baseUrl: string | null;
+  aliases: PathAlias[];
+}
+
+/** Parse JSON-with-comments the way tsc accepts it: `//` and `/* *\/` comments and
+ *  trailing commas (the Vite react-ts template ships all three). Strings are kept
+ *  intact. Returns null when it still does not parse. */
+export function parseJsonc(text: string): unknown {
+  let out = '';
+  let i = 0;
+  let inStr = false;
+  while (i < text.length) {
+    const c = text[i];
+    if (inStr) {
+      out += c;
+      if (c === '\\') { out += text[i + 1] ?? ''; i += 2; continue; }
+      if (c === '"') inStr = false;
+      i++;
+      continue;
+    }
+    if (c === '"') { inStr = true; out += c; i++; continue; }
+    if (c === '/' && text[i + 1] === '/') { while (i < text.length && text[i] !== '\n') i++; continue; }
+    if (c === '/' && text[i + 1] === '*') { i += 2; while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) i++; i += 2; continue; }
+    out += c;
+    i++;
+  }
+  out = out.replace(/,(\s*[}\]])/g, '$1');
+  try { return JSON.parse(out); } catch { return null; }
+}
+
+interface RawTsconfig {
+  extends?: string | string[];
+  references?: Array<{ path?: string }>;
+  compilerOptions?: { baseUrl?: string; paths?: Record<string, string[]> };
+}
+
+function readTsconfig(file: string): RawTsconfig | null {
+  try { return parseJsonc(fsSync.readFileSync(file, 'utf8')) as RawTsconfig | null; } catch { return null; }
+}
+
+/** baseUrl + paths for one config file, following relative `extends` chains (the
+ *  child wins, and `paths` resolve against the config that declared them / its
+ *  baseUrl, exactly as tsc does). */
+function effectivePaths(file: string, depth = 0): { baseUrl: string | null; paths: Record<string, string[]>; pathsBase: string } | null {
+  if (depth > 8) return null;
+  const cfg = readTsconfig(file);
+  if (!cfg) return null;
+  const dir = path.dirname(file);
+  let res: { baseUrl: string | null; paths: Record<string, string[]>; pathsBase: string } = { baseUrl: null, paths: {}, pathsBase: dir };
+  for (const ext of Array.isArray(cfg.extends) ? cfg.extends : cfg.extends ? [cfg.extends] : []) {
+    if (!ext.startsWith('.')) continue;   // package-published bases (@tsconfig/…) carry no app paths
+    const extFile = ext.endsWith('.json') ? path.resolve(dir, ext) : path.resolve(dir, `${ext}.json`);
+    const parent = effectivePaths(extFile, depth + 1);
+    if (parent) res = parent;
+  }
+  const co = cfg.compilerOptions ?? {};
+  if (typeof co.baseUrl === 'string') res = { ...res, baseUrl: path.resolve(dir, co.baseUrl), pathsBase: path.resolve(dir, co.baseUrl) };
+  if (co.paths && typeof co.paths === 'object') res = { ...res, paths: co.paths, pathsBase: res.baseUrl ?? dir };
+  return res;
+}
+
+function toAliases(paths: Record<string, string[]>, base: string): PathAlias[] {
+  const out: PathAlias[] = [];
+  for (const [pattern, targets] of Object.entries(paths)) {
+    if (!Array.isArray(targets)) continue;
+    const star = pattern.indexOf('*');
+    out.push({
+      prefix: star < 0 ? pattern : pattern.slice(0, star),
+      suffix: star < 0 ? '' : pattern.slice(star + 1),
+      hasStar: star >= 0,
+      targets: targets.filter((t) => typeof t === 'string').map((t) => path.resolve(base, t)),
+    });
+  }
+  // Longest prefix first — tsc picks the most specific pattern.
+  return out.sort((a, b) => b.prefix.length - a.prefix.length);
+}
+
+/** The path config of the project rooted at `configDir`: its tsconfig.json (or
+ *  jsconfig.json), and — when that is a solution file with `references` (the Vite
+ *  react-ts template: `files: []` + tsconfig.app.json) — the referenced configs. */
+export function loadPathConfig(configDir: string): PathConfig | null {
+  for (const name of ['tsconfig.json', 'jsconfig.json']) {
+    const file = path.join(configDir, name);
+    if (!fsSync.existsSync(file)) continue;
+    const own = effectivePaths(file);
+    const aliases: PathAlias[] = own ? toAliases(own.paths, own.pathsBase) : [];
+    let baseUrl = own?.baseUrl ?? null;
+    for (const ref of readTsconfig(file)?.references ?? []) {
+      if (!ref?.path) continue;
+      let refFile = path.resolve(configDir, ref.path);
+      if (fsSync.existsSync(refFile) && fsSync.statSync(refFile).isDirectory()) refFile = path.join(refFile, 'tsconfig.json');
+      const r = effectivePaths(refFile);
+      if (!r) continue;
+      aliases.push(...toAliases(r.paths, r.pathsBase));
+      baseUrl ??= r.baseUrl;
+    }
+    aliases.sort((a, b) => b.prefix.length - a.prefix.length);
+    return { configFile: file, baseUrl, aliases };
+  }
+  return null;
+}
+
+const pathConfigCache = new Map<string, { key: string; cfg: PathConfig | null }>();
+
+/** The path config governing `file`: the nearest tsconfig/jsconfig walking up from
+ *  it, stopping at the first directory that has a package.json (the app root).
+ *  Cached per config dir, invalidated when the config file changes. */
+export function pathConfigFor(file: string): PathConfig | null {
+  let dir = path.dirname(path.resolve(file));
+  for (;;) {
+    const ts = path.join(dir, 'tsconfig.json');
+    const js = path.join(dir, 'jsconfig.json');
+    const cfgFile = fsSync.existsSync(ts) ? ts : fsSync.existsSync(js) ? js : null;
+    if (cfgFile) {
+      let key = '';
+      try { key = String(fsSync.statSync(cfgFile).mtimeMs); } catch { /* raced */ }
+      const hit = pathConfigCache.get(dir);
+      if (hit && hit.key === key) return hit.cfg;
+      const cfg = loadPathConfig(dir);
+      pathConfigCache.set(dir, { key, cfg });
+      return cfg;
+    }
+    if (fsSync.existsSync(path.join(dir, 'package.json'))) return null;
+    const up = path.dirname(dir);
+    if (up === dir) return null;
+    dir = up;
+  }
+}
+
+// ── Next.js file-system routes ───────────────────────────────────────────────
+
+/** The URL route an App Router file serves, or null when it serves none.
+ *  `app/(tabs)/10-2/page.tsx` → `/10-2` (route groups are not URL segments),
+ *  `app/@modal/x/page.tsx` → `/x` (parallel-route slots neither), `app/_lib/…` →
+ *  null (a `_` folder is PRIVATE — opted out of routing), `app/%5Fpreview/10-3/…` →
+ *  `/_preview/10-3` (`%5F` is the escape for a literal `_`), intercepting routes
+ *  (`(.)x`, `(..)x`) → null, `[id]` / `[...slug]` kept verbatim. */
+export function nextAppRoute(appDir: string, file: string): string | null {
+  if (!/^page\.(tsx|jsx|ts|js)$/.test(path.basename(file))) return null;
+  const rel = path.relative(appDir, path.dirname(file));
+  if (rel.startsWith('..') || path.isAbsolute(rel)) return null;
+  const segs: string[] = [];
+  for (const seg of rel.split(path.sep).filter(Boolean)) {
+    if (/^\(\.+\)/.test(seg)) return null;                         // intercepting route
+    if (/^\(.*\)$/.test(seg)) continue;                          // route group
+    if (seg.startsWith('@')) continue;                            // parallel-route slot
+    if (seg.startsWith('_')) return null;                         // private folder
+    segs.push(seg.replace(/%5F/gi, '_'));
+  }
+  return `/${segs.join('/')}`;
+}
+
+/** The URL route a Pages Router file serves, or null (`_app`, `_document`, `api/`). */
+export function nextPagesRoute(pagesDir: string, file: string): string | null {
+  if (!/\.(tsx|jsx|ts|js)$/.test(file)) return null;
+  const rel = path.relative(pagesDir, file);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) return null;
+  const parts = rel.replace(/\.(tsx|jsx|ts|js)$/, '').split(path.sep);
+  if (parts[0] === 'api' || parts.some((p) => /^_(app|document|error)$/.test(p))) return null;
+  if (parts[parts.length - 1] === 'index') parts.pop();
+  return `/${parts.join('/')}`;
 }
 
 // ── Index construction ───────────────────────────────────────────────────────
@@ -196,27 +428,71 @@ const firstExisting = (root: string, ...rels: string[]): string | null => {
   return null;
 };
 
+const isDir = (p: string): boolean => { try { return fsSync.statSync(p).isDirectory(); } catch { return false; } };
+
+/** Every existing source root, outermost only. */
+function sourceRootsOf(projectRoot: string): string[] {
+  const cands = ['src', 'app', 'pages', 'components', 'lib'].map((d) => path.join(projectRoot, d)).filter(isDir);
+  return cands.filter((d) => !cands.some((o) => o !== d && d.startsWith(o + path.sep)));
+}
+
+/** Every source file of the app across all its roots (deduped, stable order).
+ *  Passes that need "the whole app" walk this, never one hardcoded directory. */
+export async function listWebSources(ix: Pick<WebAppIndex, 'sourceRoots'>): Promise<string[]> {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const r of ix.sourceRoots) for (const f of await listSourceFiles(r)) if (!seen.has(f)) { seen.add(f); out.push(f); }
+  return out;
+}
+
 export async function loadWebApp(projectRoot: string): Promise<WebAppIndex | null> {
   const kind = await detectWebKind(projectRoot);
   if (!kind) return null;
 
-  const srcDir = firstExisting(projectRoot, 'src', 'app') ?? path.join(projectRoot, 'src');
+  // Next: `app/` wins over `src/app/` (and `pages/` over `src/pages/`) — Next itself
+  // ignores the src/ copy when the root one exists.
+  const appDir = kind === 'next' ? [path.join(projectRoot, 'app'), path.join(projectRoot, 'src', 'app')].find(isDir) ?? null : null;
+  const pagesDir = kind === 'next' ? [path.join(projectRoot, 'pages'), path.join(projectRoot, 'src', 'pages')].find(isDir) ?? null : null;
+  const routerDir = appDir ?? pagesDir;
+  // CONTRACTS §5: pipeline-owned files live beside the app dir's parent.
+  const pipelineRoot = kind === 'next'
+    ? (routerDir ? path.dirname(routerDir) : projectRoot)
+    : path.join(projectRoot, 'src');
+  const pr = path.relative(projectRoot, pipelineRoot) || '.';
+  const under = (...rels: string[]) => rels.map((r) => path.join(pr, r));
+
+  const srcDir = kind === 'next'
+    ? routerDir ?? firstExisting(projectRoot, 'src') ?? path.join(projectRoot, 'src')
+    : firstExisting(projectRoot, 'src', 'app') ?? path.join(projectRoot, 'src');
   const index: WebAppIndex = {
     kind,
     projectRoot,
     srcDir,
-    screensDir: firstExisting(projectRoot, 'src/screens', 'src/pages', 'app') ?? path.join(srcDir, 'screens'),
-    componentsDir: firstExisting(projectRoot, 'src/components', 'components') ?? path.join(srcDir, 'components'),
+    sourceRoots: sourceRootsOf(projectRoot),
+    appDir,
+    pagesDir,
+    pipelineRoot,
+    screensDir: kind === 'next'
+      ? routerDir ?? path.join(srcDir, 'screens')
+      : firstExisting(projectRoot, 'src/screens', 'src/pages') ?? path.join(srcDir, 'screens'),
+    componentsDir: firstExisting(projectRoot, ...under('components'), 'src/components', 'components') ?? path.join(pipelineRoot, 'components'),
     routesFile: firstExisting(projectRoot, 'src/router/routes.ts', 'src/routes.ts'),
-    routerFile: firstExisting(projectRoot, 'src/App.tsx', 'src/app.tsx'),
-    themeFile: firstExisting(projectRoot, 'src/theme/theme.ts', 'src/theme/index.ts', 'src/theme.ts'),
-    resourcesFile: firstExisting(projectRoot, 'src/resources/assets.ts', 'src/assets.ts'),
-    modalControllerFile: firstExisting(projectRoot, 'src/modal/modalController.ts'),
+    routerFile: kind === 'react' ? firstExisting(projectRoot, 'src/App.tsx', 'src/app.tsx') : null,
+    themeFile: firstExisting(projectRoot,
+      ...under('lib/theme.ts', 'lib/theme/index.ts', 'lib/theme/theme.ts'),
+      'src/theme/theme.ts', 'src/theme/index.ts', 'src/theme.ts'),
+    resourcesFile: firstExisting(projectRoot,
+      ...under('lib/resources.ts', 'lib/resources/index.ts', 'lib/resources/assets.ts'),
+      'src/resources/assets.ts', 'src/assets.ts'),
+    modalControllerFile: firstExisting(projectRoot,
+      'src/modal/modalController.ts',
+      ...under('lib/modal/modalController.ts', 'lib/modalController.ts', 'components/modalController.ts')),
     constToRoute: new Map(),
     routeToConst: new Map(),
     byId: new Map(),
     byRoute: new Map(),
   };
+  if (index.sourceRoots.length === 0) index.sourceRoots = [srcDir];
 
   if (index.routesFile) {
     const t = parseRouteTable(await fs.readFile(index.routesFile, 'utf-8'));
@@ -224,8 +500,8 @@ export async function loadWebApp(projectRoot: string): Promise<WebAppIndex | nul
     index.routeToConst = t.routeToConst;
   }
 
-  // Layer 1 — headers. Authoritative when present.
-  const files = await listSourceFiles(index.srcDir);
+  // Layer 1 — headers, across EVERY source root. Authoritative when present.
+  const files = await listWebSources(index);
   const byFile = new Map<string, string>();
   for (const f of files) {
     const src = await fs.readFile(f, 'utf-8').catch(() => '');
@@ -275,27 +551,42 @@ export async function loadWebApp(projectRoot: string): Promise<WebAppIndex | nul
     }
   }
 
-  // Layer 3 — Next's file-system router: app/<segment>/page.tsx.
+  // Layer 3 — Next's file-system router. The route is computed with Next's own
+  // rules (route groups, private folders, %5F, slots), indexed by route string for
+  // semantic routes (`/settings`) and additionally by id core for frame routes.
   if (kind === 'next') {
+    const pages: Array<{ f: string; route: string }> = [];
     for (const f of files) {
-      if (!/[/\\]page\.(tsx|jsx)$/.test(f)) continue;
-      const segment = path.relative(index.screensDir, path.dirname(f)).split(path.sep).join('/');
-      const route = `/${segment}`;
-      const core = routeCore(route);
-      if (!core || index.byId.has(core)) continue;
+      const route = appDir && isInside(appDir, f) ? nextAppRoute(appDir, f)
+        : pagesDir && isInside(pagesDir, f) ? nextPagesRoute(pagesDir, f) : null;
+      if (route) pages.push({ f, route });
+    }
+    for (const { f, route } of pages) {
+      if (route.startsWith('/_preview')) continue;   // verify harness, not the app
       const src = byFile.get(f) ?? '';
-      const comp = topLevelComponent(src) ?? 'Page';
+      const placeholder = /\bPlaceholder[A-Za-z]*\b/.test(src.replace(/^import\s.*$/gm, '')) && !readHeader(src);
+      const headerEntry = [...index.byId.values()].find((e) => e.file === f);
+      if (headerEntry) {
+        // A stamped page: its header id wins, but the URL it is actually served at
+        // is the file-system route — index that too so `/settings` resolves.
+        if (!index.byRoute.has(route)) index.byRoute.set(route, headerEntry);
+        continue;
+      }
       const entry: WebScreenFile = {
-        canonicalId: null, route, routeConst: null, file: f, componentName: comp,
-        placeholder: /Placeholder/.test(src),
+        canonicalId: null, route, routeConst: null, file: f,
+        componentName: topLevelComponent(src) ?? 'Page',
+        placeholder,
       };
-      index.byId.set(core, entry);
-      index.byRoute.set(route, entry);
+      if (!index.byRoute.has(route)) index.byRoute.set(route, entry);
+      const core = routeCore(route) ?? routeCore(`/${route.split('/').pop() ?? ''}`);
+      if (core && !index.byId.has(core)) index.byId.set(core, entry);
     }
   }
 
   return index;
 }
+
+const isInside = (dir: string, f: string): boolean => f === dir || f.startsWith(dir + path.sep);
 
 /** `/88-4361` → `88_4361`, so a frame-derived route joins the same keyspace as a
  *  canonical id core. Returns null for semantic routes like `/escrow`. */
@@ -400,11 +691,17 @@ export function collectRouteConstRefs(src: string): Set<string> {
  *       directly, which is what a screen does when the modal needs a prefill or a
  *       submit callback the fixed-signature presenter cannot carry.
  *
- *  The modal id in (2) is a literal, so it identifies the modal exactly. */
+ *  The modal id in (2) is a literal, so it identifies the modal exactly.
+ *
+ *  A presenter's own DECLARATION is not a call site: `function showModal_10_8() {
+ *  modalController.open('m_10_8', …) }` matched both shapes, so a screen that merely
+ *  imported the presenter module — and left its "Log out" button dead — was credited
+ *  twice (PG-11). Declarations are stripped before counting. */
 export function countPresenterCalls(src: string, presenter: string, modalId?: string): number {
-  const byPresenter = (src.match(new RegExp(`\\b${escapeRe(presenter)}\\s*\\(`, 'g')) ?? []).length;
+  const code = stripPresenterDeclarations(src);
+  const byPresenter = (code.match(new RegExp(`\\b${escapeRe(presenter)}\\s*\\(`, 'g')) ?? []).length;
   if (!modalId) return byPresenter;
-  const direct = (src.match(
+  const direct = (code.match(
     new RegExp(`\\bmodalController\\s*\\.\\s*open\\s*\\(\\s*['"\`]${escapeRe(modalId)}['"\`]`, 'g'),
   ) ?? []).length;
   return byPresenter + direct;
@@ -412,7 +709,40 @@ export function countPresenterCalls(src: string, presenter: string, modalId?: st
 
 /** Any modal presenter at all — the React analogue of `showModalBottomSheet|showDialog`. */
 export function countAnyPresenterCalls(src: string): number {
-  return (src.match(/\bshowModal_[0-9_]+\s*\(|\bmodalController\s*\.\s*open\s*\(/g) ?? []).length;
+  return (stripPresenterDeclarations(src).match(/\bshowModal_[0-9_]+\s*\(|\bmodalController\s*\.\s*open\s*\(/g) ?? []).length;
+}
+
+/** Remove every `showModal_<id>` declaration (function or arrow const) INCLUDING its
+ *  body, so neither its name nor the `modalController.open(…)` inside it counts as a
+ *  presentation. Brace-matched; an expression-bodied arrow is cut at its `;`/EOL. */
+export function stripPresenterDeclarations(src: string): string {
+  const decl = /(?:export\s+)?(?:(?:async\s+)?function\s+showModal_[0-9_]+\s*\(|(?:const|let|var)\s+showModal_[0-9_]+\s*(?::[^=]+)?=\s*(?:async\s*)?(?:function\s*)?\()/g;
+  let out = '';
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = decl.exec(src)) !== null) {
+    const start = m.index;
+    // Skip the parameter list (balanced parens), then find the body.
+    let i = m.index + m[0].length;
+    let depth = 1;
+    while (i < src.length && depth > 0) { if (src[i] === '(') depth++; else if (src[i] === ')') depth--; i++; }
+    const rest = src.slice(i);
+    const bodyOpen = /^\s*(?::[^{=]+)?(?:=>)?\s*\{/.exec(rest);
+    let end: number;
+    if (bodyOpen) {
+      let j = i + bodyOpen[0].length;
+      let d = 1;
+      while (j < src.length && d > 0) { if (src[j] === '{') d++; else if (src[j] === '}') d--; j++; }
+      end = j;
+    } else {
+      const eol = rest.search(/;|\n/);
+      end = eol < 0 ? src.length : i + eol + 1;
+    }
+    out += src.slice(last, start);
+    last = end;
+    decl.lastIndex = end;
+  }
+  return out + src.slice(last);
 }
 
 // ── Dead triggers ────────────────────────────────────────────────────────────

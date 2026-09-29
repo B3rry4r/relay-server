@@ -1232,7 +1232,9 @@ const webStrategy = (framework: Framework): ModalStrategy => ({
         presentationSource: 'structure',
         modalFile: t.modalFile ?? '(folded — presenter not located)',
         baseFile: t.baseFile,
-        trigger: { wired: 'rewrote-push', how: 'deterministic' },
+        // The web converter credits a presenter the build ALREADY calls; it never
+        // rewrites a trigger, so it must not claim it did (PG-10).
+        trigger: { wired: 'none', how: 'none' },
         ...(t.removedRoute ? { removedRoute: t.removedRoute } : {}),
       },
     };
