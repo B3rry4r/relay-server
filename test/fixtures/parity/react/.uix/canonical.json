@@ -1,0 +1,162 @@
+{
+  "version": 1,
+  "projectId": "parity-react",
+  "contentHash": "parity-react-v1",
+  "screens": [
+    {
+      "canonicalId": "c_10_1",
+      "name": "loginScreen",
+      "route": "/10-1",
+      "role": "screen",
+      "frameIds": [
+        "10:1"
+      ],
+      "states": [
+        {
+          "id": "default",
+          "frameId": "10:1"
+        }
+      ],
+      "modals": []
+    },
+    {
+      "canonicalId": "c_10_2",
+      "name": "homeScreen",
+      "route": "/10-2",
+      "role": "screen",
+      "frameIds": [
+        "10:2"
+      ],
+      "states": [
+        {
+          "id": "default",
+          "frameId": "10:2"
+        }
+      ],
+      "modals": [
+        {
+          "id": "m_10_9",
+          "frameId": "10:9",
+          "baseCanonicalId": "c_10_2"
+        }
+      ]
+    },
+    {
+      "canonicalId": "c_10_3",
+      "name": "settingsScreen",
+      "route": "/10-3",
+      "role": "screen",
+      "frameIds": [
+        "10:3"
+      ],
+      "states": [
+        {
+          "id": "default",
+          "frameId": "10:3"
+        }
+      ],
+      "modals": [
+        {
+          "id": "m_10_8",
+          "frameId": "10:8",
+          "baseCanonicalId": "c_10_3"
+        }
+      ]
+    },
+    {
+      "canonicalId": "c_10_4",
+      "name": "283:1967",
+      "route": "/10-4",
+      "role": "screen",
+      "frameIds": [
+        "10:4"
+      ],
+      "states": [
+        {
+          "id": "default",
+          "frameId": "10:4"
+        }
+      ],
+      "modals": []
+    },
+    {
+      "canonicalId": "c_10_5",
+      "name": "detailsScreen",
+      "route": "/10-5",
+      "role": "screen",
+      "frameIds": [
+        "10:5"
+      ],
+      "states": [
+        {
+          "id": "default",
+          "frameId": "10:5"
+        }
+      ],
+      "modals": []
+    }
+  ],
+  "components": [
+    {
+      "id": "cmp_section_heading",
+      "name": "SectionHeading",
+      "canonicalName": "SectionHeading",
+      "kind": "text",
+      "usedIn": [
+        "c_10_2",
+        "c_10_3"
+      ],
+      "count": 2
+    }
+  ],
+  "templates": [],
+  "flow": {
+    "entryCanonicalId": "c_10_1",
+    "edges": [
+      {
+        "fromCanonicalId": "c_10_1",
+        "toCanonicalId": "c_10_2",
+        "kind": "push",
+        "label": "Sign in"
+      },
+      {
+        "fromCanonicalId": "c_10_2",
+        "toCanonicalId": "c_10_3",
+        "kind": "push",
+        "label": "Settings"
+      },
+      {
+        "fromCanonicalId": "c_10_2",
+        "toCanonicalId": "c_10_5",
+        "kind": "push",
+        "label": "View details"
+      },
+      {
+        "fromCanonicalId": "c_10_2",
+        "toCanonicalId": "m_10_9",
+        "kind": "modal",
+        "label": "Filter"
+      },
+      {
+        "fromCanonicalId": "c_10_3",
+        "toCanonicalId": "m_10_8",
+        "kind": "modal",
+        "label": "Log out"
+      },
+      {
+        "fromCanonicalId": "c_10_2",
+        "toCanonicalId": "c_10_4",
+        "kind": "tab",
+        "label": "Profile"
+      },
+      {
+        "fromCanonicalId": "c_10_3",
+        "toCanonicalId": "c_10_1",
+        "kind": "replace",
+        "label": "Sign out"
+      }
+    ]
+  },
+  "frameMap": {},
+  "warnings": []
+}
