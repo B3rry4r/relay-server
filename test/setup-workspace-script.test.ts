@@ -42,8 +42,15 @@ describe('setup-workspace script', () => {
     expect(script).toContain('RELAY_MACHINE_ID_PATH="$RELAY_STATE_DIR/machine-id"');
     expect(script).toContain('RELAY_HOSTNAME_PATH="$RELAY_STATE_DIR/hostname"');
     expect(script).toContain('ensure_relay_identity() {');
-    expect(script).toContain('printf \'%s\\n\' "$RELAY_MACHINE_ID" > /etc/machine-id');
-    expect(script).toContain('printf \'%s\\n\' "$RELAY_MACHINE_ID" > /var/lib/dbus/machine-id');
+    // 46ab8e2: the container runs as the non-root `dev` user (Dockerfile USER dev),
+    // so the root-owned system machine-id files are written through passwordless
+    // sudo and are best-effort — the volume-backed identity above is authoritative.
+    expect(script).toContain('printf \'%s\\n\' "$RELAY_MACHINE_ID" | sudo tee /etc/machine-id >/dev/null 2>&1 || true');
+    expect(script).toContain('sudo mkdir -p /var/lib/dbus 2>/dev/null || true');
+    expect(script).toContain('printf \'%s\\n\' "$RELAY_MACHINE_ID" | sudo tee /var/lib/dbus/machine-id >/dev/null 2>&1 || true');
+    // Never a bare (non-sudo) redirect into a root-owned file — that crash-looped boot.
+    expect(script).not.toMatch(/> \/etc\/machine-id/);
+    expect(script).not.toMatch(/> \/var\/lib\/dbus\/machine-id/);
     expect(script).toContain('hostname "$RELAY_HOSTNAME" >/dev/null 2>&1 || true');
   });
 });
