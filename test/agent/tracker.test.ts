@@ -113,6 +113,20 @@ describe('AgentTracker', () => {
     expect(snap.session?.state).toBe('ended');
   });
 
+  it('sweeps spools of terminals that closed while the server was down (old + absent from a fresh list only)', async () => {
+    const ws = tmp();
+    const spoolDir = path.join(ws, 'spool');
+    fs.mkdirSync(spoolDir, { recursive: true });
+    const old = new Date(Date.now() - 2 * 3_600_000);
+    for (const name of ['gone.jsonl', 'gone.jsonl.1', 't1.jsonl', 'fresh.jsonl']) fs.writeFileSync(path.join(spoolDir, name), '');
+    for (const name of ['gone.jsonl', 'gone.jsonl.1', 't1.jsonl']) fs.utimesSync(path.join(spoolDir, name), old, old);
+    const tracker = new AgentTracker({ workspace: ws, spoolDir, mode: 'embedded', listTerminals: () => [{ id: 't1', pid: 999_999, cwd: ws }], inspector: new ProcessInspector({ procfs: fakeProcFs([]) }), probeSizes: false, tickMs: 3_600_000, log: () => undefined });
+    trackers.push(tracker);
+    await tracker.start();
+    await tracker.tick();
+    expect(fs.readdirSync(spoolDir).sort()).toEqual(['fresh.jsonl', 't1.jsonl']);
+  });
+
   it('rotates a consumed spool past the size limit, keeps reading, and deletes both files on close', async () => {
     const dir = tmp();
     const seen: string[] = [];

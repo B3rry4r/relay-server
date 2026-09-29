@@ -27,7 +27,7 @@ import { getBridgeWriter, getEmbeddedPtyAccess, ptyHub } from './pty-hub';
 import { isAnswerable, TerminalTimeline, type SessionState } from './reducer';
 import { CODEX_HOOK_REVIEW, commandUnderSignature, matchesPermission, SCREEN_SIGNATURES, ScreenGuard } from './screen';
 import type { PtyServiceLink } from './service-link';
-import { SpoolWatcher, type SpoolLine } from './spool';
+import { SpoolWatcher, spoolFileName, type SpoolLine } from './spool';
 import { JsonlTailer, readCompleteLines } from './tail';
 import type {
   AgentAck, AgentCli, AgentEvent, AgentSessionSummary, PermissionChoice, SessionCandidate,
@@ -99,6 +99,9 @@ export class AgentTracker extends EventEmitter {
   private started = false;
   private now: () => number;
   private refreshing: Promise<void> | null = null;
+  private lastListError = '';
+  private lastListAt = 0;
+  private lastOrphanSweep = 0;
 
   constructor(opts: AgentTrackerOptions) {
     super();
@@ -170,10 +173,15 @@ export class AgentTracker extends EventEmitter {
       try {
         list = await this.opts.listTerminals();
       } catch (error) {
-        // never treat a failed fetch as "every terminal closed"
-        this.log(`terminal list unavailable: ${error instanceof Error ? error.message : String(error)}`);
+        // never treat a failed fetch as "every terminal closed"; log once per distinct error
+        const message = error instanceof Error ? error.message : String(error);
+        if (message !== this.lastListError) this.log(`terminal list unavailable: ${message}`);
+        this.lastListError = message;
         return;
       }
+      if (this.lastListError) this.log('terminal list available again');
+      this.lastListError = '';
+      this.lastListAt = this.now();
       const seen = new Set<string>();
       for (const info of list) {
         if (!info?.id) continue;
@@ -564,6 +572,29 @@ export class AgentTracker extends EventEmitter {
       }
     }
     this.attachDiscovered(discoveries);
+    this.sweepOrphanSpools();
+  }
+
+  /**
+   * Spool files of terminals that closed while relay-server was down are never
+   * deleted by a close event: every 10 min, drop files older than 1 h whose
+   * terminal is absent from a FRESH, successful terminal list.
+   */
+  private sweepOrphanSpools(): void {
+    const now = this.now();
+    if (now - this.lastOrphanSweep < 10 * 60_000 || now - this.lastListAt > 10_000) return;
+    this.lastOrphanSweep = now;
+    let names: string[] = [];
+    try { names = fs.readdirSync(this.spool.dir); } catch { return; }
+    const live = new Set([...this.terminals.keys()].map((id) => spoolFileName(id).replace(/\.jsonl$/, '')));
+    for (const name of names) {
+      const m = /^(.+)\.jsonl(\.1)?$/.exec(name);
+      if (!m || live.has(m[1]) || m[1] === '_unattributed') continue;
+      try {
+        if (now - fs.statSync(path.join(this.spool.dir, name)).mtimeMs < 3_600_000) continue;
+        this.spool.remove(m[1]);
+      } catch { /* raced */ }
+    }
   }
 
   private transcriptClaimed(file: string): boolean {
