@@ -16,6 +16,7 @@ import { spawn, execFile as execFileCb, type ChildProcess } from 'node:child_pro
 import { promisify } from 'node:util';
 import { createServer } from 'node:net';
 import { exists, resolveWorkspace, getFlutterRoot, createTerminalEnv } from './runtime';
+import { childProcessEnv } from './auth/secrets';
 
 const execFile = promisify(execFileCb);
 
@@ -86,7 +87,7 @@ async function ensureTool(name: string): Promise<void> {
   } catch {
     // Try apt-get
     await execFile('apt-get', ['install', '-y', '--no-install-recommends', name], {
-      env: { ...process.env, DEBIAN_FRONTEND: 'noninteractive' },
+      env: childProcessEnv({ DEBIAN_FRONTEND: 'noninteractive' }),
     });
   }
 }

@@ -14,6 +14,7 @@ import { listListeningPorts } from './projects';
 import { listCustomToolStatuses, listNixPackageStatuses } from './tooling-custom';
 import { ensureRelayRuntimeAssets } from './tooling';
 import { listManagedToolStatuses } from './tooling-management';
+import { childProcessEnv } from './auth/secrets';
 
 const execFile = promisify(execFileCallback);
 
@@ -58,12 +59,12 @@ export async function getWorkspaceHealth(): Promise<{
 
   const toolchains: Record<string, string | boolean> = { git: false, node: false };
   try {
-    toolchains.git = (await execFile('git', ['--version'], { cwd: process.cwd(), env: process.env })).stdout.trim();
+    toolchains.git = (await execFile('git', ['--version'], { cwd: process.cwd(), env: childProcessEnv() })).stdout.trim();
   } catch {
     toolchains.git = false;
   }
   try {
-    toolchains.node = (await execFile('node', ['-v'], { cwd: process.cwd(), env: process.env })).stdout.trim();
+    toolchains.node = (await execFile('node', ['-v'], { cwd: process.cwd(), env: childProcessEnv() })).stdout.trim();
   } catch {
     toolchains.node = false;
   }
@@ -72,7 +73,7 @@ export async function getWorkspaceHealth(): Promise<{
   try {
     const { stdout } = await execFile('sh', ['-c', `df -k "${workspace}" | tail -n 1`], {
       cwd: process.cwd(),
-      env: process.env,
+      env: childProcessEnv(),
     });
     const parts = stdout.trim().split(/\s+/);
     disk = { total: Number(parts[1]) * 1024 || null, available: Number(parts[3]) * 1024 || null };

@@ -167,6 +167,20 @@ EOF
 chmod +x "$RELAY_BIN_DIR/relay-chrome"
 record_status relay_chrome "ready"
 
+# relay-auth: box-local session management (login-link break-glass, sessions,
+# revoke, mint, local-token). Copied from this checkout; idempotent (only
+# rewritten when the content changed).
+RELAY_AUTH_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/relay-auth"
+if [[ -f "$RELAY_AUTH_SRC" ]]; then
+  if ! cmp -s "$RELAY_AUTH_SRC" "$RELAY_BIN_DIR/relay-auth"; then
+    install -m 0755 "$RELAY_AUTH_SRC" "$RELAY_BIN_DIR/relay-auth"
+  fi
+  record_status relay_auth "ready"
+else
+  echo "[bootstrap] relay-auth source not found at $RELAY_AUTH_SRC" >&2
+  record_status relay_auth "missing"
+fi
+
 if [[ ! -f "$WORKSPACE/.gemini/settings.json" ]]; then
   cat > "$WORKSPACE/.gemini/settings.json" <<EOF
 {
@@ -218,6 +232,7 @@ export CHROME_EXECUTABLE="$RELAY_BIN_DIR/relay-chrome"
 export CHROME_EXECUTABLE_PATH="\${CHROME_EXECUTABLE_PATH:-\$CHROME_EXECUTABLE}"
 export BROWSER="$RELAY_BIN_DIR/relay-browser"
 export RELAY_BROWSER_STATE_PATH="$RELAY_STATE_DIR/browser-url.txt"
+export RELAY_LOCAL_TOKEN_FILE="$RELAY_STATE_DIR/local-token"
 export TERM="xterm-256color"
 export COLORTERM="truecolor"
 export PATH="$MISE_BIN_DIR:$RELAY_BIN_DIR:$GO_HOME_DIR/bin:$CARGO_HOME_DIR/bin:$NPM_GLOBAL_DIR/bin:$PYTHON_USERBASE/bin:$FLUTTER_HOME_DIR/bin:\$PATH"

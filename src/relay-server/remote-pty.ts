@@ -21,6 +21,7 @@
 
 import type { Socket as ServerSocket } from 'socket.io';
 import { io as ioClient } from 'socket.io-client';
+import { getSecret } from './auth/secrets';
 
 export function isRemotePtyEnabled(): boolean {
   return (process.env.RELAY_PTY_MODE || 'embedded').trim().toLowerCase() === 'remote';
@@ -30,8 +31,20 @@ export function getRemotePtyUrl(): string {
   return (process.env.RELAY_PTY_URL || '').trim().replace(/\/+$/, '');
 }
 
+let warnedPtyTokenFallback = false;
 export function getRemotePtyToken(): string {
-  return process.env.RELAY_PTY_TOKEN || process.env.AUTH_TOKEN || '';
+  // Secrets are sealed out of process.env at boot (auth/secrets.ts) — read them
+  // through getSecret. RELAY_PTY_TOKEN should be set and DISTINCT from the owner
+  // secret; the AUTH_TOKEN fallback is kept only so an existing remote-PTY
+  // deployment keeps working, and it is loud about it.
+  const token = getSecret('RELAY_PTY_TOKEN');
+  if (token) return token;
+  const fallback = getSecret('AUTH_TOKEN');
+  if (fallback && !warnedPtyTokenFallback) {
+    warnedPtyTokenFallback = true;
+    console.warn('[relay] RELAY_PTY_TOKEN is not set — falling back to AUTH_TOKEN for the PTY service link. Set a distinct RELAY_PTY_TOKEN.');
+  }
+  return fallback;
 }
 
 // Client -> relay -> pty-service (terminal-scoped input events).

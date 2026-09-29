@@ -1,8 +1,23 @@
 import { ensureReaperOrReExec } from './pid1-reaper';
 import { createRelayServer } from './relay-server';
 import { runWorkspaceBootstrap } from './workspace-bootstrap';
+import { sealProcessSecrets } from './relay-server/auth/secrets';
+import { validateOwnerSecretEnv } from './relay-server/auth/owner-secret';
 
 async function main(): Promise<void> {
+  // 1. Move every secret out of process.env BEFORE anything is spawned, so no
+  //    child (bootstrap script, PTY, agent, git, Chrome, npm, …) can inherit it.
+  //    Readers use getSecret() (auth/secrets.ts).
+  sealProcessSecrets();
+  // 2. Refuse to boot without a usable owner secret (no silent "the password is
+  //    the published placeholder").
+  const secretCheck = validateOwnerSecretEnv();
+  if (!secretCheck.ok) {
+    console.error(`[relay] FATAL: ${secretCheck.error}`);
+    process.exit(1);
+  }
+  for (const warning of secretCheck.warnings) console.warn(`[relay] ${warning}`);
+
   await runWorkspaceBootstrap();
   const relay = createRelayServer();
   const port = await relay.start();

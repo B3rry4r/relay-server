@@ -3,6 +3,7 @@ import path from 'node:path';
 import { execFile as execFileCallback } from 'node:child_process';
 import { promisify } from 'node:util';
 import { ensureGitRepo, runGit, getGitStatus } from './git';
+import { childProcessEnv } from './auth/secrets';
 import {
   RECENT_PROJECT_LIMIT,
   type TreeNode,
@@ -200,7 +201,7 @@ export async function listListeningPorts(): Promise<number[]> {
     try {
       const { stdout } = await execFile('sh', ['-c', 'ss -ltnH 2>/dev/null || netstat -ltn 2>/dev/null'], {
         cwd: process.cwd(),
-        env: process.env,
+        env: childProcessEnv(),
       });
 
       const ports = stdout

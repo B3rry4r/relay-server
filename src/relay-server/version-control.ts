@@ -32,6 +32,7 @@ import * as fsSync from 'node:fs';
 import * as path from 'node:path';
 import { promisify } from 'node:util';
 import { assertSafeProjectRoot } from './runtime';
+import { childProcessEnv } from './auth/secrets';
 
 const execFile = promisify(execFileCb);
 
@@ -160,7 +161,7 @@ async function git(
   ];
   const run = () => execFile('git', [...identity, ...args], {
     cwd: projectRoot,
-    env: env ?? process.env,
+    env: env ?? childProcessEnv(),
     maxBuffer: 32 * 1024 * 1024,
   });
   try {
@@ -181,7 +182,7 @@ let gitAvailable: boolean | null = null;
 async function isGitAvailable(env?: NodeJS.ProcessEnv): Promise<boolean> {
   if (gitAvailable != null) return gitAvailable;
   try {
-    await execFile('git', ['--version'], { env: env ?? process.env });
+    await execFile('git', ['--version'], { env: env ?? childProcessEnv() });
     gitAvailable = true;
   } catch {
     gitAvailable = false;

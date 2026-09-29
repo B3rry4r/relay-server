@@ -1,0 +1,217 @@
+#!/usr/bin/env node
+/*
+ * relay-auth — box-local session management for relay-server.
+ *
+ * Talks to the relay API over LOOPBACK with the box-local token
+ * ($RELAY_HOME/state/local-token), which relay accepts only from 127.0.0.1 with no
+ * forwarding headers. Installed into $RELAY_HOME/bin by setup-workspace.sh.
+ *
+ *   relay-auth login-link [--web URL] [--server URL]   one-time sign-in link (break-glass)
+ *   relay-auth sessions                                list sessions
+ *   relay-auth revoke <id> | --all                     revoke session(s)
+ *   relay-auth mint --label <name> [--ttl-days N]      mint an api session token (shown once)
+ *   relay-auth local-token [--rotate]                  print the local-token path / rotate it
+ *   relay-auth whoami                                  what the API sees for this credential
+ *   relay-auth hash-secret                             read a secret on stdin → AUTH_TOKEN_HASH value
+ *
+ * Global flags: --api <url> (default: RELAY_API_URL, $RELAY_HOME/state/api-url,
+ * then http://127.0.0.1:$PORT), --json (raw JSON output).
+ */
+'use strict';
+
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const path = require('node:path');
+
+function stateDir() {
+  if (process.env.RELAY_HOME) return path.join(process.env.RELAY_HOME, 'state');
+  return path.join(process.env.WORKSPACE || process.env.HOME || '/workspace', '.relay', 'state');
+}
+
+function readTrimmed(file) {
+  try { return fs.readFileSync(file, 'utf8').trim(); } catch { return ''; }
+}
+
+function parseArgs(argv) {
+  const positional = [];
+  const flags = {};
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg.startsWith('--')) {
+      const [key, inline] = arg.slice(2).split('=', 2);
+      if (inline !== undefined) flags[key] = inline;
+      else if (i + 1 < argv.length && !argv[i + 1].startsWith('--')) flags[key] = argv[++i];
+      else flags[key] = true;
+    } else {
+      positional.push(arg);
+    }
+  }
+  return { positional, flags };
+}
+
+function die(message, code = 1) {
+  process.stderr.write(`relay-auth: ${message}\n`);
+  process.exit(code);
+}
+
+function apiBase(flags) {
+  const explicit = typeof flags.api === 'string' ? flags.api : '';
+  return (explicit || process.env.RELAY_API_URL || readTrimmed(path.join(stateDir(), 'api-url'))
+    || `http://127.0.0.1:${process.env.PORT || '8080'}`).replace(/\/+$/, '');
+}
+
+function credential() {
+  if (process.env.RELAY_TOKEN) return process.env.RELAY_TOKEN.trim();
+  const file = process.env.RELAY_LOCAL_TOKEN_FILE || path.join(stateDir(), 'local-token');
+  const token = readTrimmed(file);
+  if (!token) die(`cannot read the local token at ${file} (run this on the relay box, as the relay user).`);
+  return token;
+}
+
+async function api(flags, method, route, body) {
+  const url = `${apiBase(flags)}${route}`;
+  let response;
+  try {
+    response = await fetch(url, {
+      method,
+      headers: {
+        authorization: `Bearer ${credential()}`,
+        ...(body ? { 'content-type': 'application/json' } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch (error) {
+    die(`cannot reach the relay API at ${url}: ${error && error.message ? error.message : error}`);
+  }
+  const text = await response.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+  if (!response.ok) die(`${method} ${route} → ${response.status}: ${(data && (data.message || data.error)) || text}`);
+  return data;
+}
+
+function out(flags, data, human) {
+  if (flags.json) process.stdout.write(`${JSON.stringify(data, null, 2)}\n`);
+  else process.stdout.write(`${human(data)}\n`);
+}
+
+function table(sessions) {
+  if (!sessions.length) return '(no sessions)';
+  const rows = sessions.map((s) => [
+    s.id, s.kind, s.label || '-', s.createdAt.slice(0, 16).replace('T', ' '),
+    (s.lastUsedAt || '').slice(0, 16).replace('T', ' '), (s.expiresAt || 'never').slice(0, 10), s.ip || '-',
+  ]);
+  const head = ['ID', 'KIND', 'LABEL', 'CREATED', 'LAST USED', 'EXPIRES', 'IP'];
+  const widths = head.map((h, i) => Math.max(h.length, ...rows.map((r) => String(r[i]).length)));
+  const fmt = (r) => r.map((c, i) => String(c).padEnd(widths[i])).join('  ').trimEnd();
+  return [fmt(head), ...rows.map(fmt)].join('\n');
+}
+
+async function readStdin() {
+  if (process.stdin.isTTY) {
+    process.stderr.write('Owner secret (input is not hidden; pipe it in to avoid echo): ');
+  }
+  const chunks = [];
+  for await (const chunk of process.stdin) chunks.push(chunk);
+  return Buffer.concat(chunks).toString('utf8').replace(/\r?\n$/, '');
+}
+
+async function main() {
+  const { positional, flags } = parseArgs(process.argv.slice(2));
+  const command = positional[0] || 'help';
+
+  switch (command) {
+    case 'login-link': {
+      const body = {};
+      if (typeof flags.web === 'string') body.webUrl = flags.web;
+      if (typeof flags.server === 'string') body.serverUrl = flags.server;
+      const data = await api(flags, 'POST', '/api/auth/login-link', body);
+      out(flags, data, (d) => {
+        const lines = [];
+        if (d.url) {
+          lines.push('Open this link on the device you want to sign in (one use, expires in 5 minutes):', '', `  ${d.url}`, '');
+        } else {
+          lines.push('One-time sign-in code (expires in 5 minutes):', '', `  ${d.code}`, '');
+          lines.push('No link could be built (' + (!d.webUrl ? 'relay-web URL unknown: pass --web https://<relay-web> or set RELAY_WEB_URL' : 'public relay URL unknown: pass --server https://<relay> or set RELAY_PUBLIC_URL') + ').');
+          lines.push('relay-web completes the sign-in with: POST <relay>/api/auth/login-link/exchange {"code":"<code>"}');
+        }
+        lines.push(`Expires: ${d.expiresAt}`);
+        return lines.join('\n');
+      });
+      return;
+    }
+    case 'sessions': {
+      const data = await api(flags, 'GET', '/api/auth/sessions');
+      out(flags, data, (d) => table(d.sessions || []));
+      return;
+    }
+    case 'revoke': {
+      if (flags.all) {
+        const data = await api(flags, 'POST', '/api/auth/sessions/revoke-all', {});
+        out(flags, data, (d) => `Revoked ${d.revoked} session(s); ${d.disconnected} socket(s) disconnected.`);
+        return;
+      }
+      const id = positional[1];
+      if (!id) die('usage: relay-auth revoke <session-id> | --all');
+      const data = await api(flags, 'DELETE', `/api/auth/sessions/${encodeURIComponent(id)}`);
+      out(flags, data, (d) => `Revoked ${d.id}; ${d.disconnected} socket(s) disconnected.`);
+      return;
+    }
+    case 'mint': {
+      const label = typeof flags.label === 'string' ? flags.label : '';
+      if (!label) die('usage: relay-auth mint --label <name> [--ttl-days N]');
+      const body = { kind: 'api', label };
+      if (flags['ttl-days'] !== undefined) body.ttlDays = Number(flags['ttl-days']);
+      const data = await api(flags, 'POST', '/api/auth/sessions', body);
+      out(flags, data, (d) => [
+        `API session "${d.session.label}" (${d.session.id}), expires ${d.session.expiresAt}.`,
+        'Token (shown ONCE — store it now, e.g. as RELAY_TOKEN):',
+        '',
+        `  ${d.token}`,
+      ].join('\n'));
+      return;
+    }
+    case 'local-token': {
+      const file = process.env.RELAY_LOCAL_TOKEN_FILE || path.join(stateDir(), 'local-token');
+      if (flags.rotate) {
+        const data = await api(flags, 'POST', '/api/auth/local-token/rotate', {});
+        out(flags, data, () => `Rotated. New local token written to ${file}.`);
+        return;
+      }
+      out(flags, { file }, () => file);
+      return;
+    }
+    case 'whoami': {
+      const data = await api(flags, 'GET', '/api/auth/session');
+      out(flags, data, (d) => `authenticated via ${d.via}${d.session ? ` (session ${d.session.id}, ${d.session.label})` : ''}`);
+      return;
+    }
+    case 'hash-secret': {
+      const secret = await readStdin();
+      if (secret.length < 16) die('the secret must be at least 16 characters.');
+      const N = 2 ** 15;
+      const r = 8;
+      const p = 1;
+      const salt = crypto.randomBytes(16);
+      const hash = crypto.scryptSync(secret, salt, 32, { N, r, p, maxmem: 256 * N * r + 1024 * 1024 });
+      process.stdout.write(`scrypt$${N}$${r}$${p}$${salt.toString('base64')}$${hash.toString('base64')}\n`);
+      return;
+    }
+    default:
+      process.stdout.write([
+        'usage: relay-auth <command> [--api URL] [--json]',
+        '',
+        '  login-link [--web URL] [--server URL]   one-time sign-in link for relay-web (break-glass)',
+        '  sessions                                list sessions',
+        '  revoke <id> | --all                     revoke session(s) and disconnect their sockets',
+        '  mint --label NAME [--ttl-days N]        mint an api session token (e.g. for MCP / UIX)',
+        '  local-token [--rotate]                  print the local-token path, or rotate it',
+        '  whoami                                  show how the API sees this credential',
+        '  hash-secret                             stdin secret → AUTH_TOKEN_HASH value',
+        '',
+      ].join('\n'));
+      if (command !== 'help' && command !== '--help') process.exit(2);
+  }
+}
+
+main().catch((error) => die(error && error.stack ? error.stack : String(error)));
