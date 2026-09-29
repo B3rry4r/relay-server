@@ -1299,6 +1299,8 @@ export interface RollupRollup {
   built: number;
   needsReview: number;
   failed: number;
+  /** Screens that never finished building (pending / building). */
+  unbuilt: number;
   blocking: number;
 }
 export function resolveRollupVerdict(resolved: BuildRun | null | undefined, expectedCount: number): RollupRollup {
@@ -1311,7 +1313,8 @@ export function resolveRollupVerdict(resolved: BuildRun | null | undefined, expe
     const built = Array.isArray(screens) ? screens.filter(s => s.status === 'done').length : 0;
     const needsReview = Array.isArray(screens) ? screens.filter(s => s.status === 'needs-review').length : 0;
     const failed = Array.isArray(screens) ? screens.filter(s => s.status === 'failed').length : 0;
-    return { verdict: 'fault', total, built, needsReview, failed, blocking: needsReview + failed };
+    const unbuilt = Array.isArray(screens) ? screens.filter(s => s.status === 'pending' || s.status === 'building').length : 0;
+    return { verdict: 'fault', total, built, needsReview, failed, unbuilt, blocking: needsReview + failed + unbuilt };
   }
   const total = screens.length;
   const built = screens.filter(s => s.status === 'done').length;
@@ -1326,11 +1329,18 @@ export function resolveRollupVerdict(resolved: BuildRun | null | undefined, expe
   // like needs-review: an unfinished screen must be VISIBLE, never a green tick.
   const unbuilt = screens.filter(s => s.status === 'pending' || s.status === 'building').length;
   const blocking = needsReview + failed + unbuilt;
-  if (blocking > 0) return { verdict: 'park-needs-review', total, built, needsReview, failed, blocking };
-  // blocking === 0, but a ZERO-built run is never "complete" — that is itself a fault
-  // (e.g. every screen was skipped/never ran). Only a positive built count finalizes.
-  if (built <= 0) return { verdict: 'fault', total, built, needsReview, failed, blocking };
-  return { verdict: 'finalize', total, built, needsReview, failed, blocking };
+  const out = { total, built, needsReview, failed, unbuilt, blocking };
+  // Screens a human must act on (needs-review / failed) → the normal review park.
+  if (needsReview + failed > 0) return { verdict: 'park-needs-review', ...out };
+  // Nothing reviewable and a ZERO-built run is never "complete" — that is itself a
+  // fault (e.g. every screen was skipped/never ran). This MUST be checked before the
+  // unbuilt park below: when `unbuilt` joined `blocking`, an all-pending run fell
+  // into the review park instead (non-resumable, "0 need review"), which made this
+  // branch unreachable for its own documented case.
+  if (built <= 0) return { verdict: 'fault', ...out };
+  // Some screens built, others never ran → hold the run open, visibly.
+  if (unbuilt > 0) return { verdict: 'park-needs-review', ...out };
+  return { verdict: 'finalize', ...out };
 }
 
 // Re-read the run with a bounded retry until it returns a run whose screens.length
@@ -2479,7 +2489,7 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
     // tested guard that NEVER lets a fault read masquerade as a clean 0/0 completion.
     const done = await readRollupRun(projectId, runId, run);
     const rollup = resolveRollupVerdict(done, run.screens.length);
-    const { total, built, needsReview, failed, blocking } = rollup;
+    const { total, built, needsReview, failed, unbuilt, blocking } = rollup;
 
     // ── CONSOLIDATION PASS (option 3): de-duplicate token literals ───────────────
     // Every screen is built; sweep the generated screens/components and replace raw
@@ -2515,8 +2525,9 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
     // finalize. Park the run resumable so a human / resume rebuilds it (an empty 0/0
     // never silently ships). RETURN before the finalize/park branch.
     if (rollup.verdict === 'fault') {
-      await appendRunLog(projectId, runId, `[run] rollup read inconsistent — refusing to finalize a possibly-incomplete app (no silent 0/0). expected=${run.screens.length} read=${total} built=${built} needs-review=${needsReview} failed=${failed}`);
-      await setGenPhase(projectId, runId, 'Verify', 'rollup read inconsistent — held for review', true);
+      const why = total !== run.screens.length ? 'rollup read inconsistent' : 'zero screens built';
+      await appendRunLog(projectId, runId, `[run] ${why} — refusing to finalize a possibly-incomplete app (no silent 0/0). expected=${run.screens.length} read=${total} built=${built} needs-review=${needsReview} failed=${failed} unbuilt=${unbuilt}`);
+      await setGenPhase(projectId, runId, 'Verify', `${why} — held for review`, true);
       try { await setRunResumable(projectId, runId, true); } catch { /* non-fatal */ }
       await setRunStatus(projectId, runId, 'needs-review');
       return;
@@ -2535,12 +2546,14 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
       // the UI reads "Phase 6/7: Verify — k need review" alongside the needs-review state.
       // AWAIT the phase write before the status flip (same read-modify-write clobber as
       // the terminal-done path: a fire-and-forget phase write could overwrite status).
-      await setGenPhase(projectId, runId, 'Verify', `${needsReview} need review${failed ? `, ${failed} failed` : ''}`, true);
+      // Unbuilt screens hold the run open too — say so, or the park reads "0 need review".
+      const extra = `${failed ? `, ${failed} failed` : ''}${unbuilt ? `, ${unbuilt} unbuilt` : ''}`;
+      await setGenPhase(projectId, runId, 'Verify', `${needsReview} need review${extra}`, true);
       await setRunStatus(projectId, runId, 'needs-review');
-      await appendRunLog(projectId, runId, `[run] paused for review — ${built}/${total} matched, ${needsReview} need review${failed ? `, ${failed} failed` : ''}`);
+      await appendRunLog(projectId, runId, `[run] paused for review — ${built}/${total} matched, ${needsReview} need review${extra}`);
       void notify({
         kind: 'needs-review', projectId, runId,
-        detail: `Build parked — ${needsReview} screen(s) need review${failed ? `, ${failed} failed` : ''} (${built}/${total} matched)`,
+        detail: `Build parked — ${needsReview} screen(s) need review${extra} (${built}/${total} matched)`,
       });
     } else {
       // ── P7 FINALIZE PHASE (best-effort, build-safe) ──────────────────────────

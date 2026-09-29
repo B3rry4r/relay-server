@@ -21,6 +21,7 @@ import { reconcileLexicon } from '../../src/relay-server/canonicalize-ai/reconci
 import { reduceToCanonical, type ReduceFlow } from '../../src/relay-server/canonicalize-ai/reduce';
 import type { FrameDescriptor } from '../../src/relay-server/canonicalize-ai/descriptor-schema';
 import { getNodeTree } from '../../src/relay-server/reference-render';
+import { requirePingIr } from './_ping-ir';
 
 const FIG = '5d055820-e6af-46f4-8ce5-14c35e9e44a3.fig';
 const PROJECT = 'Ping';
@@ -86,7 +87,8 @@ function synth(frameId: string, tree: string): FrameDescriptor {
 }
 
 describe('Phase 1c reduceToCanonical (Ping, real IR fingerprints)', () => {
-  it('produces a valid, idempotent canonical model with a bound modal, folded states, and components', async () => {
+  it('produces a valid, idempotent canonical model with a bound modal, folded states, and components', async (ctx) => {
+    await requirePingIr(ctx);
     // 1a (real IR) — fetch each frame's IR tree → real fingerprint → descriptor.
     const ids = Object.keys(FRAMES);
     const trees = await Promise.all(ids.map(id => getNodeTree(FIG, id)));

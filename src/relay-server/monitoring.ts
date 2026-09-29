@@ -19,6 +19,9 @@ const execFile = promisify(execFileCallback);
 
 let lastHealth: any = null;
 let lastHealthTime = 0;
+// The report describes ONE workspace; a cached report is only valid for the
+// workspace it was computed for (never serve workspace A's health for B).
+let lastHealthWorkspace: string | null = null;
 const HEALTH_CACHE_TTL_MS = 5000;
 
 export async function getWorkspaceHealth(): Promise<{
@@ -39,11 +42,11 @@ export async function getWorkspaceHealth(): Promise<{
   disk: { available: number | null; total: number | null };
   activePorts: number[];
 }> {
-  if (lastHealth && Date.now() - lastHealthTime < HEALTH_CACHE_TTL_MS) {
+  const workspace = resolveWorkspace();
+  if (lastHealth && lastHealthWorkspace === workspace && Date.now() - lastHealthTime < HEALTH_CACHE_TTL_MS) {
     return lastHealth;
   }
 
-  const workspace = resolveWorkspace();
   await ensureRelayRuntimeAssets(workspace);
   const [status, activePorts, managedTools, customTools, nixPackages] = await Promise.all([
     parseBootstrapStatus(),
@@ -98,6 +101,7 @@ export async function getWorkspaceHealth(): Promise<{
 
   lastHealth = result;
   lastHealthTime = Date.now();
+  lastHealthWorkspace = workspace;
   return result;
 }
 

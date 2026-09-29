@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile as execFileCallback } from 'node:child_process';
 import { promisify } from 'node:util';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
 import { io as createClient, type Socket } from 'socket.io-client';
 import { createRelayServer, FakePty, type PtyFactory, type RelayServer } from '../src/relay-server';
@@ -44,6 +44,16 @@ describe('Relay server', () => {
     await execFile('git', ['config', 'user.email', 'relay@example.com'], { cwd: projectRoot });
     await execFile('git', ['config', 'user.name', 'Relay Test'], { cwd: projectRoot });
   }
+
+  // Every test gets a throwaway WORKSPACE unless it sets its own. Without this the
+  // tests that never set WORKSPACE ran against the process default `/workspace` —
+  // on a relay container that is the REAL volume, and `relay.stop()` persists the
+  // test's terminal list over the user's .relay/state/terminal-sessions.json — and
+  // the ones pinned to a fixed `/tmp/relay-workspace` leaked persisted terminal
+  // sessions into the next run, which restored them and took a different path.
+  beforeEach(async () => {
+    process.env.WORKSPACE = await createWorkspaceFixture();
+  });
 
   afterEach(async () => {
     while (clients.length > 0) {
@@ -301,11 +311,21 @@ describe('Relay server', () => {
       .set('x-auth-token', 'test-token');
 
     expect(tree.status).toBe(200);
+    // 7cf949f: the tree is NESTED — a directory carries its entries in `children`
+    // (default depth 2), folders first then files, each group alphabetical.
     expect(tree.body.tree).toEqual(expect.arrayContaining([
-      expect.objectContaining({ path: 'src', type: 'directory' }),
-      expect.objectContaining({ path: path.join('src', 'components'), type: 'directory' }),
-      expect.objectContaining({ path: path.join('src', 'index.ts'), type: 'file' }),
+      expect.objectContaining({
+        name: 'src',
+        path: 'src',
+        type: 'directory',
+        children: [
+          expect.objectContaining({ name: 'components', path: path.join('src', 'components'), type: 'directory' }),
+          expect.objectContaining({ name: 'index.ts', path: path.join('src', 'index.ts'), type: 'file', size: 'console.log("hello");\n'.length }),
+        ],
+      }),
     ]));
+    // Nested entries are not ALSO flattened into the top level.
+    expect(tree.body.tree.map((node: { path: string }) => node.path)).not.toContain(path.join('src', 'index.ts'));
 
     const rename = await base
       .patch('/api/projects/my-app/rename')
@@ -553,7 +573,9 @@ describe('Relay server', () => {
       expect.objectContaining({ id: 'zig', installed: true, source: 'relay' }),
     ]));
 
-    await expect(fs.readFile(path.join(process.env.WORKSPACE, '.gemini', 'settings.json'), 'utf8')).resolves.toContain('"selectedType": "oauth-personal"');
+    // e364255 made writeJsonFile emit compact JSON — assert the parsed setting.
+    const geminiSettings = JSON.parse(await fs.readFile(path.join(process.env.WORKSPACE, '.gemini', 'settings.json'), 'utf8'));
+    expect(geminiSettings.security.auth.selectedType).toBe('oauth-personal');
     await expect(fs.readFile(path.join(process.env.WORKSPACE, '.relay', 'bin', 'relay-browser'), 'utf8')).resolves.toContain('Browser auth URL');
     await expect(fs.readFile(path.join(process.env.WORKSPACE, '.relay', 'bin', 'relay-chrome'), 'utf8')).resolves.toContain('--no-sandbox');
 
@@ -945,7 +967,7 @@ chmod +x "$PROFILE/bin/$NAME"
 
   it('spawns a shell in the workspace and relays PTY output', async () => {
     process.env.PORT = '0';
-    process.env.WORKSPACE = '/tmp/relay-workspace';
+    const ws = process.env.WORKSPACE!;
     process.env.SHELL = '/bin/sh';
     process.env.AUTH_TOKEN = 'test-token';
     process.env.VSCODE_GIT_IPC_HANDLE = '/tmp/vscode.sock';
@@ -956,18 +978,18 @@ chmod +x "$PROFILE/bin/$NAME"
     const ptys: FakePty[] = [];
     const factory: PtyFactory = (options) => {
       expect(options.command).toBe('/bin/sh');
-      expect(options.cwd).toBe('/tmp/relay-workspace');
-      expect(options.env.HOME).toBe('/tmp/relay-workspace');
-      expect(options.env.RELAY_HOME).toBe('/tmp/relay-workspace/.relay');
-      expect(options.env.RELAY_TOOLS).toBe('/tmp/relay-workspace/.relay/tools');
-      expect(options.env.RELAY_CACHE).toBe('/tmp/relay-workspace/.relay/cache');
-      expect(options.env.RELAY_BIN).toBe('/tmp/relay-workspace/.relay/bin');
-      expect(options.env.npm_config_prefix).toBe('/tmp/relay-workspace/.relay/tools/npm-global');
+      expect(options.cwd).toBe(ws);
+      expect(options.env.HOME).toBe(ws);
+      expect(options.env.RELAY_HOME).toBe(`${ws}/.relay`);
+      expect(options.env.RELAY_TOOLS).toBe(`${ws}/.relay/tools`);
+      expect(options.env.RELAY_CACHE).toBe(`${ws}/.relay/cache`);
+      expect(options.env.RELAY_BIN).toBe(`${ws}/.relay/bin`);
+      expect(options.env.npm_config_prefix).toBe(`${ws}/.relay/tools/npm-global`);
       expect(options.env.PROMPT_COMMAND).toBe('');
       expect(options.env.VSCODE_GIT_IPC_HANDLE).toBeUndefined();
       expect(options.env.TERM_PROGRAM).toBeUndefined();
       expect(options.env.TERM_PROGRAM_VERSION).toBeUndefined();
-      expect(String(options.env.PATH)).toContain('/tmp/relay-workspace/.relay/bin');
+      expect(String(options.env.PATH)).toContain(`${ws}/.relay/bin`);
       expect(options.cols).toBe(80);
       expect(options.rows).toBe(24);
 
@@ -982,13 +1004,24 @@ chmod +x "$PROFILE/bin/$NAME"
     const client = await connectClient(port, 'test-token');
     clients.push(client);
 
-    const output = new Promise<string>((resolve) => {
-      client.once('output', resolve);
+    // 4c3097e: PTY output is MULTIPLEXED — every terminal streams live, tagged by
+    // id, on 'terminal:output' (the bare 'output' event now only carries relay
+    // notices such as "Failed to start shell").
+    const output = new Promise<{ id: string; data: string }>((resolve) => {
+      client.once('terminal:output', resolve);
     });
+    const bareOutput: string[] = [];
+    client.on('output', (chunk: string) => bareOutput.push(chunk));
 
+    expect(ptys).toHaveLength(1);
     ptys[0].pushOutput('hello from shell');
 
-    await expect(output).resolves.toBe('hello from shell');
+    const terminals = await request(`http://127.0.0.1:${port}`)
+      .get('/api/terminals')
+      .set('x-auth-token', 'test-token');
+    expect(terminals.body.terminals).toHaveLength(1);
+    await expect(output).resolves.toEqual({ id: terminals.body.terminals[0].id, data: 'hello from shell' });
+    expect(bareOutput).toEqual([]);
   });
 
   it('writes terminal input to the PTY and forwards resize events', async () => {
@@ -1018,7 +1051,7 @@ chmod +x "$PROFILE/bin/$NAME"
   it('keeps relay-managed global tool paths rooted at the workspace for project terminals', async () => {
     process.env.PORT = '0';
     process.env.AUTH_TOKEN = 'test-token';
-    process.env.WORKSPACE = '/tmp/relay-workspace';
+    const ws = process.env.WORKSPACE!;
 
     const calls: Array<{ cwd: string; env: NodeJS.ProcessEnv }> = [];
     const factory: PtyFactory = (options) => {
@@ -1032,22 +1065,72 @@ chmod +x "$PROFILE/bin/$NAME"
     const client = await connectClient(port, 'test-token');
     clients.push(client);
 
+    // The connection's own initial terminal also announces 'terminal:created' (cwd =
+    // workspace) and may land after this listener is attached — wait for the one
+    // this request created, identified by its cwd.
     const created = new Promise<{ id: string; cwd: string }>((resolve) => {
-      client.once('terminal:created', resolve);
+      client.on('terminal:created', (session: { id: string; cwd: string }) => {
+        if (session.cwd === `${ws}/projects/cloned-app`) resolve(session);
+      });
     });
 
-    client.emit('terminal:create', { cwd: '/tmp/relay-workspace/projects/cloned-app' });
+    client.emit('terminal:create', { cwd: `${ws}/projects/cloned-app` });
 
     await expect(created).resolves.toMatchObject({
-      cwd: '/tmp/relay-workspace/projects/cloned-app',
+      cwd: `${ws}/projects/cloned-app`,
     });
 
     expect(calls).toHaveLength(2);
-    expect(calls[1]?.cwd).toBe('/tmp/relay-workspace/projects/cloned-app');
-    expect(calls[1]?.env.HOME).toBe('/tmp/relay-workspace');
-    expect(calls[1]?.env.RELAY_HOME).toBe('/tmp/relay-workspace/.relay');
-    expect(calls[1]?.env.npm_config_prefix).toBe('/tmp/relay-workspace/.relay/tools/npm-global');
-    expect(String(calls[1]?.env.PATH)).toContain('/tmp/relay-workspace/.relay/tools/npm-global/bin');
+    expect(calls[0]?.cwd).toBe(ws);
+    expect(calls[1]?.cwd).toBe(`${ws}/projects/cloned-app`);
+    expect(calls[1]?.env.HOME).toBe(ws);
+    expect(calls[1]?.env.RELAY_HOME).toBe(`${ws}/.relay`);
+    expect(calls[1]?.env.npm_config_prefix).toBe(`${ws}/.relay/tools/npm-global`);
+    expect(String(calls[1]?.env.PATH)).toContain(`${ws}/.relay/tools/npm-global/bin`);
+  });
+
+  it('gives every terminal a distinct id even when several are created in the same millisecond', async () => {
+    process.env.PORT = '0';
+    process.env.AUTH_TOKEN = 'test-token';
+
+    const ptys: FakePty[] = [];
+    const relay = createRelayServer(() => {
+      const pty = new FakePty();
+      ptys.push(pty);
+      return pty;
+    });
+    servers.push(relay);
+    const port = await relay.start();
+    const client = await connectClient(port, 'test-token');
+    clients.push(client);
+
+    // Three creates handled within the same millisecond on the server. The clock
+    // is pinned so this is deterministic rather than depending on scheduling:
+    // any id scheme derived from Date.now() alone collides on every run.
+    // (setTimeout is not driven by Date.now, so the wait below is real time.)
+    const frozenNow = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(frozenNow);
+    try {
+      client.emit('terminal:create', {});
+      client.emit('terminal:create', {});
+      client.emit('terminal:create', {});
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      // All three creates were handled while the clock was pinned.
+      expect(ptys).toHaveLength(4);
+    } finally {
+      clock.mockRestore();
+    }
+
+    const response = await request(`http://127.0.0.1:${port}`)
+      .get('/api/terminals')
+      .set('x-auth-token', 'test-token');
+
+    expect(ptys).toHaveLength(4);
+    const ids = response.body.terminals.map((terminal: { id: string }) => terminal.id);
+    expect(new Set(ids).size).toBe(4);
+    // No PTY was orphaned by an id collision (overwritten in the session map but
+    // still running, unreachable and never killed).
+    expect(ptys.every((pty) => !pty.killed)).toBe(true);
   });
 
   it('emits structured shell transcript events alongside raw output', async () => {

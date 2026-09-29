@@ -28,6 +28,7 @@ import { reduceToCanonical, type ReduceFlow } from '../../src/relay-server/canon
 import { adjudicateCanonical } from '../../src/relay-server/canonicalize-ai/adjudicate';
 import type { FrameDescriptor } from '../../src/relay-server/canonicalize-ai/descriptor-schema';
 import { getNodeTree } from '../../src/relay-server/reference-render';
+import { requirePingIr } from './_ping-ir';
 import { resolveProjectRoot } from '../../src/relay-server/runtime';
 
 const FIG = '5d055820-e6af-46f4-8ce5-14c35e9e44a3.fig';
@@ -102,7 +103,8 @@ async function buildCanonical() {
 }
 
 describe('Phase 1d adjudicateCanonical (Ping, real IR)', () => {
-  it('drills only the uncertain residue, preserves flow-authoritative bindings, stays idempotent', async () => {
+  it('drills only the uncertain residue, preserves flow-authoritative bindings, stays idempotent', async (ctx) => {
+    await requirePingIr(ctx);
     const { canonical, descriptors } = await buildCanonical();
 
     // sanity on the 1c input: 315:3794 is flow-bound (overlay edge present), 315:3863 is
