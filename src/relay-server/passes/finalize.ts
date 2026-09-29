@@ -1114,10 +1114,15 @@ async function measureErrorsFor(framework: Framework, projectRoot: string, env?:
 }
 
 /** The repair prompt, in the idiom of the framework's checker. */
-function gateRepairPrompt(framework: Framework, n: number, lines: string[]): string {
+function gateRepairPrompt(framework: Framework, n: number, lines: string[], projectRoot: string): string {
   const web = framework === 'react' || framework === 'next';
+  // The exact check the gate runs: a solution-style root tsconfig (Vite react-ts)
+  // checks NOTHING with `-p .`, so name every project it builds.
+  const cmd = web
+    ? tscProjectsFor(projectRoot).map((p) => `node_modules/.bin/tsc --noEmit -p ${path.relative(projectRoot, p.config) || 'tsconfig.json'}`).join(' && ')
+    : '';
   const head = web
-    ? `The ${framework === 'next' ? 'Next.js' : 'React (Vite)'} TypeScript project in the current directory has ${n} TypeScript ERROR(S) (run the project's own compiler, \`node_modules/.bin/tsc --noEmit -p .\`, to see them).`
+    ? `The ${framework === 'next' ? 'Next.js' : 'React (Vite)'} TypeScript project in the current directory has ${n} TypeScript ERROR(S) (run the project's own compiler, \`${cmd}\`, to see them).`
     : `The Flutter project in the current directory has ${n} analyzer ERROR(S) (run \`flutter analyze\` to see them).`;
   const what = web ? 'TypeScript errors' : 'analyzer errors';
   return [
@@ -1181,7 +1186,7 @@ export async function runAnalyzeGate(opts: {
   if (opts.model && opts.runModel) {
     repairAttempted = true;
     log(`[finalize] analyze gate (${framework}): ${initialErrors} ${checker} error(s) — one bounded AI repair attempt (model=${opts.model})`);
-    const prompt = gateRepairPrompt(framework, initialErrors, errorLines.slice(0, 40));
+    const prompt = gateRepairPrompt(framework, initialErrors, errorLines.slice(0, 40), opts.projectRoot);
     try {
       await opts.runModel(opts.model, prompt, opts.env ?? process.env, opts.projectRoot, { format: 'text' });
     } catch (e) {
