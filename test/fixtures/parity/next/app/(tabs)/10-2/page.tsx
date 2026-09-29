@@ -1,7 +1,7 @@
 // canonicalId: c_10_2 route: /10-2
 'use client';
 import { useRouter } from 'next/navigation';
-import { assets } from '@/src/resources/assets';
+import { assets } from '@/lib/resources/assets';
 import { showModal_10_9 } from '@/components/FilterSheet';
 
 const ICONS = { search: 'assets/icons/vector_10_20.svg' };

@@ -270,7 +270,8 @@ async function clearScreenArtifacts(screenDir: string): Promise<void> {
  */
 export async function findBrokenAssets(projectRoot: string): Promise<string[]> {
   const broken: string[] = [];
-  for (const rel of ['assets/icons', 'assets/images']) {
+  // flutter bundles assets/; react/next serve public/assets/ (CONTRACTS §5).
+  for (const rel of ['assets/icons', 'assets/images', 'public/assets/icons', 'public/assets/images']) {
     const dir = path.join(projectRoot, rel);
     let names: string[];
     try { names = await fs.readdir(dir); } catch { continue; }

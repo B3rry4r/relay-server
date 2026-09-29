@@ -36,7 +36,8 @@ import type { AIModel } from '../ai-adapters';
 import { getFlutterRoot } from '../runtime';
 import { gatherExistingAssets, runAssetPass } from '../reference-render';
 import { repointAssetUsage } from './asset-usage';
-import { detectFramework, type Framework } from './framework';
+import { detectFramework, webResourcesRel, assetBaseDir, webAssetKey, type Framework } from './framework';
+import { webTypecheck, webBuildOk } from './finalize';
 import { ensureProjectGit, snapshotBeforeMutation, rollbackTo, commitCheckpoint } from '../version-control';
 
 // ── Public contract ──────────────────────────────────────────────────────────
@@ -97,9 +98,12 @@ export interface AssetPhaseReport {
   repointSkipped: number;
   /** warnings surfaced by the re-point pass. */
   warnings: string[];
-  /** `flutter analyze` issue count before / after (null when not buildable). */
+  /** Error count before / after — `flutter analyze` issues on flutter, the project's
+   *  own `tsc` errors on web (null when not measurable). */
   baselineAnalyze: number | null;
   finalAnalyze: number | null;
+  /** web: legacy root `assets/` files moved into `public/assets/` (PG-28). */
+  migrated?: number;
 }
 
 // ── Orchestrator ─────────────────────────────────────────────────────────────
@@ -134,7 +138,10 @@ export async function runAssetPhaseOnBuild(
   }
   log(`[asset-phase] gathered ${gathered.length} on-disk asset(s)`);
 
-  const resourcesAbs = path.join(projectRoot, FLUTTER_RESOURCES_REL);
+  const isWeb = framework === 'react' || framework === 'next';
+  // The framework's own resources module (PG-30: idempotence used to look for the
+  // Dart file on every framework, so a web project was never "already applied").
+  const resourcesAbs = path.join(projectRoot, isWeb ? webResourcesRel(projectRoot, framework) : FLUTTER_RESOURCES_REL);
   const assetMapAbs = path.join(projectRoot, ASSET_MAP_REL);
 
   // IDEMPOTENCE GUARD. The asset pass (semantic-rename) is NOT itself idempotent:
@@ -146,16 +153,17 @@ export async function runAssetPhaseOnBuild(
   // APPLIED state: a valid asset-map + a resources file, every mapped newPath on
   // disk. When applied, run ONLY the (idempotent) re-point — it sees refs already
   // pointing at AppAssets and changes nothing — and report a clean no-op.
-  if (!opts.dryRun && await alreadyApplied(projectRoot, resourcesAbs, assetMapAbs)) {
+  if (!opts.dryRun && await alreadyApplied(projectRoot, resourcesAbs, assetMapAbs, isWeb ? `${assetBaseDir(framework)}/` : null)) {
     log('[asset-phase] already applied (asset-map + resources present, paths resolve) — skipping rename, idempotent no-op');
     return { ...base, status: 'skipped', reason: 'already applied (idempotent no-op)' };
   }
 
-  // Build-safety: only flutter with a lib/ gets the analyze/build gate.
+  // Build-safety: flutter (with a lib/) gets `flutter analyze` + `flutter build web`;
+  // react/next get the project's own `tsc` + `npm run build` (PG-30 — a web rename
+  // that broke every image used to be committed without any check).
   const buildCheckable =
     !opts.skipBuildCheck &&
-    framework === 'flutter' &&
-    fsSync.existsSync(path.join(projectRoot, 'lib'));
+    ((framework === 'flutter' && fsSync.existsSync(path.join(projectRoot, 'lib'))) || isWeb);
 
   // VERSION-CONTROL SNAPSHOT (RFC §9.3/§9.4) — replaces the /tmp byte-snapshot.
   // This pass is the SHARPEST hazard: runAssetPass DELETES dedup duplicates and
@@ -190,11 +198,18 @@ export async function runAssetPhaseOnBuild(
   // total, decide pass/fail.
   let baselineAnalyze: number | null = null;
   let baselineErrors: number | null = null;
+  const gateWarnings: string[] = [];
+  const measure = async (): Promise<{ total: number; errors: number } | null> => {
+    if (!isWeb) return flutterAnalyze(projectRoot, env);
+    const t = await webTypecheck(projectRoot, framework as 'react' | 'next', env);
+    if (!t.ok) { gateWarnings.push(`web typecheck gate did not run: ${t.reason}`); return null; }
+    return { total: t.errors, errors: t.errors };
+  };
   if (buildCheckable) {
-    const a = await flutterAnalyze(projectRoot, env);
+    const a = await measure();
     baselineAnalyze = a?.total ?? null;
     baselineErrors = a?.errors ?? null;
-    log(`[asset-phase] baseline analyze: ${baselineAnalyze ?? 'n/a'} issue(s), ${baselineErrors ?? 'n/a'} error(s)`);
+    log(`[asset-phase] baseline ${isWeb ? 'tsc' : 'analyze'}: ${baselineAnalyze ?? 'n/a'} issue(s), ${baselineErrors ?? 'n/a'} error(s)`);
   }
   base.baselineAnalyze = baselineAnalyze;
 
@@ -231,8 +246,27 @@ export async function runAssetPhaseOnBuild(
   let threw: Error | null = null;
 
   try {
+    // WEB MIGRATION (PG-28). Before B56 every framework localized into the project
+    // root `assets/`, which no web server serves. Move those files into
+    // `public/assets/` (the IR's `assets/…` literal and the served `/assets/…` URL
+    // then name the same file) — inside the atomic unit, so a failed gate restores
+    // them via the git rollback.
+    let toRename = gathered;
+    const legacyMap = isWeb ? await readMapEntries(assetMapAbs) : [];
+    if (isWeb) {
+      const mig = await migrateRootAssetsToPublic(projectRoot, gathered, framework);
+      toRename = mig.assets;
+      base.migrated = mig.moved;
+      warnings.push(...mig.warnings);
+      if (mig.moved) log(`[asset-phase] migrated ${mig.moved} legacy root assets/ file(s) → ${assetBaseDir(framework)}/ (served at /assets)`);
+    }
     log(`[asset-phase] runAssetPass: content-dedup + semantic-rename${noAi ? ' (DEGRADED: no-AI, hint names)' : ' (AI-required)'} + emit resources + asset-map…`);
-    const ap = await runAssetPass(projectId, framework, gathered, model, env, { noAi });
+    const ap = await runAssetPass(projectId, framework, toRename, model, env, { noAi });
+    // A legacy (pre-migration) asset-map knew the IR's OPAQUE names
+    // (`assets/icons/vector_10_20.svg` → search_icon.svg). The re-run only sees the
+    // already-semantic files, so carry those old names forward as aliases of the
+    // entry now serving the same file — code still holding an opaque literal re-points.
+    if (legacyMap.length) await carryLegacyAliases(assetMapAbs, legacyMap);
     if (ap) {
       renamed = ap.renamed;
       repaired = ap.repaired;
@@ -283,17 +317,23 @@ export async function runAssetPhaseOnBuild(
   let finalAnalyze: number | null = null;
   let finalErrors: number | null = null;
   if (!failure && buildCheckable) {
-    const a = await flutterAnalyze(projectRoot, env);
+    const a = await measure();
     finalAnalyze = a?.total ?? null;
     finalErrors = a?.errors ?? null;
     if (finalErrors != null && baselineErrors != null && finalErrors > baselineErrors) {
-      failure = `flutter analyze errors regressed (${baselineErrors} → ${finalErrors} error(s))`;
+      failure = `${isWeb ? 'tsc' : 'flutter analyze'} errors regressed (${baselineErrors} → ${finalErrors} error(s))`;
+    } else if (isWeb) {
+      const built = await webBuildOk(projectRoot, env);
+      if (built.ok === false) failure = `${built.tool ?? 'npm run build'} failed: ${built.error}`;
+      else if (built.ok === null) gateWarnings.push(`web build gate did not run: ${built.reason}`);
     } else {
       const built = await flutterBuildWebOk(projectRoot, env);
       if (!built.ok) failure = `flutter build web failed: ${built.error}`;
     }
   }
   base.finalAnalyze = finalAnalyze;
+  // A gate that could not run is SAID, never read as a pass.
+  base.warnings = [...base.warnings, ...new Set(gateWarnings)];
 
   // ── dry-run: always restore (report would-be counts, leave no net change) ────
   if (opts.dryRun) {
@@ -326,6 +366,75 @@ export async function runAssetPhaseOnBuild(
   return { ...base, status: 'applied', finalAnalyze };
 }
 
+// ── web: legacy root assets/ → public/assets/ ─────────────────────────────────
+
+/** Move every gathered asset under the project-root `assets/` into
+ *  `public/assets/` (same sub-path) and return the gathered list re-pointed at the
+ *  new paths. A same-bytes file already at the target just drops the root copy; a
+ *  DIFFERENT file at the target is left alone (reported) — never overwritten. */
+async function migrateRootAssetsToPublic(
+  projectRoot: string, gathered: LocalizedAssetLike[], framework: string,
+): Promise<{ assets: LocalizedAssetLike[]; moved: number; warnings: string[] }> {
+  const base = assetBaseDir(framework);
+  const warnings: string[] = [];
+  let moved = 0;
+  const out: LocalizedAssetLike[] = [];
+  const seen = new Set<string>();
+  for (const a of gathered) {
+    if (!a.relPath.startsWith('assets/')) { if (!seen.has(a.relPath)) { seen.add(a.relPath); out.push(a); } continue; }
+    const target = `${base}/${a.relPath.slice('assets/'.length)}`;
+    const from = path.join(projectRoot, a.relPath);
+    const to = path.join(projectRoot, target);
+    if (fsSync.existsSync(to)) {
+      const same = Buffer.compare(await fs.readFile(from), await fs.readFile(to)) === 0;
+      if (!same) { warnings.push(`kept ${a.relPath}: ${target} already exists with different bytes`); out.push(a); continue; }
+      await fs.rm(from, { force: true });
+    } else {
+      await fs.mkdir(path.dirname(to), { recursive: true });
+      await fs.rename(from, to);
+    }
+    moved++;
+    if (!seen.has(target)) { seen.add(target); out.push({ ...a, relPath: target }); }
+  }
+  // Drop the emptied legacy dirs (assets/icons, assets/images, assets/).
+  for (const d of ['assets/icons', 'assets/images', 'assets']) {
+    const abs = path.join(projectRoot, d);
+    try { if ((await fs.readdir(abs)).length === 0) await fs.rmdir(abs); } catch { /* absent / not empty */ }
+  }
+  out.sort((x, y) => x.relPath.localeCompare(y.relPath));
+  return { assets: out, moved, warnings };
+}
+
+type LocalizedAssetLike = Awaited<ReturnType<typeof gatherExistingAssets>>[number];
+
+type MapEntry = { oldPath?: string; newPath?: string; [k: string]: unknown };
+
+async function readMapEntries(abs: string): Promise<MapEntry[]> {
+  try {
+    const m = JSON.parse(await fs.readFile(abs, 'utf8')) as { assets?: MapEntry[] };
+    return Array.isArray(m.assets) ? m.assets : [];
+  } catch { return []; }
+}
+
+async function carryLegacyAliases(abs: string, legacy: MapEntry[]): Promise<void> {
+  let map: { assets?: MapEntry[] } & Record<string, unknown>;
+  try { map = JSON.parse(await fs.readFile(abs, 'utf8')); } catch { return; }
+  const cur = Array.isArray(map.assets) ? map.assets : [];
+  const byKey = new Map<string, MapEntry>();
+  for (const e of cur) if (e.newPath) byKey.set(webAssetKey(e.newPath), e);
+  const known = new Set(cur.map((e) => e.oldPath && webAssetKey(e.oldPath)).filter(Boolean) as string[]);
+  let added = 0;
+  for (const l of legacy) {
+    if (!l.oldPath || !l.newPath) continue;
+    const target = byKey.get(webAssetKey(l.newPath));
+    if (!target || known.has(webAssetKey(l.oldPath))) continue;
+    cur.push({ ...target, oldPath: l.oldPath });
+    known.add(webAssetKey(l.oldPath));
+    added++;
+  }
+  if (added) await fs.writeFile(abs, JSON.stringify({ ...map, assets: cur }, null, 2));
+}
+
 // ── idempotence detection ──────────────────────────────────────────────────────
 
 /**
@@ -335,7 +444,7 @@ export async function runAssetPhaseOnBuild(
  * In that state a re-run must NOT rename again (it would churn names). Best-effort:
  * any read/parse failure → treat as NOT-applied (fall through to a normal run).
  */
-async function alreadyApplied(projectRoot: string, resourcesAbs: string, assetMapAbs: string): Promise<boolean> {
+async function alreadyApplied(projectRoot: string, resourcesAbs: string, assetMapAbs: string, servedPrefix: string | null): Promise<boolean> {
   if (!fsSync.existsSync(resourcesAbs) || !fsSync.existsSync(assetMapAbs)) return false;
   try {
     const map = JSON.parse(await fs.readFile(assetMapAbs, 'utf8')) as {
@@ -346,6 +455,9 @@ async function alreadyApplied(projectRoot: string, resourcesAbs: string, assetMa
     for (const a of assets) {
       if (!a.newPath) return false;
       if (!fsSync.existsSync(path.join(projectRoot, a.newPath))) return false;
+      // Web: an asset pass applied BEFORE the public/assets contract (root assets/,
+      // path-valued resources) is not "applied" — it is re-run so it migrates.
+      if (servedPrefix && !a.newPath.replace(/\\/g, '/').startsWith(servedPrefix)) return false;
     }
     return true;
   } catch {

@@ -823,7 +823,7 @@ async function buildOkFor(
   return r;
 }
 
-interface BuildOutcome { ok: boolean | null; error?: string; reason?: string; tool?: string }
+export interface BuildOutcome { ok: boolean | null; error?: string; reason?: string; tool?: string }
 
 type TypecheckOutcome =
   | { ok: true; errors: number; lines: string[]; tool: string }
@@ -922,7 +922,7 @@ export async function webTypecheck(projectRoot: string, framework: 'react' | 'ne
  *  check that catches what `tsc --noEmit` cannot (bundler resolution, missing
  *  imports behind path aliases). It can only run with dependencies installed; a
  *  missing node_modules is reported as a build that did NOT run, never as ok. */
-async function webBuildOk(projectRoot: string, env?: NodeJS.ProcessEnv): Promise<BuildOutcome> {
+export async function webBuildOk(projectRoot: string, env?: NodeJS.ProcessEnv): Promise<BuildOutcome> {
   let hasBuild = false;
   try {
     const pkg = JSON.parse(fsSync.readFileSync(path.join(projectRoot, 'package.json'), 'utf8')) as { scripts?: Record<string, string> };

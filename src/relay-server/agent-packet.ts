@@ -145,7 +145,10 @@ function bootstrapSteps(framework: string, fwLabel: string, flow: FlowGraph, ass
       + `a navigation stack for push/replace/modal routes. Create a central route table / router and register screens by name.`,
   ] : [];
   const assetStep = assetCount > 0 ? [
-    `${hasNav ? 5 : 4}. The design's real assets (${assetCount} files) are already in assets/icons/ (SVG) and assets/images/ (raster). Reference these actual files for icons/images — the IR tree's "assets/..." paths point at them; do NOT invent placeholder icons.`,
+    isWeb
+      // Web (CONTRACTS §5): assets live in public/assets/ and are SERVED at /assets/….
+      ? `${hasNav ? 5 : 4}. The design's real assets (${assetCount} files) are already in public/assets/icons/ (SVG) and public/assets/images/ (raster), served at /assets/icons/… and /assets/images/…. Reference them through the generated resources module (\`assets.<symbol>\` — its values are those served URLs; \`<img src={assets.x} />\`) — the IR tree's "assets/..." paths name the same files; do NOT invent placeholder icons or redraw images.`
+      : `${hasNav ? 5 : 4}. The design's real assets (${assetCount} files) are already in assets/icons/ (SVG) and assets/images/ (raster). Reference these actual files for icons/images — the IR tree's "assets/..." paths point at them; do NOT invent placeholder icons.`,
   ] : [];
   return [
     isWeb

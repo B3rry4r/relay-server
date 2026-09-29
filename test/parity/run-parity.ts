@@ -222,6 +222,12 @@ const SCREEN = {
   next: { login: 'app/10-1/page.tsx', home: 'app/(tabs)/10-2/page.tsx', settings: 'app/10-3/page.tsx', profile: 'app/(tabs)/10-4/page.tsx' },
 } as const;
 
+/** Where each framework's localized design assets live (CONTRACTS §5: a web server
+ *  serves only public/, so web assets are public/assets/…, served at /assets/…). */
+const ASSET_DIR: Record<Fw, string> = { flutter: 'assets', react: 'public/assets', next: 'public/assets' };
+/** The generated resources module (next: beside the app dir's parent, CONTRACTS §5). */
+const RES_FILE: Record<Fw, string> = { flutter: 'lib/resources/app_assets.dart', react: 'src/resources/assets.ts', next: 'lib/resources/assets.ts' };
+
 /** All source files a framework's app is made of (for "anywhere in source" checks). */
 async function appSources(root: string, fw: Fw): Promise<string[]> {
   if (fw === 'flutter') return listFiles(root, 'lib', /\.dart$/);
@@ -399,6 +405,10 @@ const CHECKS: Record<PassName, CheckFn> = {
     const syn = fw === 'flutter' ? [] : syntaxErrorsIn(r.root, r.files);
     const warn = (r.reported?.warnings ?? []).join('\n');
     const artReported = fw === 'flutter' ? true : /inline <svg> artwork/.test(warn);
+    // The fixture's screens were built under the pre-B56 packet (`/${assets.x}`, values
+    // were paths). The resources values are served URLs now (`/assets/…`), so a prefix
+    // left behind requests `//assets/…` — a protocol-relative URL to host "assets".
+    const prefixLeft = fw === 'flutter' ? [] : await grepSources(r.root, fw, /`\/\$\{\s*assets\b/);
     return [
       chk('a.old-path', oldPathGone && oldToSym, 'stub', "the IR's OPAQUE pre-rename path 'assets/icons/vector_10_20.svg' (asset-map oldPath) is re-pointed to the searchIcon symbol",
         oldPathGone ? `home now: ${home.split('\n').find((l) => /searchIcon/.test(l))?.trim() ?? '?'}` : `still a raw literal in ${s.home}: ${home.split('\n').find((l) => /vector_10_20/.test(l))?.trim()}`),
@@ -408,6 +418,7 @@ const CHECKS: Record<PassName, CheckFn> = {
       chk('a.import', importOk, 'lie', 'a file that now uses the symbol imports the resources module', importOk ? 'import present' : `${s.login} uses ${sym}.userAvatar with no import`),
       chk('a.art-reported', artReported, 'stub', 'the art-sized hand-drawn <svg> (DeliveryMapCard) is reported against the real image assets', artReported ? 'reported' : `no inline-svg finding in warnings (${(r.reported?.warnings ?? []).length} warning(s))`),
       chk('a.syntax', syn.length === 0, 'lie', 'every file the pass wrote parses', syn.join(' | ') || 'ok'),
+      ...(fw === 'flutter' ? [] : [chk('a.served-url', prefixLeft.length === 0, 'lie', 'no `/${assets.x}` prefix is left now that every symbol value is a served URL (it would request //assets/…)', prefixLeft.slice(0, 4).join(' | ') || 'none left')]),
     ];
   },
 
@@ -557,7 +568,7 @@ const CHECKS: Record<PassName, CheckFn> = {
       checks.push(chk('h.preview', previewPages.length === 0, 'stub', 'app/_preview preview pages removed', previewPages.join(', ') || 'removed'));
       checks.push(chk('h.placeholder', placeholderPages.length === 0, 'stub', 'pages that only mount PlaceholderScreen removed', placeholderPages.join(', ') || 'removed'));
     }
-    const kept = exists(r.root, 'assets/images/promo_banner.png');
+    const kept = exists(r.root, `${ASSET_DIR[fw]}/images/promo_banner.png`);
     checks.push(chk('h.computed-asset-kept', kept, 'lie', 'asset reached only via a computed key (promoBanner) is NOT deleted', kept ? 'kept' : 'DELETED'));
     const warn = (r.reported?.warnings ?? []).join('\n');
     checks.push(chk('h.computed-asset-reported', /computed key|assets\[/.test(warn), 'stub', 'unreferenced-looking asset symbols are REPORTED, flagging the computed-key access', warn.slice(0, 300) || 'no warning'));
@@ -850,32 +861,38 @@ async function gradeWebSkeleton(root: string, fw: 'react' | 'next', canonical: {
   return checks;
 }
 
+/** Put a fixture copy back into the RESOLVE-path state: opaque on-disk names under
+ *  `into`, no asset-map, no resources module (the legacy re-export stub included). */
+async function unApplyAssets(root: string, fw: Fw, into: string): Promise<void> {
+  await fs.rm(path.join(root, '.uix', 'asset-map.json'), { force: true });
+  await fs.rm(path.join(root, RES_FILE[fw]), { force: true });
+  if (fw !== 'flutter') await fs.rm(path.join(root, 'src', 'resources', 'assets.ts'), { force: true });
+  const from = ASSET_DIR[fw];
+  const moves: Array<[string, string]> = [
+    [`${from}/icons/search_icon.svg`, `${into}/icons/vector_10_20.svg`],
+    [`${from}/images/map_dark.png`, `${into}/images/image_10_40.png`],
+    [`${from}/images/promo_banner.png`, `${into}/images/image_10_41.png`],
+    [`${from}/images/user_avatar.png`, `${into}/images/user_avatar_10_31.png`],
+  ];
+  for (const [a, b] of moves) {
+    await fs.mkdir(path.dirname(path.join(root, b)), { recursive: true });
+    await fs.rename(path.join(root, a), path.join(root, b));
+  }
+  if (into !== from) await fs.rm(path.join(root, from), { recursive: true, force: true });
+}
+
 async function phaseAssetPhase(): Promise<Cell[]> {
   const { runAssetPhaseOnBuild } = await import('../../src/relay-server/passes/asset-phase');
   const { gatherExistingAssets } = await import('../../src/relay-server/reference-render');
   const cells: Cell[] = [];
-  /** Put the fixture back into the RESOLVE-path state: opaque on-disk names, no map, no resources file. */
-  const unApply = async (root: string, fw: Fw, into = 'assets') => {
-    await fs.rm(path.join(root, '.uix', 'asset-map.json'), { force: true });
-    await fs.rm(path.join(root, fw === 'flutter' ? 'lib/resources/app_assets.dart' : 'src/resources/assets.ts'), { force: true });
-    const moves: Array<[string, string]> = [
-      ['assets/icons/search_icon.svg', `${into}/icons/vector_10_20.svg`],
-      ['assets/images/map_dark.png', `${into}/images/image_10_40.png`],
-      ['assets/images/promo_banner.png', `${into}/images/image_10_41.png`],
-      ['assets/images/user_avatar.png', `${into}/images/user_avatar_10_31.png`],
-    ];
-    for (const [a, b] of moves) {
-      await fs.mkdir(path.dirname(path.join(root, b)), { recursive: true });
-      await fs.rename(path.join(root, a), path.join(root, b));
-    }
-    if (into !== 'assets') await fs.rm(path.join(root, 'assets'), { recursive: true, force: true });
-  };
   for (const fw of FRAMEWORKS) {
+    // Web: root `assets/` is where EVERY framework localized before B56 (a web server
+    // never serves it) — the phase must migrate it; public/assets is the contract.
     const variants: Array<{ label: string; into: string }> = [{ label: 'assets/ (where localize writes)', into: 'assets' }];
     if (fw !== 'flutter') variants.push({ label: 'public/assets (where the web server serves)', into: 'public/assets' });
     for (const v of variants) {
       const { projectId, root } = await copyFixture(fw, 'assetphase');
-      await unApply(root, fw, v.into);
+      await unApplyAssets(root, fw, v.into);
       const gathered = await gatherExistingAssets(root, fw);
       const before = await snapshot(root);
       const r1 = await runAssetPhaseOnBuild(projectId, { projectRoot: root, skipBuildCheck: true });
@@ -884,17 +901,18 @@ async function phaseAssetPhase(): Promise<Cell[]> {
       const after = await snapshot(root);
       const d1 = diffSnaps(before, mid);
       const d2 = diffSnaps(mid, after);
-      const resFile = fw === 'flutter' ? 'lib/resources/app_assets.dart' : 'src/resources/assets.ts';
+      const resFile = RES_FILE[fw];
       const res = read(root, resFile);
       // After run 1, every asset path literal left in app code must still point at a
       // file that exists (the pass RENAMED the files; anything it did not re-point is
-      // now a broken image).
+      // now a broken image). A web literal resolves the way the server serves it.
       const dangling: string[] = [];
       for (const f of await appSources(root, fw)) {
         if (f === resFile) continue;
         for (const m of read(root, f).matchAll(/['"]\/?((?:public\/)?assets\/[^'"$]+)['"]/g)) {
           const p = m[1];
-          if (!exists(root, p) && !exists(root, path.join('public', p))) dangling.push(`${f}: '${p}'`);
+          const ok = fw === 'flutter' ? exists(root, p) : exists(root, path.join('public', p.replace(/^public\//, '')));
+          if (!ok) dangling.push(`${f}: '${p}'`);
         }
       }
       const checks: Check[] = [
@@ -904,10 +922,16 @@ async function phaseAssetPhase(): Promise<Cell[]> {
         chk('ap.idempotent', d2.length === 0, 'lie', 'run 2 is a no-op (already applied)', `run2 status=${r2.status}${r2.reason ? ` (${r2.reason})` : ''}; run2 changed ${d2.length} file(s): ${d2.map((d) => `${d.change}:${d.file}`).slice(0, 8).join(', ')}`),
       ];
       if (fw !== 'flutter' && res) {
-        const served = !/'public\//.test(res);
-        checks.push(chk('ap.web-urls', served, 'lie', 'emitted symbol values are URLs the web server serves (no `public/` prefix)', res.split('\n').filter((l) => /:\s*'/.test(l)).slice(0, 3).join(' | ')));
+        const values = [...res.matchAll(/:\s*'([^']+)'/g)].map((m) => m[1]);
+        const served = values.length > 0 && values.every((x) => /^\/assets\//.test(x));
+        checks.push(chk('ap.web-urls', served, 'lie', 'emitted symbol values are URLs the web server serves (`/assets/…`, no `public/` prefix)', res.split('\n').filter((l) => /:\s*'/.test(l)).slice(0, 3).join(' | ')));
+        // Every served URL is backed by a file the server will actually serve.
+        const unbacked = values.filter((x) => !exists(root, path.join('public', x)));
+        checks.push(chk('ap.served-files', values.length > 0 && unbacked.length === 0, 'lie', 'every emitted URL is a file under public/ (so it is in the build output)', unbacked.join(', ') || `${values.length} URL(s) backed by public/`));
+        const rootLeft = await listFiles(root, 'assets', /\.(svg|png)$/);
+        checks.push(chk('ap.no-root-assets', rootLeft.length === 0, 'stub', 'no design asset is left in the unserved root assets/', rootLeft.join(', ') || 'none'));
       }
-      cells.push({ pass: `asset-phase [${v.label}]`, framework: fw, reported: { status: r1.status, counts: { gathered: r1.gathered, renamed: r1.renamed, repointed: r1.repointed }, warnings: r1.warnings, ...(r1.error ? { error: r1.error } : {}) }, files: d1.slice(0, 30), checks, cell_status: classify(null, checks), notes: [] });
+      cells.push({ pass: `asset-phase [${v.label}]`, framework: fw, reported: { status: r1.status, ...(r1.reason ? { reason: r1.reason } : {}), counts: { gathered: r1.gathered, renamed: r1.renamed, repointed: r1.repointed }, warnings: r1.warnings, ...(r1.error ? { error: r1.error } : {}) }, files: d1.slice(0, 30), checks, cell_status: classify(null, checks), notes: fw !== 'flutter' && v.into === 'assets' ? ['web: root assets/ is the pre-B56 localize location; the phase migrates it into public/assets'] : [] });
     }
   }
   return cells;
@@ -1055,32 +1079,51 @@ async function phaseVerifyServing(): Promise<Cell[]> {
   }];
 }
 
-/** Do the design's assets reach the served web build? Asset localization writes
- *  <projectRoot>/assets/{icons,images} for EVERY framework (reference-render.ts), the
- *  packet tells the web agent to reference them as `/${assets.x}` at runtime, and the
- *  verify harness serves the production build. Vite copies only public/ into dist/, so
- *  a runtime `/assets/icons/x.svg` 404s. Probed with the real vite binary. */
+/** Do the design's assets reach the served web build? The asset phase runs for real
+ *  on a react copy in the RESOLVE state with the assets where every build localized
+ *  them before B56 (root `assets/`); then a real `vite build` bundles a page that
+ *  renders every `assets.<symbol>` exactly as the packet tells the agent
+ *  (`<img src={assets.x}>`), and each URL is fetched from the served build. */
 async function phaseWebAssetServing(): Promise<Cell[]> {
   let viteBin = '';
   try { viteBin = path.join(path.dirname(require.resolve('vite/package.json')), 'bin', 'vite.js'); } catch { /* absent */ }
-  const { root } = await copyFixture('react', 'vite-assets');
   if (!viteBin || !fsSync.existsSync(viteBin)) {
     return [{ pass: 'web asset serving (vite build)', framework: 'react', reported: null, files: [], checks: [chk('va.vite', false, 'stub', 'vite available to probe', 'vite not resolvable')], cell_status: 'SKIPPED_WITH_REASON', notes: ['vite absent'] }];
   }
-  const probe = path.join(root, '_vite_probe');
-  await fs.mkdir(probe, { recursive: true });
-  await fs.cp(path.join(root, 'assets'), path.join(probe, 'assets'), { recursive: true });
-  await fs.writeFile(path.join(probe, 'index.html'), '<!doctype html><html><body><div id="root"></div><script type="module" src="/main.js"></script></body></html>');
-  // Exactly the shape renderAssetInventory tells the web agent to emit.
-  await fs.writeFile(path.join(probe, 'main.js'), "const assets = { searchIcon: 'assets/icons/search_icon.svg' };\ndocument.getElementById('root').innerHTML = `<img src=\"/${assets.searchIcon}\">`;\n");
-  const r = spawnSync(process.execPath, [viteBin, 'build', '--logLevel', 'error'], { cwd: probe, encoding: 'utf8', timeout: 120000 });
-  const shipped = fsSync.existsSync(path.join(probe, 'dist', 'assets', 'icons', 'search_icon.svg'));
-  const distFiles = await listFiles(probe, 'dist');
+  const { runAssetPhaseOnBuild } = await import('../../src/relay-server/passes/asset-phase');
+  const { serveDir } = await import('../../src/relay-server/visual-routes');
+  const { projectId, root } = await copyFixture('react', 'vite-assets');
+  await unApplyAssets(root, 'react', 'assets');
+  const ap = await runAssetPhaseOnBuild(projectId, { projectRoot: root, skipBuildCheck: true });
+  const res = read(root, RES_FILE.react);
+  const symbols = [...res.matchAll(/^\s*([A-Za-z0-9_$]+):\s*'([^']+)'/gm)].map((m) => ({ sym: m[1], url: m[2] }));
+  // The app's own vite config needs @vitejs/plugin-react (not installed here): build
+  // the probe page with an empty config — the public/ → dist/ copy is vite's own.
+  await fs.writeFile(path.join(root, 'probe.config.mjs'), 'export default {};\n');
+  await fs.writeFile(path.join(root, 'index.html'), '<!doctype html><html><body><div id="root"></div><script type="module" src="/probe-main.ts"></script></body></html>');
+  await fs.writeFile(path.join(root, 'probe-main.ts'), `import { assets } from './src/resources/assets';\ndocument.getElementById('root')!.innerHTML = Object.values(assets).map((u) => \`<img src="\${u}">\`).join('');\n`);
+  const r = spawnSync(process.execPath, [viteBin, 'build', '--config', 'probe.config.mjs', '--logLevel', 'error'], { cwd: root, encoding: 'utf8', timeout: 120000 });
+  const bundled = (await listFiles(root, 'dist/assets', /\.js$/)).map((f) => read(root, f)).join('\n');
+  const results: string[] = [];
+  let ok200 = 0;
+  const srv = await serveDir(path.join(root, 'dist'));
+  try {
+    const base = srv.url.replace(/\/index\.html$/, '');
+    for (const { sym, url } of symbols) {
+      const resp = await fetch(`${base}${url}`);
+      const body = Buffer.from(await resp.arrayBuffer());
+      const want = fsSync.existsSync(path.join(root, 'public', url)) ? fsSync.readFileSync(path.join(root, 'public', url)) : null;
+      const same = !!want && Buffer.compare(body, want) === 0;
+      if (resp.status === 200 && same && bundled.includes(url)) ok200++;
+      results.push(`${sym} ${url} → HTTP ${resp.status}${same ? '' : ' (bytes differ)'}${bundled.includes(url) ? '' : ' (not in bundle)'}`);
+    }
+  } finally { srv.close(); }
+  const shipped = ap.status === 'applied' && symbols.length === 4 && ok200 === symbols.length;
   return [{
     pass: 'web asset serving (vite build)', framework: 'react', reported: null, files: [],
-    checks: [chk('va.shipped', shipped, 'lie', 'an asset localized to <root>/assets/ and referenced as `/${assets.x}` is present in the served build', `vite exit=${r.status}; dist: ${distFiles.join(', ')}`)],
+    checks: [chk('va.shipped', shipped, 'lie', 'after the asset phase, every `assets.<symbol>` URL the bundle renders is served by the real vite build (HTTP 200, the design bytes)', `asset phase ${ap.status}; vite exit=${r.status}${r.stderr ? ` ${r.stderr.slice(0, 200)}` : ''}; ${results.join(' | ') || 'no symbols emitted'}`)],
     cell_status: shipped ? 'IMPLEMENTED' : 'LIES',
-    notes: ['next: `next build` likewise serves static files only from public/ — same mechanism, not probed (no next binary)'],
+    notes: ['next: `next build` serves public/ the same way — proven with the real next binary in scratchpad/web-real/B56 (not required by this harness)'],
   }];
 }
 
@@ -1237,9 +1280,10 @@ export async function runParity(opts: { log?: (m: string) => void } = {}): Promi
   const cells: Cell[] = [];
   const flowRuns = new Map<Fw, PassRun>();
 
-  // The Next fixture carries src/resources/assets.ts because the asset pass emits it
-  // there for `next` (resources-emit EMITTERS.next). A second Next column without src/
-  // isolates what breaks BECAUSE of that file from what is broken regardless.
+  // The Next fixture's resources module lives at lib/resources/assets.ts (CONTRACTS
+  // §5); its src/ holds only the legacy re-export the asset pass leaves at the pre-B56
+  // location. A second Next column without src/ proves nothing depends on src/ and
+  // that src/ never hides app/ from the resolver.
   const NO_SRC = ' [next variant: app/ only, no src/]';
   const runs: Array<{ fw: Fw; suffix: string; mutate?: (root: string) => Promise<void> }> = [
     ...FRAMEWORKS.map((fw) => ({ fw, suffix: '' })),

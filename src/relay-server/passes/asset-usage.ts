@@ -11,8 +11,8 @@
 // usages to the correct exported resource.
 //
 // FRAMEWORK-AGNOSTIC. detectFramework() (same contract as 7a/7b) dispatches to a
-// per-framework `AssetUsageStrategy`. Flutter ships a full implementation; react
-// is a stubbed seam so the contract is visible.
+// per-framework `AssetUsageStrategy`: flutter here, react + next in
+// asset-usage-web.ts (the same old+new path index, every source root).
 //
 // DETERMINISTIC where possible: rewriting a raw path literal that appears
 // verbatim in the asset-map → its resources symbol, and inserting the import,
@@ -36,6 +36,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import type { AIModel } from '../ai-adapters';
 import { repointWeb, findWebResourcesFile, parseDeclaredWebSymbols, WEB_RESOURCES_SYMBOL } from './asset-usage-web';
+import { loadWebApp } from './web-app';
 import { detectFramework, type Framework } from './framework';
 
 // ── Public contract ──────────────────────────────────────────────────────────
@@ -848,18 +849,22 @@ async function readFileOrNull(abs: string): Promise<string | null> {
 }
 
 // =============================================================================
-// React strategy (seam only — Phase 7c ships flutter; react contract is stubbed)
+// Web strategy (react + next) — asset-usage-web.ts
 // =============================================================================
 
 const webStrategy = (framework: Framework): AssetUsageStrategy => ({
   framework,
   async repoint(projectRoot, index, opts) {
+    // The same old+new path index flutter re-points through (PG-15): the IR the
+    // agent built from carries the OPAQUE pre-rename paths.
+    const byPath = new Map<string, string>();
+    for (const [p, a] of index.byPath) byPath.set(p, a.symbolKey);
     const r = await repointWeb(
       projectRoot,
       index.assets.map((a) => ({
         symbolKey: a.symbolKey, name: a.name, newPath: a.newPath, format: a.format, kind: a.kind,
       })),
-      { dryRun: opts.dryRun, onlyFiles: opts.onlyFiles },
+      { dryRun: opts.dryRun, onlyFiles: opts.onlyFiles, byPath },
     );
     return {
       repointed: r.repointed.map((x) => ({
@@ -929,7 +934,9 @@ export async function buildAssetInventory(projectRoot: string): Promise<AssetInv
   // asset block at all — which is why it hand-drew photos and avatars that shipped in
   // the .fig. Same contract, web symbols.
   if (framework === 'react' || framework === 'next') {
-    const resourcesFile = findWebResourcesFile(projectRoot);
+    const ix = await loadWebApp(projectRoot);
+    const viaIx = ix?.resourcesFile ? parseDeclaredWebSymbols((await readFileOrNull(ix.resourcesFile)) ?? '').size > 0 : false;
+    const resourcesFile = viaIx ? ix!.resourcesFile : findWebResourcesFile(projectRoot);
     if (!resourcesFile) return null;
     const resourcesSrc = await readFileOrNull(resourcesFile);
     if (!resourcesSrc) return null;
@@ -969,7 +976,7 @@ export function renderAssetInventory(inv: AssetInventory, cap = 120): string {
   if (inv.framework === 'flutter') {
     lines.push(`Import it with a relative path to ${inv.resourcesRel}. SVG symbols → \`SvgPicture.asset(${inv.className}.x, width:.., height:.., colorFilter: ColorFilter.mode(color, BlendMode.srcIn))\` (needs \`flutter_svg\`); raster symbols → \`Image.asset(${inv.className}.x)\`.`);
   } else {
-    lines.push(`Import it: \`import { ${inv.className} } from '<relative path to ${inv.resourcesRel}>'\`. Raster symbols → \`<img src={\`/\${${inv.className}.x}\`} alt="" />\`. Monochrome icon symbols → the project's \`<Icon name="x" />\` component when one exists, else \`<img src={\`/\${${inv.className}.x}\`} />\`. A photo, avatar, map or illustration in the design is a REAL exported image — do NOT draw it with inline <svg>.`);
+    lines.push(`Import it: \`import { ${inv.className} } from '<relative path (or the project's @/ alias) to ${inv.resourcesRel}>'\`. Each value is the URL the asset is SERVED at (the files live in public/assets/, served at /assets/…), so use it as-is: raster symbols → \`<img src={${inv.className}.x} alt="" />\`; monochrome icon symbols → the project's \`<Icon name="x" />\` component when one exists, else \`<img src={${inv.className}.x} alt="" />\`. Never prefix it (\`/\${${inv.className}.x}\` yields //assets/… — a broken protocol-relative URL). A photo, avatar, map or illustration in the design is a REAL exported image — do NOT draw it with inline <svg>.`);
   }
   if (icons.length) lines.push(`Icons: ${shown.filter(a => a.kind === 'icon').map(fmt).join('; ')}`);
   if (images.length) lines.push(`Images: ${shown.filter(a => a.kind === 'image').map(fmt).join('; ')}`);

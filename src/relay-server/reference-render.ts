@@ -24,6 +24,7 @@ import { captureUrlScreenshot, serveDir } from './visual-routes';
 import { buildAgentPacket, screenDirName, type FigFrame, type FlowGraph } from './agent-packet';
 import type { ScreenSpec } from './build-run-store';
 import { emitResources, canEmitResources } from './resources-emit';
+import { assetBaseDir, isWebFramework, webResourcesRel } from './passes/framework';
 import { renameAssetsSemantic } from './asset-naming';
 import type { AIModel } from './ai-adapters';
 
@@ -362,9 +363,10 @@ const safeName = (s: string) => s.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+
 
 /**
  * Localize ONLY the assets the frame's subtree references — its raster image fills
- * (by `ih` hash) + its SVG icons/illustrations — into <projectRoot>/assets/icons
- * (svg) and assets/images (raster), so the IR notation's assets/... references
- * resolve. `seen` dedupes across a whole-app batch (screens share most assets).
+ * (by `ih` hash) + its SVG icons/illustrations — into <assets>/icons (svg) and
+ * <assets>/images (raster), where <assets> is `assets/` on flutter (bundled via
+ * pubspec) and `public/assets/` on react/next (the only dir a web server serves;
+ * the IR notation's `assets/...` references then resolve as `/assets/...` URLs). `seen` dedupes across a whole-app batch (screens share most assets).
  * Returns the number of assets written this call, and the dir-relative paths
  * written (so prepScreen can replay them on a cache hit).
  */
@@ -501,10 +503,16 @@ export async function localizeFrameAssets(
   frameId: string,
   irData: IrData | null,
   seen: Set<string>,
-  opts: { harnessBaseUrl?: string } = {},
+  opts: { harnessBaseUrl?: string; framework?: string } = {},
 ): Promise<{ count: number; written: string[]; assets: LocalizedAsset[] }> {
   const root = resolveProjectRoot(projectId);
   if (!root) return { count: 0, written: [], assets: [] };
+  // WHERE the framework serves/bundles assets (PG-28): flutter bundles `assets/`
+  // (pubspec); a web server serves only `public/`, so react/next localize into
+  // `public/assets/{icons,images}` — the same files, reachable at `/assets/…`.
+  const base = assetBaseDir(opts.framework ?? 'flutter');
+  const ICONS = `${base}/icons`;
+  const IMAGES = `${base}/images`;
   const written: string[] = [];
   const assets: LocalizedAsset[] = [];
 
@@ -616,13 +624,13 @@ export async function localizeFrameAssets(
       // A harness repair returns PNG bytes — never leave them under a .jpg name.
       if (nodeId) {
         const pngName = name.replace(/\.[a-z0-9]+$/i, '.png');
-        tasks.push(() => repairRaster(nodeId, 'assets/images', pngName, a.url));
+        tasks.push(() => repairRaster(nodeId, IMAGES, pngName, a.url));
         continue;
       }
     }
     // `format` is the LocalizedAsset raster/vector discriminator ('svg' | 'png'),
     // not the file extension — a .jpg fill is still a raster.
-    tasks.push(() => upload(a.url, 'assets/images', name, { format: 'png', kind: 'image' }));
+    tasks.push(() => upload(a.url, IMAGES, name, { format: 'png', kind: 'image' }));
   }
   // 2. Icon + illustration assets under THIS frame. SIMPLE flat icons come back as
   //    SVG and STAY SVG (they extract correctly — never rasterize). But a COMPOSITE
@@ -636,7 +644,7 @@ export async function localizeFrameAssets(
   for (const s of svgAssets) {
     if (s.format === 'png') {
       svgDecisions.push({ fileName: s.fileName, nodeId: s.nodeId, route: 'raster', dim: 0, reason: 'uix-flagged-png' });
-      tasks.push(() => repairRaster(s.nodeId, 'assets/images', s.fileName, s.url));
+      tasks.push(() => repairRaster(s.nodeId, IMAGES, s.fileName, s.url));
       continue;
     }
     // Decide ILLUSTRATION (→ raster) vs ICON (→ keep SVG). Primary signal: the IR
@@ -681,7 +689,7 @@ export async function localizeFrameAssets(
       // Rasterize the composite illustration via the harness; rename to .png so the
       // asset map/resources treat it as a raster image (mirrors repairRaster output).
       const pngName = s.fileName.replace(/\.svg$/i, '') + '.png';
-      tasks.push(() => repairRaster(s.nodeId, 'assets/images', pngName, s.url));
+      tasks.push(() => repairRaster(s.nodeId, IMAGES, pngName, s.url));
     } else if (brokenIcon || instanceComposite) {
       const reason = brokenIcon ? `broken-icon:${iconSig!.reason}` : 'instance-composite';
       svgDecisions.push({ fileName: s.fileName, nodeId: s.nodeId, route: 'raster', dim, reason });
@@ -689,10 +697,10 @@ export async function localizeFrameAssets(
       // it under assets/icons (it IS an icon) but as a .png — the harness renders the
       // complete glyph the broken SVG synth dropped.
       const pngName = s.fileName.replace(/\.svg$/i, '') + '.png';
-      tasks.push(() => repairRaster(s.nodeId, 'assets/icons', pngName, s.url));
+      tasks.push(() => repairRaster(s.nodeId, ICONS, pngName, s.url));
     } else {
       svgDecisions.push({ fileName: s.fileName, nodeId: s.nodeId, route: 'svg', dim, reason: iconSig ? iconSig.reason : 'simple-icon' });
-      tasks.push(() => upload(s.url, 'assets/icons', s.fileName, { nodeId: s.nodeId, format: 'svg', kind: 'icon' }));
+      tasks.push(() => upload(s.url, ICONS, s.fileName, { nodeId: s.nodeId, format: 'svg', kind: 'icon' }));
     }
   }
   if (svgDecisions.length && process.env.RELAY_ASSET_DEBUG) {
@@ -837,7 +845,7 @@ export async function prepScreen(
       }
       // Replay assets (dedup-aware): re-fetch + write only assets not already seen
       // this batch. Cheap when the batch shares assets; correct on a fresh project.
-      const { count: assetCount, assets } = await localizeFrameAssets(projectId, cfg.figStorageKey, frame.id, irData, seen, { harnessBaseUrl: cfg.harnessBaseUrl });
+      const { count: assetCount, assets } = await localizeFrameAssets(projectId, cfg.figStorageKey, frame.id, irData, seen, { harnessBaseUrl: cfg.harnessBaseUrl, framework: cfg.framework });
       const spec: ScreenSpec = {
         packet,
         referenceImagePath: fsSync.existsSync(refAbs) ? refRel : (meta.referenceImagePath || ''),
@@ -877,7 +885,7 @@ export async function prepScreen(
   }
 
   // 2. Localize the frame's assets (broken rasters re-rasterized via the harness).
-  const { count: assetCount, assets } = await localizeFrameAssets(projectId, cfg.figStorageKey, frame.id, irData, seen, { harnessBaseUrl: cfg.harnessBaseUrl });
+  const { count: assetCount, assets } = await localizeFrameAssets(projectId, cfg.figStorageKey, frame.id, irData, seen, { harnessBaseUrl: cfg.harnessBaseUrl, framework: cfg.framework });
 
   // 3. Assemble the agent packet.
   const packet = buildAgentPacket({
@@ -967,14 +975,17 @@ export async function runAssetPass(
   //    (one symbol per unique content — NOT one per duplicate file).
   let resourcesPath: string | null = null;
   if (canEmitResources(framework)) {
+    // Web: the resources module sits at the CONTRACTS §5 location (next → beside the
+    // app dir's parent), and its values are the SERVED URLs (resources-emit).
     const emitted = emitResources(framework, renamed.map(r => ({
       name: r.name, relPath: r.newRelPath, format: r.format, kind: r.kind,
-    })));
+    })), isWebFramework(framework) ? { filePath: webResourcesRel(root, framework) } : {});
     if (emitted) {
       const abs = path.join(root, emitted.filePath);
       await fs.mkdir(path.dirname(abs), { recursive: true });
       await fs.writeFile(abs, emitted.contents);
       resourcesPath = emitted.filePath;
+      if (isWebFramework(framework)) await redirectLegacyWebResources(root, emitted.filePath);
     }
   }
 
@@ -1028,6 +1039,30 @@ export async function runAssetPass(
     unique: representatives.length,
     duplicatesDeleted,
   };
+}
+
+/** Before B56 the web resources module was always emitted at `src/resources/assets.ts`
+ *  (a Next app keeps it beside `app/`, so the contract location is now
+ *  `lib/resources/assets.ts`). Screens built then still import the old module; turn
+ *  a GENERATED one at a legacy location into a re-export of the current module so
+ *  those imports resolve to the served-URL values. A hand-written file is untouched. */
+async function redirectLegacyWebResources(root: string, currentRel: string): Promise<void> {
+  for (const legacy of ['src/resources/assets.ts', 'src/assets.ts']) {
+    if (legacy === currentRel) continue;
+    const abs = path.join(root, legacy);
+    let src: string;
+    try { src = await fs.readFile(abs, 'utf8'); } catch { continue; }
+    if (!src.includes('GENERATED by relay-server asset pass')) continue;
+    let spec = path.posix.relative(path.posix.dirname(legacy), currentRel).replace(/\.ts$/, '');
+    if (!spec.startsWith('.')) spec = `./${spec}`;
+    await fs.writeFile(abs, [
+      '// GENERATED by relay-server asset pass — do not edit by hand.',
+      `// Legacy location: the resources module now lives at ${currentRel} (CONTRACTS §5).`,
+      '// Kept as a re-export so screens that import this path still resolve.',
+      `export * from '${spec}';`,
+      '',
+    ].join('\n'));
+  }
 }
 
 /**
@@ -1097,12 +1132,12 @@ async function dedupAssetsByContent(
 /** The on-disk asset root(s) a framework bundles its assets under. Flutter is the
  *  one that must work; the others are reasonable defaults for the shared seam. */
 function assetDirsFor(framework: string): string[] {
-  switch ((framework || '').toLowerCase()) {
-    case 'flutter': return ['assets'];
-    case 'react': case 'vite': case 'ts': return ['src/assets', 'public'];
-    case 'next': case 'web': return ['public', 'src/assets'];
-    default: return ['assets'];
-  }
+  // Web (PG-28): where localize writes (`public/assets`, served at `/assets`) — plus
+  // the root `assets/` every web build localized into before B56, which a web
+  // server never serves; the asset phase MIGRATES those into public/assets. Not
+  // `src/assets`: those are bundler imports (`import x from './x.svg'`), renaming
+  // them would break the import, and the asset pipeline never writes there.
+  return isWebFramework(framework) ? [assetBaseDir(framework), 'assets'] : ['assets'];
 }
 
 /** Parse a trailing Figma node id baked into an opaque asset filename. UIX names

@@ -1,7 +1,7 @@
 // canonicalId: c_10_3 route: /10-3
 'use client';
 import { useRouter } from 'next/navigation';
-import { assets } from '@/src/resources/assets';
+import { assets } from '@/lib/resources/assets';
 import { showModal_10_8 } from '@/components/LogoutDialog';
 
 function SectionHeading({ children }: { children: string }) {
