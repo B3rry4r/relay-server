@@ -106,7 +106,13 @@ describe('ensureScreenPreviewEntry variants', () => {
   it('web frameworks get the deterministic preview ROUTE (variant frame selects it) and write no file', async () => {
     for (const fw of ['react', 'next']) {
       expect(await ensureScreenPreviewEntry(root, fw, '1:1')).toBe('/_preview/1-1');
+      // A variant without a frame of its own falls back to the base screen's route.
       expect(await ensureScreenPreviewEntry(root, fw, '1:1', { variant: { kind: 'state', id: 'x' } })).toBe('/_preview/1-1');
+      // The production variant loop (ai-screen-loop.ts, variant: {kind, id, frameId:
+      // v.frameId}) always passes the folded frame: a STATE variant is then
+      // screenshotted at its own route, not the base screen's.
+      expect(await ensureScreenPreviewEntry(root, fw, '1:1', { variant: { kind: 'state', id: 's_loading', frameId: '3:7' } }))
+        .toBe('/_preview/3-7');
       expect(await ensureScreenPreviewEntry(root, fw, '1:1', { variant: { kind: 'modal', id: 'm_2_5', frameId: '2:5' } }))
         .toBe('/_preview/2-5');
     }
