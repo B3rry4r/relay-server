@@ -33,8 +33,7 @@
 // identifier when a canonical name is ambiguous, multi-word, or collides.
 //
 // FRAMEWORK-AGNOSTIC. detectFramework() (same contract as 7a–7d) dispatches to a
-// per-framework `RenameStrategy`. Flutter ships a full implementation; react is a
-// stubbed seam so the contract is visible.
+// per-framework `RenameStrategy`: flutter here, react + next in semantic-rename-web.ts.
 //
 // IDEMPOTENT: a second run finds every screen already semantic (its file/class/
 // route no longer match the machine shape) and applies 0 renames.
@@ -474,6 +473,14 @@ async function renameFlutter(
       if (next !== src) contents.set(file, next);
     }
 
+    // 3) PG-21: the screen's `// canonicalId: … route: …` header names the route the
+    // app now serves — rewritten in the same transaction (stamped when absent). A
+    // stale header made the next finalize re-rename the screen (settings_2_screen)
+    // and flip 7d verdicts, because every pass resolves a screen by it.
+    const own = contents.get(oldAbs);
+    const headerRoute = r.newRoutePath ?? r.oldRoutePath ?? null;
+    if (own != null) contents.set(oldAbs, syncDartHeader(own, r.canonicalId, headerRoute));
+
     moves.push({ from: oldAbs, to: newAbs });
   }
 
@@ -500,6 +507,16 @@ async function renameFlutter(
   void dirty;
 
   return { renames, skipped, builtScreens: builtById.size, filesTouched };
+}
+
+/** Rewrite (or stamp) a Dart screen's canonical header route, keeping its spacing. */
+export function syncDartHeader(src: string, canonicalId: string, route: string | null): string {
+  const re = /^(\/\/\s*canonicalId:\s*\S+)(?:(\s+route:\s*)(\S+))?/m;
+  const m = re.exec(src);
+  if (!m) return `// canonicalId: ${canonicalId}${route ? `  route: ${route}` : ''}\n${src}`;
+  if (!route) return src;
+  const line = `${m[1]}${m[2] ?? '  route: '}${route}`;
+  return m[0] === line ? src : src.slice(0, m.index) + line + src.slice(m.index + m[0].length);
 }
 
 // ── route table parsing ──────────────────────────────────────────────────────
@@ -686,7 +703,7 @@ async function listDartFiles(dir: string): Promise<string[]> {
 function rel(root: string, abs: string): string { return path.relative(root, abs); }
 
 // =============================================================================
-// React strategy (seam only — Phase 7e ships flutter; react contract is stubbed)
+// Web strategy (react + next) — semantic-rename-web.ts
 // =============================================================================
 
 const webStrategy = (framework: Framework): RenameStrategy => ({
@@ -702,12 +719,12 @@ const webStrategy = (framework: Framework): RenameStrategy => ({
         canonicalId: x.canonicalId,
         canonicalName: x.canonicalName,
         oldFile: x.file,
-        newFile: x.file,
-        oldClass: '',
-        newClass: '',
-        ...(x.routeConst ? { oldRouteConst: x.routeConst, newRouteConst: x.routeConst } : {}),
-        oldRoutePath: x.oldRoutePath,
-        newRoutePath: x.newRoutePath,
+        newFile: x.newFile,
+        oldClass: x.oldComponent,
+        newClass: x.newComponent,
+        ...(x.routeConst ? { oldRouteConst: x.routeConst, newRouteConst: x.newRouteConst ?? x.routeConst } : {}),
+        ...(x.oldRoutePath ? { oldRoutePath: x.oldRoutePath } : {}),
+        ...(x.newRoutePath ? { newRoutePath: x.newRoutePath } : {}),
         identifierHow: 'deterministic' as const,
       })),
       skipped: r.skipped,

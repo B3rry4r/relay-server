@@ -164,9 +164,12 @@ describe('finalize records skipped + reason (PG-01)', () => {
     const r = await finalizeApp('p', { projectRoot: dir, skipBuildCheck: true, noReport: true });
     const zeroApplied = r.passes.filter((p) => p.status === 'applied' && Object.values(p.counts).every((v) => !v));
     expect(zeroApplied).toEqual([]);
+    // renameSemantic was the Next stub this test first pinned (skipped, "Next App
+    // Router … not implemented"); PG-20 implemented it, so it must now be APPLIED
+    // with a real count — never applied-with-zeros, never a leftover skip.
     const rename = r.passes.find((p) => p.name === 'renameSemantic')!;
-    expect(rename.status).toBe('skipped');
-    expect(rename.reason).toMatch(/Next App Router/);
+    expect(rename.status).toBe('applied');
+    expect(rename.counts.renamed).toBeGreaterThan(0);
     for (const p of r.passes.filter((x) => x.status === 'skipped')) expect(p.reason, p.name).toBeTruthy();
     // skipBuildCheck is itself reported, not dressed up as a passing gate.
     expect(r.gate.typecheck).toMatchObject({ status: 'skipped', reason: expect.stringMatching(/skipBuildCheck/) });
@@ -175,7 +178,8 @@ describe('finalize records skipped + reason (PG-01)', () => {
   it('a dry run records the same skip reasons and writes nothing', async () => {
     await fs.cp(path.join(FIXTURES, 'next'), dir, { recursive: true });
     const r = await finalizeApp('p', { projectRoot: dir, dryRun: true });
-    expect(r.passes.find((p) => p.name === 'renameSemantic')).toMatchObject({ status: 'skipped', reason: expect.any(String) });
+    for (const p of r.passes.filter((x) => x.status === 'skipped')) expect(p.reason, p.name).toEqual(expect.any(String));
+    expect(r.passes.find((p) => p.name === 'renameSemantic')).toMatchObject({ status: 'applied' });
     expect(fsSync.existsSync(path.join(dir, '.uix', 'finalize-report.json'))).toBe(false);
     expect(fsSync.existsSync(path.join(dir, '.uix', 'flow-wiring-report.json'))).toBe(false);
   });

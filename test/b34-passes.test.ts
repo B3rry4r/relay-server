@@ -251,3 +251,57 @@ describe('7d next: layout-hosted tabs and the useRouter auto-fix (PG-13, PG-14);
     expect(e3.detail).toMatch(/^HIGH: .*still the skeleton stub/);
   });
 });
+
+// ── 7e ────────────────────────────────────────────────────────────────────────
+import { renameSemantic } from '../src/relay-server/passes/semantic-rename';
+import { __test as rweb } from '../src/relay-server/passes/semantic-rename-web';
+
+describe('7e rename: react components/files/keys, Next directories, headers in the same transaction (PG-19..21)', () => {
+  it('flutter: the renamed screen header names the served route; run 2 renames nothing', async () => {
+    const root = await fixture('flutter');
+    await renameSemantic('p', { projectRoot: root, noAi: true, noReport: true });
+    expect((await fs.readFile(path.join(root, 'lib', 'screens', 'settings_screen.dart'), 'utf8')).split('\n')[0]).toBe('// canonicalId: c_10_3  route: /settings');
+    const again = await renameSemantic('p', { projectRoot: root, noAi: true, noReport: true });
+    expect(again.report.renames).toEqual([]);
+    expect(fsSync.existsSync(path.join(root, 'lib', 'screens', 'settings_2_screen.dart'))).toBe(false);
+  });
+
+  it('react: machine component + file + ROUTES key renamed; importers (App.tsx, the preview) follow; run 2 is a no-op', async () => {
+    const root = await fixture('react');
+    const r = await renameSemantic('p', { projectRoot: root, noAi: true, noReport: true });
+    const s = r.report.renames.find((x) => x.canonicalId === 'c_10_3')!;
+    expect(s).toMatchObject({ newFile: 'src/screens/SettingsScreen.tsx', newClass: 'SettingsScreen', oldRouteConst: 'c103', newRouteConst: 'settings', newRoutePath: '/settings' });
+    const app = await fs.readFile(path.join(root, 'src', 'App.tsx'), 'utf8');
+    expect(app).toMatch(/import \{ SettingsScreen \} from '\.\/screens\/SettingsScreen';/);
+    expect(app).toMatch(/<Route path=\{ROUTES\.settings\} element=\{<SettingsScreen \/>\} \/>/);
+    // A frame-code canonical name ('283:1967') uses the pipeline's own semantic ROUTES key.
+    expect(r.report.renames.find((x) => x.canonicalId === 'c_10_4')).toMatchObject({ newClass: 'ProfileScreen', newRoutePath: '/profile' });
+    expect(await fs.readFile(path.join(root, 'src', 'screens', 'SettingsPreview.tsx'), 'utf8')).toMatch(/from '\.\/SettingsScreen'/);
+    const again = await renameSemantic('p', { projectRoot: root, noAi: true, noReport: true });
+    expect(again.report.renames).toEqual([]);
+  });
+
+  it('next: app/10-3 moves to app/settings in place, literals + header follow, the preview import is re-pointed, a generic `Page` elsewhere is untouched', async () => {
+    const root = await fixture('next');
+    const other = "export default function Page() { return null; }\n";
+    await fs.mkdir(path.join(root, 'app', 'about'), { recursive: true });
+    await fs.writeFile(path.join(root, 'app', 'about', 'page.tsx'), other);
+    await renameSemantic('p', { projectRoot: root, noAi: true, noReport: true });
+    expect(fsSync.existsSync(path.join(root, 'app', '10-3'))).toBe(false);
+    const settings = await fs.readFile(path.join(root, 'app', 'settings', 'page.tsx'), 'utf8');
+    expect(settings.split('\n')[0]).toBe('// canonicalId: c_10_3 route: /settings');
+    expect(settings).toMatch(/export default function SettingsPage\(\)/);
+    expect(settings).toMatch(/router\.push\('\/login'\)/);
+    expect(fsSync.existsSync(path.join(root, 'app', '(tabs)', 'home', 'page.tsx'))).toBe(true);
+    expect(await fs.readFile(path.join(root, 'app', '_preview', '10-3', 'page.tsx'), 'utf8')).toMatch(/from '\.\.\/\.\.\/settings\/page'/);
+    expect(await fs.readFile(path.join(root, 'app', 'about', 'page.tsx'), 'utf8')).toBe(other);
+    const again = await renameSemantic('p', { projectRoot: root, noAi: true, noReport: true });
+    expect(again.report.renames).toEqual([]);
+  });
+
+  it('header sync + alias specifier rewrite', () => {
+    expect(rweb.syncHeader("// canonicalId: c_1_2 route: /1-2\n'use client';\n", 'c_1_2', '/x').src).toBe("// canonicalId: c_1_2 route: /x\n'use client';\n");
+    expect(rweb.syncHeader("'use client';\n", 'c_1_2', '/x')).toEqual({ src: "// canonicalId: c_1_2 route: /x\n'use client';\n", stamped: true });
+    expect(rweb.replaceRouteLiteral("push('/10-3'); push('/10-3/edit'); push('/10-30')", '/10-3', '/settings')).toBe("push('/settings'); push('/settings/edit'); push('/10-30')");
+  });
+});

@@ -439,7 +439,18 @@ const CHECKS: Record<PassName, CheckFn> = {
   // ── 7e ────────────────────────────────────────────────────────────────────
   async renameSemantic(fw, r) {
     const machineClass = await grepSources(r.root, fw, /IPhone1415Pro57(Screen|Page)|Frame123(Screen|Page)/);
-    const machineFiles = (await appSources(r.root, fw)).filter((f) => /screen_10_[34]\.dart|IPhone1415Pro57|Frame123|(^|\/)10-3(\/|$)/.test(f));
+    // Verify-harness previews are addressed by FRAME id by contract (`/_preview/<frame>`,
+    // lib/_preview/screen_<frame>_…): their paths are not the app's names and must
+    // not be renamed — but they must keep compiling (r.preview-intact).
+    const isPreviewPath = (f: string) => /(^|\/)(_preview|%5Fpreview)\//i.test(f);
+    const machineFiles = (await appSources(r.root, fw)).filter((f) => !isPreviewPath(f) && /screen_10_[34]\.dart|IPhone1415Pro57|Frame123|(^|\/)10-3(\/|$)/.test(f));
+    const brokenPreviewImports: string[] = [];
+    for (const f of (await appSources(r.root, fw)).filter(isPreviewPath)) {
+      for (const m of read(r.root, f).matchAll(/(?:from\s*|import\s+)['"](\.[^'"]+)['"]/g)) {
+        const base = path.resolve(r.root, path.dirname(f), m[1]);
+        if (![base, `${base}.tsx`, `${base}.ts`, `${base}.dart`].some((c) => fsSync.existsSync(c) && fsSync.statSync(c).isFile())) brokenPreviewImports.push(`${f} → ${m[1]}`);
+      }
+    }
     const frameCode = await grepSources(r.root, fw, /283[_:-]?1967|2831967/);
     let routeTable = '';
     let settingsRoute: string | null = null;
@@ -470,6 +481,7 @@ const CHECKS: Record<PassName, CheckFn> = {
       chk('r.route-path', !!settingsRoute, 'stub', "settings' machine route /10-3 becomes a semantic path (/settings)", settingsRoute ? `served at ${settingsRoute}` : `no /settings route (reported renamed=${renamed}); warnings: ${(r.reported?.warnings ?? []).slice(0, 3).join(' | ')}`),
       chk('r.class', machineClass.length === 0, 'stub', 'machine component/class names (IPhone1415Pro57*, Frame123*) are renamed', machineClass.length ? machineClass.slice(0, 6).join(' | ') : 'none left'),
       chk('r.file', machineFiles.length === 0, 'stub', 'machine file/dir names (screen_10_3.dart / IPhone1415Pro57Screen.tsx / app/10-3/) are renamed', machineFiles.length ? machineFiles.join(', ') : 'none left'),
+      chk('r.preview-intact', brokenPreviewImports.length === 0, 'lie', 'verify-harness previews still import the (renamed) screens they mount', brokenPreviewImports.join(' | ') || 'every preview import resolves'),
       chk('r.frame-code', frameCode.length === 0, 'lie', 'the raw frame-code name "283:1967" never becomes an identifier', frameCode.slice(0, 4).join(' | ') || 'none'),
       chk('r.headers-consistent', stale.length === 0, 'lie', 'every `// canonicalId: … route:` header names the route the app actually serves (later passes resolve by it)', stale.slice(0, 6).join(' | ') || 'all headers match'),
       chk('r.syntax', syn.length === 0, 'lie', 'every file the pass wrote parses', syn.join(' | ') || 'ok'),
