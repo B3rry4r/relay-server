@@ -279,6 +279,10 @@ export class AgentTracker extends EventEmitter {
       partKeys.length = 0;
       partKeys.push(...keys);
     }
+    // The CLIs write the transcript line BEFORE firing the hook (e.g. the tool_use
+    // is on disk while the permission prompt shows): catch the transcript up first
+    // so the timeline reads tool.call → permission.request, not the reverse.
+    for (const b of t.transcripts.values()) if (b.sessionId === sid) b.tailer.poll();
     const attribution = verdict === 'detached' ? 'detached' : verdict === 'hook' ? 'hook' : (existing?.attribution ?? 'hook');
     const events = t.timeline.ingest(raws, { idBase, source: 'hook', cli, sessionId: sid, attribution, cwd: typeof payload.cwd === 'string' ? payload.cwd : t.info.cwd, partKeys });
     const s = t.timeline.session(sid);
