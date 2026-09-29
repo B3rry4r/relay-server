@@ -49,7 +49,8 @@ import { verifyFlowWiring } from './flow-wiring';
 import { auditInteractions } from './interaction-audit';
 import { runProductionHygiene } from './production-hygiene';
 import { renameSemantic } from './semantic-rename';
-import { deepenTokensAndCleanup, detectFramework, type Framework } from './token-cleanup';
+import { deepenTokensAndCleanup } from './token-cleanup';
+import { detectFramework, type Framework } from './framework';
 import { ensureProjectGit, snapshotBeforeMutation, rollbackTo, commitCheckpoint } from '../version-control';
 
 // ── Public contract ──────────────────────────────────────────────────────────

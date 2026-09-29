@@ -33,10 +33,13 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import type { AIModel } from '../ai-adapters';
 import { collectWebWidgets, extractWebGroup } from './component-extraction-web';
+import { detectFramework, type Framework } from './framework';
 
 // ── Public contract ──────────────────────────────────────────────────────────
 
-export type Framework = 'flutter' | 'react' | 'next' | 'unknown';
+/** One shared detector (./framework) — never a local copy that can drift. */
+export { detectFramework };
+export type { Framework };
 
 export interface ExtractOptions {
   /** Resolved absolute project root. */
@@ -161,24 +164,6 @@ async function readCanonicalComponents(projectRoot: string): Promise<CanonicalCo
   } catch {
     return [];
   }
-}
-
-// ── Framework detection ──────────────────────────────────────────────────────
-
-export async function detectFramework(projectRoot: string): Promise<Framework> {
-  const has = async (p: string) => {
-    try { await fs.access(path.join(projectRoot, p)); return true; } catch { return false; }
-  };
-  if (await has('pubspec.yaml')) return 'flutter';
-  if (await has('package.json')) {
-    try {
-      const pkg = JSON.parse(await fs.readFile(path.join(projectRoot, 'package.json'), 'utf8'));
-      const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
-      if (deps.next) return 'next';
-      if (deps.react) return 'react';
-    } catch { /* fall through */ }
-  }
-  return 'unknown';
 }
 
 // ── Orchestrator ─────────────────────────────────────────────────────────────

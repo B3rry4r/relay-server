@@ -20,26 +20,18 @@
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import path from 'node:path';
+import { detectWebKindFromPackage, type WebKind } from './framework';
 
 // ── Framework ────────────────────────────────────────────────────────────────
 
-export type WebKind = 'react' | 'next';
+export type { WebKind };
 
 /** `next` is NOT a flavour of `react` for our purposes: App Router has no central
  *  `<Routes>` table — the route IS the directory — so route resolution, dead-route
- *  removal and semantic rename all differ. Detect it distinctly. */
+ *  removal and semantic rename all differ. Detect it distinctly. Delegates to the
+ *  one shared detector (./framework) so no pass can disagree about the framework. */
 export async function detectWebKind(projectRoot: string): Promise<WebKind | null> {
-  const pkgPath = path.join(projectRoot, 'package.json');
-  if (!fsSync.existsSync(pkgPath)) return null;
-  try {
-    const pkg = JSON.parse(await fs.readFile(pkgPath, 'utf-8')) as {
-      dependencies?: Record<string, string>; devDependencies?: Record<string, string>;
-    };
-    const deps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) };
-    if (deps.next) return 'next';
-    if (deps.react) return 'react';
-  } catch { /* unreadable package.json → not a web app we can index */ }
-  return null;
+  return detectWebKindFromPackage(projectRoot);
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────

@@ -45,10 +45,13 @@ import * as path from 'path';
 import type { AIModel } from '../ai-adapters';
 import { deriveSemanticIdentifiers } from '../semantic-names';
 import { renameWeb } from './semantic-rename-web';
+import { detectFramework, type Framework } from './framework';
 
 // ── Public contract ──────────────────────────────────────────────────────────
 
-export type Framework = 'flutter' | 'react' | 'next' | 'unknown';
+/** One shared detector (./framework) — never a local copy that can drift. */
+export { detectFramework };
+export type { Framework };
 
 export interface RenameSemanticOptions {
   /** Resolved absolute project root. */
@@ -151,24 +154,6 @@ async function readCanonical(root: string): Promise<CanonModel | null> {
   } catch {
     return null;
   }
-}
-
-// ── Framework detection (same contract as 7a–7d) ─────────────────────────────
-
-export async function detectFramework(projectRoot: string): Promise<Framework> {
-  const has = async (p: string) => {
-    try { await fs.access(path.join(projectRoot, p)); return true; } catch { return false; }
-  };
-  if (await has('pubspec.yaml')) return 'flutter';
-  if (await has('package.json')) {
-    try {
-      const pkg = JSON.parse(await fs.readFile(path.join(projectRoot, 'package.json'), 'utf8'));
-      const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
-      if (deps.next) return 'next';
-      if (deps.react) return 'react';
-    } catch { /* fall through */ }
-  }
-  return 'unknown';
 }
 
 // ── Per-framework strategy seam ──────────────────────────────────────────────

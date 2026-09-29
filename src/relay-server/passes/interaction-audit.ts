@@ -19,7 +19,7 @@ import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import path from 'node:path';
 
-import { detectFramework, type Framework } from './component-extraction';
+import { detectFramework, type Framework } from './framework';
 import {
   loadWebApp, listSourceFiles, findDeadHandlers, enclosingMentions, readHeader, idCore,
 } from './web-app';

@@ -53,7 +53,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import type { AIModel } from '../ai-adapters';
-import { detectFramework, type Framework } from './component-extraction';
+import { detectFramework, type Framework } from './framework';
 import { deepenWebTokens } from './token-cleanup-web';
 
 export { detectFramework };

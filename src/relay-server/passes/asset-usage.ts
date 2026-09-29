@@ -36,10 +36,13 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import type { AIModel } from '../ai-adapters';
 import { repointWeb, findWebResourcesFile, parseDeclaredWebSymbols, WEB_RESOURCES_SYMBOL } from './asset-usage-web';
+import { detectFramework, type Framework } from './framework';
 
 // ── Public contract ──────────────────────────────────────────────────────────
 
-export type Framework = 'flutter' | 'react' | 'next' | 'unknown';
+/** One shared detector (./framework) — never a local copy that can drift. */
+export { detectFramework };
+export type { Framework };
 
 export interface RepointOptions {
   /** Resolved absolute project root. */
@@ -126,24 +129,6 @@ async function readAssetMap(root: string): Promise<AssetMap | null> {
   } catch {
     return null;
   }
-}
-
-// ── Framework detection (same contract as 7a/7b) ─────────────────────────────
-
-export async function detectFramework(projectRoot: string): Promise<Framework> {
-  const has = async (p: string) => {
-    try { await fs.access(path.join(projectRoot, p)); return true; } catch { return false; }
-  };
-  if (await has('pubspec.yaml')) return 'flutter';
-  if (await has('package.json')) {
-    try {
-      const pkg = JSON.parse(await fs.readFile(path.join(projectRoot, 'package.json'), 'utf8'));
-      const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
-      if (deps.next) return 'next';
-      if (deps.react) return 'react';
-    } catch { /* fall through */ }
-  }
-  return 'unknown';
 }
 
 // ── Per-framework strategy seam ──────────────────────────────────────────────

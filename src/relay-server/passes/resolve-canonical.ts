@@ -54,7 +54,7 @@ import * as fsSync from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import type { AIModel } from '../ai-adapters';
-import { detectFramework, type Framework } from './component-extraction';
+import { detectFramework, type Framework } from './framework';
 import {
   canonicalIdFor,
   modalIdFor,

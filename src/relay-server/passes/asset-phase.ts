@@ -36,7 +36,7 @@ import type { AIModel } from '../ai-adapters';
 import { getFlutterRoot } from '../runtime';
 import { gatherExistingAssets, runAssetPass } from '../reference-render';
 import { repointAssetUsage } from './asset-usage';
-import { detectFramework, type Framework } from './token-cleanup';
+import { detectFramework, type Framework } from './framework';
 import { ensureProjectGit, snapshotBeforeMutation, rollbackTo, commitCheckpoint } from '../version-control';
 
 // ── Public contract ──────────────────────────────────────────────────────────
