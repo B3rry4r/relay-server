@@ -6,6 +6,9 @@
 //  3. The phase-based header reads "Phase 1/7: Assets — naming 197 assets",
 //     NOT "Built 0/20", and falls back to "Building 3/20: <frame>" on build-screens.
 
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { io as createClient, type Socket } from 'socket.io-client';
 import { createRelayServer, FakePty, type RelayServer } from '../src/relay-server';
@@ -39,14 +42,24 @@ describe('T18 — live run events', () => {
   const servers: RelayServer[] = [];
   const clients: Socket[] = [];
 
+  const workspaces: string[] = [];
+
   afterEach(async () => {
     while (clients.length) clients.pop()?.disconnect();
     while (servers.length) await servers.pop()?.stop();
     delete process.env.PORT;
     delete process.env.AUTH_TOKEN;
+    delete process.env.WORKSPACE;
+    while (workspaces.length) await fs.rm(workspaces.pop()!, { recursive: true, force: true });
   });
 
   async function bootClient(): Promise<Socket> {
+    // A throwaway WORKSPACE: relay.start()/stop() restore and persist terminal
+    // sessions + write runtime assets under WORKSPACE, which otherwise defaults to
+    // /workspace — the REAL volume on a relay host.
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'relay-live-events-'));
+    workspaces.push(workspace);
+    process.env.WORKSPACE = workspace;
     process.env.PORT = '0';
     process.env.AUTH_TOKEN = 'test-token';
     const relay = createRelayServer(() => new FakePty());
