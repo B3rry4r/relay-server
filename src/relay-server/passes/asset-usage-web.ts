@@ -130,20 +130,22 @@ export async function repointWeb(
   projectRoot: string,
   assets: WebIndexedAsset[],
   opts: WebRepointOptions,
-): Promise<{ repointed: WebRepoint[]; skipped: WebRepointSkip[]; warnings: string[] }> {
+): Promise<{ repointed: WebRepoint[]; skipped: WebRepointSkip[]; warnings: string[]; filesScanned: number; skippedReason?: string }> {
   const repointed: WebRepoint[] = [];
   const skipped: WebRepointSkip[] = [];
   const warnings: string[] = [];
 
   const resourcesFile = findWebResourcesFile(projectRoot);
   if (!resourcesFile) {
-    warnings.push(`no web resources file (looked for ${WEB_RESOURCES_RELS.join(', ')}) — nothing to re-point onto`);
-    return { repointed, skipped, warnings };
+    const reason = `no web resources file (looked for ${WEB_RESOURCES_RELS.join(', ')}) — nothing to re-point onto`;
+    warnings.push(reason);
+    return { repointed, skipped, warnings, filesScanned: 0, skippedReason: reason };
   }
   const declared = parseDeclaredWebSymbols(await fs.readFile(resourcesFile, 'utf-8'));
   if (declared.size === 0) {
-    warnings.push(`${rel(projectRoot, resourcesFile)} declares no asset symbols`);
-    return { repointed, skipped, warnings };
+    const reason = `${rel(projectRoot, resourcesFile)} declares no asset symbols`;
+    warnings.push(reason);
+    return { repointed, skipped, warnings, filesScanned: 0, skippedReason: reason };
   }
 
   // path → symbol, from the resources file itself (the only source of truth about
@@ -229,7 +231,10 @@ export async function repointWeb(
     }
   }
 
-  return { repointed, skipped, warnings };
+  return {
+    repointed, skipped, warnings, filesScanned: targets.length,
+    ...(targets.length === 0 ? { skippedReason: `no source files to scan under ${rel(projectRoot, srcDir)}/` } : {}),
+  };
 }
 
 const rel = (root: string, p: string): string => path.relative(root, p).split(path.sep).join('/');

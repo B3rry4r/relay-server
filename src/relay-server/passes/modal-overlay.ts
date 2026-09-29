@@ -121,6 +121,8 @@ export interface ModalOverlayResult {
   /** Modals left untouched (orphans / already-overlay / unmapped) with reasons. */
   skipped: ModalOverlaySkip[];
   dryRun: boolean;
+  /** Set when the pass had no input / no support — finalize records `skipped` with it. */
+  skippedReason?: string;
 }
 
 // ── Canonical model (subset we read) ─────────────────────────────────────────
@@ -208,11 +210,15 @@ export async function applyModalOverlays(projectId: string, opts: ModalOverlayOp
   // pass a silent no-op on every AI-canonical run (zero modals examined).
   const allModals = canonical ? collectModals(canonical) : [];
   if (!canonical || allModals.length === 0) {
-    return { framework, transformed: [], skipped: [], dryRun: !!opts.dryRun };
+    return {
+      framework, transformed: [], skipped: [], dryRun: !!opts.dryRun,
+      skippedReason: !canonical ? 'no .uix/canonical.json — no modals to convert' : 'canonical declares no modals',
+    };
   }
   if (!strategy) {
     return {
       framework,
+      skippedReason: `no modal-overlay strategy for framework '${framework}'`,
       transformed: [],
       skipped: allModals.map((m) => ({ canonicalId: m.canonicalId, name: m.name, reason: `no strategy for framework '${framework}'` })),
       dryRun: !!opts.dryRun,

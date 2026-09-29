@@ -171,6 +171,8 @@ export interface FlowWiringResult {
   /** Path the report was written to (null if noReport). */
   reportPath: string | null;
   dryRun: boolean;
+  /** Set when the pass had no input / no support — finalize records `skipped` with it. */
+  skippedReason?: string;
 }
 
 // ── Canonical model (subset we read) ─────────────────────────────────────────
@@ -296,7 +298,10 @@ export async function verifyFlowWiring(projectId: string, opts: FlowWiringOption
   if (!canonical || !canonical.flow || !Array.isArray(canonical.flow.edges)) {
     const report = emptyReport([], 0, 0, 0);
     const reportPath = await maybeWriteReport(projectRoot, report, opts);
-    return { report, autoFixesApplied: 0, reportPath, dryRun: !!opts.dryRun };
+    return {
+      report, autoFixesApplied: 0, reportPath, dryRun: !!opts.dryRun,
+      skippedReason: !canonical ? 'no .uix/canonical.json — no flow to verify' : 'canonical has no flow edges to verify',
+    };
   }
 
   if (!strategy) {
@@ -308,7 +313,7 @@ export async function verifyFlowWiring(projectId: string, opts: FlowWiringOption
     }));
     const report = emptyReport(findings, 0, 0, 0);
     const reportPath = await maybeWriteReport(projectRoot, report, opts);
-    return { report, autoFixesApplied: 0, reportPath, dryRun: !!opts.dryRun };
+    return { report, autoFixesApplied: 0, reportPath, dryRun: !!opts.dryRun, skippedReason: `no flow-wiring strategy for framework '${framework}'` };
   }
 
   let flow = canonical.flow;
@@ -321,7 +326,10 @@ export async function verifyFlowWiring(projectId: string, opts: FlowWiringOption
 
   const report = emptyReport(findings, autoFixes, screensMapped, screensReferenced);
   const reportPath = await maybeWriteReport(projectRoot, report, opts);
-  return { report, autoFixesApplied: autoFixes, reportPath, dryRun: !!opts.dryRun };
+  return {
+    report, autoFixesApplied: autoFixes, reportPath, dryRun: !!opts.dryRun,
+    ...(flow.edges.length === 0 ? { skippedReason: 'canonical has no flow edges to verify' } : {}),
+  };
 }
 
 function getStrategy(fw: Framework): FlowStrategy | null {

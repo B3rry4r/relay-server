@@ -48,6 +48,10 @@ export interface WebTokenResult {
   removals: { imports: number; consts: number; methods: number };
   changes: WebTokenChange[];
   rejected: WebTokenReject[];
+  /** Source files read. 0 = examined nothing. */
+  filesScanned: number;
+  /** Set when there was no input (no theme module / no sources). */
+  skippedReason?: string;
 }
 
 const THEME_RELS = ['src/theme/theme.ts', 'src/theme/index.ts', 'src/theme.ts'];
@@ -177,11 +181,11 @@ export async function deepenWebTokens(projectRoot: string, opts: WebTokenOptions
     tokensAvailable: { colors: [], spacing: [], radius: [], textStyles: [] },
     substitutions: { colors: 0, textStyles: 0, spacing: 0, radius: 0 },
     removals: { imports: 0, consts: 0, methods: 0 },
-    changes: [], rejected: [],
+    changes: [], rejected: [], filesScanned: 0,
   };
 
   const theme = parseWebTheme(projectRoot);
-  if (!theme) return empty;
+  if (!theme) return { ...empty, skippedReason: `no web theme module with an exported token object (looked for ${THEME_RELS.join(', ')})` };
 
   const result: WebTokenResult = {
     ...empty,
@@ -199,6 +203,8 @@ export async function deepenWebTokens(projectRoot: string, opts: WebTokenOptions
   const files = (await listSourceFiles(srcDir)).filter((f) => f !== theme.themeFile);
   const targets = opts.onlyFiles?.length ? files.filter((f) => opts.onlyFiles!.includes(path.basename(f))) : files;
 
+  result.filesScanned = targets.length;
+  if (targets.length === 0) result.skippedReason = `no source files to scan under ${rel(projectRoot, srcDir)}/`;
   for (const file of targets) {
     const before = await fs.readFile(file, 'utf-8').catch(() => '');
     if (!before) continue;

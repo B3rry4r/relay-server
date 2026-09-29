@@ -38,6 +38,7 @@ import * as fs from 'fs/promises';
 import * as fsSync from 'fs';
 import * as path from 'path';
 import { spawn } from 'child_process';
+import { parseJsonc } from './web-app';
 import type { AIModel } from '../ai-adapters';
 import { getFlutterRoot } from '../runtime';
 import { runModelObserved } from '../ai-observability';
@@ -119,7 +120,12 @@ export interface PassAiProof {
 
 export interface PassReport {
   name: PassName;
+  /** `applied` = the pass examined real input (its counts say how much);
+   *  `skipped` = it had no input or no support for this layout — `reason` says which
+   *  (never `applied` with all-zero counts: that is how a stub launders itself). */
   status: PassStatus;
+  /** Why the pass was skipped. Always present when status === 'skipped'. */
+  reason?: string;
   /** Pass-specific counts (what it changed). */
   counts: Record<string, number>;
   /** Warnings surfaced by the pass (or the orchestrator). */
@@ -146,8 +152,26 @@ export interface FinalizeReport {
   baselineErrors: number | null;
   /** Analyzer ERROR count after the sequence (null when not flutter / skipped). */
   finalErrors: number | null;
+  /** What the build-safety gate could actually run. A gate that could not run says
+   *  so here with a reason — it never reads as a clean typecheck (PG-37). */
+  gate: FinalizeGate;
   /** Path the report was written to (null when noReport / write failed). */
   reportPath: string | null;
+}
+
+export interface GateCheck {
+  status: 'ran' | 'skipped';
+  /** Why the check could not run (status 'skipped'). */
+  reason?: string;
+  /** The tool that ran (e.g. `typescript@5.9.3 (node_modules)`). */
+  tool?: string;
+}
+
+export interface FinalizeGate {
+  /** flutter: `flutter analyze`; web: the project's own `tsc --noEmit`. */
+  typecheck: GateCheck;
+  /** flutter: `flutter build web`; web: `npm run build`. */
+  build: GateCheck;
 }
 
 // ── Pass registry (order is load-bearing) ─────────────────────────────────────
@@ -158,7 +182,16 @@ interface PassDef {
    *  `proof` collector is swapped in per pass to tally AI firing. `ctx` carries
    *  orchestrator capabilities a pass may opt into (e.g. the per-group build guard
    *  for extractComponents — T32). */
-  run: (projectId: string, opts: FinalizeOptions, proof: AiProofCollector, ctx: PassRunCtx) => Promise<{ counts: Record<string, number>; warnings: string[] }>;
+  run: (projectId: string, opts: FinalizeOptions, proof: AiProofCollector, ctx: PassRunCtx) => Promise<PassOutcome>;
+}
+
+/** What a pass adapter hands the orchestrator. `skipped` (a reason) means the pass
+ *  had no input or no support for this layout; counts always include how much input
+ *  the pass examined, so `applied` is never indistinguishable from a no-op stub. */
+interface PassOutcome {
+  counts: Record<string, number>;
+  warnings: string[];
+  skipped?: string;
 }
 
 /** Orchestrator-provided capabilities a pass may use during a real run. */
@@ -232,8 +265,9 @@ const PASSES: PassDef[] = [
         perGroupGuard: ctx.makeExtractGroupGuard() ?? undefined,
       });
       return {
-        counts: { extracted: r.extracted.length, rejected: r.rejected.length },
+        counts: { scanned: r.scanned, extracted: r.extracted.length, rejected: r.rejected.length },
         warnings: r.rejected.map((x) => `rejected ${x.names.join('/')}: ${x.reason}`),
+        skipped: r.skippedReason,
       };
     },
   },
@@ -251,6 +285,7 @@ const PASSES: PassDef[] = [
       return {
         counts: { transformed: r.transformed.length, skipped: r.skipped.length },
         warnings: r.skipped.map((s) => `${s.name}: ${s.reason}`),
+        skipped: r.skippedReason,
       };
     },
   },
@@ -266,8 +301,9 @@ const PASSES: PassDef[] = [
         runModel: passRunModel(opts, proof, 'repointAssetUsage'),
       });
       return {
-        counts: { repointed: r.repointed.length, skipped: r.skipped.length },
+        counts: { filesScanned: r.filesScanned, repointed: r.repointed.length, skipped: r.skipped.length },
         warnings: [...r.warnings, ...r.skipped.map((s) => `${s.file}: ${s.what} — ${s.reason}`)],
+        skipped: r.skippedReason,
       };
     },
   },
@@ -300,6 +336,7 @@ const PASSES: PassDef[] = [
           .filter((f) => f.status === 'wrong-target' || f.status === 'missing' || f.status === 'unmapped'
             || f.status === 'wrong-verb' || f.status === 'tab-as-push' || f.status === 'missing-step-presenter')
           .map((f) => `${f.from}→${f.to} [${f.status}]: ${f.detail}`),
+        skipped: r.skippedReason,
       };
     },
   },
@@ -318,6 +355,7 @@ const PASSES: PassDef[] = [
       return {
         counts: { renamed: s.renamed, skipped: s.skipped, filesTouched: s.filesTouched },
         warnings: r.report.skipped.map((sk) => `${sk.canonicalId}: ${sk.reason}`),
+        skipped: r.skippedReason,
       };
     },
   },
@@ -336,6 +374,7 @@ const PASSES: PassDef[] = [
       const rem = r.report.removals;
       return {
         counts: {
+          filesScanned: r.report.filesScanned ?? 0,
           colors: sub.colors,
           textStyles: sub.textStyles,
           spacing: sub.spacing,
@@ -345,6 +384,7 @@ const PASSES: PassDef[] = [
           removedClasses: rem.methods,
         },
         warnings: r.report.rejected.map((rej) => `${rej.file}: ${rej.kind} ${rej.literal} — ${rej.reason}`),
+        skipped: r.report.skippedReason,
       };
     },
   },
@@ -361,10 +401,11 @@ const PASSES: PassDef[] = [
       });
       const s = r.report.summary;
       return {
-        counts: { total: s.total, high: s.high, med: s.med, screensAffected: s.screensAffected },
+        counts: { filesScanned: s.filesScanned, total: s.total, high: s.high, med: s.med, screensAffected: s.screensAffected },
         warnings: r.report.findings
           .filter((f) => f.severity === 'high')
           .map((f) => `${f.file}:${f.line} — dead ${f.handler} on "${f.element ?? '<unlabelled>'}" (${f.kind})`),
+        skipped: r.skippedReason,
       };
     },
   },
@@ -374,12 +415,14 @@ const PASSES: PassDef[] = [
       const r = await runProductionHygiene({ projectRoot: opts.projectRoot, dryRun: opts.dryRun });
       return {
         counts: {
+          filesScanned: r.filesScanned,
           previewRoutesRemoved: r.previewRoutesRemoved,
           previewFilesRemoved: r.previewFilesRemoved,
           placeholderRemoved: r.placeholderRemoved ? 1 : 0,
           unreferencedAssets: r.unreferencedAssets,
         },
         warnings: r.warnings,
+        skipped: r.skippedReason,
       };
     },
   },
@@ -416,17 +459,48 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
       // broken pass shipped silently, since only a THROWN pass was ever rolled back.
       || (isWeb && fsSync.existsSync(path.join(projectRoot, 'package.json'))));
 
+  // What the gate can actually run. Every check starts `skipped` with the reason it
+  // could not run, and only becomes `ran` once a real checker produced a result — a
+  // checker that is missing is REPORTED, never read as a clean pass (PG-37).
+  const notBuildable = opts.dryRun ? 'dry run — nothing is written, nothing to gate'
+    : opts.skipBuildCheck ? 'skipBuildCheck set by the caller'
+      : isWeb ? 'no package.json — not a buildable web project'
+        : framework === 'flutter' ? 'no lib/ — not a buildable flutter project'
+          : `no build gate for framework '${framework}'`;
+  const gate: FinalizeGate = {
+    typecheck: { status: 'skipped', reason: buildCheckable ? 'not measured yet' : notBuildable },
+    build: { status: 'skipped', reason: buildCheckable ? 'not measured yet' : notBuildable },
+  };
+  const gateHook: GateHook = {
+    typecheck: (c) => { if (gate.typecheck.status !== 'ran') gate.typecheck = c; },
+    build: (c) => { if (gate.build.status !== 'ran') gate.build = c; },
+  };
+
   // Baseline analyze (best-effort). On a non-buildable project this is null and the
   // gate uses thrown-pass detection only.
   let baselineAnalyze: number | null = null;
   let baselineErrors: number | null = null;
+  let baselineBuildBroken = false;
   if (buildCheckable) {
-    const a = await analyzeErrorsFor(framework, projectRoot, opts.env);
+    const a = await analyzeErrorsFor(framework, projectRoot, opts.env, gateHook);
     baselineAnalyze = a?.total ?? null;
     baselineErrors = a?.errors ?? null;
     log(`[finalize] baseline analyze: ${baselineAnalyze ?? 'n/a'} issue(s), ${baselineErrors ?? 'n/a'} error(s)`);
+    if (gate.typecheck.status === 'skipped') {
+      log(`[finalize] WARNING: ${framework} typecheck gate UNAVAILABLE — ${gate.typecheck.reason}. Passes are NOT typechecked; only a build failure or a thrown pass is rolled back.`);
+    }
+    // Baseline build. A build that already fails BEFORE any pass cannot judge a pass:
+    // without this every pass was reverted for a failure none of them caused.
+    const baseBuild = await buildOkFor(framework, projectRoot, opts.env, gateHook);
+    if (baseBuild.ok === false) {
+      baselineBuildBroken = true;
+      gate.build = { status: 'skipped', reason: `the build already fails before any pass — build failures cannot be attributed to a pass: ${(baseBuild.error ?? '').replace(/\s+/g, ' ').slice(-240)}` };
+      log(`[finalize] WARNING: baseline ${framework} build FAILS before any pass — the build gate cannot judge passes (typecheck still gates): ${gate.build.reason}`);
+    } else if (baseBuild.ok === null) {
+      log(`[finalize] WARNING: ${framework} build gate UNAVAILABLE — ${baseBuild.reason}`);
+    }
   } else if (!opts.dryRun) {
-    log(`[finalize] build-check disabled (framework=${framework}, lib/=${fsSync.existsSync(path.join(projectRoot, 'lib'))}) — only a THROWING pass is rolled back`);
+    log(`[finalize] build-check disabled (framework=${framework}: ${notBuildable}) — only a THROWING pass is rolled back`);
   }
 
   // VERSION-CONTROL SNAPSHOTS (RFC §9.3): replace the fragile /tmp byte-snapshots
@@ -482,7 +556,7 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
   for (const def of PASSES) {
     if (refuseNoGit) break;   // T11 #4 — refused above; do not mutate without rollback.
     if (!want(def.name)) {
-      passReports.push({ name: def.name, status: 'skipped', counts: {}, warnings: ['not in onlyPasses'] });
+      passReports.push({ name: def.name, status: 'skipped', reason: 'not in onlyPasses', counts: {}, warnings: ['not in onlyPasses'] });
       log(`[finalize] ${def.name}: skipped (not in onlyPasses)`);
       continue;
     }
@@ -515,25 +589,35 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
           snapshot: () => snapshotBeforeMutation(projectRoot, `${def.name} group (P8 per-group)`, vc),
           restore: (token: string) => rollbackTo(projectRoot, token, vc),
           buildOk: async () => {
-            const a = await analyzeErrorsFor(framework, projectRoot, opts.env);
+            const a = await analyzeErrorsFor(framework, projectRoot, opts.env, gateHook);
             const afterErrors = a?.errors ?? null;
             if (afterErrors != null && budgetAtPassStart != null && afterErrors > budgetAtPassStart) {
               return { ok: false, reason: `analyze errors ${budgetAtPassStart} → ${afterErrors}` };
             }
-            const built = await buildOkFor(framework, projectRoot, opts.env);
-            return built.ok ? { ok: true } : { ok: false, reason: `build failed: ${built.error}` };
+            if (baselineBuildBroken) return { ok: true };
+            const built = await buildOkFor(framework, projectRoot, opts.env, gateHook);
+            return built.ok !== false ? { ok: true } : { ok: false, reason: `build failed: ${built.error}` };
           },
         };
       },
     };
 
+    let skipReason: string | undefined;
     try {
       const out = await def.run(projectId, opts, proof, ctx);
       counts = out.counts;
       warnings = out.warnings;
+      skipReason = out.skipped;
+      // Safety net: a pass that reports nothing it looked at did not "apply" anything.
+      // Recording it `applied` is exactly how six stubs finalized green (PG-01).
+      if (!skipReason && Object.values(counts).every((v) => !v)) {
+        skipReason = 'examined no input — every count is zero (the pass reported nothing it looked at)';
+      }
     } catch (e) {
       threw = e as Error;
     }
+    const okStatus: PassStatus = skipReason ? 'skipped' : 'applied';
+    const okExtra = skipReason ? { reason: skipReason } : {};
     const aiProof: PassAiProof = {
       available: proof.available,
       fired: proof.calls > 0,
@@ -549,8 +633,8 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
         passReports.push({ name: def.name, status: 'reverted', counts: {}, warnings, error: threw.message, aiProof });
         log(`[finalize] ${def.name}: ERROR (dry-run, nothing written): ${threw.message}`);
       } else {
-        passReports.push({ name: def.name, status: 'applied', counts, warnings, aiProof });
-        log(`[finalize] ${def.name}: ${summarizeCounts(counts)} (dry-run)`);
+        passReports.push({ name: def.name, status: okStatus, ...okExtra, counts, warnings, aiProof });
+        log(`[finalize] ${def.name}: ${skipReason ? `skipped — ${skipReason}` : summarizeCounts(counts)} (dry-run)`);
       }
       continue;
     }
@@ -563,13 +647,13 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
     // a pass that introduces a real error or breaks the build is reverted; a pass
     // that only churns cosmetic info/warning lints is allowed (matches asset-phase).
     if (!failure && buildCheckable) {
-      const a = await analyzeErrorsFor(framework, projectRoot, opts.env);
+      const a = await analyzeErrorsFor(framework, projectRoot, opts.env, gateHook);
       const afterErrors = a?.errors ?? null;
       if (afterErrors != null && lastGoodErrors != null && afterErrors > lastGoodErrors) {
         failure = `${framework} typecheck errors regressed (${lastGoodErrors} → ${afterErrors} error(s))`;
       } else {
-        const built = await buildOkFor(framework, projectRoot, opts.env);
-        if (!built.ok) failure = `${framework} build failed: ${built.error}`;
+        const built: BuildOutcome = baselineBuildBroken ? { ok: null, reason: 'baseline build already failing' } : await buildOkFor(framework, projectRoot, opts.env, gateHook);
+        if (built.ok === false) failure = `${framework} build failed: ${built.error}`;
         else {
           // Pass is good: advance the error bar to this pass's error count.
           lastGoodErrors = afterErrors ?? lastGoodErrors;
@@ -578,14 +662,14 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
     }
 
     if (!failure) {
-      passReports.push({ name: def.name, status: 'applied', counts, warnings, aiProof });
-      log(`[finalize] ${def.name}: applied — ${summarizeCounts(counts)}`);
+      passReports.push({ name: def.name, status: okStatus, ...okExtra, counts, warnings, aiProof });
+      log(`[finalize] ${def.name}: ${skipReason ? `skipped — ${skipReason}` : `applied — ${summarizeCounts(counts)}`}`);
       // Commit the applied pass as a durable checkpoint (RFC §9.2). This both
       // records history AND establishes the clean baseline the NEXT pass's
       // snapshotBeforeMutation will return — so a later pass rolls back only its own
       // delta, not earlier applied passes'.
       if (gitReady) {
-        await commitCheckpoint(projectRoot, `${def.name} applied`, summarizeCounts(counts), vc);
+        await commitCheckpoint(projectRoot, `${def.name} ${okStatus}`, skipReason ?? summarizeCounts(counts), vc);
       }
       continue;
     }
@@ -617,7 +701,7 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
   let finalAnalyze: number | null = null;
   let finalErrors: number | null = null;
   if (buildCheckable) {
-    const fa = await analyzeErrorsFor(framework, projectRoot, opts.env);
+    const fa = await analyzeErrorsFor(framework, projectRoot, opts.env, gateHook);
     finalAnalyze = fa?.total ?? null;
     finalErrors = fa?.errors ?? null;
     log(`[finalize] final analyze: ${finalAnalyze ?? 'n/a'} issue(s), ${finalErrors ?? 'n/a'} error(s) (baseline ${baselineAnalyze ?? 'n/a'} issue(s), ${baselineErrors ?? 'n/a'} error(s))`);
@@ -639,6 +723,7 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
     finalAnalyze,
     baselineErrors,
     finalErrors,
+    gate,
     reportPath: null,
   };
 
@@ -681,57 +766,163 @@ function sourceDirsFor(framework: Framework, projectRoot: string): string[] {
 
 // ── Build-safety checks (framework-agnostic seam) ────────────────────────────
 
-/** ERROR count for the framework. Flutter: `flutter analyze`. Web: `tsc --noEmit`
- *  diagnostics. Null when the toolchain is unavailable → the gate degrades to
- *  build-only, never to silently-pass. */
+/** Reports what each gate check could actually run (first real result wins). */
+interface GateHook {
+  typecheck: (c: GateCheck) => void;
+  build: (c: GateCheck) => void;
+}
+
+/** ERROR count for the framework. Flutter: `flutter analyze`. Web: the project's own
+ *  `tsc --noEmit`. Null when the checker is unavailable → the gate degrades to
+ *  build-only and the report says so (gate.typecheck.status 'skipped' + reason);
+ *  it never degrades to a silent pass. */
 async function analyzeErrorsFor(
-  framework: Framework, projectRoot: string, env?: NodeJS.ProcessEnv,
+  framework: Framework, projectRoot: string, env?: NodeJS.ProcessEnv, hook?: GateHook,
 ): Promise<{ total: number; errors: number } | null> {
   if (framework === 'flutter') {
     const a = await flutterAnalyze(projectRoot, env);
+    hook?.typecheck(a ? { status: 'ran', tool: 'flutter analyze' }
+      : { status: 'skipped', reason: flutterBin() ? '`flutter analyze` produced no output' : `flutter SDK not found (${safeFlutterRoot()}/bin/flutter)` });
     return a ? { total: a.total, errors: a.errors } : null;
   }
-  if (framework === 'react' || framework === 'next') return tscErrors(projectRoot, env);
+  if (framework === 'react' || framework === 'next') {
+    const t = await webTypecheck(projectRoot, framework, env);
+    if (t.ok) {
+      hook?.typecheck({ status: 'ran', tool: t.tool });
+      return { total: t.errors, errors: t.errors };
+    }
+    hook?.typecheck({ status: 'skipped', reason: t.reason });
+    return null;
+  }
   return null;
 }
 
+/** Build check. `ok: null` = the build could not be run (reported with `reason`,
+ *  never counted as a pass); `ok: false` = it ran and failed. */
 async function buildOkFor(
-  framework: Framework, projectRoot: string, env?: NodeJS.ProcessEnv,
-): Promise<{ ok: boolean; error?: string }> {
-  if (framework === 'flutter') return flutterBuildWebOk(projectRoot, env);
-  if (framework === 'react' || framework === 'next') return webBuildOk(projectRoot, env);
-  return { ok: true };
+  framework: Framework, projectRoot: string, env?: NodeJS.ProcessEnv, hook?: GateHook,
+): Promise<BuildOutcome> {
+  const r = framework === 'flutter' ? await flutterBuildWebOk(projectRoot, env)
+    : (framework === 'react' || framework === 'next') ? await webBuildOk(projectRoot, env)
+      : { ok: null, reason: `no build check for framework '${framework}'` } as BuildOutcome;
+  hook?.build(r.ok === null ? { status: 'skipped', reason: r.reason } : { status: 'ran', tool: r.tool });
+  return r;
 }
 
-/** `tsc --noEmit` error count. A generated app has a plain tsconfig (no project
- *  references), so this really does typecheck the sources. */
-async function tscErrors(projectRoot: string, env?: NodeJS.ProcessEnv): Promise<{ total: number; errors: number } | null> {
-  if (!fsSync.existsSync(path.join(projectRoot, 'tsconfig.json'))) return null;
-  // runCmd resolves with combined output on a non-zero exit, which is exactly what
-  // tsc does when it finds errors. A spawn failure (no npx) must degrade to null —
-  // returning 0 there would report a clean typecheck that never ran.
-  const raw = await runCmd('npx', ['tsc', '--noEmit', '--pretty', 'false'], projectRoot, env).catch(() => null);
-  if (raw == null) return null;
-  const errors = (raw.match(/^\S.*\berror TS\d+:/gm) ?? []).length;
-  return { total: errors, errors };
+interface BuildOutcome { ok: boolean | null; error?: string; reason?: string; tool?: string }
+
+type TypecheckOutcome =
+  | { ok: true; errors: number; lines: string[]; tool: string }
+  | { ok: false; reason: string };
+
+/** The project's OWN TypeScript compiler, or null. Never `npx tsc`: in a project
+ *  without a local typescript (and a production image with no global tsc) npx
+ *  installs the unrelated `tsc@2` package, which prints a banner, reports zero
+ *  `error TS` lines, and read as a clean typecheck that never ran (PG-37). The
+ *  package name is checked, so a stray `tsc` package in node_modules is refused. */
+export function resolveLocalTypescript(projectRoot: string): { tscJs: string; version: string } | null {
+  const pkgPath = path.join(projectRoot, 'node_modules', 'typescript', 'package.json');
+  try {
+    const pkg = JSON.parse(fsSync.readFileSync(pkgPath, 'utf8')) as { name?: string; version?: string };
+    if (pkg.name !== 'typescript') return null;
+    const tscJs = path.join(projectRoot, 'node_modules', 'typescript', 'bin', 'tsc');
+    return fsSync.existsSync(tscJs) ? { tscJs, version: pkg.version ?? '?' } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The tsconfig(s) to check. A solution-style root (`"files": []` + `references`,
+ *  the Vite react-ts template) typechecks NOTHING with a bare `tsc --noEmit` — exit
+ *  0 over a planted error — so each referenced project is checked instead. */
+export function tscProjectsFor(projectRoot: string): Array<{ config: string; composite: boolean }> {
+  const root = path.join(projectRoot, 'tsconfig.json');
+  const read = (file: string) => {
+    try { return parseJsonc(fsSync.readFileSync(file, 'utf8')) as { files?: unknown[]; include?: unknown[]; references?: Array<{ path?: string }>; compilerOptions?: { composite?: boolean } } | null; } catch { return null; }
+  };
+  const cfg = read(root);
+  if (!cfg) return [{ config: root, composite: false }];
+  const out: Array<{ config: string; composite: boolean }> = [];
+  const solutionOnly = Array.isArray(cfg.files) && cfg.files.length === 0 && !cfg.include;
+  if (!solutionOnly) out.push({ config: root, composite: !!cfg.compilerOptions?.composite });
+  for (const ref of cfg.references ?? []) {
+    if (!ref?.path) continue;
+    let file = path.resolve(projectRoot, ref.path);
+    if (fsSync.existsSync(file) && fsSync.statSync(file).isDirectory()) file = path.join(file, 'tsconfig.json');
+    if (!fsSync.existsSync(file)) continue;
+    out.push({ config: file, composite: !!read(file)?.compilerOptions?.composite });
+  }
+  return out.length ? out : [{ config: root, composite: false }];
+}
+
+/** Parse `tsc --noEmit --pretty false` output. Null when the output is not a real
+ *  typecheck: a non-zero exit with no `error TS` diagnostic is a checker that did not
+ *  run (the tsc@2 banner, a crash, OOM, a missing binary) — never "0 errors". */
+export function parseTscOutput(raw: string, exitCode: number | null): { errors: number; lines: string[] } | null {
+  const lines = raw.split('\n').filter((l) => /\berror TS\d+:/.test(l)).map((l) => l.trim());
+  if (exitCode === 0) return { errors: 0, lines: [] };
+  if (lines.length === 0) return null;
+  return { errors: lines.length, lines };
+}
+
+/** Typecheck a web project with its own compiler across every tsconfig it builds. */
+export async function webTypecheck(projectRoot: string, framework: 'react' | 'next', env?: NodeJS.ProcessEnv): Promise<TypecheckOutcome> {
+  if (!fsSync.existsSync(path.join(projectRoot, 'tsconfig.json'))) {
+    return { ok: false, reason: 'no tsconfig.json — nothing to typecheck' };
+  }
+  const ts = resolveLocalTypescript(projectRoot);
+  if (!ts) {
+    return {
+      ok: false,
+      reason: fsSync.existsSync(path.join(projectRoot, 'node_modules'))
+        ? 'no typescript installed (node_modules/typescript missing) — the web typecheck gate did not run'
+        : 'no typescript installed (node_modules missing — dependencies not installed) — the web typecheck gate did not run',
+    };
+  }
+  // Next 15.5+/16 declares route types (LayoutProps, PageProps) in generated
+  // .next/types; without them a pristine app fails tsc. Generate them first
+  // (best-effort: older Next has no `typegen`, and then there is nothing to generate).
+  if (framework === 'next') {
+    const nextBin = path.join(projectRoot, 'node_modules', 'next', 'dist', 'bin', 'next');
+    if (fsSync.existsSync(nextBin)) await runCmdStatus(process.execPath, [nextBin, 'typegen'], projectRoot, env, 120_000).catch(() => null);
+  }
+  let errors = 0;
+  const all: string[] = [];
+  for (const p of tscProjectsFor(projectRoot)) {
+    const args = [ts.tscJs, '--noEmit', '--pretty', 'false', '-p', p.config];
+    // Never leave a tsconfig.tsbuildinfo behind in the app (Next sets incremental).
+    if (!p.composite) args.push('--incremental', 'false');
+    const r = await runCmdStatus(process.execPath, args, projectRoot, env, 300_000).catch((e: Error) => ({ code: null as number | null, out: String(e?.message ?? e) }));
+    const parsed = parseTscOutput(r.out, r.code);
+    if (!parsed) {
+      const first = r.out.split('\n').map((l) => l.trim()).find(Boolean) ?? '(no output)';
+      return { ok: false, reason: `typescript@${ts.version} on ${path.relative(projectRoot, p.config)} exited ${r.code ?? 'abnormally'} without a single TS diagnostic — not a real typecheck: ${first.slice(0, 200)}` };
+    }
+    errors += parsed.errors;
+    all.push(...parsed.lines);
+  }
+  return { ok: true, errors, lines: all, tool: `typescript@${ts.version} (node_modules)` };
 }
 
 /** The project's real build. `npm run build` when the script exists — the only
  *  check that catches what `tsc --noEmit` cannot (bundler resolution, missing
- *  imports behind path aliases). */
-async function webBuildOk(projectRoot: string, env?: NodeJS.ProcessEnv): Promise<{ ok: boolean; error?: string }> {
+ *  imports behind path aliases). It can only run with dependencies installed; a
+ *  missing node_modules is reported as a build that did NOT run, never as ok. */
+async function webBuildOk(projectRoot: string, env?: NodeJS.ProcessEnv): Promise<BuildOutcome> {
   let hasBuild = false;
   try {
     const pkg = JSON.parse(fsSync.readFileSync(path.join(projectRoot, 'package.json'), 'utf8')) as { scripts?: Record<string, string> };
     hasBuild = !!pkg.scripts?.build;
-  } catch { return { ok: true }; }
-  if (!hasBuild) return { ok: true };
-  if (!fsSync.existsSync(path.join(projectRoot, 'node_modules'))) return { ok: true }; // deps not installed → can't verify, don't block
+  } catch { return { ok: null, reason: 'package.json unreadable — build gate did not run' }; }
+  if (!hasBuild) return { ok: null, reason: 'package.json has no "build" script — build gate did not run' };
+  if (!fsSync.existsSync(path.join(projectRoot, 'node_modules'))) {
+    return { ok: null, reason: 'node_modules missing (dependencies not installed) — `npm run build` cannot run; build gate did not run' };
+  }
   try {
     await runCmd('npm', ['run', 'build'], projectRoot, env, true);
-    return { ok: true };
+    return { ok: true, tool: 'npm run build' };
   } catch (e) {
-    return { ok: false, error: String((e as Error)?.message ?? e).slice(0, 400) };
+    return { ok: false, error: String((e as Error)?.message ?? e).slice(0, 400), tool: 'npm run build' };
   }
 }
 
@@ -762,9 +953,10 @@ async function flutterAnalyzeCount(projectRoot: string, env?: NodeJS.ProcessEnv)
 }
 
 /** Run `flutter build web` and report whether it succeeded. */
-async function flutterBuildWebOk(projectRoot: string, env?: NodeJS.ProcessEnv): Promise<{ ok: boolean; error?: string }> {
+async function flutterBuildWebOk(projectRoot: string, env?: NodeJS.ProcessEnv): Promise<BuildOutcome> {
   const flutter = flutterBin();
-  if (!flutter) return { ok: true }; // can't verify → don't block (analyze already gated).
+  // can't verify → don't block, but REPORT that the build did not run.
+  if (!flutter) return { ok: null, reason: `flutter SDK not found (${safeFlutterRoot()}/bin/flutter) — build gate did not run` };
   // Ensure a web/ dir exists so build web doesn't fail spuriously on a fresh project.
   if (!fsSync.existsSync(path.join(projectRoot, 'web'))) {
     await runCmd(flutter, ['create', '--platforms=web', '.'], projectRoot, env).catch(() => '');
@@ -772,10 +964,14 @@ async function flutterBuildWebOk(projectRoot: string, env?: NodeJS.ProcessEnv): 
   try {
     await runCmd(flutter, ['build', 'web', '-t', 'lib/main.dart'], projectRoot, env, true);
     const ok = fsSync.existsSync(path.join(projectRoot, 'build', 'web', 'index.html'));
-    return ok ? { ok: true } : { ok: false, error: 'no web output produced' };
+    return ok ? { ok: true, tool: 'flutter build web' } : { ok: false, error: 'no web output produced', tool: 'flutter build web' };
   } catch (e) {
-    return { ok: false, error: String((e as Error).message || e).slice(-400) };
+    return { ok: false, error: String((e as Error).message || e).slice(-400), tool: 'flutter build web' };
   }
+}
+
+function safeFlutterRoot(): string {
+  try { return getFlutterRoot(); } catch { return '<flutter root unresolved>'; }
 }
 
 /** Absolute path to the flutter binary, or null if the SDK is not present. */
@@ -805,6 +1001,21 @@ function runCmd(cmd: string, args: string[], cwd: string, env?: NodeJS.ProcessEn
       if (rejectOnNonZero && code !== 0) reject(new Error(out.slice(-400) || `exit ${code}`));
       else resolve(out);
     });
+  });
+}
+
+/** Spawn and resolve `{code, out}` (combined output) whatever the exit status —
+ *  the caller needs the exit code to tell "found errors" from "did not run". */
+function runCmdStatus(cmd: string, args: string[], cwd: string, env?: NodeJS.ProcessEnv, timeoutMs = 0): Promise<{ code: number | null; out: string }> {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, args, { cwd, env: env ?? process.env });
+    let out = '';
+    let timer: NodeJS.Timeout | null = null;
+    if (timeoutMs > 0) timer = setTimeout(() => { out += `\n[timeout after ${timeoutMs}ms]`; p.kill('SIGKILL'); }, timeoutMs);
+    p.stdout.on('data', (d) => (out += d.toString()));
+    p.stderr.on('data', (d) => (out += d.toString()));
+    p.on('error', (e) => { if (timer) clearTimeout(timer); reject(e); });
+    p.on('close', (code) => { if (timer) clearTimeout(timer); resolve({ code, out }); });
   });
 }
 
@@ -914,4 +1125,4 @@ function summarizeCounts(counts: Record<string, number>): string {
 // Test-only surface for source-dir resolution. Exported so the resolution contract
 // can be unit-tested without a live server / Flutter SDK. The build-safe rollback is
 // now git-based (see ../version-control); not part of the runtime API.
-export const __test = { sourceDirsFor };
+export const __test = { sourceDirsFor, webBuildOk, analyzeErrorsFor, buildOkFor };

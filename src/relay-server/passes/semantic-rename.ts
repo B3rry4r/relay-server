@@ -136,6 +136,8 @@ export interface RenameSemanticResult {
   report: RenameSemanticReport;
   reportPath: string | null;
   dryRun: boolean;
+  /** Set when the pass had no input / no support — finalize records `skipped` with it. */
+  skippedReason?: string;
 }
 
 // ── Canonical model (subset we read) ─────────────────────────────────────────
@@ -164,7 +166,7 @@ export interface RenameStrategy {
     projectRoot: string,
     screens: CanonScreen[],
     opts: RenameSemanticOptions,
-  ): Promise<{ renames: ScreenRename[]; skipped: SkippedScreen[]; builtScreens: number; filesTouched: number }>;
+  ): Promise<{ renames: ScreenRename[]; skipped: SkippedScreen[]; builtScreens: number; filesTouched: number; unsupported?: string }>;
 }
 
 // ── Orchestrator ─────────────────────────────────────────────────────────────
@@ -198,7 +200,7 @@ export async function renameSemantic(projectId: string, opts: RenameSemanticOpti
   if (!canonical || !Array.isArray(canonical.screens)) {
     const report = mkReport([], [], 0, 0, 0);
     const reportPath = await maybeWriteReport(projectRoot, report, opts);
-    return { report, reportPath, dryRun: !!opts.dryRun };
+    return { report, reportPath, dryRun: !!opts.dryRun, skippedReason: 'no .uix/canonical.json screens to rename' };
   }
 
   if (!strategy) {
@@ -206,19 +208,22 @@ export async function renameSemantic(projectId: string, opts: RenameSemanticOpti
       canonicalId: s.canonicalId, reason: `no rename strategy for framework '${framework}'`,
     })), 0, 0, 0);
     const reportPath = await maybeWriteReport(projectRoot, report, opts);
-    return { report, reportPath, dryRun: !!opts.dryRun };
+    return { report, reportPath, dryRun: !!opts.dryRun, skippedReason: `no rename strategy for framework '${framework}'` };
   }
 
   let screens = canonical.screens;
   if (opts.only?.length) screens = screens.filter((s) => opts.only!.includes(s.canonicalId));
 
-  const { renames, skipped, builtScreens, filesTouched } = await strategy.rename(projectRoot, screens, opts);
+  const { renames, skipped, builtScreens, filesTouched, unsupported } = await strategy.rename(projectRoot, screens, opts);
   // mappable = renames + skips-that-mapped-but-were-not-renamed-for-non-unmapped-reasons.
   const mappable = renames.length + skipped.filter((s) => !/no built|unmapped/i.test(s.reason)).length;
 
   const report = mkReport(renames, skipped, builtScreens, filesTouched, mappable);
   const reportPath = await maybeWriteReport(projectRoot, report, opts);
-  return { report, reportPath, dryRun: !!opts.dryRun };
+  return {
+    report, reportPath, dryRun: !!opts.dryRun,
+    ...(unsupported ? { skippedReason: unsupported } : screens.length === 0 ? { skippedReason: 'no canonical screens selected to rename' } : {}),
+  };
 }
 
 function getStrategy(fw: Framework): RenameStrategy | null {
@@ -708,6 +713,7 @@ const webStrategy = (framework: Framework): RenameStrategy => ({
       skipped: r.skipped,
       builtScreens: r.builtScreens,
       filesTouched: r.filesTouched,
+      ...(r.unsupported ? { unsupported: r.unsupported } : {}),
     };
   },
 });

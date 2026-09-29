@@ -104,6 +104,10 @@ export interface RepointResult {
   warnings: string[];
   resourcesPath: string | null;
   dryRun: boolean;
+  /** Source files the strategy actually read. 0 means it examined nothing. */
+  filesScanned: number;
+  /** Set when the pass had no input / no support — finalize records `skipped` with it. */
+  skippedReason?: string;
 }
 
 // ── asset-map model ──────────────────────────────────────────────────────────
@@ -145,7 +149,7 @@ export interface AssetUsageStrategy {
     projectRoot: string,
     index: AssetIndex,
     opts: RepointOptions,
-  ): Promise<{ repointed: Repoint[]; skipped: RepointSkip[]; warnings: string[] }>;
+  ): Promise<{ repointed: Repoint[]; skipped: RepointSkip[]; warnings: string[]; filesScanned: number; skippedReason?: string }>;
 }
 
 // ── Orchestrator ─────────────────────────────────────────────────────────────
@@ -161,6 +165,7 @@ export async function repointAssetUsage(projectId: string, opts: RepointOptions)
       framework, repointed: [], skipped: [],
       warnings: ['no .uix/asset-map.json (or empty) — nothing to re-point. Run the Phase-2 asset pass (runAssetPass) first.'],
       resourcesPath: map?.resourcesPath ?? null, dryRun: !!opts.dryRun,
+      filesScanned: 0, skippedReason: 'no .uix/asset-map.json (or it is empty) — nothing to re-point',
     };
   }
   if (!strategy) {
@@ -168,6 +173,7 @@ export async function repointAssetUsage(projectId: string, opts: RepointOptions)
       framework, repointed: [], skipped: [],
       warnings: [`no strategy for framework '${framework}'`],
       resourcesPath: map.resourcesPath ?? null, dryRun: !!opts.dryRun,
+      filesScanned: 0, skippedReason: `no asset re-point strategy for framework '${framework}'`,
     };
   }
 
@@ -180,6 +186,8 @@ export async function repointAssetUsage(projectId: string, opts: RepointOptions)
     warnings: out.warnings,
     resourcesPath: map.resourcesPath ?? null,
     dryRun: !!opts.dryRun,
+    filesScanned: out.filesScanned,
+    ...(out.skippedReason ? { skippedReason: out.skippedReason } : {}),
   };
 }
 
@@ -310,7 +318,7 @@ async function repointFlutter(
   projectRoot: string,
   index: AssetIndex,
   opts: RepointOptions,
-): Promise<{ repointed: Repoint[]; skipped: RepointSkip[]; warnings: string[] }> {
+): Promise<{ repointed: Repoint[]; skipped: RepointSkip[]; warnings: string[]; filesScanned: number; skippedReason?: string }> {
   const repointed: Repoint[] = [];
   const skipped: RepointSkip[] = [];
   const warnings: string[] = [];
@@ -326,8 +334,9 @@ async function repointFlutter(
   const resourcesAbs = path.join(projectRoot, FLUTTER_RESOURCES_REL);
   const resourcesSrc = await readFileOrNull(resourcesAbs);
   if (!resourcesSrc) {
-    warnings.push(`resources file ${FLUTTER_RESOURCES_REL} not found — cannot reference ${FLUTTER_RESOURCES_CLASS} symbols. Run the asset pass first.`);
-    return { repointed, skipped, warnings };
+    const reason = `resources file ${FLUTTER_RESOURCES_REL} not found — cannot reference ${FLUTTER_RESOURCES_CLASS} symbols. Run the asset pass first.`;
+    warnings.push(reason);
+    return { repointed, skipped, warnings, filesScanned: 0, skippedReason: reason };
   }
   const declaredSymbols = parseDeclaredSymbols(resourcesSrc);
 
@@ -420,7 +429,10 @@ async function repointFlutter(
     }
   }
 
-  return { repointed, skipped, warnings };
+  return {
+    repointed, skipped, warnings, filesScanned: files.length,
+    ...(files.length === 0 ? { skippedReason: 'no .dart source files under lib/ to scan' } : {}),
+  };
 }
 
 // ── pubspec / resources introspection ────────────────────────────────────────
@@ -857,6 +869,8 @@ const webStrategy = (framework: Framework): AssetUsageStrategy => ({
       })),
       skipped: r.skipped,
       warnings: r.warnings,
+      filesScanned: r.filesScanned,
+      ...(r.skippedReason ? { skippedReason: r.skippedReason } : {}),
     };
   },
 });

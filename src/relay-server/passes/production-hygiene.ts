@@ -34,6 +34,10 @@ export interface HygieneResult {
   unreferencedAssets: number;
   warnings: string[];
   dryRun: boolean;
+  /** Source files / scaffolding entries examined. 0 = examined nothing. */
+  filesScanned: number;
+  /** Set when the pass had no input / no support — finalize records `skipped` with it. */
+  skippedReason?: string;
 }
 
 export interface HygieneOptions { projectRoot: string; dryRun?: boolean }
@@ -73,9 +77,15 @@ async function hygieneWeb(projectRoot: string, dryRun: boolean): Promise<Hygiene
   const ix = await loadWebApp(projectRoot);
   const result: HygieneResult = {
     framework: 'react', previewRoutesRemoved: 0, previewFilesRemoved: 0,
-    placeholderRemoved: false, unreferencedAssets: 0, warnings, dryRun,
+    placeholderRemoved: false, unreferencedAssets: 0, warnings, dryRun, filesScanned: 0,
   };
-  if (!ix || !ix.routerFile) { warnings.push('no react/next router to clean'); return result; }
+  if (!ix || !ix.routerFile) {
+    warnings.push('no react/next router to clean');
+    result.skippedReason = ix?.kind === 'next'
+      ? 'hygiene strips a react-router App.tsx; Next App Router preview/placeholder pages are not handled yet (PG-25)'
+      : 'no react-router App.tsx to clean';
+    return result;
+  }
 
   // ── App.tsx: strip preview routes, preview imports, PlaceholderScreen ────────
   let app = await fs.readFile(ix.routerFile, 'utf-8');
@@ -104,6 +114,7 @@ async function hygieneWeb(projectRoot: string, dryRun: boolean): Promise<Hygiene
   // Deletion stays scoped to the primary screen root (hygiene's own scope — PG-25);
   // only the read-only reference scan below walks every root.
   const files = await listSourceFiles(ix.srcDir);
+  result.filesScanned = files.length;
   for (const f of files) {
     if (/Preview\.(tsx|jsx)$/.test(f) || /PlaceholderScreen\.(tsx|jsx)$/.test(f)) {
       result.previewFilesRemoved++;
@@ -156,13 +167,16 @@ async function hygieneFlutter(projectRoot: string, dryRun: boolean): Promise<Hyg
   const warnings: string[] = [];
   const result: HygieneResult = {
     framework: 'flutter', previewRoutesRemoved: 0, previewFilesRemoved: 0,
-    placeholderRemoved: false, unreferencedAssets: 0, warnings, dryRun,
+    placeholderRemoved: false, unreferencedAssets: 0, warnings, dryRun, filesScanned: 0,
   };
   const previewDir = path.join(projectRoot, 'lib', '_preview');
   if (fsSync.existsSync(previewDir)) {
     const entries = await fs.readdir(previewDir).catch(() => []);
     result.previewFilesRemoved = entries.length;
+    result.filesScanned = entries.length;
     if (!dryRun) await fs.rm(previewDir, { recursive: true, force: true }).catch(() => {});
+  } else {
+    result.skippedReason = 'no verify scaffolding present (lib/_preview absent) — nothing to strip';
   }
   return result;
 }
@@ -178,6 +192,7 @@ export async function runProductionHygiene(opts: HygieneOptions): Promise<Hygien
   return {
     framework, previewRoutesRemoved: 0, previewFilesRemoved: 0, placeholderRemoved: false,
     unreferencedAssets: 0, warnings: [`no hygiene strategy for framework '${framework}'`], dryRun: !!opts.dryRun,
+    filesScanned: 0, skippedReason: `no hygiene strategy for framework '${framework}'`,
   };
 }
 

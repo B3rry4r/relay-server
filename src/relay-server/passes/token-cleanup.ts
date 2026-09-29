@@ -128,6 +128,10 @@ export interface TokenCleanupReport {
   /** Substitutions considered but REJECTED (and why) — the adversarial trail. */
   rejected: Array<{ file: string; kind: string; literal: string; reason: string }>;
   analyze: { before: number | null; after: number | null; skipped: boolean };
+  /** Source files the strategy read. 0 = examined nothing. */
+  filesScanned?: number;
+  /** Set when the pass had no input / no support — finalize records `skipped` with it. */
+  skippedReason?: string;
 }
 
 export interface TokenCleanupResult {
@@ -198,6 +202,8 @@ export async function deepenTokensAndCleanup(
     changes: [],
     rejected: [],
     analyze: { before: null, after: null, skipped: true },
+    filesScanned: 0,
+    skippedReason: `no token-cleanup strategy for framework '${framework}'`,
   };
 
   if (!strategy) {
@@ -484,6 +490,8 @@ async function runFlutter(projectRoot: string, opts: DeepenTokensOptions): Promi
       changes,
       rejected,
       analyze: { before: analyzeBefore, after: analyzeAfter, skipped: !!opts.skipAnalyze },
+      filesScanned: dartFiles.length,
+      ...(dartFiles.length === 0 ? { skippedReason: 'no .dart files under lib/ to scan' } : {}),
     },
   };
 }
@@ -1111,6 +1119,8 @@ const webStrategy = (framework: Framework): DeepenStrategy => ({
         // The finalize orchestrator owns the typecheck gate for web; this pass does
         // not shell out a second time.
         analyze: { before: null, after: null, skipped: true },
+        filesScanned: r.filesScanned,
+        ...(r.skippedReason ? { skippedReason: r.skippedReason } : {}),
       },
     };
   },

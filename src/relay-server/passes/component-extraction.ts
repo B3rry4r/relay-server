@@ -118,6 +118,10 @@ export interface ExtractResult {
   rejected: Array<{ names: string[]; reason: string }>;
   componentsDir: string;
   dryRun: boolean;
+  /** Local component/widget declarations collected and compared. 0 = examined nothing. */
+  scanned: number;
+  /** Set when the pass had no input / no support — finalize records `skipped` with it. */
+  skippedReason?: string;
 }
 
 // ── Per-framework strategy seam ──────────────────────────────────────────────
@@ -174,10 +178,20 @@ export async function extractComponents(projectId: string, opts: ExtractOptions)
   const framework = await detectFramework(projectRoot);
   const strategy = getStrategy(framework);
   if (!strategy) {
-    return { framework, extracted: [], rejected: [], componentsDir: '', dryRun: !!opts.dryRun };
+    return {
+      framework, extracted: [], rejected: [], componentsDir: '', dryRun: !!opts.dryRun,
+      scanned: 0, skippedReason: `no component-extraction strategy for framework '${framework}'`,
+    };
   }
 
   const units = await strategy.collectWidgets(projectRoot, opts.onlyFiles);
+  if (units.length === 0) {
+    return {
+      framework, extracted: [], rejected: [], componentsDir: path.join(projectRoot, strategy.componentsDirName),
+      dryRun: !!opts.dryRun, scanned: 0,
+      skippedReason: `no local component declarations found to compare (the ${framework} strategy collected 0 candidates)`,
+    };
+  }
 
   // Group by exact normalized structural signature. Cross-file, name-agnostic.
   const bySig = new Map<string, WidgetUnit[]>();
@@ -260,6 +274,7 @@ export async function extractComponents(projectId: string, opts: ExtractOptions)
     rejected,
     componentsDir: path.join(projectRoot, strategy.componentsDirName),
     dryRun: !!opts.dryRun,
+    scanned: units.length,
   };
 }
 

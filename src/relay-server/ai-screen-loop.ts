@@ -2617,7 +2617,12 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
           reportFinalErrors = report.finalErrors;
           const applied = report.passes.filter(p => p.status === 'applied').length;
           const reverted = report.passes.filter(p => p.status === 'reverted').length;
-          await appendRunLog(projectId, runId, `[finalize] complete — ${applied} applied, ${reverted} reverted (analyze ${report.baselineAnalyze ?? 'n/a'} → ${report.finalAnalyze ?? 'n/a'})`);
+          const skippedPasses = report.passes.filter(p => p.status === 'skipped');
+          await appendRunLog(projectId, runId, `[finalize] complete — ${applied} applied, ${skippedPasses.length} skipped, ${reverted} reverted (analyze ${report.baselineAnalyze ?? 'n/a'} → ${report.finalAnalyze ?? 'n/a'})`);
+          for (const p of skippedPasses) await appendRunLog(projectId, runId, `[finalize]   ${p.name}: skipped — ${p.reason ?? 'no reason given'}`);
+          if (report.gate.typecheck.status === 'skipped' || report.gate.build.status === 'skipped') {
+            await appendRunLog(projectId, runId, `[finalize] WARNING: build gate incomplete — typecheck ${report.gate.typecheck.status}${report.gate.typecheck.reason ? ` (${report.gate.typecheck.reason})` : ''}; build ${report.gate.build.status}${report.gate.build.reason ? ` (${report.gate.build.reason})` : ''}`);
+          }
           // RFC §9.2 — checkpoint after finalize (the production passes are already
           // per-pass committed inside finalizeApp; this captures any net residue).
           await runCheckpoint(projectId, runId, projectRoot, 'phase finalize', `${applied} applied, ${reverted} reverted`);
@@ -3582,6 +3587,12 @@ export function registerScreenLoopRoutes(app: Express): void {
       const skippedPasses = report.passes.filter(p => p.status === 'skipped').length;
       await appendRunLog(projectId, runId,
         `[finalize] complete — ${applied} applied, ${skippedPasses} skipped, ${reverted} reverted (analyze ${report.baselineAnalyze ?? 'n/a'} → ${report.finalAnalyze ?? 'n/a'})`);
+      for (const p of report.passes.filter(x => x.status === 'skipped')) {
+        await appendRunLog(projectId, runId, `[finalize]   ${p.name}: skipped — ${p.reason ?? 'no reason given'}`);
+      }
+      if (!dryRun && (report.gate.typecheck.status === 'skipped' || report.gate.build.status === 'skipped')) {
+        await appendRunLog(projectId, runId, `[finalize] WARNING: build gate incomplete — typecheck ${report.gate.typecheck.status}${report.gate.typecheck.reason ? ` (${report.gate.typecheck.reason})` : ''}; build ${report.gate.build.status}${report.gate.build.reason ? ` (${report.gate.build.reason})` : ''}`);
+      }
 
       if (!dryRun) {
         await runCheckpoint(projectId, runId, projectRoot, 'phase finalize (standalone)', `${applied} applied, ${reverted} reverted`);

@@ -43,18 +43,23 @@ export async function renameWeb(
   projectRoot: string,
   screens: WebRenameCanonScreen[],
   opts: WebRenameOptions,
-): Promise<{ renames: WebRename[]; skipped: WebRenameSkip[]; builtScreens: number; filesTouched: number }> {
+): Promise<{ renames: WebRename[]; skipped: WebRenameSkip[]; builtScreens: number; filesTouched: number; unsupported?: string }> {
   const renames: WebRename[] = [];
   const skipped: WebRenameSkip[] = [];
 
   const ix = await loadWebApp(projectRoot);
   if (!ix) {
     for (const s of screens) skipped.push({ canonicalId: s.canonicalId, reason: 'no react/next app index' });
-    return { renames, skipped, builtScreens: 0, filesTouched: 0 };
+    return { renames, skipped, builtScreens: 0, filesTouched: 0, unsupported: 'no react/next app index (package.json declares neither)' };
   }
   if (!ix.routesFile) {
     for (const s of screens) skipped.push({ canonicalId: s.canonicalId, reason: 'no route table (src/router/routes.ts) to rewrite' });
-    return { renames, skipped, builtScreens: 0, filesTouched: 0 };
+    return {
+      renames, skipped, builtScreens: 0, filesTouched: 0,
+      unsupported: ix.kind === 'next'
+        ? 'semantic rename of Next App Router route directories is not implemented (it rewrites a react-router ROUTES table; Next has none — PG-20)'
+        : 'no route table (src/router/routes.ts) to rewrite',
+    };
   }
 
   const targets = opts.only?.length ? screens.filter((s) => opts.only!.includes(s.canonicalId)) : screens;

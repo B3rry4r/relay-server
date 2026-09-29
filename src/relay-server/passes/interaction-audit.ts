@@ -43,7 +43,7 @@ export interface InteractionAuditReport {
   projectId: string;
   framework: Framework;
   generatedAt: string;
-  summary: { total: number; high: number; med: number; screensAffected: number };
+  summary: { total: number; high: number; med: number; screensAffected: number; filesScanned: number };
   findings: InteractionFinding[];
 }
 
@@ -58,7 +58,11 @@ export interface InteractionAuditOptions {
 export interface InteractionAuditResult {
   report: InteractionAuditReport;
   reportPath: string | null;
+  /** Set when the audit read no source at all — finalize records `skipped` with it. */
+  skippedReason?: string;
 }
+
+interface AuditScan { findings: InteractionFinding[]; filesScanned: number; skippedReason?: string }
 
 // The visible-label extractor: the text a user reads on the control. `>Resolve<`,
 // `label="Filter"`, `aria-label="Close"`, or a nearby JSX text node.
@@ -76,10 +80,10 @@ const lineOf = (src: string, pos: number): number => src.slice(0, pos).split('\n
 
 // ── Web ──────────────────────────────────────────────────────────────────────
 
-async function auditWeb(projectRoot: string, opts: InteractionAuditOptions): Promise<InteractionFinding[]> {
+async function auditWeb(projectRoot: string, opts: InteractionAuditOptions): Promise<AuditScan> {
   const ix = await loadWebApp(projectRoot);
   const srcDir = path.join(projectRoot, 'src');
-  if (!fsSync.existsSync(srcDir)) return [];
+  if (!fsSync.existsSync(srcDir)) return { findings: [], filesScanned: 0, skippedReason: 'no src/ directory to audit' };
 
   // folder of each screen's *Screen file → its canonicalId, so a dead handler in a
   // sibling panel (DisputeDetailPanel.tsx) maps to the Disputes screen.
@@ -122,16 +126,16 @@ async function auditWeb(projectRoot: string, opts: InteractionAuditOptions): Pro
       });
     }
   }
-  return findings;
+  return { findings, filesScanned: targets.length, ...(targets.length === 0 ? { skippedReason: 'no source files under src/ to audit' } : {}) };
 }
 
 // ── Flutter ──────────────────────────────────────────────────────────────────
 
 const DART_DEAD = /\b(onTap|onPressed|onChanged|onSubmitted)\s*:\s*(null|\(\s*\)\s*(?:=>\s*null|\{\s*(?:\/\/[^\n]*\s*)*\}))/g;
 
-async function auditFlutter(projectRoot: string, opts: InteractionAuditOptions): Promise<InteractionFinding[]> {
+async function auditFlutter(projectRoot: string, opts: InteractionAuditOptions): Promise<AuditScan> {
   const screensDir = path.join(projectRoot, 'lib', 'screens');
-  if (!fsSync.existsSync(screensDir)) return [];
+  if (!fsSync.existsSync(screensDir)) return { findings: [], filesScanned: 0, skippedReason: 'no lib/screens/ directory to audit' };
   const files = (await listSourceFiles(screensDir)).filter((f) => f.endsWith('.dart') && !/_preview\.dart$/.test(f));
   const targets = opts.onlyFiles?.length ? files.filter((f) => opts.onlyFiles!.includes(path.basename(f))) : files;
 
@@ -157,18 +161,22 @@ async function auditFlutter(projectRoot: string, opts: InteractionAuditOptions):
       });
     }
   }
-  return findings;
+  return {
+    findings, filesScanned: targets.length,
+    ...(targets.length === 0 ? { skippedReason: 'no .dart screen files were read under lib/screens/ (0 files matched)' } : {}),
+  };
 }
 
 // ── Orchestrator ─────────────────────────────────────────────────────────────
 
 export async function auditInteractions(projectId: string, opts: InteractionAuditOptions): Promise<InteractionAuditResult> {
   const framework = await detectFramework(opts.projectRoot);
-  const findings = framework === 'flutter'
+  const scan: AuditScan = framework === 'flutter'
     ? await auditFlutter(opts.projectRoot, opts)
     : (framework === 'react' || framework === 'next')
       ? await auditWeb(opts.projectRoot, opts)
-      : [];
+      : { findings: [], filesScanned: 0, skippedReason: `no interaction-audit strategy for framework '${framework}'` };
+  const findings = scan.findings;
 
   const high = findings.filter((f) => f.severity === 'high').length;
   const report: InteractionAuditReport = {
@@ -181,6 +189,7 @@ export async function auditInteractions(projectId: string, opts: InteractionAudi
       high,
       med: findings.length - high,
       screensAffected: new Set(findings.map((f) => f.screenCanonicalId).filter(Boolean)).size,
+      filesScanned: scan.filesScanned,
     },
     findings,
   };
@@ -194,7 +203,7 @@ export async function auditInteractions(projectId: string, opts: InteractionAudi
       reportPath = abs;
     } catch { /* best-effort */ }
   }
-  return { report, reportPath };
+  return { report, reportPath, ...(scan.skippedReason ? { skippedReason: scan.skippedReason } : {}) };
 }
 
 const rel = (root: string, p: string): string => path.relative(root, p).split(path.sep).join('/');

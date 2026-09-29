@@ -59,7 +59,7 @@ export interface FileDiff {
 export interface Cell {
   pass: string;
   framework: Fw;
-  reported: { status: string; counts: Record<string, number>; warnings: string[]; error?: string } | null;
+  reported: { status: string; reason?: string; counts: Record<string, number>; warnings: string[]; error?: string } | null;
   files: FileDiff[];
   checks: Check[];
   cell_status: CellStatus;
@@ -205,7 +205,9 @@ function chk(id: string, ok: boolean, cls: FailClass, what: string, evidence: st
 
 function classify(reported: Cell['reported'], checks: Check[]): CellStatus {
   if (reported?.status === 'reverted') return 'ERROR';
-  if (reported?.status === 'skipped' && checks.every((c) => c.ok || c.cls === 'stub')) return 'SKIPPED_WITH_REASON';
+  // `skipped` only earns SKIPPED_WITH_REASON when it carries the reason (PG-01) and
+  // nothing it left behind is a lie.
+  if (reported?.status === 'skipped' && !!reported.reason?.trim() && checks.every((c) => c.ok || c.cls === 'stub')) return 'SKIPPED_WITH_REASON';
   const failed = checks.filter((c) => !c.ok);
   if (!failed.length) return 'IMPLEMENTED';
   if (failed.some((c) => c.cls === 'error')) return 'ERROR';
@@ -268,7 +270,7 @@ async function runOnePass(fw: Fw, pass: PassName, mutate?: (root: string) => Pro
   const p = report.passes.find((x) => x.name === pass) ?? null;
   return {
     root, projectId, logs, mutate,
-    reported: p ? { status: p.status, counts: p.counts, warnings: p.warnings, ...(p.error ? { error: p.error } : {}) } : null,
+    reported: p ? { status: p.status, ...(p.reason ? { reason: p.reason } : {}), counts: p.counts, warnings: p.warnings, ...(p.error ? { error: p.error } : {}) } : null,
     files: diffSnaps(before, after),
   };
 }
@@ -960,10 +962,13 @@ async function phaseFinalizeTwice(): Promise<Cell[]> {
       if (g && g.status !== f.status) flowDelta.push(`${f.from}→${f.to}: ${f.status} → ${g.status} (${g.detail.slice(0, 120)})`);
     }
     const zeroApplied = r1.passes.filter((p) => p.status === 'applied' && Object.values(p.counts).every((v) => !v)).map((p) => p.name);
+    const reasonless = r1.passes.filter((p) => p.status === 'skipped' && !p.reason?.trim()).map((p) => p.name);
+    const skippedWithReason = r1.passes.filter((p) => p.status === 'skipped' && p.reason).map((p) => `${p.name}: ${p.reason}`);
     const checks = [
       chk('fz.idempotent-files', d2.length === 0, 'lie', 'finalize run 2 changes no source file', d2.map((d) => `${d.change}:${d.file}`).slice(0, 10).join(', ') || 'no changes'),
       chk('fz.idempotent-verdicts', flowDelta.length === 0, 'lie', 'finalize run 2 grades every flow edge the same as run 1', flowDelta.join(' | ') || 'identical'),
       chk('fz.no-zero-applied', zeroApplied.length === 0, 'lie', "no pass is recorded `applied` with all-zero counts (a stub or a no-input run must say `skipped` + reason)", zeroApplied.join(', ') || 'none'),
+      chk('fz.skip-reasons', reasonless.length === 0, 'lie', 'every `skipped` pass carries its reason', reasonless.join(', ') || skippedWithReason.join(' | ') || 'no pass skipped'),
     ];
     const summary = (r: typeof r1) => r.passes.map((p) => `${p.name}:${p.status}`).join(', ');
     cells.push({
