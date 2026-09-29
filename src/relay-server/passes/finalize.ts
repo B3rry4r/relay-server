@@ -437,6 +437,8 @@ const PASSES: PassDef[] = [
           previewRoutesRemoved: r.previewRoutesRemoved,
           previewFilesRemoved: r.previewFilesRemoved,
           placeholderRemoved: r.placeholderRemoved ? 1 : 0,
+          stubComponentsRemoved: r.stubComponentsRemoved,
+          commentsStripped: r.commentsStripped,
           unreferencedAssets: r.unreferencedAssets,
         },
         warnings: r.warnings,

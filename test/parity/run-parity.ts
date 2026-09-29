@@ -1249,6 +1249,94 @@ async function phaseFinalizeTwice(): Promise<Cell[]> {
   return cells;
 }
 
+// ── readability (lane B78) ──────────────────────────────────────────────────
+
+/** Where each framework keeps shared components (CONTRACTS §5). */
+const COMPONENTS_DIR: Record<Fw, string> = { flutter: 'lib/components', react: 'src/components', next: 'components' };
+
+/** 7h readability hygiene (F1 + F6): a skeleton stub component nothing imports is
+ *  deleted, one something imports is kept; Figma/IR provenance leaves every comment
+ *  while the behaviour text, the canonicalId header and string literals stay. */
+async function phaseReadabilityHygiene(): Promise<Cell[]> {
+  const { finalizeApp } = await import('../../src/relay-server/passes/finalize');
+  const cells: Cell[] = [];
+  const LEAK = /IR "Rectangle 24"|frame 61|Frame 83|m_313_9543|added by \/login|27×27/;
+  for (const fw of FRAMEWORKS) {
+    const { projectId, root } = await copyFixture(fw, 'readability-hygiene');
+    const s = SCREEN[fw];
+    const dir = COMPONENTS_DIR[fw];
+    const login = read(root, s.login);
+    const header = login.split('\n')[0];
+    const provenance = [
+      '// Login form (IR "Rectangle 24", frame 61) — submits the credentials.',
+      '// Frame 83 shows the biometric shortcut.',
+      '// Loading sheet (modal m_313_9543) that resolves into the dashboard',
+      '// (added by /login). Dots are 27×27 each.',
+    ].join('\n');
+    const literal = fw === 'flutter' ? `\nconst kProvenanceLiteral = 'frame 61 (IR "Rectangle 24")';\n` : `\nexport const PROVENANCE_LITERAL = 'frame 61 (IR "Rectangle 24")';\n`;
+    const lines = login.split('\n');
+    // after the header (and after 'use client' on next, which must stay first-statement)
+    const at = lines.findIndex((l, i) => i > 0 && !/^\/\/|^'use client'/.test(l));
+    lines.splice(at, 0, provenance);
+    await fs.writeFile(path.join(root, s.login), lines.join('\n') + (fw === 'next' ? '' : literal));
+    if (fw === 'next') await fs.appendFile(path.join(root, 'components/FilterSheet.tsx'), literal);
+    const literalFile = fw === 'next' ? 'components/FilterSheet.tsx' : s.login;
+    let unused: string; let used: string;
+    if (fw === 'flutter') {
+      unused = `${dir}/cmp_other_17.dart`; used = `${dir}/cmp_used_3.dart`;
+      const stub = (c: string) => `// GENERATED SKELETON — shared component stub (write-locked API surface).\nimport 'package:flutter/material.dart';\n\nclass ${c} extends StatelessWidget {\n  const ${c}({super.key});\n  @override\n  Widget build(BuildContext context) => const SizedBox.shrink();\n}\n`;
+      await fs.mkdir(path.join(root, dir), { recursive: true });
+      await fs.writeFile(path.join(root, unused), stub('OtherWidget'));
+      await fs.writeFile(path.join(root, used), stub('UsedWidget'));
+      const home = read(root, s.home);
+      await fs.writeFile(path.join(root, s.home), home.replace(/^(import 'package:flutter\/material\.dart';)$/m, "$1\nimport '../components/cmp_used_3.dart';"));
+    } else {
+      unused = `${dir}/Other.tsx`; used = `${dir}/UsedStub.tsx`;
+      const stub = (c: string) => `// GENERATED SKELETON — shared component stub (write-locked API surface).\nexport function ${c}() {\n  return null;\n}\n`;
+      await fs.mkdir(path.join(root, dir), { recursive: true });
+      await fs.writeFile(path.join(root, unused), stub('Other'));
+      await fs.writeFile(path.join(root, used), stub('UsedStub'));
+      const homeRel = s.home;
+      const spec = fw === 'react' ? '../../components/UsedStub' : '@/components/UsedStub';
+      const home = read(root, homeRel);
+      const lines2 = home.split('\n');
+      const lastImport = lines2.reduce((acc, l, i) => (/^import\s/.test(l) ? i : acc), 0);
+      lines2.splice(lastImport + 1, 0, `import { UsedStub } from '${spec}';`, 'void UsedStub;');
+      await fs.writeFile(path.join(root, homeRel), lines2.join('\n'));
+    }
+    const before = await snapshot(root);
+    const r1 = await finalizeApp(projectId, { projectRoot: root, onlyPasses: ['productionHygiene'], skipBuildCheck: true, noReport: true });
+    const mid = await snapshot(root);
+    const r2 = await finalizeApp(projectId, { projectRoot: root, onlyPasses: ['productionHygiene'], skipBuildCheck: true, noReport: true });
+    const after = await snapshot(root);
+    const files = diffSnaps(before, mid);
+    const p = r1.passes.find((x) => x.name === 'productionHygiene');
+    const leftLogin = read(root, s.login);
+    const commentLeaks = (await appSources(root, fw)).flatMap((f) => read(root, f).split('\n').map((l, i) => ({ f, i, l })))
+      .filter(({ l }) => /^\s*\/\//.test(l) && LEAK.test(l)).map(({ f, i, l }) => `${f}:${i + 1}: ${l.trim()}`);
+    const syn = fw === 'flutter' ? [] : syntaxErrorsIn(root, files);
+    const d2 = diffSnaps(mid, after);
+    const checks = [
+      chk('rh.stub-removed', !exists(root, unused), 'stub', `the stub component nothing imports (${unused}) is deleted`, exists(root, unused) ? 'still present' : 'deleted'),
+      chk('rh.stub-kept', exists(root, used), 'lie', `a stub something still imports (${used}) is kept (deleting it would break the build)`, exists(root, used) ? 'kept' : 'DELETED'),
+      chk('rh.leak-stripped', commentLeaks.length === 0, 'stub', 'no comment carries Figma/IR provenance (frame numbers, IR layer names, node/modal ids, "added by /route", design pixel sizes)', commentLeaks.join(' | ') || 'none'),
+      chk('rh.behaviour-kept', /Login form/.test(leftLogin) && /submits the credentials/.test(leftLogin) && /Loading sheet/.test(leftLogin) && /resolves into the dashboard/.test(leftLogin), 'lie', 'the behavioural text of a stripped comment survives', leftLogin.split('\n').filter((l) => /Login form|Loading sheet|resolves into|Dots are/.test(l)).join(' | ') || 'behaviour text gone'),
+      chk('rh.header', leftLogin.split('\n')[0] === header, 'lie', 'the `// canonicalId:` header line is untouched', leftLogin.split('\n')[0]),
+      chk('rh.string-untouched', read(root, literalFile).includes(`'frame 61 (IR "Rectangle 24")'`), 'lie', 'a string literal that happens to contain provenance words is never edited (comments only)', read(root, literalFile).split('\n').find((l) => /frame 61/.test(l)) ?? 'literal gone'),
+      chk('rh.counts', (p?.counts?.stubComponentsRemoved ?? -1) === 1 && (p?.counts?.commentsStripped ?? 0) >= 1, 'lie', 'the report counts exactly the one removed stub and the stripped comment(s)', JSON.stringify(p?.counts ?? {})),
+      chk('rh.syntax', syn.length === 0, 'lie', 'every file the pass rewrote parses', syn.join(' | ') || 'ok'),
+      chk('rh.idempotent', d2.length === 0, 'lie', 'a second run changes nothing', d2.map((d) => `${d.change}:${d.file}`).join(', ') || 'no changes'),
+    ];
+    cells.push({
+      pass: 'readability hygiene: stub components + provenance comments (F1/F6)', framework: fw,
+      reported: p ? { status: p.status, ...(p.reason ? { reason: p.reason } : {}), counts: p.counts, warnings: p.warnings } : null,
+      files, checks, cell_status: classify(p ? { status: p.status, reason: p.reason, counts: p.counts, warnings: p.warnings } : null, checks),
+      notes: [`run 2: ${r2.passes.find((x) => x.name === 'productionHygiene')?.status}`],
+    });
+  }
+  return cells;
+}
+
 // ── toolchain probe (what the passes / gates would spawn) ──────────────────
 
 function probeTools(): Record<string, string> {
@@ -1273,7 +1361,7 @@ function probeTools(): Record<string, string> {
 
 // ── entry ───────────────────────────────────────────────────────────────────
 
-export async function runParity(opts: { log?: (m: string) => void } = {}): Promise<ParityResult> {
+export async function runParity(opts: { log?: (m: string) => void; /** debug: run only the passes/phases whose name contains this */ only?: string } = {}): Promise<ParityResult> {
   const log = opts.log ?? (() => { /* quiet */ });
   await initWorkspace();
   const toolchain = probeTools();
@@ -1292,6 +1380,7 @@ export async function runParity(opts: { log?: (m: string) => void } = {}): Promi
   for (const { fw, suffix, mutate } of runs) {
     for (const passName of PASS_NAMES) {
       const pass = passName;
+      if (opts.only && !pass.includes(opts.only)) continue;
       log(`[parity] ${fw}${suffix} × ${pass}`);
       let r: PassRun;
       try {
@@ -1327,8 +1416,10 @@ export async function runParity(opts: { log?: (m: string) => void } = {}): Promi
     ['standalone-finalize', phaseStandaloneFinalize],
     ['finalize×2', phaseFinalizeTwice],
     ['finalize-dryrun', phaseFinalizeDryRun],
+    ['readability-hygiene', phaseReadabilityHygiene],
   ];
   for (const [name, fn] of phases) {
+    if (opts.only && !name.includes(opts.only)) continue;
     log(`[parity] phase ${name}`);
     try { cells.push(...await fn()); } catch (e) {
       cells.push({ pass: name, framework: 'flutter', reported: null, files: [], checks: [chk('run', false, 'error', `${name} ran`, String((e as Error).stack ?? e))], cell_status: 'ERROR', notes: ['phase harness threw'] });

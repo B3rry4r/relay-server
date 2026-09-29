@@ -18,8 +18,10 @@
  *   - next: the `app/%5Fpreview` (and private `app/_preview`) route dirs, and
  *     header-less pages that only mount `<PlaceholderScreen>` (the route IS the dir);
  *   - flutter: lib/_preview.
- * Every strategy then REPORTS unreferenced asset symbols (resources module / AppAssets),
- * flagging computed-key access.
+ * Every strategy then (readability F1 + F6, source-hygiene.ts) deletes skeleton stub
+ * components that nothing imports and strips Figma/IR provenance from comments
+ * (keeping the `// canonicalId:` header), and REPORTS unreferenced asset symbols
+ * (resources module / AppAssets), flagging computed-key access.
  *
  * Scope is deliberately narrow and reversible-by-regeneration: preview routes,
  * preview imports, preview files, and PlaceholderScreen. It does NOT delete asset
@@ -35,8 +37,9 @@ import path from 'node:path';
 import { detectFramework, type Framework } from './framework';
 import {
   loadWebApp, listSourceFiles, listWebSources, stillReferenced, readHeader, nextAppRoute,
-  isPlaceholderOnlyPage, sourceLinksTo, type WebAppIndex,
+  isPlaceholderOnlyPage, sourceLinksTo, resolveSpecifier, type WebAppIndex,
 } from './web-app';
+import { stripProvenanceInTree, removeStubComponents, dartImportsFile } from './source-hygiene';
 
 export interface HygieneResult {
   framework: Framework;
@@ -46,6 +49,10 @@ export interface HygieneResult {
   unreferencedAssets: number;
   warnings: string[];
   dryRun: boolean;
+  /** Comments whose Figma/IR provenance was stripped (readability F6). */
+  commentsStripped: number;
+  /** Skeleton stub components nothing imported, deleted (readability F1). */
+  stubComponentsRemoved: number;
   /** Source files / scaffolding entries examined. 0 = examined nothing. */
   filesScanned: number;
   /** Set when the pass had no input / no support — finalize records `skipped` with it. */
@@ -90,6 +97,7 @@ async function hygieneWeb(projectRoot: string, dryRun: boolean): Promise<Hygiene
   const result: HygieneResult = {
     framework: 'react', previewRoutesRemoved: 0, previewFilesRemoved: 0,
     placeholderRemoved: false, unreferencedAssets: 0, warnings, dryRun, filesScanned: 0,
+    commentsStripped: 0, stubComponentsRemoved: 0,
   };
   if (ix?.kind === 'next') return hygieneNext(ix, dryRun, result);
   if (!ix || !ix.routerFile) {
@@ -147,10 +155,34 @@ async function hygieneWeb(projectRoot: string, dryRun: boolean): Promise<Hygiene
   // the module under it breaks the build (the gate would revert the whole pass).
   result.previewFilesRemoved += await removeUnusedPlaceholderModule(ix, files, deleted, { [ix.routerFile]: app }, dryRun, warnings);
 
+  // ── Readability: dead stub components + provenance comments (F1, F6) ─────────
+  await webReadabilityHygiene(ix, dryRun, result);
+
   // ── Report (never delete) unreferenced asset symbols ────────────────────────
   result.unreferencedAssets = await countUnreferencedAssets(ix, ix.resourcesFile, warnings);
 
   return result;
+}
+
+/** Web half of the readability hygiene (F1 + F6), shared by react and next: delete
+ *  skeleton stub components that nothing imports, strip Figma/IR provenance from
+ *  every comment of every source root. */
+async function webReadabilityHygiene(ix: WebAppIndex, dryRun: boolean, result: HygieneResult): Promise<void> {
+  const all = await listWebSources(ix);
+  const importsFile = (src: string, fromFile: string, target: string): boolean => {
+    for (const m of src.matchAll(/(?:\bfrom\s*|\bimport\s*\(\s*|^\s*import\s+)['"]([^'"]+)['"]/gm)) {
+      if (resolveSpecifier(fromFile, m[1]) === target) return true;
+    }
+    return false;
+  };
+  const stubs = await removeStubComponents(ix.projectRoot, ix.componentsDir, all, 'ts', importsFile, dryRun);
+  result.stubComponentsRemoved = stubs.removed.length;
+  result.filesScanned += stubs.examined;
+  for (const k of stubs.kept) result.warnings.push(`kept stub component ${k.file}: still imported by ${k.importers.slice(0, 4).join(', ')}`);
+  const live = all.filter((f) => !stubs.removed.includes(path.relative(ix.projectRoot, f).split(path.sep).join('/')));
+  const prov = await stripProvenanceInTree(ix.projectRoot, live, dryRun);
+  result.commentsStripped = prov.commentsStripped;
+  if (!result.filesScanned) result.filesScanned = prov.filesScanned;
 }
 
 /** Next App Router strategy (PG-25). There is no route table: a route IS a directory,
@@ -211,6 +243,7 @@ async function hygieneNext(ix: WebAppIndex, dryRun: boolean, result: HygieneResu
   }
 
   result.previewFilesRemoved += await removeUnusedPlaceholderModule(ix, all, deleted, {}, dryRun, warnings);
+  await webReadabilityHygiene(ix, dryRun, result);
   result.unreferencedAssets = await countUnreferencedAssets(ix, ix.resourcesFile, warnings);
   return result;
 }
@@ -314,6 +347,7 @@ async function hygieneFlutter(projectRoot: string, dryRun: boolean): Promise<Hyg
   const result: HygieneResult = {
     framework: 'flutter', previewRoutesRemoved: 0, previewFilesRemoved: 0,
     placeholderRemoved: false, unreferencedAssets: 0, warnings, dryRun, filesScanned: 0,
+    commentsStripped: 0, stubComponentsRemoved: 0,
   };
   const previewDir = path.join(projectRoot, 'lib', '_preview');
   const hadPreview = fsSync.existsSync(previewDir);
@@ -323,13 +357,27 @@ async function hygieneFlutter(projectRoot: string, dryRun: boolean): Promise<Hyg
     result.filesScanned = entries.length;
     if (!dryRun) await fs.rm(previewDir, { recursive: true, force: true }).catch(() => {});
   }
+  // Readability (F1 + F6): delete skeleton stub components nothing imports, strip
+  // Figma/IR provenance from every comment under lib/.
+  const lib = path.join(projectRoot, 'lib');
+  const dart = fsSync.existsSync(lib)
+    ? (await listAllFiles(lib)).filter((f) => f.endsWith('.dart') && !isInside(path.join(lib, '_preview'), f))
+    : [];
+  const pkg = /^name:\s*([A-Za-z0-9_]+)/m.exec(await fs.readFile(path.join(projectRoot, 'pubspec.yaml'), 'utf8').catch(() => ''))?.[1] ?? null;
+  const stubs = await removeStubComponents(projectRoot, path.join(lib, 'components'), dart, 'dart', dartImportsFile(projectRoot, pkg), dryRun);
+  result.stubComponentsRemoved = stubs.removed.length;
+  for (const k of stubs.kept) warnings.push(`kept stub component ${k.file}: still imported by ${k.importers.slice(0, 4).join(', ')}`);
+  const removedAbs = new Set(stubs.removed.map((r) => path.join(projectRoot, r)));
+  const prov = await stripProvenanceInTree(projectRoot, dart.filter((f) => !removedAbs.has(f)), dryRun);
+  result.commentsStripped = prov.commentsStripped;
+
   // Report (never delete) AppAssets symbols with no static reference (PG-26) — the
   // same review the web strategy gives its resources module.
   const assets = await countUnreferencedDartAssets(projectRoot, warnings);
   result.unreferencedAssets = assets.unreferenced;
-  result.filesScanned += assets.filesScanned;
-  if (!hadPreview && assets.filesScanned === 0) {
-    result.skippedReason = 'no verify scaffolding (lib/_preview absent) and no AppAssets class under lib/ — nothing to strip or review';
+  result.filesScanned += Math.max(assets.filesScanned, prov.filesScanned);
+  if (!hadPreview && result.filesScanned === 0) {
+    result.skippedReason = 'no verify scaffolding (lib/_preview absent) and no Dart source under lib/ — nothing to strip or review';
   }
   return result;
 }
@@ -380,6 +428,7 @@ export async function runProductionHygiene(opts: HygieneOptions): Promise<Hygien
   }
   return {
     framework, previewRoutesRemoved: 0, previewFilesRemoved: 0, placeholderRemoved: false,
+    commentsStripped: 0, stubComponentsRemoved: 0,
     unreferencedAssets: 0, warnings: [`no hygiene strategy for framework '${framework}'`], dryRun: !!opts.dryRun,
     filesScanned: 0, skippedReason: `no hygiene strategy for framework '${framework}'`,
   };

@@ -67,10 +67,13 @@
   "POST /api/ai/runs/:runId/finalize | flutter": "IMPLEMENTED",
   "POST /api/ai/runs/:runId/finalize | react": "IMPLEMENTED",
   "POST /api/ai/runs/:runId/finalize | next": "IMPLEMENTED",
-  "finalize (standalone \u00d72) | flutter": "IMPLEMENTED",
-  "finalize (standalone \u00d72) | react": "IMPLEMENTED",
-  "finalize (standalone \u00d72) | next": "IMPLEMENTED",
+  "finalize (standalone ×2) | flutter": "IMPLEMENTED",
+  "finalize (standalone ×2) | react": "IMPLEMENTED",
+  "finalize (standalone ×2) | next": "IMPLEMENTED",
   "finalize dryRun | flutter": "IMPLEMENTED",
   "finalize dryRun | react": "IMPLEMENTED",
-  "finalize dryRun | next": "IMPLEMENTED"
+  "finalize dryRun | next": "IMPLEMENTED",
+  "readability hygiene: stub components + provenance comments (F1/F6) | flutter": "IMPLEMENTED",
+  "readability hygiene: stub components + provenance comments (F1/F6) | react": "IMPLEMENTED",
+  "readability hygiene: stub components + provenance comments (F1/F6) | next": "IMPLEMENTED"
 }
