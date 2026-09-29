@@ -83,7 +83,17 @@ const lineOf = (src: string, pos: number): number => src.slice(0, pos).split('\n
 async function auditWeb(projectRoot: string, opts: InteractionAuditOptions): Promise<AuditScan> {
   const ix = await loadWebApp(projectRoot);
   const srcDir = path.join(projectRoot, 'src');
-  if (!fsSync.existsSync(srcDir)) return { findings: [], filesScanned: 0, skippedReason: 'no src/ directory to audit' };
+  // This strategy walks <root>/src only. A Next app's pages live under the App
+  // Router dir, which is outside src/ unless the app uses src/app — auditing a
+  // src/ that holds only pipeline modules (src/resources/assets.ts) and calling it
+  // `applied` is how the audit passed on a Next app it never read (B1 verify #1).
+  const outsideSrc = (d: string | null | undefined): boolean => !!d && d !== srcDir && !d.startsWith(srcDir + path.sep);
+  const unreadRouter = ix?.kind === 'next' ? [ix.appDir, ix.pagesDir].find(outsideSrc) ?? null : null;
+  const pagesNotAudited = (): string =>
+    `the web interaction audit walks only src/; this Next app's pages under ${rel(projectRoot, unreadRouter!)}/ were not read — auditing the App Router is not implemented (PG-24)`;
+  if (!fsSync.existsSync(srcDir)) {
+    return { findings: [], filesScanned: 0, skippedReason: unreadRouter ? pagesNotAudited() : 'no src/ directory to audit' };
+  }
 
   // folder of each screen's *Screen file → its canonicalId, so a dead handler in a
   // sibling panel (DisputeDetailPanel.tsx) maps to the Disputes screen.
@@ -104,6 +114,9 @@ async function auditWeb(projectRoot: string, opts: InteractionAuditOptions): Pro
 
   const files = (await listSourceFiles(srcDir)).filter((f) => !/Preview\.(tsx|jsx)$/.test(f));
   const targets = opts.onlyFiles?.length ? files.filter((f) => opts.onlyFiles!.includes(path.basename(f))) : files;
+
+  // No page of the app is among what this walk can read → nothing was audited.
+  if (unreadRouter) return { findings: [], filesScanned: 0, skippedReason: `${pagesNotAudited()} (read ${targets.length} non-page file(s) under src/ instead)` };
 
   const findings: InteractionFinding[] = [];
   for (const file of targets) {
@@ -138,6 +151,16 @@ async function auditFlutter(projectRoot: string, opts: InteractionAuditOptions):
   if (!fsSync.existsSync(screensDir)) return { findings: [], filesScanned: 0, skippedReason: 'no lib/screens/ directory to audit' };
   const files = (await listSourceFiles(screensDir)).filter((f) => f.endsWith('.dart') && !/_preview\.dart$/.test(f));
   const targets = opts.onlyFiles?.length ? files.filter((f) => opts.onlyFiles!.includes(path.basename(f))) : files;
+  // listSourceFiles is the WEB lister (.ts/.tsx/.js/.jsx): it never returns a .dart
+  // file, so `targets` is empty even when lib/screens/ is full of screens. Say what
+  // is unsupported — never that the input is absent (B1 verify #2).
+  const dartOnDisk = targets.length === 0 && !opts.onlyFiles?.length ? countDartFiles(screensDir) : 0;
+  if (dartOnDisk > 0) {
+    return {
+      findings: [], filesScanned: 0,
+      skippedReason: `the flutter audit lists files with the web source lister (.ts/.tsx/.js/.jsx only), so none of the ${dartOnDisk} .dart file(s) under lib/screens/ was read — auditing Dart is not implemented (PG-22)`,
+    };
+  }
 
   const findings: InteractionFinding[] = [];
   for (const file of targets) {
@@ -165,6 +188,21 @@ async function auditFlutter(projectRoot: string, opts: InteractionAuditOptions):
     findings, filesScanned: targets.length,
     ...(targets.length === 0 ? { skippedReason: 'no .dart screen files were read under lib/screens/ (0 files matched)' } : {}),
   };
+}
+
+/** .dart files under a dir (recursive, previews excluded) — only to word a skip. */
+function countDartFiles(dir: string): number {
+  let n = 0;
+  const walk = (d: string): void => {
+    let entries: fsSync.Dirent[] = [];
+    try { entries = fsSync.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.isDirectory()) { if (e.name !== '_preview') walk(path.join(d, e.name)); }
+      else if (e.name.endsWith('.dart') && !e.name.endsWith('_preview.dart')) n++;
+    }
+  };
+  walk(dir);
+  return n;
 }
 
 // ── Orchestrator ─────────────────────────────────────────────────────────────

@@ -31,9 +31,11 @@
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import * as fsSync from 'fs';
 import type { AIModel } from '../ai-adapters';
 import { collectWebWidgets, extractWebGroup } from './component-extraction-web';
 import { detectFramework, type Framework } from './framework';
+import { loadWebApp } from './web-app';
 
 // ── Public contract ──────────────────────────────────────────────────────────
 
@@ -170,6 +172,27 @@ async function readCanonicalComponents(projectRoot: string): Promise<CanonicalCo
   }
 }
 
+/** Why a strategy collected nothing — worded from what is on disk, so a layout the
+ *  strategy cannot read is never reported as an app with nothing to extract (B1
+ *  verify #2: a Next app with locally-declared components under app/ was reported
+ *  "no local component declarations found"). */
+async function emptyCollectionReason(projectRoot: string, framework: string): Promise<string> {
+  if (framework === 'next') {
+    // The web strategy reads <root>/src/screens only (collectWebWidgets); Next pages
+    // are App Router / Pages Router files.
+    const ix = await loadWebApp(projectRoot);
+    const router = ix?.appDir ?? ix?.pagesDir ?? null;
+    const rel = router ? path.relative(projectRoot, router).split(path.sep).join('/') : 'app';
+    return `the web strategy collects local components only from src/screens/; this Next app's pages under ${rel}/ were not read — component extraction for Next pages is not implemented (PG-07)`;
+  }
+  if (framework === 'react') {
+    const screens = path.join(projectRoot, 'src', 'screens');
+    if (!fsSync.existsSync(screens)) return 'no src/screens/ directory — the react strategy reads local components from src/screens/ only; nothing was read';
+    return 'no local (non-exported) component declarations found in src/screens/ — nothing to compare';
+  }
+  return `no local widget declarations found to compare (the ${framework} strategy collected 0 candidates)`;
+}
+
 // ── Orchestrator ─────────────────────────────────────────────────────────────
 
 export async function extractComponents(projectId: string, opts: ExtractOptions): Promise<ExtractResult> {
@@ -189,7 +212,7 @@ export async function extractComponents(projectId: string, opts: ExtractOptions)
     return {
       framework, extracted: [], rejected: [], componentsDir: path.join(projectRoot, strategy.componentsDirName),
       dryRun: !!opts.dryRun, scanned: 0,
-      skippedReason: `no local component declarations found to compare (the ${framework} strategy collected 0 candidates)`,
+      skippedReason: await emptyCollectionReason(projectRoot, framework),
     };
   }
 

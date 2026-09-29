@@ -277,6 +277,19 @@ async function runOnePass(fw: Fw, pass: PassName, mutate?: (root: string) => Pro
 
 type CheckFn = (fw: Fw, r: PassRun) => Promise<Check[]>;
 
+/** A pass whose input (the fixture's screens) EXISTS may skip only by naming what it
+ *  does not support — never by claiming the input is absent ("no local component
+ *  declarations found", "0 files matched"): an operator reading that concludes the
+ *  app has nothing to extract/audit (B1 verify #2). Vacuous unless the pass skipped. */
+export function honestSkipReason(reason: string): boolean {
+  return /not implemented|not supported|unsupported|were not read|was not read|not audited|PG-\d+/i.test(reason);
+}
+function honestSkip(id: string, r: PassRun, inputFact: string): Check {
+  const reason = r.reported?.status === 'skipped' ? r.reported.reason ?? '' : null;
+  return chk(id, reason === null || honestSkipReason(reason), 'lie', `a skip names the unsupported layout/scope instead of claiming absent input (${inputFact})`,
+    reason === null ? 'not skipped' : `reason: ${reason}`);
+}
+
 const flowReport = (root: string): { findings: Array<{ from: string; to: string; status: string; detail: string; autoFixed?: boolean }> } | null => {
   try { return JSON.parse(read(root, '.uix/flow-wiring-report.json')); } catch { return null; }
 };
@@ -320,6 +333,7 @@ const CHECKS: Record<PassName, CheckFn> = {
         : chk('x.near-dup-kept', !pillMerged, 'lie', 'near-duplicate PillButton (differing colour literal) is NOT merged blind', pillMerged ? 'a PillButton component was extracted' : 'PillButton left in place'),
       chk('x.syntax', syn.length === 0, 'lie', 'every file the pass wrote parses', syn.length ? syn.join(' | ') : 'all written TS/TSX files parse'),
       chk('x.deps-carried', depsMissing.length === 0, 'lie', 'a hoisted component carries the imports its body uses (SearchGlyph uses `assets`)', depsMissing.join(' | ') || 'every hoisted component imports what it uses'),
+      honestSkip('x.skip-reason-honest', r, 'SectionHeading is declared locally in two screens'),
     ];
   },
 
@@ -501,6 +515,7 @@ const CHECKS: Record<PassName, CheckFn> = {
     }
     const inPreview = fs_.filter((x) => /preview/i.test(x.file));
     out.push(chk('i.no-preview', inPreview.length === 0, 'lie', 'verify-harness preview files are never audited as shipped UI', inPreview.map((x) => x.file).join(', ') || 'none'));
+    out.push(honestSkip('i.skip-reason-honest', r, 'the screens hold planted dead controls'));
     return out;
   },
 
@@ -939,6 +954,16 @@ async function phaseFinalizeDryRun(): Promise<Cell[]> {
   return cells;
 }
 
+/** Passes that claim `applied` without having examined anything: recorded `applied`
+ *  with every count zero, or `guarded` — the pass returned an all-zero `applied` and
+ *  only finalize's safety net recorded it `skipped`. Exported so the check itself is
+ *  tested (it must be able to fail). */
+export function zeroAppliedViolations(passes: Array<{ name: string; status: string; counts: Record<string, number>; guarded?: boolean }>): string[] {
+  return passes
+    .filter((p) => (p.status === 'applied' && Object.values(p.counts).every((v) => !v)) || (p.status === 'skipped' && p.guarded))
+    .map((p) => (p.guarded ? `${p.name} (all-zero applied, skipped only by the safety net)` : p.name));
+}
+
 /** Full finalize twice (standalone, no agent): run 2 must change nothing, and the
  *  report must not claim `applied` for passes that are stubs. */
 async function phaseFinalizeTwice(): Promise<Cell[]> {
@@ -950,6 +975,7 @@ async function phaseFinalizeTwice(): Promise<Cell[]> {
     const r1 = await finalizeApp(projectId, { projectRoot: root, skipBuildCheck: true });
     const s1 = await snapshot(root);
     const flow1 = flowReport(root);
+    const audit1 = (() => { try { return JSON.parse(read(root, '.uix/interaction-audit-report.json')) as { findings: Array<{ file: string; line: number }> }; } catch { return null; } })();
     const r2 = await finalizeApp(projectId, { projectRoot: root, skipBuildCheck: true });
     const s2 = await snapshot(root);
     const flow2 = flowReport(root);
@@ -961,13 +987,21 @@ async function phaseFinalizeTwice(): Promise<Cell[]> {
       const g = flow2?.findings.find((x) => x.from === f.from && x.to === f.to);
       if (g && g.status !== f.status) flowDelta.push(`${f.from}→${f.to}: ${f.status} → ${g.status} (${g.detail.slice(0, 120)})`);
     }
-    const zeroApplied = r1.passes.filter((p) => p.status === 'applied' && Object.values(p.counts).every((v) => !v)).map((p) => p.name);
+    const zeroApplied = zeroAppliedViolations(r1.passes);
+    // `applied` must be grounded in the pass's OUTPUT, not its counts (a padded count —
+    // filesScanned=1 on src/resources/assets.ts — passes any count-based check): an
+    // applied interaction audit must have found the dead 'Resolve' control planted in
+    // the settings screen (B1 verify #3).
+    const auditApplied = r1.passes.find((p) => p.name === 'auditInteractions')?.status === 'applied';
+    const plantedLine = read(root, SCREEN[fw].settings).split('\n').findIndex((l) => (fw === 'flutter' ? /onPressed:\s*\(\)\s*\{\}.*Resolve/ : /onClick=\{\(\) => \{\}\}.*Resolve/).test(l)) + 1;
+    const auditHit = audit1?.findings.some((f) => f.file === SCREEN[fw].settings && f.line === plantedLine) ?? false;
     const reasonless = r1.passes.filter((p) => p.status === 'skipped' && !p.reason?.trim()).map((p) => p.name);
     const skippedWithReason = r1.passes.filter((p) => p.status === 'skipped' && p.reason).map((p) => `${p.name}: ${p.reason}`);
     const checks = [
       chk('fz.idempotent-files', d2.length === 0, 'lie', 'finalize run 2 changes no source file', d2.map((d) => `${d.change}:${d.file}`).slice(0, 10).join(', ') || 'no changes'),
       chk('fz.idempotent-verdicts', flowDelta.length === 0, 'lie', 'finalize run 2 grades every flow edge the same as run 1', flowDelta.join(' | ') || 'identical'),
-      chk('fz.no-zero-applied', zeroApplied.length === 0, 'lie', "no pass is recorded `applied` with all-zero counts (a stub or a no-input run must say `skipped` + reason)", zeroApplied.join(', ') || 'none'),
+      chk('fz.no-zero-applied', zeroApplied.length === 0, 'lie', "no pass is recorded `applied` with all-zero counts, and no pass leaves it to finalize's safety net to turn its all-zero `applied` into a skip (a stub or a no-input run must say `skipped` + its own reason)", zeroApplied.join(', ') || 'none'),
+      chk('fz.applied-grounded', !auditApplied || auditHit, 'lie', "an `applied` interaction audit's report contains the dead 'Resolve' control planted in the settings screen (applied means it read the screens)", auditApplied ? (auditHit ? `found at ${SCREEN[fw].settings}:${plantedLine}` : `applied, but .uix/interaction-audit-report.json has no finding at ${SCREEN[fw].settings}:${plantedLine} (${audit1?.findings.length ?? 'no'} finding(s))`) : 'auditInteractions not applied'),
       chk('fz.skip-reasons', reasonless.length === 0, 'lie', 'every `skipped` pass carries its reason', reasonless.join(', ') || skippedWithReason.join(' | ') || 'no pass skipped'),
     ];
     const summary = (r: typeof r1) => r.passes.map((p) => `${p.name}:${p.status}`).join(', ');

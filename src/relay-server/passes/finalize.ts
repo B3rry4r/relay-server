@@ -135,6 +135,11 @@ export interface PassReport {
   error?: string;
   /** AI-firing proof for this pass (RFC §0.2). */
   aiProof?: PassAiProof;
+  /** true when the PASS itself claimed `applied` with every count zero and only the
+   *  orchestrator's safety net turned it into `skipped`. A pass must say why it had
+   *  nothing to do; a guarded skip is a pass that would have lied (the parity
+   *  harness's fz.no-zero-applied fails on it). */
+  guarded?: boolean;
 }
 
 export interface FinalizeReport {
@@ -189,10 +194,22 @@ interface PassDef {
 /** What a pass adapter hands the orchestrator. `skipped` (a reason) means the pass
  *  had no input or no support for this layout; counts always include how much input
  *  the pass examined, so `applied` is never indistinguishable from a no-op stub. */
-interface PassOutcome {
+export interface PassOutcome {
   counts: Record<string, number>;
   warnings: string[];
   skipped?: string;
+}
+
+/** Settle a pass outcome into its recorded status. Safety net: a pass that reports
+ *  nothing it looked at did not "apply" anything — recording it `applied` is exactly
+ *  how six stubs finalized green (PG-01). When the net (not the pass) produced the
+ *  skip, `guarded` says so: the pass itself would have claimed `applied`. */
+export function settlePassOutcome(out: PassOutcome): { skipReason: string | undefined; guarded: boolean } {
+  if (out.skipped) return { skipReason: out.skipped, guarded: false };
+  if (Object.values(out.counts).every((v) => !v)) {
+    return { skipReason: 'examined no input — every count is zero (the pass reported nothing it looked at)', guarded: true };
+  }
+  return { skipReason: undefined, guarded: false };
 }
 
 /** Orchestrator-provided capabilities a pass may use during a real run. */
@@ -604,21 +621,17 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
     };
 
     let skipReason: string | undefined;
+    let guarded = false;
     try {
       const out = await def.run(projectId, opts, proof, ctx);
       counts = out.counts;
       warnings = out.warnings;
-      skipReason = out.skipped;
-      // Safety net: a pass that reports nothing it looked at did not "apply" anything.
-      // Recording it `applied` is exactly how six stubs finalized green (PG-01).
-      if (!skipReason && Object.values(counts).every((v) => !v)) {
-        skipReason = 'examined no input — every count is zero (the pass reported nothing it looked at)';
-      }
+      ({ skipReason, guarded } = settlePassOutcome(out));
     } catch (e) {
       threw = e as Error;
     }
     const okStatus: PassStatus = skipReason ? 'skipped' : 'applied';
-    const okExtra = skipReason ? { reason: skipReason } : {};
+    const okExtra = skipReason ? { reason: skipReason, ...(guarded ? { guarded: true } : {}) } : {};
     const aiProof: PassAiProof = {
       available: proof.available,
       fired: proof.calls > 0,

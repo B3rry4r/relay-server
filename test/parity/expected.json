@@ -21,7 +21,7 @@
   "verifyFlowWiring | next": "STUB",
   "renameSemantic | next": "SKIPPED_WITH_REASON",
   "deepenTokensAndCleanup | next": "SKIPPED_WITH_REASON",
-  "auditInteractions | next": "STUB",
+  "auditInteractions | next": "SKIPPED_WITH_REASON",
   "productionHygiene | next": "SKIPPED_WITH_REASON",
   "extractComponents [next variant: app/ only, no src/] | next": "SKIPPED_WITH_REASON",
   "applyModalOverlays [next variant: app/ only, no src/] | next": "STUB",
