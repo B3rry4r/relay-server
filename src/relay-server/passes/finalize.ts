@@ -37,6 +37,7 @@
 import * as fs from 'fs/promises';
 import * as fsSync from 'fs';
 import * as path from 'path';
+import * as os from 'os';
 import { spawn } from 'child_process';
 import { parseJsonc } from './web-app';
 import type { AIModel } from '../ai-adapters';
@@ -958,15 +959,37 @@ async function flutterBuildWebOk(projectRoot: string, env?: NodeJS.ProcessEnv): 
   // can't verify → don't block, but REPORT that the build did not run.
   if (!flutter) return { ok: null, reason: `flutter SDK not found (${safeFlutterRoot()}/bin/flutter) — build gate did not run` };
   // Ensure a web/ dir exists so build web doesn't fail spuriously on a fresh project.
-  if (!fsSync.existsSync(path.join(projectRoot, 'web'))) {
-    await runCmd(flutter, ['create', '--platforms=web', '.'], projectRoot, env).catch(() => '');
-  }
+  await ensureFlutterWebDir(flutter, projectRoot, env);
   try {
     await runCmd(flutter, ['build', 'web', '-t', 'lib/main.dart'], projectRoot, env, true);
     const ok = fsSync.existsSync(path.join(projectRoot, 'build', 'web', 'index.html'));
     return ok ? { ok: true, tool: 'flutter build web' } : { ok: false, error: 'no web output produced', tool: 'flutter build web' };
   } catch (e) {
     return { ok: false, error: String((e as Error).message || e).slice(-400), tool: 'flutter build web' };
+  }
+}
+
+/** Add ONLY `web/` to a project that lacks it. `flutter create --platforms=web .`
+ *  in the project also scaffolds test/widget_test.dart (importing flutter_test and
+ *  a `MyApp` that does not exist), README.md, analysis_options.yaml — 17 analyzer
+ *  errors the typecheck gate then blamed on whichever pass ran next, reverting all
+ *  of them. Scaffold into a temp dir and copy `web/` across instead. */
+async function ensureFlutterWebDir(flutter: string, projectRoot: string, env?: NodeJS.ProcessEnv): Promise<void> {
+  if (fsSync.existsSync(path.join(projectRoot, 'web'))) return;
+  let name = 'app';
+  try {
+    const m = /^name:\s*([a-z_][a-z0-9_]*)\s*$/m.exec(fsSync.readFileSync(path.join(projectRoot, 'pubspec.yaml'), 'utf8'));
+    if (m) name = m[1];
+  } catch { /* default name */ }
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'relay-flutter-web-'));
+  try {
+    const scaffold = path.join(tmp, name);
+    await runCmd(flutter, ['create', '--platforms=web', '--project-name', name, scaffold], tmp, env).catch(() => '');
+    if (fsSync.existsSync(path.join(scaffold, 'web'))) {
+      await fs.cp(path.join(scaffold, 'web'), path.join(projectRoot, 'web'), { recursive: true });
+    }
+  } finally {
+    await fs.rm(tmp, { recursive: true, force: true }).catch(() => {});
   }
 }
 
