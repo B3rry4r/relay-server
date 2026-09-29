@@ -10,7 +10,8 @@
     "build:native": "mkdir -p build && gcc -O2 -Wall -Wextra -o build/pty-bridge native/pty-bridge.c -lutil",
     "start": "npm run build && node dist/src/index.js",
     "mcp": "node mcp-server.mjs",
-    "test": "vitest run --dir test"
+    "test": "vitest run --dir test",
+    "pack:release": "node scripts/pack-release.mjs"
   },
   "license": "Apache-2.0",
   "dependencies": {
