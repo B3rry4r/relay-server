@@ -236,6 +236,19 @@ export async function verifyWeb(
     }
 
     if (!toScreen) {
+      // A canonical screen FROM links to, but no page/route serves it at all (never
+      // built, or its placeholder page was stripped by 7h). Same verdict as a
+      // placeholder target: the user taps and lands nowhere. Grading it `unmapped`
+      // here but `missing` while the placeholder existed flipped the verdict between
+      // two finalize runs.
+      const canonRoute = toCanon?.route ?? null;
+      if (canonRoute && surface.routes.has(canonRoute)) {
+        findings.push({
+          ...base, status: 'missing', toRoute: canonRoute,
+          detail: `HIGH: FROM navigates to ${canonRoute}, but no built screen serves TO ${edge.to} — the screen was never built`,
+        });
+        continue;
+      }
       findings.push({ ...base, detail: `TO ${edge.to} has no built screen file — cannot verify` });
       continue;
     }

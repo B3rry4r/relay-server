@@ -12,6 +12,15 @@
  * preview that screen needs, and finalize strips again. The operation is idempotent —
  * a clean app yields zero removals.
  *
+ * Per framework:
+ *   - react: the `/_preview` `<Route>` lines + `*Preview` modules + src/_preview, and
+ *     `<Route element={<PlaceholderScreen/>}>` lines;
+ *   - next: the `app/%5Fpreview` (and private `app/_preview`) route dirs, and
+ *     header-less pages that only mount `<PlaceholderScreen>` (the route IS the dir);
+ *   - flutter: lib/_preview.
+ * Every strategy then REPORTS unreferenced asset symbols (resources module / AppAssets),
+ * flagging computed-key access.
+ *
  * Scope is deliberately narrow and reversible-by-regeneration: preview routes,
  * preview imports, preview files, and PlaceholderScreen. It does NOT delete asset
  * files — an asset reached only through `assets[computedKey]` looks unreferenced to
@@ -24,7 +33,9 @@ import fsSync from 'node:fs';
 import path from 'node:path';
 
 import { detectFramework, type Framework } from './framework';
-import { loadWebApp, listSourceFiles, listWebSources, stillReferenced, escapeRe, type WebAppIndex } from './web-app';
+import {
+  loadWebApp, listSourceFiles, listWebSources, stillReferenced, escapeRe, readHeader, nextAppRoute, type WebAppIndex,
+} from './web-app';
 
 export interface HygieneResult {
   framework: Framework;
@@ -79,11 +90,10 @@ async function hygieneWeb(projectRoot: string, dryRun: boolean): Promise<Hygiene
     framework: 'react', previewRoutesRemoved: 0, previewFilesRemoved: 0,
     placeholderRemoved: false, unreferencedAssets: 0, warnings, dryRun, filesScanned: 0,
   };
+  if (ix?.kind === 'next') return hygieneNext(ix, dryRun, result);
   if (!ix || !ix.routerFile) {
-    warnings.push('no react/next router to clean');
-    result.skippedReason = ix?.kind === 'next'
-      ? 'hygiene strips a react-router App.tsx; Next App Router preview/placeholder pages are not handled yet (PG-25)'
-      : 'no react-router App.tsx to clean';
+    warnings.push('no react-router App.tsx to clean');
+    result.skippedReason = 'no react-router App.tsx to clean';
     return result;
   }
 
@@ -111,13 +121,13 @@ async function hygieneWeb(projectRoot: string, dryRun: boolean): Promise<Hygiene
   if (app !== before && !dryRun) await fs.writeFile(ix.routerFile, app, 'utf-8');
 
   // ── Delete the preview + placeholder source files ───────────────────────────
-  // Deletion stays scoped to the primary screen root (hygiene's own scope — PG-25);
-  // only the read-only reference scan below walks every root.
   const files = await listSourceFiles(ix.srcDir);
   result.filesScanned = files.length;
+  const deleted = new Set<string>();
   for (const f of files) {
-    if (/Preview\.(tsx|jsx)$/.test(f) || /PlaceholderScreen\.(tsx|jsx)$/.test(f)) {
+    if (/Preview\.(tsx|jsx)$/.test(f)) {
       result.previewFilesRemoved++;
+      deleted.add(f);
       if (!dryRun) await fs.rm(f, { force: true }).catch(() => {});
     }
   }
@@ -125,17 +135,143 @@ async function hygieneWeb(projectRoot: string, dryRun: boolean): Promise<Hygiene
   // listSourceFiles, like lib/_preview on Flutter). Its routes + imports were just
   // stripped from App.tsx, so the directory is dead code: remove it whole.
   const harnessDir = path.join(ix.pipelineRoot, '_preview');
-  if (ix.kind === 'react' && fsSync.existsSync(harnessDir)) {
+  if (fsSync.existsSync(harnessDir)) {
     const harness = await fs.readdir(harnessDir).catch(() => [] as string[]);
     result.previewFilesRemoved += harness.length;
     result.filesScanned += harness.length;
     if (!dryRun) await fs.rm(harnessDir, { recursive: true, force: true }).catch(() => {});
   }
+  // The PlaceholderScreen module goes only when nothing still imports it: a screen
+  // the build never replaced is still the skeleton's stub, which renders it — deleting
+  // the module under it breaks the build (the gate would revert the whole pass).
+  result.previewFilesRemoved += await removeUnusedPlaceholderModule(ix, files, deleted, { [ix.routerFile]: app }, dryRun, warnings);
 
   // ── Report (never delete) unreferenced asset symbols ────────────────────────
   result.unreferencedAssets = await countUnreferencedAssets(ix, ix.resourcesFile, warnings);
 
   return result;
+}
+
+/** Next App Router strategy (PG-25). There is no route table: a route IS a directory,
+ *  so hygiene removes directories.
+ *   - verify routes: `app/%5Fpreview/**` (served at `/_preview/<frame>`) and any
+ *     `app/_preview/**` (a private folder Next never routes — still verify-only code);
+ *   - placeholder-only pages: a `page.tsx` whose only element is `<PlaceholderScreen>`
+ *     and that carries no canonical header (the react analogue is a
+ *     `<Route element={<PlaceholderScreen/>}>` line, which the react strategy strips).
+ *     A header-stamped skeleton stub is a canonical screen's slot the build has not
+ *     filled yet — it stays, exactly like react keeps the stub component it routes to.
+ *     A removed page that source still links to is REPORTED (the link now 404s; 7d
+ *     already grades that edge `missing` and requeues its FROM screen).
+ *  Then unreferenced assets are reported exactly as on react. */
+async function hygieneNext(ix: WebAppIndex, dryRun: boolean, result: HygieneResult): Promise<HygieneResult> {
+  const warnings = result.warnings;
+  const routerDir = ix.appDir ?? ix.pagesDir;
+  if (!routerDir) {
+    result.skippedReason = 'no Next app/ or pages/ directory — nothing routable to clean';
+    return result;
+  }
+  const rel = (p: string): string => path.relative(ix.projectRoot, p).split(path.sep).join('/');
+  const all = await listWebSources(ix);   // previews are never listed here
+  result.filesScanned = all.length;
+  const deleted = new Set<string>();
+
+  // 1. Verify-harness route dirs.
+  const previewDirs = (await fs.readdir(routerDir, { withFileTypes: true }).catch(() => [] as fsSync.Dirent[]))
+    .filter((e) => e.isDirectory() && /^(_preview|%5Fpreview)$/i.test(e.name))
+    .map((e) => path.join(routerDir, e.name));
+  for (const d of previewDirs) {
+    const files = await listAllFiles(d);
+    result.previewFilesRemoved += files.length;
+    result.previewRoutesRemoved += files.filter((f) => /^page\.(tsx|jsx|ts|js)$/.test(path.basename(f))).length;
+    result.filesScanned += files.length;
+    if (!dryRun) await fs.rm(d, { recursive: true, force: true }).catch(() => {});
+  }
+
+  // 2. Placeholder-only pages (no canonical header).
+  const sources = new Map<string, string>();
+  for (const f of all) sources.set(f, await fs.readFile(f, 'utf-8').catch(() => ''));
+  const pageRe = /^page\.(tsx|jsx|ts|js)$/;
+  for (const [f, src] of sources) {
+    if (!pageRe.test(path.basename(f)) || !isInside(routerDir, f)) continue;
+    if (readHeader(src) || !isPlaceholderOnly(src)) continue;
+    const route = ix.appDir && isInside(ix.appDir, f) ? nextAppRoute(ix.appDir, f) : null;
+    const linkers = route ? [...sources].filter(([g, s]) => g !== f && linksTo(s, route, ix.routeToConst.get(route) ?? null)).map(([g]) => rel(g)) : [];
+    if (linkers.length) warnings.push(`removed placeholder-only page ${rel(f)} (${route}) — still linked from ${linkers.join(', ')}; that link now 404s until the screen is built (7d reports the edge)`);
+    result.previewRoutesRemoved++;
+    result.placeholderRemoved = true;
+    deleted.add(f);
+    if (!dryRun) {
+      // Remove the page and its route dir when nothing else lives there (a layout,
+      // loading.tsx or nested routes keep the dir).
+      await fs.rm(f, { force: true }).catch(() => {});
+      await removeEmptyDirsUpTo(path.dirname(f), routerDir);
+    }
+  }
+
+  result.previewFilesRemoved += await removeUnusedPlaceholderModule(ix, all, deleted, {}, dryRun, warnings);
+  result.unreferencedAssets = await countUnreferencedAssets(ix, ix.resourcesFile, warnings);
+  return result;
+}
+
+const isInside = (dir: string, f: string): boolean => f === dir || f.startsWith(dir + path.sep);
+
+/** A page whose only JSX element is `<PlaceholderScreen …/>` (fragments aside). */
+function isPlaceholderOnly(src: string): boolean {
+  const code = src.replace(/^import\s.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+  const tags = [...code.matchAll(/<([A-Za-z][A-Za-z0-9_.$]*)/g)].map((m) => m[1]);
+  return tags.length > 0 && tags.every((t) => t === 'PlaceholderScreen');
+}
+
+/** Does `src` navigate/link to `route` (literal) or its ROUTES constant? */
+function linksTo(src: string, route: string, routeConst: string | null): boolean {
+  const lit = new RegExp(`['"\`]${escapeRe(route)}['"\`]`);
+  return lit.test(src) || (!!routeConst && new RegExp(`\\bROUTES\\s*\\.\\s*${escapeRe(routeConst)}\\b`).test(src));
+}
+
+async function listAllFiles(dir: string, out: string[] = []): Promise<string[]> {
+  for (const e of await fs.readdir(dir, { withFileTypes: true }).catch(() => [] as fsSync.Dirent[])) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) await listAllFiles(p, out); else out.push(p);
+  }
+  return out;
+}
+
+async function removeEmptyDirsUpTo(dir: string, stop: string): Promise<void> {
+  let d = dir;
+  while (d !== stop && isInside(stop, d)) {
+    const left = await fs.readdir(d).catch(() => ['?']);
+    if (left.length) return;
+    await fs.rmdir(d).catch(() => {});
+    d = path.dirname(d);
+  }
+}
+
+/** Delete `PlaceholderScreen.(tsx|jsx)` when no surviving source file imports it.
+ *  `overrides` carries files rewritten in this pass (react's App.tsx) whose on-disk
+ *  copy is stale during a dry run. Returns the number of files removed. */
+async function removeUnusedPlaceholderModule(
+  ix: Pick<WebAppIndex, 'sourceRoots' | 'projectRoot'>, scanned: string[], deleted: Set<string>,
+  overrides: Record<string, string>, dryRun: boolean, warnings: string[],
+): Promise<number> {
+  const all = await listWebSources(ix);
+  const mods = [...new Set([...scanned, ...all])].filter((f) => /(^|[/\\])PlaceholderScreen\.(tsx|jsx)$/.test(f));
+  let removed = 0;
+  for (const mod of mods) {
+    const users: string[] = [];
+    for (const f of all) {
+      if (f === mod || deleted.has(f)) continue;
+      const src = overrides[f] ?? await fs.readFile(f, 'utf-8').catch(() => '');
+      if (/\bPlaceholderScreen\b/.test(src.replace(/^import\s.*$/gm, ''))) users.push(path.relative(ix.projectRoot, f).split(path.sep).join('/'));
+    }
+    if (users.length) {
+      warnings.push(`kept ${path.relative(ix.projectRoot, mod).split(path.sep).join('/')}: still rendered by ${users.length} un-built screen stub(s) (${users.slice(0, 4).join(', ')})`);
+      continue;
+    }
+    removed++;
+    if (!dryRun) await fs.rm(mod, { force: true }).catch(() => {});
+  }
+  return removed;
 }
 
 /** Count declared asset symbols with no static reference. Reported only: a symbol
@@ -145,7 +281,19 @@ async function hygieneWeb(projectRoot: string, dryRun: boolean): Promise<Hygiene
 async function countUnreferencedAssets(
   ix: Pick<WebAppIndex, 'sourceRoots'>, resourcesFile: string | null, warnings: string[],
 ): Promise<number> {
-  if (!resourcesFile || !fsSync.existsSync(resourcesFile)) return 0;
+  if (!resourcesFile || !fsSync.existsSync(resourcesFile)) {
+    // No resources module on disk — but a screen that still reads `assets[key]` from
+    // one is exactly what an operator must hear about (its import cannot resolve).
+    const dyn: string[] = [];
+    for (const f of await listWebSources(ix)) {
+      const s = await fs.readFile(f, 'utf-8').catch(() => '');
+      if (/\bassets\s*\[\s*[^'"\]]/.test(s)) dyn.push(path.basename(path.dirname(f)) + '/' + path.basename(f));
+    }
+    if (dyn.length) {
+      warnings.push(`no resources module found, yet ${dyn.length} file(s) read assets by computed key (assets[…]: ${dyn.slice(0, 4).join(', ')}) — asset usage could not be reviewed and those imports do not resolve; review before shipping.`);
+    }
+    return 0;
+  }
   const decl = [...fsSync.readFileSync(resourcesFile, 'utf-8').matchAll(/^\s*([A-Za-z0-9_$]+)\s*:/gm)].map((m) => m[1]);
   if (decl.length === 0) return 0;
 
@@ -180,15 +328,58 @@ async function hygieneFlutter(projectRoot: string, dryRun: boolean): Promise<Hyg
     placeholderRemoved: false, unreferencedAssets: 0, warnings, dryRun, filesScanned: 0,
   };
   const previewDir = path.join(projectRoot, 'lib', '_preview');
-  if (fsSync.existsSync(previewDir)) {
+  const hadPreview = fsSync.existsSync(previewDir);
+  if (hadPreview) {
     const entries = await fs.readdir(previewDir).catch(() => []);
     result.previewFilesRemoved = entries.length;
     result.filesScanned = entries.length;
     if (!dryRun) await fs.rm(previewDir, { recursive: true, force: true }).catch(() => {});
-  } else {
-    result.skippedReason = 'no verify scaffolding present (lib/_preview absent) — nothing to strip';
+  }
+  // Report (never delete) AppAssets symbols with no static reference (PG-26) — the
+  // same review the web strategy gives its resources module.
+  const assets = await countUnreferencedDartAssets(projectRoot, warnings);
+  result.unreferencedAssets = assets.unreferenced;
+  result.filesScanned += assets.filesScanned;
+  if (!hadPreview && assets.filesScanned === 0) {
+    result.skippedReason = 'no verify scaffolding (lib/_preview absent) and no AppAssets class under lib/ — nothing to strip or review';
   }
   return result;
+}
+
+/** Flutter analogue of countUnreferencedAssets: `static const String x = …` symbols
+ *  of the generated AppAssets class that no .dart file under lib/ references as
+ *  `AppAssets.x`. A symbol reached through a computed key (`banners[bannerKey]`) or an
+ *  asset loader fed a non-literal (`Image.asset(path)`) is invisible to this scan, so
+ *  when either shape exists the count is flagged as NOT safe to prune. */
+async function countUnreferencedDartAssets(projectRoot: string, warnings: string[]): Promise<{ unreferenced: number; filesScanned: number }> {
+  const lib = path.join(projectRoot, 'lib');
+  const dart = (await listAllFiles(lib)).filter((f) => f.endsWith('.dart') && !isInside(path.join(lib, '_preview'), f));
+  const resFile = dart.find((f) => /class\s+AppAssets\b/.test(fsSync.readFileSync(f, 'utf-8')));
+  if (!resFile) return { unreferenced: 0, filesScanned: 0 };
+  const decl = [...fsSync.readFileSync(resFile, 'utf-8').matchAll(/static\s+const\s+(?:String\s+)?([A-Za-z0-9_$]+)\s*=/g)].map((m) => m[1]);
+  const used = new Set<string>();
+  const dynamic: string[] = [];
+  for (const f of dart) {
+    if (f === resFile) continue;
+    const src = await fs.readFile(f, 'utf-8').catch(() => '');
+    for (const m of src.matchAll(/\bAppAssets\s*\.\s*([A-Za-z0-9_$]+)/g)) used.add(m[1]);
+    // An asset loader whose path argument is neither a literal nor AppAssets.x.
+    for (const m of src.matchAll(/\b(Image\.asset|SvgPicture\.asset|AssetImage|rootBundle\.load(?:String)?)\s*\(\s*([^,)\s][^,)]*)/g)) {
+      const arg = m[2].trim();
+      if (/^['"]/.test(arg) || /^AppAssets\s*\./.test(arg)) continue;
+      dynamic.push(`${m[1]}(${arg}) in ${path.relative(projectRoot, f).split(path.sep).join('/')}`);
+    }
+  }
+  const unref = decl.filter((d) => !used.has(d));
+  if (unref.length) {
+    warnings.push(
+      `${unref.length}/${decl.length} AppAssets symbols are not statically referenced (${unref.join(', ')})`
+      + (dynamic.length
+        ? ` — but the app loads assets by computed key (${dynamic.slice(0, 3).join('; ')}), so these are NOT safe to prune automatically; review before removing.`
+        : ' — no computed-key asset access found, so these are safe to prune (kept anyway; deletion is out of scope for this pass).'),
+    );
+  }
+  return { unreferenced: unref.length, filesScanned: dart.length };
 }
 
 export async function runProductionHygiene(opts: HygieneOptions): Promise<HygieneResult> {
@@ -206,4 +397,4 @@ export async function runProductionHygiene(opts: HygieneOptions): Promise<Hygien
   };
 }
 
-export const __test = { stripPreviewRoutes, stripImports };
+export const __test = { stripPreviewRoutes, stripImports, isPlaceholderOnly, linksTo };

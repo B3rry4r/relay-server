@@ -28,3 +28,54 @@ describe('7g labels name the control that owns the dead handler (PG-22, PG-23)',
     expect(audit.dartOwnerLabel(bare, bare.indexOf('onTap'))).toBeNull();
   });
 });
+
+// ── 7h ────────────────────────────────────────────────────────────────────────
+import * as fs from 'node:fs/promises';
+import * as fsSync from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { runProductionHygiene } from '../src/relay-server/passes/production-hygiene';
+
+const FIX = path.resolve(__dirname, 'fixtures', 'parity');
+async function fixture(fw: 'flutter' | 'react' | 'next'): Promise<string> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), `b34-${fw}-`));
+  await fs.cp(path.join(FIX, fw), root, { recursive: true });
+  return root;
+}
+
+describe('7h productionHygiene (PG-25, PG-26)', () => {
+  it('next: strips preview route dirs and header-less placeholder pages, keeps a stamped skeleton stub and the module it renders', async () => {
+    const root = await fixture('next');
+    await fs.mkdir(path.join(root, 'app', '%5Fpreview', '10-2'), { recursive: true });
+    await fs.writeFile(path.join(root, 'app', '%5Fpreview', '10-2', 'page.tsx'), "export default function P() { return null; }\n");
+    await fs.mkdir(path.join(root, 'app', 'details'), { recursive: true });
+    const stub = "// canonicalId: c_10_7 route: /details\nimport { PlaceholderScreen } from '@/components/PlaceholderScreen';\n// TODO(build): implement\nexport default function DetailsPage() { return <PlaceholderScreen title=\"Details\" />; }\n";
+    await fs.writeFile(path.join(root, 'app', 'details', 'page.tsx'), stub);
+    const r = await runProductionHygiene({ projectRoot: root });
+    expect(r.skippedReason).toBeUndefined();
+    for (const gone of ['app/_preview', 'app/%5Fpreview', 'app/10-5', 'app/10-8', 'app/10-9']) expect(fsSync.existsSync(path.join(root, gone)), gone).toBe(false);
+    expect(await fs.readFile(path.join(root, 'app', 'details', 'page.tsx'), 'utf8')).toBe(stub);
+    expect(fsSync.existsSync(path.join(root, 'components', 'PlaceholderScreen.tsx'))).toBe(true);
+    expect(r.warnings.join('\n')).toMatch(/still linked from app\/\(tabs\)\/10-2\/page\.tsx/);
+    expect(r.warnings.join('\n')).toMatch(/computed key/);
+    const again = await runProductionHygiene({ projectRoot: root });
+    expect([again.previewRoutesRemoved, again.previewFilesRemoved, again.placeholderRemoved]).toEqual([0, 0, false]);
+  });
+
+  it('react: PlaceholderScreen.tsx survives while an un-built stub still renders it', async () => {
+    const root = await fixture('react');
+    await fs.writeFile(path.join(root, 'src', 'screens', 'DetailsScreen.tsx'), "// canonicalId: c_10_5 route: /10-5\nimport { PlaceholderScreen } from './PlaceholderScreen';\nexport function DetailsScreen() { return <PlaceholderScreen title=\"Details\" />; }\n");
+    const r = await runProductionHygiene({ projectRoot: root });
+    expect(fsSync.existsSync(path.join(root, 'src', 'screens', 'PlaceholderScreen.tsx'))).toBe(true);
+    expect(r.warnings.join('\n')).toMatch(/kept src\/screens\/PlaceholderScreen\.tsx/);
+  });
+
+  it('flutter: reports unreferenced AppAssets symbols and flags the computed-key loader, deletes nothing', async () => {
+    const root = await fixture('flutter');
+    const r = await runProductionHygiene({ projectRoot: root });
+    expect(r.unreferencedAssets).toBe(2);   // searchIcon, userAvatar — promoBanner/mapDark are referenced
+    expect(r.warnings.join('\n')).toMatch(/computed key \(Image\.asset\(banners\[bannerKey\]!\) in lib\/screens\/home_screen\.dart\)/);
+    expect(fsSync.existsSync(path.join(root, 'assets', 'images', 'promo_banner.png'))).toBe(true);
+    expect(fsSync.existsSync(path.join(root, 'lib', '_preview'))).toBe(false);
+  });
+});
