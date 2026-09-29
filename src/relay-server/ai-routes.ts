@@ -1,5 +1,6 @@
 import { type Express } from 'express';
 import { execFile, type ChildProcess } from 'node:child_process';
+import { sanitizeChildEnv } from './auth/secrets';
 import { randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
 import { promises as fsp } from 'node:fs';
@@ -156,6 +157,9 @@ export async function runModel(
   cwd: string,
   opts: { sessionId?: string; format?: AIFormat; agent?: boolean; jobId?: string; projectId?: string; modelId?: string } = {},
 ): Promise<{ text: string; sessionId?: string; tokens?: number }> {
+  // Every caller's env (often `opts.env ?? process.env` from a pass) is scrubbed
+  // of the CONTRACTS §3 strip list here, the one place agent CLIs are spawned.
+  env = sanitizeChildEnv(env, 'agent');
   const adapter = getAdapter(model);
   // In agent mode for claude (resume + json capable), use stream-json output:
   // it emits NDJSON events DURING the run (assistant text, tool uses) so the

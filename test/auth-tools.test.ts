@@ -275,7 +275,7 @@ describe('UIX proxies and service token', () => {
     });
     const { base } = await h.boot({ UIX_URL: uix.url, UIX_SERVICE_TOKEN: 'uix-svc-secret' });
     const proxyBase = await getHarnessUixBase();
-    expect(proxyBase).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
+    expect(proxyBase).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/h\/[A-Za-z0-9_-]{32}$/);
     expect(proxyBase).not.toBe(uix.url);
     const list = await fetch(`${proxyBase}/api/v1/figma/uploads`).then((r) => r.json()) as { uploads: Array<{ assets: Array<{ url: string }> }> };
     const assetUrl = list.uploads[0].assets[0].url;
@@ -287,6 +287,37 @@ describe('UIX proxies and service token', () => {
     expect(JSON.stringify(list)).not.toContain('uix-svc-secret');
     // Anything that came through a proxy/tunnel is refused.
     expect((await fetch(`${proxyBase}/api/v1/figma/uploads`, { headers: { 'cf-connecting-ip': '1.2.3.4' } })).status).toBe(403);
+    // Narrow by design (verifier r1 LOW): without the per-boot capability path it is
+    // a 404; it is read-only; only the harness's UIX reads are reachable.
+    const origin = new URL(proxyBase).origin;
+    const seenBefore = uix.seen.length;
+    expect((await fetch(`${origin}/api/v1/figma/uploads`)).status).toBe(404);
+    expect((await fetch(`${origin}/h/${'A'.repeat(32)}/api/v1/figma/uploads`)).status).toBe(404);
+    for (const method of ['POST', 'PUT', 'PATCH', 'DELETE']) {
+      const r = await fetch(`${proxyBase}/api/v1/figma/uploads/u1`, { method, body: method === 'DELETE' ? undefined : '{}' });
+      expect(r.status, method).toBe(405);
+      expect(r.headers.get('access-control-allow-origin')).toBeNull();
+    }
+    for (const p of ['/api/v1/figma/ir/status', '/api/v1/auth/me', '/api/v1/figma/raster/k/n', '/assets/../api/v1/figma/flow', '/assets/%2e%2e/api/v1/figma/flow', '/assets/..%2fapi', '/health']) {
+      expect((await fetch(`${proxyBase}${p}`)).status, p).toBeGreaterThanOrEqual(400);
+    }
+    // Raw (un-normalised by the client) traversal attempts are normalised server-side.
+    const capPath = new URL(proxyBase).pathname;
+    for (const raw of ['/assets/../api/v1/figma/flow', '/assets/%2e%2e/api/v1/figma/flow', '/assets/.%2E/.%2e/api/v1/auth/me']) {
+      const status = await new Promise<number>((resolve, reject) => {
+        http.get({ host: '127.0.0.1', port: Number(new URL(proxyBase).port), path: `${capPath}${raw}` }, (r) => { r.resume(); resolve(r.statusCode!); }).on('error', reject);
+      });
+      expect(status, raw).toBe(403);
+    }
+    const pre = await fetch(`${proxyBase}/api/v1/figma/uploads`, { method: 'OPTIONS', headers: { 'Access-Control-Request-Method': 'DELETE' } });
+    expect(pre.status).toBe(204);
+    expect(pre.headers.get('access-control-allow-methods')).toBe('GET, HEAD, OPTIONS');
+    expect(uix.seen.length).toBe(seenBefore); // none of the refusals reached UIX
+    // The harness's own reads still work (fonts list/file, IR data).
+    for (const p of ['/api/v1/figma/ir/data?figStorageKey=k', '/api/v1/figma/fonts/list?figStorageKey=k', '/api/v1/figma/fonts/file/abc.woff2']) {
+      expect((await fetch(`${proxyBase}${p}`)).status, p).toBe(200);
+    }
+    expect(uix.seen.slice(seenBefore).map((s) => s.url)).toEqual(['/api/v1/figma/ir/data?figStorageKey=k', '/api/v1/figma/fonts/list?figStorageKey=k', '/api/v1/figma/fonts/file/abc.woff2']);
     // …and relay refuses to tunnel it.
     const { token } = await h.login(base);
     const port = Number(new URL(proxyBase).port);

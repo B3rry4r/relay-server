@@ -35,6 +35,48 @@ export function isSafeStaticServeDir(dir: string, workspace = resolveWorkspace()
   return true;
 }
 
+/**
+ * The static preview server run by POST /api/previews/:port/serve. Python's stock
+ * `http.server` follows symlinks, so a link inside a project (e.g. to
+ * /workspace/.relay/state) would be served and could then be tunnelled. This
+ * handler resolves every path (and a directory's index.html) with realpath and
+ * answers 404 unless it stays inside the served root and outside `.relay`.
+ * argv: <port> <root> <workspace/.relay>.
+ */
+export const SAFE_STATIC_SERVER_PY = `
+import functools, http.server, os, sys
+port, root, relay = int(sys.argv[1]), os.path.realpath(sys.argv[2]), os.path.realpath(sys.argv[3])
+def inside(p, base):
+    return p == base or p.startswith(base.rstrip(os.sep) + os.sep)
+def allowed(p):
+    real = os.path.realpath(p)
+    return inside(real, root) and not inside(real, relay)
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def send_head(self):
+        path = self.translate_path(self.path)
+        ok = allowed(path)
+        if ok and os.path.isdir(path):
+            for index in ('index.html', 'index.htm'):
+                candidate = os.path.join(path, index)
+                if os.path.lexists(candidate) and not allowed(candidate):
+                    ok = False
+        if not ok:
+            self.send_error(404, 'File not found')
+            return None
+        return super().send_head()
+    def list_directory(self, path):
+        # Hide entries that resolve outside the root (symlink escapes).
+        real_listdir = os.listdir
+        def filtered(p):
+            return [n for n in real_listdir(p) if allowed(os.path.join(p, n))]
+        os.listdir = filtered
+        try:
+            return super().list_directory(path)
+        finally:
+            os.listdir = real_listdir
+http.server.ThreadingHTTPServer(('127.0.0.1', port), functools.partial(Handler, directory=root)).serve_forever()
+`;
+
 // Kept for flutter-routes compatibility — now delegates to closeTunnel.
 export function invalidatePortTargetCache(port: number): void {
   closeTunnel(port);
@@ -302,7 +344,8 @@ export function registerCoreRoutes(app: Express): void {
     }
     await fs.promises.mkdir(serveDir, { recursive: true });
     const { spawn } = await import('node:child_process');
-    spawn('python3', ['-m', 'http.server', String(port), '--bind', '127.0.0.1', '--directory', serveDir], {
+    // `relay-static-serve` is only a process tag (so `pkill -f` can find it).
+    spawn('python3', ['-c', SAFE_STATIC_SERVER_PY, String(port), serveDir, path.join(resolveWorkspace(), '.relay'), 'relay-static-serve'], {
       cwd: serveDir, detached: true, stdio: 'ignore', env: childProcessEnv(),
     }).unref();
     res.json({ ok: true, port, directory: serveDir, message: `Preview server starting on port ${port}` });

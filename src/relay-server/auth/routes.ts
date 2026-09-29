@@ -2,7 +2,9 @@
  * /api/auth/* endpoints (CONTRACTS §2).
  *
  *   POST   /api/auth/login                  {secret, label?} → {token, session}     PUBLIC, rate-limited
- *   POST   /api/auth/login-link/exchange    {code, label?}   → {token, session}     PUBLIC, rate-limited
+ *   POST   /api/auth/login-link/exchange    {code, label?}   → {token, session}     PUBLIC, NOT rate-limited
+ *                                            (break-glass: 192-bit one-time codes; must work while
+ *                                            the password path is backed off — audit §4.6)
  *   GET    /api/auth/session                → {authenticated, via, session?}
  *   GET    /api/auth/validate               (deprecated alias of /api/auth/session)
  *   POST   /api/auth/logout                 revoke the current session
@@ -27,6 +29,7 @@ import {
   mintLoginLinkCode,
 } from './login-links';
 import { readOwnerSecretConfig, verifyOwnerSecret } from './owner-secret';
+import { hasForwardingHeaders } from './state';
 import {
   createSession,
   listSessions,
@@ -38,6 +41,8 @@ import {
 } from './session-store';
 
 let warnedPlainLogin = false;
+let lastRefusedExchangeLog = 0;
+let refusedExchanges = 0;
 
 function deviceLabel(req: Request, fallback: string): string {
   const explicit = typeof req.body?.label === 'string' ? req.body.label.trim() : '';
@@ -50,9 +55,25 @@ function deviceLabel(req: Request, fallback: string): string {
   return [browser, os].filter(Boolean).join(' on ') || fallback;
 }
 
+let warnedSharedProxyKey = false;
+/**
+ * Behind a proxy that is not trusted (not on loopback, RELAY_TRUST_PROXY unset),
+ * req.ip is the proxy's own address, so every remote client shares ONE backoff key
+ * and an attacker's failures delay the owner's password login too (the login-link
+ * exchange is unaffected). Say so once, loudly.
+ */
+function warnIfSharedProxyKey(req: Request, key: string): void {
+  if (warnedSharedProxyKey) return;
+  const peer = req.socket?.remoteAddress || '';
+  if (!peer || key !== peer || !hasForwardingHeaders(req.headers)) return;
+  warnedSharedProxyKey = true;
+  console.warn(`[auth] login backoff is keyed on the proxy address ${peer} (its X-Forwarded-For is not trusted), so all remote clients share one key. Set RELAY_TRUST_PROXY (e.g. "1" or the proxy's address) so each client gets its own.`);
+}
+
 function rateLimited(runtime: AuthRuntime, req: Request, res: Response): string | null {
   if (isLocalRequest(req)) return null;
   const key = clientIp(req) || 'unknown';
+  warnIfSharedProxyKey(req, key);
   const decision = runtime.limiter.check(key);
   if (!decision.allowed) {
     res.setHeader('Retry-After', String(decision.retryAfterSec));
@@ -102,16 +123,22 @@ export function registerAuthRoutes(app: Express, runtime: AuthRuntime): void {
     issueBrowserSession(req, res, 'Browser');
   });
 
+  // Break-glass: deliberately NOT behind the login limiter, and a bad code never
+  // feeds it. The codes are 192-bit, one-time and short-lived (nothing to guess),
+  // and this path must keep working while password login is backed off.
   app.post('/api/auth/login-link/exchange', smallJson, (req, res) => {
-    const key = rateLimited(runtime, req, res);
-    if (key === '') return;
     const code = typeof req.body?.code === 'string' ? req.body.code.trim() : '';
     if (!consumeLoginLinkCode(code)) {
-      if (key) runtime.limiter.recordFailure(key);
+      const now = Date.now();
+      refusedExchanges++;
+      if (now - lastRefusedExchangeLog >= 10_000) { // log, but never let a flood flood the log
+        console.warn(`[auth] login-link exchange refused ip=${clientIp(req) || '-'} (refused since last log: ${refusedExchanges})`);
+        lastRefusedExchangeLog = now;
+        refusedExchanges = 0;
+      }
       res.status(401).json({ error: 'invalid_code', message: 'This sign-in link is invalid, expired, or was already used.' });
       return;
     }
-    if (key) runtime.limiter.recordSuccess(key);
     console.warn(`[auth] login-link exchanged ip=${clientIp(req) || '-'}`);
     issueBrowserSession(req, res, 'Login link');
   });

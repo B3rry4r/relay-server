@@ -13,8 +13,16 @@
  *     token) → a LOOPBACK-ONLY proxy (`getHarnessUixBase()`) that adds the token.
  *     It refuses non-loopback peers and anything carrying a forwarding header, its
  *     port is protected from tunnelling, and it rewrites the UIX origin inside JSON
- *     bodies so absolute asset/font URLs route through it too.
+ *     bodies so absolute asset/font URLs route through it too. It is deliberately
+ *     narrow, because it holds the service token and needs no credential:
+ *       - every URL must start with a per-boot random capability path
+ *         (`/h/<192-bit cap>/`), known only to the harness page relay loads (so
+ *         other on-box processes and other pages in the same Chrome, e.g. a
+ *         built app rendered by /api/visual/web-screenshot, cannot use it);
+ *       - read-only: GET/HEAD (+ OPTIONS preflight) only;
+ *       - only the UIX paths the harness reads (HARNESS_UIX_PATHS).
  */
+import crypto from 'node:crypto';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { NextFunction, Request as ExpressRequest, Response as ExpressResponse } from 'express';
@@ -120,8 +128,44 @@ export function uixProxyMiddleware(req: ExpressRequest, res: ExpressResponse, ne
 
 let harnessProxy: Promise<{ url: string; close: () => void } | null> | null = null;
 
-async function forwardForHarness(req: http.IncomingMessage, res: http.ServerResponse, selfBase: string): Promise<void> {
-  const target = `${uixBaseUrl()}${req.url || '/'}`;
+/** The UIX reads the render harness makes (relay-web src/render-harness/main.ts). */
+const HARNESS_UIX_EXACT = new Set(['/api/v1/figma/ir/data', '/api/v1/figma/uploads', '/api/v1/figma/fonts/list']);
+const HARNESS_UIX_PREFIXES = ['/api/v1/figma/fonts/file/', '/assets/'];
+
+/**
+ * Map a harness-proxy request URL to the UIX path+query it may fetch, or a refusal.
+ * Exported for tests.
+ */
+export function resolveHarnessRequest(
+  method: string | undefined,
+  rawUrl: string | undefined,
+  cap: string,
+): { ok: true; target: string } | { ok: false; status: number; message: string } {
+  const url = rawUrl || '/';
+  const prefix = `/h/${cap}/`;
+  const head = Buffer.from(url.slice(0, prefix.length));
+  const want = Buffer.from(prefix);
+  if (head.length !== want.length || !crypto.timingSafeEqual(head, want)) {
+    return { ok: false, status: 404, message: 'not found' };
+  }
+  const m = (method || 'GET').toUpperCase();
+  if (m !== 'GET' && m !== 'HEAD') return { ok: false, status: 405, message: 'read-only proxy (GET/HEAD)' };
+  const rest = url.slice(prefix.length - 1); // keep the leading '/'
+  if (/%2f|%5c|\\/i.test(rest.split('?')[0])) return { ok: false, status: 400, message: 'encoded separators refused' };
+  let parsed: URL;
+  try {
+    parsed = new URL(rest, 'http://harness.invalid'); // normalises '.', '..' and %2e segments
+  } catch {
+    return { ok: false, status: 400, message: 'bad url' };
+  }
+  const pathname = parsed.pathname;
+  const allowed = HARNESS_UIX_EXACT.has(pathname) || HARNESS_UIX_PREFIXES.some((p) => pathname.startsWith(p) && pathname.length > p.length);
+  if (!allowed) return { ok: false, status: 403, message: 'path not available to the render harness' };
+  return { ok: true, target: `${pathname}${parsed.search}` };
+}
+
+async function forwardForHarness(req: http.IncomingMessage, res: http.ServerResponse, selfBase: string, uixPath: string): Promise<void> {
+  const target = `${uixBaseUrl()}${uixPath}`;
   const headers = new Headers();
   for (const [key, value] of Object.entries(req.headers)) {
     if (value === undefined) continue;
@@ -130,15 +174,9 @@ async function forwardForHarness(req: http.IncomingMessage, res: http.ServerResp
   }
   const token = serviceToken();
   if (token) headers.set(UIX_SERVICE_HEADER, token);
-  const method = (req.method || 'GET').toUpperCase();
-  let body: ArrayBuffer | undefined;
-  if (method !== 'GET' && method !== 'HEAD') {
-    const chunks: Buffer[] = [];
-    for await (const chunk of req) chunks.push(chunk as Buffer);
-    const buf = Buffer.concat(chunks);
-    body = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer;
-  }
-  const upstream = await fetch(target, { method, headers, body, redirect: 'manual' });
+  // resolveHarnessRequest admitted only GET/HEAD: there is never a body to forward.
+  const method = (req.method || 'GET').toUpperCase() === 'HEAD' ? 'HEAD' : 'GET';
+  const upstream = await fetch(target, { method, headers, redirect: 'manual' });
   const contentType = upstream.headers.get('content-type') || '';
   const outHeaders: Record<string, string> = {
     // The harness page is on another loopback origin and fetches cross-origin.
@@ -166,6 +204,7 @@ export async function getHarnessUixBase(): Promise<string> {
   if (!harnessProxy) {
     harnessProxy = new Promise((resolve) => {
       let selfBase = '';
+      const cap = crypto.randomBytes(24).toString('base64url');
       const server = http.createServer((req, res) => {
         if (!isLoopbackAddress(req.socket.remoteAddress) || hasForwardingHeaders(req.headers)) {
           res.writeHead(403, { 'Content-Type': 'text/plain' });
@@ -173,15 +212,25 @@ export async function getHarnessUixBase(): Promise<string> {
           return;
         }
         if (req.method === 'OPTIONS') {
+          // Preflight: answered without touching UIX; only the read methods.
+          const pre = resolveHarnessRequest('GET', req.url, cap);
+          if (!pre.ok) { res.writeHead(pre.status, { 'Content-Type': 'text/plain' }); res.end(pre.message); return; }
           res.writeHead(204, {
             'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
-            'Access-Control-Allow-Headers': String(req.headers['access-control-request-headers'] || 'content-type'),
+            'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+            'Access-Control-Allow-Headers': 'content-type, accept',
           });
           res.end();
           return;
         }
-        forwardForHarness(req, res, selfBase).catch((error: unknown) => {
+        const decision = resolveHarnessRequest(req.method, req.url, cap);
+        if (!decision.ok) {
+          // No CORS header on refusals: a page probing the port learns nothing.
+          res.writeHead(decision.status, { 'Content-Type': 'text/plain' });
+          res.end(decision.message);
+          return;
+        }
+        forwardForHarness(req, res, selfBase, decision.target).catch((error: unknown) => {
           if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
           res.end(JSON.stringify({ error: 'uix_unreachable', message: error instanceof Error ? error.message : String(error) }));
         });
@@ -191,7 +240,7 @@ export async function getHarnessUixBase(): Promise<string> {
         const { port } = server.address() as AddressInfo;
         registerProtectedPort(port, 'the relay UIX loopback proxy');
         server.unref();
-        selfBase = `http://127.0.0.1:${port}`;
+        selfBase = `http://127.0.0.1:${port}/h/${cap}`;
         resolve({ url: selfBase, close: () => server.close() });
       });
     });

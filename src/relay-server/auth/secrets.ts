@@ -15,8 +15,14 @@
  *     `createTerminalEnv` (PTY shells and agent CLIs) and every spawn site that
  *     builds its own env.
  *
- * `/proc/1/environ` still holds the boot environment (the kernel keeps the
- * original block); that is why `AUTH_TOKEN_HASH` is the recommended form.
+ * Residual (not fixable from inside Node): `/proc/<relay pid>/environ` still holds
+ * the BOOT environment (the kernel keeps the original block), and any same-uid
+ * process can read it. For the owner secret that is why `AUTH_TOKEN_HASH` is the
+ * recommended form. UIX_SERVICE_TOKEN, RELAY_DEPLOY_TOKEN, RELAY_PTY_TOKEN and
+ * RELAY_TOKEN cannot be hashed: they stay readable there by same-uid shells and
+ * agents. That is inside the existing trust boundary (the same uid can already
+ * read `.relay/state/local-token`, which grants the full API from loopback); the
+ * real fix is running terminals/agents under a separate uid.
  */
 
 /** Secret-bearing variables: never visible to any child process. */

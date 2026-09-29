@@ -57,7 +57,8 @@ never stored.
 - **Login link (break-glass).** `relay-auth login-link` on the box prints
   `<relay-web>/#relay-login-link=<code>&relay-server=<urlencoded relay URL>`. On load,
   if the fragment has `relay-login-link`: `POST <relay-server>/api/auth/login-link/exchange
-  {code, label?}` → `{token, session}` (401 if invalid/expired/used; one use, 5 min),
+  {code, label?}` → `{token, session}` (401 if invalid/expired/used; one use, 5 min;
+  never 429 — it is not rate-limited, so offer it when password login returns 429),
   store it as above, then `history.replaceState` to drop the fragment.
 - Header-less URLs: fetch with the header and use a blob URL (`review-image`,
   downloads). The Flutter preview iframe uses the server-supplied `previewIndexUrl`

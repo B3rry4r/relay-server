@@ -101,6 +101,45 @@ describe('child env strip list (audit §6 #18)', () => {
   }, 30_000);
 });
 
+describe('relay-spawned tools and agents (verifier r1 MINOR)', () => {
+  it('runModel scrubs whatever env a pass hands it (`opts.env ?? process.env`) before spawning the agent CLI', async () => {
+    const fs = await import('node:fs/promises');
+    const bin = await h.tempDir('relay-fake-agent-');
+    const out = path.join(bin, 'env.txt');
+    await fs.writeFile(path.join(bin, 'claude'), `#!/bin/sh\nenv > '${out}'\necho ok\n`, { mode: 0o755 });
+    const ws = await h.workspace();
+    process.env.WORKSPACE = ws;
+    const { runModel } = await import('../src/relay-server/ai-routes');
+    // A pass's typical call: the raw, unsealed process env (secrets + process vars).
+    const raw = { ...process.env, ...SECRETS, ...PROCESS_VARS, PATH: `${bin}:${process.env.PATH}` };
+    await runModel('claude', 'hi', raw, ws, { format: 'text' });
+    const text = await fs.readFile(out, 'utf8');
+    for (const key of SHELL_STRIPPED.filter((k) => k !== 'RELAY_RELEASE_ID')) expect(text, key).not.toMatch(new RegExp(`^${key}=`, 'm'));
+    for (const value of Object.values(SECRETS)) expect(text).not.toContain(value);
+    expect(text).toMatch(/^RELAY_RELEASE_ID=rel-123$/m); // agents keep the process tag
+  }, 30_000);
+
+  it('no spawn site in src hands a child the raw process.env', async () => {
+    const fs = await import('node:fs/promises');
+    const root = path.resolve(__dirname, '..', 'src');
+    const offenders: string[] = [];
+    const walk = async (dir: string): Promise<void> => {
+      for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) { await walk(full); continue; }
+        if (!entry.name.endsWith('.ts')) continue;
+        const lines = (await fs.readFile(full, 'utf8')).split('\n');
+        lines.forEach((line, i) => {
+          if (/\benv:\s*(?:process\.env\b|[\w.]+\s*\?\?\s*process\.env\b)/.test(line)) offenders.push(`${path.relative(root, full)}:${i + 1}`);
+        });
+      }
+    };
+    await walk(root);
+    // pid1-reaper re-execs relay ITSELF under tini (not a tool/agent child); it needs its own env.
+    expect(offenders.filter((o) => !o.startsWith('pid1-reaper.ts'))).toEqual([]);
+  });
+});
+
 describe('boot validation (audit §6 #19)', () => {
   it('validateOwnerSecretEnv', () => {
     expect(validateOwnerSecretEnv()).toMatchObject({ ok: false, error: expect.stringContaining('Neither AUTH_TOKEN_HASH nor AUTH_TOKEN') });

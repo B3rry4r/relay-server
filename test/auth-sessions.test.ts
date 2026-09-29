@@ -241,6 +241,71 @@ describe('login (audit §6 #4, #5)', () => {
     expect(limiter.check('ip', t0 + 1000).allowed).toBe(false);
     expect(limiter.check('ip', t0 + 60_000).allowed).toBe(true); // capped at 60 s
   });
+
+  // Verifier r1 BLOCKING: 30 failures from 30 addresses used to trip a global
+  // ceiling that refused EVERY key, including the owner's fresh address and the
+  // break-glass exchange. Other keys' failures must never refuse an attempt.
+  it('a distributed guesser never blocks the owner: fresh IP logs in, login-link exchange works', async () => {
+    const { base } = await h.boot();
+    for (let i = 0; i < 60; i++) {
+      const res = await request(base).post('/api/auth/login').set('x-forwarded-for', `203.0.113.${i + 1}`).send({ secret: 'wrong-guess' });
+      expect(res.status).toBe(401);
+    }
+    const owner = await request(base).post('/api/auth/login').set('x-forwarded-for', '198.51.100.7').send({ secret: OWNER_SECRET });
+    expect(owner.status).toBe(200);
+    const { mintLoginLinkCode } = await import('../src/relay-server/auth/login-links');
+    const { code } = mintLoginLinkCode({ createdBy: 'test' });
+    const ex = await request(base).post('/api/auth/login-link/exchange').set('x-forwarded-for', '198.51.100.8').send({ code });
+    expect(ex.status).toBe(200);
+    expect(ex.body.token).toMatch(/^rs_/);
+  });
+
+  it('login-link exchange is never rate-limited and invalid codes never feed the login limiter', async () => {
+    // RELAY_TRUST_PROXY=false reproduces the Railway shape: the proxy's XFF is not
+    // trusted, so every remote client shares the peer address as ONE backoff key.
+    const warn = vi.spyOn(console, 'warn');
+    const { base } = await h.boot({ RELAY_TRUST_PROXY: 'false' });
+    const remote = { 'x-forwarded-for': '192.0.2.2' };
+    // An attacker keeps the shared key backed off for password login…
+    expect((await request(base).post('/api/auth/login').set(remote).send({ secret: 'wrong-guess' })).status).toBe(401);
+    expect((await request(base).post('/api/auth/login').set(remote).send({ secret: OWNER_SECRET })).status).toBe(429);
+    expect(warn.mock.calls.some((c) => String(c[0]).includes('RELAY_TRUST_PROXY'))).toBe(true);
+    // …but break-glass still works from that same shared key.
+    const { mintLoginLinkCode } = await import('../src/relay-server/auth/login-links');
+    const { code } = mintLoginLinkCode({ createdBy: 'test' });
+    const ex = await request(base).post('/api/auth/login-link/exchange').set(remote).send({ code });
+    expect(ex.status).toBe(200);
+    // 200 junk codes: all 401, never 429, and they do not touch the password limiter.
+    const other = { 'x-forwarded-for': '198.51.100.9' };
+    const { base: base2 } = await h.boot(); // fresh limiter, trusted-proxy default
+    for (let i = 0; i < 200; i++) {
+      const res = await request(base2).post('/api/auth/login-link/exchange').set(other).send({ code: `bogus-${i}` });
+      expect(res.status).toBe(401);
+    }
+    expect((await request(base2).post('/api/auth/login').set(other).send({ secret: OWNER_SECRET })).status).toBe(200);
+    // A code used once is dead, even on a clean key.
+    expect((await request(base2).post('/api/auth/login-link/exchange').set(other).send({ code })).status).toBe(401);
+  });
+
+  it("limiter invariant: a key's wait depends only on its own failures and is bounded by 60 s", async () => {
+    const { LoginRateLimiter } = await import('../src/relay-server/auth/rate-limit');
+    const limiter = new LoginRateLimiter();
+    const t0 = 5_000_000;
+    // 1000 failures from 1000 other keys within one minute.
+    for (let i = 0; i < 1000; i++) limiter.recordFailure(`attacker-${i}`, t0 + i);
+    expect(limiter.check('owner', t0 + 1000).allowed).toBe(true); // a clean key is always allowed
+    // Under global pressure a failing key is charged the max delay at once…
+    expect(limiter.recordFailure('attacker-0', t0 + 1001)).toBe(60_000);
+    // …and the owner's own typo during the attack costs at most 60 s, then it may try again.
+    limiter.recordFailure('owner', t0 + 2000);
+    expect(limiter.check('owner', t0 + 2000 + 59_000).allowed).toBe(false);
+    for (let i = 0; i < 500; i++) limiter.recordFailure(`attacker-${i}`, t0 + 3000 + i); // attack continues
+    expect(limiter.check('owner', t0 + 2000 + 60_000).allowed).toBe(true);
+    // Without pressure the schedule starts at 1 s again.
+    const calm = new LoginRateLimiter();
+    expect(calm.recordFailure('k', t0)).toBe(1000);
+    expect(calm.recordFailure('k', t0 + 1000)).toBe(2000);
+  });
 });
 
 describe('session store (audit §6 #6, #7, #9, #10)', () => {
@@ -642,8 +707,36 @@ describe('static preview server never serves the workspace root (CONTRACTS §2 P
     expect(state).not.toBe(200);
     const listing = await fetch(`http://127.0.0.1:${free}/`).then((r) => r.text());
     expect(listing).not.toContain('.relay');
+    // Verifier r1 LOW: symlinks inside the served root that escape it are refused
+    // (file, directory, a directory's index.html) and hidden from listings.
+    const stateDir = path.join(workspace, '.relay', 'state');
+    await fs.mkdir(stateDir, { recursive: true });
+    await fs.writeFile(path.join(stateDir, 'probe-secret'), 'TOPSECRET');
+    const outside = await h.tempDir('relay-outside-');
+    await fs.writeFile(path.join(outside, 'index.html'), 'OUTSIDE');
+    await fs.mkdir(path.join(workspace, 'projects', 'demo'), { recursive: true });
+    await fs.writeFile(path.join(workspace, 'projects', 'demo', 'ok.txt'), 'fine');
+    await fs.symlink(path.join(stateDir, 'probe-secret'), path.join(workspace, 'projects', 'demo', 'leak.txt'));
+    await fs.symlink(stateDir, path.join(workspace, 'projects', 'demo', 'statedir'));
+    await fs.symlink(outside, path.join(workspace, 'projects', 'outdir'));
+    await fs.mkdir(path.join(workspace, 'projects', 'idx'));
+    await fs.symlink(path.join(outside, 'index.html'), path.join(workspace, 'projects', 'idx', 'index.html'));
+    await fs.symlink(path.join(workspace, 'projects', 'demo', 'ok.txt'), path.join(workspace, 'projects', 'demo', 'inner-link.txt'));
+    const get = (p: string) => fetch(`http://127.0.0.1:${free}${p}`).then(async (r) => ({ status: r.status, text: await r.text() }));
+    expect(await get('/demo/ok.txt')).toEqual({ status: 200, text: 'fine' });
+    expect(await get('/demo/inner-link.txt')).toEqual({ status: 200, text: 'fine' }); // a link that stays inside is fine
+    for (const p of ['/demo/leak.txt', '/demo/statedir/probe-secret', '/demo/statedir/', '/outdir/index.html', '/outdir/', '/idx/']) {
+      const r = await get(p);
+      expect(r.status, p).toBe(404);
+      expect(r.text, p).not.toContain('TOPSECRET');
+      expect(r.text, p).not.toContain('OUTSIDE');
+    }
+    const demoListing = (await get('/demo/')).text;
+    expect(demoListing).toContain('ok.txt');
+    expect(demoListing).not.toContain('leak.txt');
+    expect(demoListing).not.toContain('statedir');
     // stop the python server
     const { execSync } = await import('node:child_process');
-    try { execSync(`pkill -f "http.server ${free}"`); } catch { /* already gone */ }
+    try { execSync(`pkill -f "${free} ${path.join(workspace, 'projects')} "`); } catch { /* already gone */ }
   });
 });

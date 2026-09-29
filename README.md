@@ -61,8 +61,11 @@ Endpoints: `POST /api/auth/login {secret, label?}` → `{token, session}` ·
 `GET /api/auth/sessions` · `POST /api/auth/sessions {label, kind:'api', ttlDays?}` ·
 `DELETE /api/auth/sessions/:id` · `POST /api/auth/sessions/revoke-all {keepCurrent?}` ·
 `POST /api/auth/session/rotate` · `POST /api/auth/login-link` →
-`POST /api/auth/login-link/exchange {code}`. Failed logins back off per client IP
-(1 s doubling to 60 s, never a hard lock; loopback exempt).
+`POST /api/auth/login-link/exchange {code}`. Failed password logins back off per
+client IP (1 s doubling to 60 s; other clients' failures never block you; loopback
+exempt). The login-link exchange is not rate-limited, so break-glass always works.
+Behind a proxy that is not on loopback (e.g. Railway's edge) set `RELAY_TRUST_PROXY`
+(e.g. `1`) so the backoff is per client rather than shared.
 
 On the box, `relay-auth` (installed into `$RELAY_HOME/bin`) uses the local token:
 

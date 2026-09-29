@@ -52,6 +52,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { spawn } from 'child_process';
+import { childProcessEnv } from '../auth/secrets';
 import type { AIModel } from '../ai-adapters';
 import { detectFramework, type Framework } from './component-extraction';
 import { deepenWebTokens } from './token-cleanup-web';
@@ -1080,7 +1081,7 @@ export async function flutterAnalyze(projectRoot: string): Promise<AnalyzeResult
 
 function runCmd(cmd: string, args: string[], cwd: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { cwd, env: process.env });
+    const p = spawn(cmd, args, { cwd, env: childProcessEnv() });
     let out = ''; let err = '';
     p.stdout.on('data', (d) => (out += d.toString()));
     p.stderr.on('data', (d) => (err += d.toString()));
