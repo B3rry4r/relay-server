@@ -69,6 +69,7 @@ import { planFlowRequeue } from './passes/flow-requeue';
 import { planInteractionRequeue } from './passes/interaction-audit';
 import { repointAssetUsage, buildAssetInventory, renderAssetInventory } from './passes/asset-usage';
 import { ensureProjectGit, commitCheckpoint, snapshotBeforeMutation, rollbackTo } from './version-control';
+import { screenReadabilityFindings, readabilityFixBlock, type ReadabilityFinding } from './readability';
 
 const execFile = promisify(execFileCb);
 
@@ -1117,6 +1118,33 @@ async function readLastGen(projectRoot: string, frameId?: string): Promise<LastG
   return {};
 }
 
+/**
+ * Readability F7: the source files that make up ONE built screen — the manifest's
+ * entry + files, minus pipeline scaffolding (preview entries, the theme, generated
+ * route tables). Framework-agnostic (dart / ts / tsx / js / jsx).
+ */
+export function readabilityScreenFiles(projectRoot: string, lastGen: LastGen): string[] {
+  const out = new Set<string>();
+  for (const f of [lastGen.entry, ...(lastGen.files ?? [])]) {
+    if (!f || typeof f !== 'string' || f.startsWith('/') || f.includes('..')) continue;
+    const rel = f.replace(/^\.\//, '');
+    if (!/\.(dart|tsx?|jsx?)$/.test(rel)) continue;
+    if (/(^|\/)(_preview|%5Fpreview|\.uix|node_modules|test|theme)(\/|$)/.test(rel)) continue;
+    if (/(^|\/)(main\.dart|app_router\.dart|app_routes\.dart|app_theme\.dart|layout\.tsx?|App\.tsx?|main\.tsx?|router\.tsx?|routes\.tsx?)$/.test(rel)) continue;
+    if (fsSync.existsSync(path.join(projectRoot, rel))) out.add(rel);
+  }
+  return [...out];
+}
+
+/** F7: measure the screen's files (warn-only — the result is advisory, never a block). */
+async function screenReadability(projectRoot: string, framework: string, frameId: string): Promise<{ files: string[]; findings: ReadabilityFinding[] } | { skipped: string }> {
+  const files = readabilityScreenFiles(projectRoot, await readLastGen(projectRoot, frameId));
+  if (!files.length) return { skipped: 'the screen manifest names no source file on disk' };
+  const r = screenReadabilityFindings(projectRoot, framework, files);
+  if (!r.ok) return { skipped: r.reason };
+  return { files: r.files, findings: r.findings };
+}
+
 // ── prompt builders ───────────────────────────────────────────────────────────
 
 function verifyPrompt(refPath: string, candPath: string, frameName: string, prevScore: number | null, userNotes?: string): string {
@@ -1163,7 +1191,7 @@ function tiledVerifyPrompt(refPath: string, candTilePaths: string[], frameName: 
   ].filter(Boolean).join('\n');
 }
 
-function fixPrompt(frameId: string, frameName: string, refPath: string, candPath: string, v: Verdict, userNotes?: string): string {
+export function fixPrompt(frameId: string, frameName: string, refPath: string, candPath: string, v: Verdict, userNotes?: string, readability?: string): string {
   const items = v.discrepancies.map((d, i) => `  ${i + 1}. [${d.severity ?? 'med'}] ${d.area ? d.area + ': ' : ''}${d.issue}`).join('\n');
   const notes = (userNotes ?? '').trim();
   return [
@@ -1174,6 +1202,8 @@ function fixPrompt(frameId: string, frameName: string, refPath: string, candPath
     `Open BOTH images, then revise the EXISTING screen file(s) to fix these specific discrepancies — but skip any that contradict the user rules above:`,
     items || '  (general fidelity — bring it closer to the reference)',
     `Reuse the project's existing design system / theme / shared components — do not restyle inline.`,
+    // F7: the warn-only readability findings for THIS screen's files (empty when clean).
+    readability ?? '',
     `Keep the preview entrypoint working and keep ${screenManifestPath(frameId)} accurate (this screen's OWN manifest — never a shared one). Output a one-line summary.`,
   ].filter(Boolean).join('\n');
 }
@@ -1807,7 +1837,12 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
 
     // FIX (resume the implementation session so the agent keeps full context).
     appendJobLog(jobId, `[loop] fix ${iter}: applying ${verdict.discrepancies.length} change(s)`);
-    const fix = await observedBuildCall('fix', fixPrompt(frameId, frameName, referenceImagePath, candRel ?? '(build failed — no screenshot)', verdict, req.userNotes), { sessionId: session });
+    // F7: the fix prompt also carries this screen's readability findings (warn-only),
+    // so a fix pass stops growing magic numbers / provenance comments (Ping 04→06).
+    const rdFix = await screenReadability(projectRoot, screenFramework, frameId).catch(() => null);
+    const rdBlock = rdFix && 'findings' in rdFix ? readabilityFixBlock({ ok: true, findings: rdFix.findings, files: rdFix.files }) : '';
+    if (rdBlock) appendJobLog(jobId, `[loop] fix ${iter}: + ${(rdFix as { findings: ReadabilityFinding[] }).findings.length} readability finding(s) (advisory)`);
+    const fix = await observedBuildCall('fix', fixPrompt(frameId, frameName, referenceImagePath, candRel ?? '(build failed — no screenshot)', verdict, req.userNotes, rdBlock), { sessionId: session });
     // T29: a rate-limited (incl. empty-streak soft-limit) fix → pause resumably rather
     // than burning the remaining iterations on empty calls + ending in needs-review.
     if (fix.rateLimited && req.runId) { await pauseRunRateLimited(req.projectId, req.runId, frameId, session, fix.stalled ? stallPauseReason : undefined, fix.resetHint); return session; }
@@ -1834,6 +1869,23 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     if (recon.flags.length) appendJobLog(jobId, `[loop] ${reconcileSummary(recon)}`);
   } catch { /* recon is best-effort — never block on a grep error */ }
   const reconBlocked = !!recon && !recon.ok;
+  // F7: WARN-ONLY readability gate on the finished screen. Recorded on the run +
+  // result.json; it NEVER demotes the screen (CONTRACTS §5 — only do-nothing handlers
+  // requeue, and that is 7g's job).
+  let readability: RunScreen['readability'];
+  try {
+    const rd = await screenReadability(projectRoot, screenFramework, frameId);
+    if ('skipped' in rd) readability = { skipped: rd.skipped };
+    else {
+      const byCode: Record<string, number> = {};
+      for (const f of rd.findings) byCode[f.code] = (byCode[f.code] ?? 0) + 1;
+      readability = { warnings: rd.findings.length, byCode, files: rd.files, sample: rd.findings.slice(0, 8).map((f) => `${f.file}: ${f.message}`) };
+      if (rd.findings.length) {
+        appendJobLog(jobId, `[loop] readability (warn-only): ${rd.findings.length} finding(s) — ${Object.entries(byCode).map(([k, n]) => `${k}×${n}`).join(', ')}`);
+        if (req.runId) { try { await appendRunLog(req.projectId, req.runId, `[screen ${frameName}] readability (warn-only): ${Object.entries(byCode).map(([k, n]) => `${k}×${n}`).join(', ')}`); } catch { /* non-fatal */ } }
+      }
+    }
+  } catch (e) { readability = { skipped: `readability gate threw: ${(e as Error).message}` }; }
   if (reconBlocked && matched) {
     matched = false;
     stopReason = `reconciliation failed (${recon!.flags.filter(f => f.severity === 'high').map(f => f.code).join(', ')})`;
@@ -1920,7 +1972,10 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
       vPrev = score;
       if (iter === maxIterations) break;
       appendJobLog(jobId, `[loop] variant ${vLabel} fix ${iter}: applying ${verdict.discrepancies.length} change(s)`);
-      const fix = await observedBuildCall('fix', fixPrompt(v.frameId, vFrameName, v.referenceImagePath!, vCand ?? '(build failed — no screenshot)', verdict, req.userNotes), { sessionId: session });
+      // F7: same advisory readability block as the lead's fix (the variant lives in the lead's files).
+      const vRd = await screenReadability(projectRoot, screenFramework, frameId).catch(() => null);
+      const vRdBlock = vRd && 'findings' in vRd ? readabilityFixBlock({ ok: true, findings: vRd.findings, files: vRd.files }) : '';
+      const fix = await observedBuildCall('fix', fixPrompt(v.frameId, vFrameName, v.referenceImagePath!, vCand ?? '(build failed — no screenshot)', verdict, req.userNotes, vRdBlock), { sessionId: session });
       if (fix.rateLimited) { await pauseRunRateLimited(req.projectId, req.runId!, frameId, session, fix.stalled ? stallPauseReason : undefined, fix.resetHint); return 'paused'; }
       if (fix.sessionId) session = fix.sessionId;
       variantFixesApplied++;
@@ -2021,6 +2076,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     iterations: iterationsRun, maxIterations,
     finalVerdict, sessionId: session,
     reconciliation: recon ? { ok: recon.ok, flags: recon.flags } : undefined,
+    readability,
     referenceImage: referenceImagePath,
     candidateImage: lastCandRel ?? undefined,
     ir: req.tree ? path.join(relScreenDir, 'ir.txt') : undefined,
@@ -2034,7 +2090,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
   if (req.runId) {
     try {
       if (matched) {
-        await updateRunScreen(req.projectId, req.runId, frameId, { status: 'done', matched: true, sessionId: session, review: undefined });
+        await updateRunScreen(req.projectId, req.runId, frameId, { status: 'done', matched: true, sessionId: session, review: undefined, readability });
         // T9 (RFC v2 §8.2): explicit terminal outcome line — at a glance "ACCEPTED",
         // not just "loop done", so the human doesn't have to parse the log to know it
         // passed. Score (when the verify agent gave one) rides along.
@@ -2044,7 +2100,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
         // Surface recon flags alongside the visual discrepancies in the review queue.
         const reconDiscs = (recon?.flags ?? []).map(f => ({ area: `recon:${f.code}`, issue: f.message, severity: f.severity }));
         await updateRunScreen(req.projectId, req.runId, frameId, {
-          status: 'needs-review', matched: false, sessionId: session,
+          status: 'needs-review', matched: false, sessionId: session, readability,
           review: {
             candidateImagePath: lastCandRel ?? undefined,
             referenceImagePath,

@@ -54,6 +54,9 @@ export interface RunScreen {
   spec?: ScreenSpec;
   /** Populated when status === 'needs-review' (candidate-vs-reference + verdict). */
   review?: ReviewInfo;
+  /** Readability F7 — the WARN-ONLY per-screen readability gate. Recorded, fed to the
+   *  fix prompt, never a reason to park or demote the screen. */
+  readability?: { warnings: number; byCode: Record<string, number>; files: string[]; sample: string[] } | { skipped: string };
 }
 // 'needs-review' = the orchestrator finished every screen but one or more landed in
 // the needs-review queue, so the run is NOT complete (it must not deploy) until a
