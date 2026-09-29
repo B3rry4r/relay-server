@@ -60,7 +60,11 @@ const THEME_RELS = ['src/theme/theme.ts', 'src/theme/index.ts', 'src/theme.ts'];
 export function parseWebTheme(projectRoot: string): WebThemeModel | null {
   const themeFile = THEME_RELS.map((r) => path.join(projectRoot, r)).find((p) => fsSync.existsSync(p));
   if (!themeFile) return null;
-  const src = fsSync.readFileSync(themeFile, 'utf-8');
+  return parseWebThemeSource(fsSync.readFileSync(themeFile, 'utf-8'), themeFile);
+}
+
+/** Parse a theme module's source (the object parser behind parseWebTheme). */
+export function parseWebThemeSource(src: string, themeFile: string): WebThemeModel | null {
   const decl = /export\s+const\s+([A-Za-z0-9_$]+)\s*=\s*\{/.exec(src);
   if (!decl) return null;
   const foundKeys = new Set<string>();

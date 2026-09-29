@@ -46,7 +46,7 @@ import {
 import { notify } from './notify';
 import { getProjectsRoot } from './runtime';
 import {
-  canonicalizeRun, writeCanonical, readCanonical, generateFlutterSkeleton,
+  canonicalizeRun, writeCanonical, readCanonical, generateFlutterSkeleton, generateWebSkeleton,
   restampCanonicalHeaders, cleanOrphanScreens, syncLiveCanonical,
   nukeGeneratedAppSurface, planSemanticScreens, computeTabCluster,
   type Canonical, type CanonicalScreen,
@@ -58,7 +58,8 @@ import type { ReduceFlow } from './canonicalize-ai/reduce';
 import { AiStepError, runModelObserved, _emptyStreakConfig } from './ai-observability';
 import { generateDesignSystem, seedContextWithThemeApi, ensureMainWired, consolidateDesignTokens, ensureScreenPreviewEntry, modalPresenterName, type ThemeTokens } from './design-system';
 import { prepScreen, ensureIrComplete, getIrData, runAssetPass, type PrepConfig, type LocalizedAsset } from './reference-render';
-import { screenDirName, screenManifestPath, webPreviewRoute } from './agent-packet';
+import { screenDirName, screenManifestPath, webPreviewRoute, webPreviewDir } from './agent-packet';
+import { webScreenSlot, webModalSlots } from './web-skeleton';
 import type { FigFrame, FlowGraph } from './agent-packet';
 import { computePreflight } from './preflight';
 import { reconcileScreen, reconcileSummary, type ReconcileResult } from './reconcile';
@@ -811,12 +812,21 @@ const MODALISH_NAME = /modal|sheet|dialog|dialogue|popup|pop-?over|drawer|overla
  */
 export function modalPresentationHint(
   tree: string | undefined, frameW?: number, frameH?: number, baseW?: number, baseH?: number,
+  framework = 'flutter',
 ): { kind: ModalPresentationKind; hint: string } {
-  const hints: Record<ModalPresentationKind, string> = {
-    bottomSheet: `BOTTOM SHEET — present via showModalBottomSheet over the reused base (content anchored to the bottom edge, scrim above).`,
-    dialog: `centered DIALOG — present via showDialog over the reused base (small centered card, dimmed scrim around it).`,
-    fullOverlay: `FULL-SCREEN SCRIM OVERLAY — dim the (reused) base behind a scrim and center this content over it. Do NOT use a Material spinner dialog and do NOT rebuild the base as a new page.`,
-  };
+  const hints: Record<ModalPresentationKind, string> = isWebFramework(framework)
+    // Web: the ModalHost (web skeleton) supplies the scrim layer; the content
+    // positions itself inside it. Never name Flutter APIs to a web agent.
+    ? {
+      bottomSheet: `BOTTOM SHEET — the content anchors to the bottom edge of the ModalHost layer (position: absolute; bottom: 0), over the reused base with the host's scrim above it.`,
+      dialog: `centered DIALOG — a small card centered in the ModalHost layer over the reused base, the host's scrim around it.`,
+      fullOverlay: `FULL-SCREEN SCRIM OVERLAY — center this content over the dimmed (reused) base inside the ModalHost layer. Do NOT use a spinner dialog and do NOT rebuild the base as a new page.`,
+    }
+    : {
+      bottomSheet: `BOTTOM SHEET — present via showModalBottomSheet over the reused base (content anchored to the bottom edge, scrim above).`,
+      dialog: `centered DIALOG — present via showDialog over the reused base (small centered card, dimmed scrim around it).`,
+      fullOverlay: `FULL-SCREEN SCRIM OVERLAY — dim the (reused) base behind a scrim and center this content over it. Do NOT use a Material spinner dialog and do NOT rebuild the base as a new page.`,
+    };
   const lines = (tree ?? '').split('\n');
   // Root dims from the first node line when the caller has no frame dims.
   const rootM = lines.length ? NODE_DIMS_RE.exec(lines[0]) : null;
@@ -858,8 +868,17 @@ export function modalPresentationHint(
  */
 export function buildCanonicalContext(canonical: Canonical, cs: CanonicalScreen, runScreens?: RunScreen[], framework = 'flutter'): string {
   const web = isWebFramework(framework);
+  const next = framework === 'next';
+  // Web: the slot the web skeleton generated for this screen (PG-02) — the agent
+  // fills THAT file; it never invents a router, a route table or a preview route.
+  const slot = web ? webScreenSlot(canonical, cs.canonicalId, framework) : null;
+  const modalSlots = web ? webModalSlots(canonical, framework, Object.fromEntries((runScreens ?? []).map(s => [s.frameId, s.frameName]))) : null;
   const out: string[] = [
-    `CANONICAL SCREEN — this is ONE screen (canonicalId ${cs.canonicalId}, route ${cs.route}); build a SINGLE widget, not one page per variant. Its write-locked route slot already exists in lib/app_router.dart; fill the widget body, keep the route.`,
+    slot
+      ? (next
+        ? `CANONICAL SCREEN — this is ONE screen (canonicalId ${cs.canonicalId}, route ${cs.route}); build a SINGLE page, not one page per variant. Its write-locked route slot already exists: \`${slot.file}\` (under the app's source root) — a stub whose header \`// canonicalId: ${cs.canonicalId} route: ${cs.route}\` sits ABOVE 'use client'. REPLACE the body of its default export ${slot.className} with the real UI; keep the header, the file location and the default export. Navigate with the constants in lib/routes.ts (router.push(ROUTES.x) / <Link href={ROUTES.x}>); never add or rename routes.`
+        : `CANONICAL SCREEN — this is ONE screen (canonicalId ${cs.canonicalId}, route ${cs.route}); build a SINGLE component, not one page per variant. Its write-locked route slot already exists: src/App.tsx mounts <${slot.className} /> from \`${slot.file}\` at ROUTES.${slot.routeConst}. REPLACE the body of that stub with the real UI; keep its \`// canonicalId: ${cs.canonicalId} route: ${cs.route}\` header, file and export name. Navigate with the constants in src/router/routes.ts (navigate(ROUTES.x) / <Link to={ROUTES.x}>); never edit src/App.tsx or the route table.`)
+      : `CANONICAL SCREEN — this is ONE screen (canonicalId ${cs.canonicalId}, route ${cs.route}); build a SINGLE widget, not one page per variant. Its write-locked route slot already exists in lib/app_router.dart; fill the widget body, keep the route.`,
   ];
   const specOf = (frameId: string): ScreenSpec | undefined =>
     runScreens?.find(s => s.frameId === frameId)?.spec;
@@ -871,8 +890,9 @@ export function buildCanonicalContext(canonical: Canonical, cs: CanonicalScreen,
   // navbar + pushNamed's its siblings (Ping audit).
   const tabCluster = computeTabCluster(canonical);
   if (tabCluster?.memberIds.includes(cs.canonicalId)) {
-    out.push(
-      `APP SHELL — this screen is a TAB destination hosted inside AppShell (lib/screens/app_shell.dart, an IndexedStack over the tab cluster). Do NOT render your own bottom navigation bar — the shell owns it (one shared bottom nav for all tabs). Never Navigator.push a tab route from inside a tab screen; tab switching is the shell's job (it only changes the IndexedStack index). Build this screen's body WITHOUT any bottom nav.`,
+    out.push(web
+      ? `APP SHELL — this screen is a TAB destination hosted inside AppShell (${next ? 'components/AppShell.tsx, rendered by app/(tabs)/layout.tsx' : 'src/shell/AppShell.tsx, the <Route element={<AppShell />}> parent'}) — one shared tab bar for the whole tab cluster. Do NOT render your own bottom navigation bar and never ${next ? 'router.push()' : 'navigate()'} to a sibling tab from inside a tab screen; tab switching is the shell's job. Build this screen's body WITHOUT any bottom nav.`
+      : `APP SHELL — this screen is a TAB destination hosted inside AppShell (lib/screens/app_shell.dart, an IndexedStack over the tab cluster). Do NOT render your own bottom navigation bar — the shell owns it (one shared bottom nav for all tabs). Never Navigator.push a tab route from inside a tab screen; tab switching is the shell's job (it only changes the IndexedStack index). Build this screen's body WITHOUT any bottom nav.`,
     );
   }
   let foldedPayloads = 0;
@@ -883,9 +903,11 @@ export function buildCanonicalContext(canonical: Canonical, cs: CanonicalScreen,
       if (!spec?.referenceImagePath) { out.push(`- state "${s.id}" (frame ${s.frameId})${s.frameId === leadFrameId ? ' — the base/default state this packet builds' : ''}`); continue; }
       foldedPayloads++;
       out.push([
-        `- FOLDED STATE "${s.id}" (frame ${s.frameId}) — rendered by THIS widget as ${className}(state: '${s.id}'); NOT a separate route/file.`,
+        web
+          ? `- FOLDED STATE "${s.id}" (frame ${s.frameId}) — rendered by THIS ${next ? 'page' : 'component'} ${next ? `when useScreenState() returns '${s.id}'` : `as <${className} state="${s.id}" />`}; NOT a separate route/file.`
+          : `- FOLDED STATE "${s.id}" (frame ${s.frameId}) — rendered by THIS widget as ${className}(state: '${s.id}'); NOT a separate route/file.`,
         `  REFERENCE IMAGE (ground truth): ${spec.referenceImagePath} — OPEN this image with your file-reading tool and match it EXACTLY (layout, text, colours).`,
-        ...(web ? [`  PREVIEW ROUTE CONTRACT: register a route at EXACTLY \`${webPreviewRoute(s.frameId)}\` that mounts THIS screen in state '${s.id}'. The verify harness screenshots that exact route to check this state against the reference above; do NOT rename it. This is a verify-only entrypoint, not a user-facing page.`] : []),
+        ...(web ? [`  PREVIEW ROUTE CONTRACT: \`${webPreviewRoute(s.frameId)}\` mounts THIS screen in state '${s.id}' — the skeleton already registered it (${next ? `app/${webPreviewDir(s.frameId)}/page.tsx wraps the page in <ScreenStateProvider state="${s.id}">` : `src/App.tsx: <${className} state="${s.id}" />`}); if it is missing, create it exactly so. The verify harness screenshots that exact route to check this state against the reference above; do NOT rename it. This is a verify-only entrypoint, not a user-facing page.`] : []),
         `  IR TREE of this state's frame:`,
         boundFoldedIR(spec.tree),
       ].join('\n'));
@@ -897,17 +919,21 @@ export function buildCanonicalContext(canonical: Canonical, cs: CanonicalScreen,
       const spec = specOf(m.frameId);
       if (!spec?.referenceImagePath) { out.push(`- modal "${m.id}" (frame ${m.frameId})`); continue; }
       foldedPayloads++;
-      const p = modalPresentationHint(spec.tree, spec.width, spec.height, leadSpec?.width, leadSpec?.height);
+      const p = modalPresentationHint(spec.tree, spec.width, spec.height, leadSpec?.width, leadSpec?.height, framework);
       out.push([
         `- FOLDED MODAL "${m.id}" (frame ${m.frameId}) — part of THIS screen.`,
         `  REFERENCE IMAGE (ground truth): ${spec.referenceImagePath} — OPEN this image with your file-reading tool and match it EXACTLY (layout, text, colours).`,
         `  PRESENTATION (derived from the frame's geometry): ${p.hint}`,
         web
-          // Web has no presenter to call — the harness screenshots a ROUTE. Give the
-          // agent the exact route so producer and consumer cannot disagree, and say
-          // plainly that the BASE route renders closed (an earlier build force-opened
-          // modals on the base route to match a reference that was itself wrong).
-          ? `  PREVIEW ROUTE CONTRACT: register a route at EXACTLY \`${webPreviewRoute(m.frameId)}\` that mounts THIS base screen with this modal ALREADY OPEN. The verify harness screenshots that exact route to check the modal against the reference above; do NOT rename it. The base screen's own route \`${webPreviewRoute(leadFrameId)}\` MUST render with NO modal open — never force a modal open on the base route.`
+          // The harness screenshots a ROUTE that calls the presenter. The skeleton
+          // generated both (the presenter slot and the preview route), so producer and
+          // consumer cannot disagree; say plainly that the BASE route renders closed
+          // (an earlier build force-opened modals on the base route to match a
+          // reference that was itself wrong).
+          ? [
+            `  PRESENTER CONTRACT: the skeleton created the presenter slot \`${modalSlots?.get(m.id)?.file ?? `${modalPresenterName(m.id)}()`}\` — REPLACE the body of ${modalSlots?.get(m.id)?.component ?? 'its content component'} with the real modal UI and keep \`export function ${modalPresenterName(m.id)}()\` (it calls modalController.open('${m.id}', …); the root ModalHost renders it above a scrim). The name is FIXED. Call ${modalPresenterName(m.id)}() from the trigger in THIS screen that opens the modal — a modal only the preview presents is unreachable in the shipped app.`,
+            `  PREVIEW ROUTE CONTRACT: \`${webPreviewRoute(m.frameId)}\` mounts THIS base screen and calls ${modalPresenterName(m.id)}() on mount — the skeleton already registered it${next ? ` (app/${webPreviewDir(m.frameId)}/page.tsx)` : ' (src/App.tsx)'}; if it is missing, create it exactly so. The verify harness screenshots that exact route to check the modal against the reference above; do NOT rename it. The base screen's own route \`${webPreviewRoute(leadFrameId)}\` MUST render with NO modal open — never force a modal open on the base route.`,
+          ].join('\n')
           : `  PRESENTER CONTRACT: declare a top-level function \`Future<void> ${modalPresenterName(m.id)}(BuildContext context)\` in this screen's file that presents this modal. The name is FIXED — the automated preview harness calls it verbatim to screenshot the modal for verification.`,
         `  IR TREE of the modal frame:`,
         boundFoldedIR(spec.tree),
@@ -924,7 +950,10 @@ export function buildCanonicalContext(canonical: Canonical, cs: CanonicalScreen,
     out.push(`This screen shares template "${cs.templateRef}" with ${sibs.length} sibling screen(s) — extract the shared layout into a reusable widget + thin per-screen config.`);
   }
   if (canonical.components.length) {
-    out.push(`Shared components available (import from lib/components/ — reuse, don't re-invent): ${canonical.components.map(c => c.name).join(', ')}.`);
+    const dir = web ? (next ? 'components/' : 'src/components/') : 'lib/components/';
+    out.push(web
+      ? `Shared components (create each ONCE in ${dir} — or import it from there when an earlier screen already did — and reuse it; don't re-invent): ${canonical.components.map(c => c.name).join(', ')}.`
+      : `Shared components available (import from ${dir} — reuse, don't re-invent): ${canonical.components.map(c => c.name).join(', ')}.`);
   }
   return out.join('\n');
 }
@@ -2210,14 +2239,15 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
             // modals into base screens, rebuilds frameMap, maps states/templates/flow).
             canonical = aiModelToCanonical(result.canonical);
           }
-          // Generate the deterministic skeleton (Flutter only for now; other
-          // frameworks still get canonical.json + the manifest, no router file).
+          // Generate the deterministic skeleton for EVERY framework: flutter →
+          // generateFlutterSkeleton; react / next → generateWebSkeleton (PG-02).
           // (Skeleton writes are additive — a built screen file is never clobbered.)
-          // generateFlutterSkeleton derives SEMANTIC file/class/route-const/route-PATH
-          // names and REWRITES canonical.screens[].route to the semantic path, so the
-          // canonical must be PERSISTED AFTER the skeleton runs (below) — otherwise the
-          // sidecar carries machine routes the router no longer uses.
-          if ((run.framework || 'flutter').toLowerCase() === 'flutter') {
+          // Both derive SEMANTIC file/class/route-const/route-PATH names and REWRITE
+          // canonical.screens[].route to the semantic path, so the canonical must be
+          // PERSISTED AFTER the skeleton runs (below) — otherwise the sidecar carries
+          // machine routes the router no longer uses.
+          const skFw = (run.framework || 'flutter').toLowerCase();
+          if (skFw === 'flutter') {
             try {
               setGenPhase(projectId, runId, 'Skeleton');
               // T35: reap stale screen files from a prior (different/smaller) build so
@@ -2229,11 +2259,20 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
             } catch (e: any) {
               await appendRunLog(projectId, runId, `[canon] skeleton generation failed (continuing): ${e?.message || 'unknown'}`);
             }
+          } else if (skFw === 'react' || skFw === 'next') {
+            try {
+              setGenPhase(projectId, runId, 'Skeleton');
+              const frameNames = Object.fromEntries(run.screens.map(s => [s.frameId, s.frameName]));
+              const sk = await generateWebSkeleton(projectRoot, canonical, skFw, { frameNames });
+              await appendRunLog(projectId, runId, `[canon] skeleton (${skFw}): ${sk.files.length} file(s), ${sk.routes.length} route(s), ${sk.previews.length} /_preview route(s), ${sk.modals.length} modal presenter slot(s)${sk.kept.length ? `; kept hand-written ${sk.kept.join(', ')}` : ''}`);
+              for (const w of sk.warnings) await appendRunLog(projectId, runId, `[canon] skeleton WARNING: ${w}`);
+            } catch (e: any) {
+              await appendRunLog(projectId, runId, `[canon] skeleton generation failed (continuing): ${e?.message || 'unknown'}`);
+            }
           } else {
-            // T15 (RFC §0.1 — no silent degrade): the write-locked router/theme/component
-            // skeleton is flutter-only. A react/web run gets NO skeleton — say so LOUDLY
-            // (canonical.json + the manifest are still written above) instead of a silent no-op.
-            await appendRunLog(projectId, runId, `[canon] skeleton SKIPPED — ${(run.framework || 'flutter')} not yet supported by this phase; flutter-only (no router/theme/component stubs were generated)`);
+            // T15 (RFC §0.1 — no silent degrade): no skeleton exists for this framework.
+            // Say so LOUDLY (canonical.json + the manifest are still written above).
+            await appendRunLog(projectId, runId, `[canon] skeleton SKIPPED — no skeleton generator for framework '${skFw}' (flutter, react and next have one)`);
           }
           // Persist AFTER the skeleton has rewritten canonical.screens[].route to the
           // SEMANTIC path — so the per-run sidecar + the live `.uix/canonical.json`
@@ -2300,15 +2339,19 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
     // the app run it, so the whole app was dead code behind a counter-demo main.dart.
     // Both are idempotent (skip when already done / never clobber a real main.dart).
     let themeTokens: ThemeTokens | undefined;
-    // T15 (RFC §0.1 — no silent degrade): the EXTRACT-FIRST theme file + main.dart
-    // router wiring + AppAssets repoint below are flutter-only. A react/web run gets
-    // a degraded design-system (description only, no importable token file) and NO
-    // main wiring — make that gap LOUD up-front so the user knows, rather than the
-    // theme/app-wiring phases quietly no-op'ing on a non-flutter build.
-    const isFlutterRun = (run.framework || 'flutter').toLowerCase() === 'flutter';
-    if (!isFlutterRun) {
-      await appendRunLog(projectId, runId, `[design-system] DEGRADED — ${(run.framework || 'flutter')} not yet supported by this phase; flutter-only. No importable AppTheme token file is generated (the agent gets a theme DESCRIPTION only).`);
-      await appendRunLog(projectId, runId, `[app-wiring] SKIPPED — ${(run.framework || 'flutter')} not yet supported by this phase; flutter-only. main.dart router wiring is a no-op (the entrypoint is NOT auto-wired).`);
+    // T15 (RFC §0.1 — no silent degrade): the EXTRACT-FIRST theme file is generated
+    // for flutter (lib/theme/app_theme.dart) and react/next (a typed AppTheme module +
+    // CSS custom properties at the CONTRACTS §5 location, PG-31). main.dart wiring is
+    // flutter's; the web entry is wired by the web skeleton. Any other framework gets
+    // neither — say so LOUDLY instead of the phases quietly no-op'ing.
+    const runFw = (run.framework || 'flutter').toLowerCase();
+    if (runFw === 'react' || runFw === 'next') {
+      // The web entry (react: src/main.tsx → App; next: app/layout.tsx) is wired by
+      // the web skeleton itself; ensureMainWired is the Flutter main.dart analogue.
+      await appendRunLog(projectId, runId, `[app-wiring] ${runFw}: the entrypoint is wired by the web skeleton (${runFw === 'react' ? 'src/main.tsx → App router + theme.css' : 'app/layout.tsx → theme.css + ModalHost'}) — main.dart wiring does not apply`);
+    } else if (runFw !== 'flutter') {
+      await appendRunLog(projectId, runId, `[design-system] DEGRADED — no design-system renderer for framework '${runFw}' (flutter, react and next have one). No importable token file is generated.`);
+      await appendRunLog(projectId, runId, `[app-wiring] SKIPPED — no entrypoint wiring for framework '${runFw}'.`);
     }
     setGenPhase(projectId, runId, 'Pre-flight', 'design system + token extract');
     try {
@@ -2580,7 +2623,7 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
         try {
           const canonForStamp = await readCanonical(projectRoot, runId);
           if (canonForStamp) {
-            const r = await restampCanonicalHeaders(projectRoot, canonForStamp);
+            const r = await restampCanonicalHeaders(projectRoot, canonForStamp, run.framework || 'flutter');
             if (r.stamped.length || r.missingFiles.length) {
               await appendRunLog(projectId, runId,
                 `[finalize] header re-stamp — restored canonicalId header on ${r.stamped.length} screen file(s)`
@@ -3163,16 +3206,19 @@ export function startAutoResumeSweep(): void {
  * P5 (RFC §4.8): regenerate the write-locked skeleton after an approved amendment
  * bumps the plan version. Reuses the persisted canonical.json (the skeleton
  * generator is additive — it never clobbers a built screen file, only fills in the
- * router/route-table + missing stubs), so downstream screens see plan v+1. Flutter
- * only for now (matches generateFlutterSkeleton's scope). Best-effort + logged.
+ * router/route-table + missing stubs), so downstream screens see plan v+1. Every
+ * framework with a skeleton (flutter, react, next). Best-effort + logged.
  */
 async function regenSkeletonForRun(projectId: string, run: BuildRun): Promise<void> {
-  if (!run.canonical || (run.framework || 'flutter').toLowerCase() !== 'flutter') return;
+  const fw = (run.framework || 'flutter').toLowerCase();
+  if (!run.canonical || !['flutter', 'react', 'next'].includes(fw)) return;
   const projectRoot = resolveProjectRoot(projectId);
   if (!projectRoot || !fsSync.existsSync(projectRoot)) return;
   try {
     const canonical = (await readCanonical(projectRoot, run.id)) ?? canonicalizeRun(run.screens, run.flow);
-    const sk = await generateFlutterSkeleton(projectRoot, canonical);
+    const sk = fw === 'flutter'
+      ? await generateFlutterSkeleton(projectRoot, canonical)
+      : await generateWebSkeleton(projectRoot, canonical, fw, { frameNames: Object.fromEntries(run.screens.map(s => [s.frameId, s.frameName])) });
     await appendRunLog(projectId, run.id, `[amend] skeleton regenerated for plan v${run.planVersion ?? 1}: ${sk.files.length} file(s), ${sk.routes.length} route(s)`);
   } catch (e: any) {
     await appendRunLog(projectId, run.id, `[amend] skeleton regen failed (continuing): ${e?.message || 'unknown'}`);

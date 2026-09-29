@@ -933,7 +933,11 @@ async function webBuildOk(projectRoot: string, env?: NodeJS.ProcessEnv): Promise
     return { ok: null, reason: 'node_modules missing (dependencies not installed) — `npm run build` cannot run; build gate did not run' };
   }
   try {
-    await runCmd('npm', ['run', 'build'], projectRoot, env, true);
+    // A production build must run with NODE_ENV=production: a server (or test
+    // runner) started with NODE_ENV=development/test leaks it into the child, and
+    // `next build` then fails prerendering its own /_global-error page ("Cannot read
+    // properties of null (reading 'useContext')") — a build failure no pass caused.
+    await runCmd('npm', ['run', 'build'], projectRoot, { ...(env ?? process.env), NODE_ENV: 'production' }, true);
     return { ok: true, tool: 'npm run build' };
   } catch (e) {
     return { ok: false, error: String((e as Error)?.message ?? e).slice(0, 400), tool: 'npm run build' };

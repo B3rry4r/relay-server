@@ -592,7 +592,7 @@ async function phaseResolver(): Promise<Cell[]> {
     const res = await resolveAll(root);
     const miss = res.filter((x) => !x.hit).map((x) => x.id);
     checks.push(chk('rs.headers', miss.length === 0, 'stub', 'every stamped screen resolves by its `// canonicalId:` header', miss.length ? `unresolved: ${miss.join(', ')} (srcDir=${res[0].ix?.srcDir})` : res.map((x) => `${x.id}→${x.hit!.file.replace(root + '/', '')}`).join(', ')));
-    // Without headers (nothing in the web pipeline stamps them — restampCanonicalHeaders is lib/screens/*.dart only).
+    // Without headers (an agent that rewrote a screen may drop the header before the pre-finalize re-stamp).
     const bare = await copyFixture(fw, 'resolver-noheader');
     for (const f of await appSources(bare.root, fw)) {
       const p = path.join(bare.root, f);
@@ -628,13 +628,31 @@ async function phaseHeaderRestamp(): Promise<Cell[]> {
     const canonical = JSON.parse(read(root, '.uix/canonical.json'));
     const before = await snapshot(root);
     const r = await restampCanonicalHeaders(root, canonical);
-    const diff = diffSnaps(before, await snapshot(root));
+    const after = await snapshot(root);
+    const diff = diffSnaps(before, after);
     const stamped = diff.filter((d) => d.change === 'modified').map((d) => d.file);
     const ok = fw === 'flutter' ? stamped.length >= 2 : stamped.length >= 3;
+    const checks: Check[] = [chk('hdr.restamp', ok, 'stub', 'header re-stamp (run before finalize) restores `// canonicalId:` on built screens', `stamped=${JSON.stringify(r.stamped)} missingFiles=${JSON.stringify(r.missingFiles)}`)];
+    if (fw !== 'flutter' && ok) {
+      // The stamp must be the one the resolver reads (layer 1), and on Next it must
+      // sit ABOVE 'use client' without displacing the directive.
+      const web = await import('../../src/relay-server/passes/web-app');
+      const bad: string[] = [];
+      for (const f of stamped) {
+        const src = read(root, f);
+        const h = web.readHeader(src);
+        const firstCode = src.split('\n').find((l) => l.trim() && !l.trim().startsWith('//'));
+        if (!h || !h.route) bad.push(`${f}: no header`);
+        else if (fw === 'next' && /^['"]use client['"]/m.test(src) && !/^['"]use client['"]/.test(firstCode?.trim() ?? '')) bad.push(`${f}: 'use client' is no longer the first statement`);
+      }
+      checks.push(chk('hdr.web-header', bad.length === 0, 'lie', "the stamped header is `// canonicalId: <id> route: <route>` (above 'use client' on Next)", bad.join(' | ') || `${stamped.length} header(s) ok`));
+    }
+    await restampCanonicalHeaders(root, canonical);
+    const d2 = diffSnaps(after, await snapshot(root));
+    checks.push(chk('hdr.idempotent', d2.length === 0, 'lie', 'a second re-stamp changes nothing', d2.map((d) => `${d.change}:${d.file}`).join(', ') || 'no change'));
     cells.push({
       pass: 'restampCanonicalHeaders', framework: fw, reported: null, files: diff,
-      checks: [chk('hdr.restamp', ok, 'stub', 'header re-stamp (run before finalize) restores `// canonicalId:` on built screens', `stamped=${JSON.stringify(r.stamped)} missingFiles=${JSON.stringify(r.missingFiles)}`)],
-      cell_status: ok ? 'IMPLEMENTED' : 'STUB', notes: fw === 'flutter' ? ['flutter resolves only semantic/legacy lib/screens names; machine files like screen_10_3.dart resolve via the legacy slug'] : [],
+      checks, cell_status: classify(null, checks), notes: fw === 'flutter' ? ['flutter resolves only semantic/legacy lib/screens names; machine files like screen_10_3.dart resolve via the legacy slug'] : [],
     });
   }
   return cells;
@@ -655,6 +673,28 @@ async function phaseDesignSystem(): Promise<Cell[]> {
       chk('ds.theme-file', g.wrote && diff.some((d) => d.change === 'added'), 'stub', 'an importable theme/token file is generated before screen 1', `wrote=${g.wrote} themeFile=${g.themeFile} added=${diff.map((d) => d.file).join(', ') || 'none'}`),
       chk('ds.api-idiom', fw === 'flutter' || !apiMentionsDart, 'lie', "the design-system API injected into the agent's prompt is in this framework's idiom", `api excerpt: ${g.api.split('\n').slice(0, 1).join(' ')} … mentions Dart types: ${apiMentionsDart}; themeFile=${g.themeFile}`),
     ];
+    if (fw !== 'flutter' && g.wrote) {
+      // PG-31: the web theme is a typed token module + CSS custom properties at the
+      // CONTRACTS §5 location, found by the SAME resolver the passes use, and its
+      // `AppTheme = { color, spacing, radius }` parses with token-cleanup-web's parser.
+      const web = await import('../../src/relay-server/passes/web-app');
+      const tcw = await import('../../src/relay-server/passes/token-cleanup-web');
+      const want = fw === 'react' ? 'src/theme/theme.ts' : 'lib/theme/theme.ts';
+      const ix = await web.loadWebApp(root);
+      const ts = exists(root, want) ? read(root, want) : '';
+      const css = g.tokens.cssFile && exists(root, g.tokens.cssFile) ? read(root, g.tokens.cssFile) : '';
+      const model = ts ? tcw.parseWebThemeSource(ts, path.join(root, want)) : null;
+      const brand = model?.colors.find((c) => c.value.toLowerCase() === '#12ae89');
+      const syn = tsSyntaxErrors({ [want]: ts });
+      const problems = [
+        ...(g.themeFile !== want ? [`themeFile=${g.themeFile}, want ${want}`] : []),
+        ...(ix?.themeFile !== path.join(root, want) ? [`resolver themeFile=${ix?.themeFile ? path.relative(root, ix.themeFile) : 'null'}`] : []),
+        ...(!model || model.themeSymbol !== 'AppTheme' || !brand || !model.spacing.length || !model.radius.length ? [`token object not parseable (symbol=${model?.themeSymbol}, colors=${model?.colors.length ?? 0}, spacing=${model?.spacing.length ?? 0}, radius=${model?.radius.length ?? 0})`] : []),
+        ...(brand && !new RegExp(`--color-${brand.name}:\\s*#12ae89`, 'i').test(css) ? [`${g.tokens.cssFile ?? 'css'} lacks --color-${brand.name}`] : []),
+        ...syn,
+      ];
+      checks.push(chk('ds.web-theme', problems.length === 0, 'lie', 'the web theme is a typed AppTheme {color, spacing, radius} module + matching CSS variables, at the resolver-found CONTRACTS §5 path', problems.join(' | ') || `${want}: AppTheme.color.${brand?.name}=#12ae89, ${model?.spacing.length} spacing, ${model?.radius.length} radius; ${g.tokens.cssFile} declares --color-${brand?.name}`));
+    }
     const v = await ensureScreenPreviewEntry(root, fw, '10:3', { canonicalId: 'c_10_3', variant: { kind: 'modal', id: 'm_10_8', frameId: '10:8' } });
     checks.push(chk('ds.preview-variant', !!v, 'stub', 'a modal variant preview entry is produced (file on flutter, route on web)', `entry=${v ?? 'undefined'}${fw === 'flutter' && v ? `; presenter call present: ${/showModal_10_8\(context\)/.test(read(root, v))}` : ''}`));
     if (fw === 'next') {
@@ -691,8 +731,9 @@ async function phaseSkeletonAndRestart(): Promise<Cell[]> {
     });
     // Run the skeleton generator for this framework on an EMPTY project + the fixture
     // canonical, then grade what it wrote: one header-stamped stub per canonical screen
-    // and a route registry the passes can parse. Web contract (for the fix): canonicalize
-    // exports `generateWebSkeleton(projectRoot, canonical, framework)`.
+    // and a route registry the passes can parse. Web contract (PG-02): canonicalize
+    // exports `generateWebSkeleton(projectRoot, canonical, framework)`; its output is
+    // graded through the SAME resolver the passes use (web-app.ts), never its report.
     const canon = await import('../../src/relay-server/canonicalize');
     const skRoot = path.join(WS, 'projects', `skeleton-${fw}-${++copySeq}`);
     await fs.mkdir(path.join(skRoot, '.uix'), { recursive: true });
@@ -705,7 +746,8 @@ async function phaseSkeletonAndRestart(): Promise<Cell[]> {
       skChecks = [chk('sk.generator', false, 'stub', 'a skeleton generator exists for this framework',
         'canonicalize.ts exports no generateWebSkeleton; ai-screen-loop.ts only calls generateFlutterSkeleton and logs "[canon] skeleton SKIPPED — <fw> not yet supported by this phase; flutter-only"')];
     } else {
-      await (fw === 'flutter' ? (gen as (c: unknown) => Promise<unknown>)(canonical) : (gen as (r: string, c: unknown, f: string) => Promise<unknown>)(skRoot, canonical, fw));
+      const runGen = () => (fw === 'flutter' ? (gen as (c: unknown) => Promise<unknown>)(canonical) : (gen as (r: string, c: unknown, f: string) => Promise<unknown>)(skRoot, canonical, fw));
+      await runGen();
       const files = await listFiles(skRoot, '', /\.(dart|tsx?|jsx?)$/);
       const stamped = new Set<string>();
       for (const f of files) { const h = /^\/\/\s*canonicalId:\s*(\S+)\s+route:/m.exec(read(skRoot, f)); if (h) stamped.add(h[1]); }
@@ -714,10 +756,67 @@ async function phaseSkeletonAndRestart(): Promise<Cell[]> {
         chk('sk.generator', true, 'stub', 'a skeleton generator exists for this framework', `${files.length} file(s) written`),
         chk('sk.stamped-stubs', missing.length === 0, 'stub', 'one `// canonicalId: <id> route: <route>` stamped stub per canonical screen', missing.length ? `missing: ${missing.join(', ')}` : 'all stamped'),
       ];
+      if (fw !== 'flutter') skChecks.push(...await gradeWebSkeleton(skRoot, fw, canonical, files));
+      // Additive + idempotent: a second run over its own output changes nothing.
+      const snap1 = await snapshot(skRoot);
+      await runGen();
+      const d2 = diffSnaps(snap1, await snapshot(skRoot));
+      skChecks.push(chk('sk.idempotent', d2.length === 0, 'lie', 'a second skeleton run over its own output changes nothing', d2.length ? d2.map((d) => `${d.change}:${d.file}`).join(', ') : 'no change'));
     }
     cells.push({ pass: 'Skeleton (GEN_PHASE 3)', framework: fw, reported: null, files: [], checks: skChecks, cell_status: classify(null, skChecks), notes: [] });
   }
   return cells;
+}
+
+/** The web skeleton's contract, graded from the files through the passes' own
+ *  resolver: a parseable route table + router (react) / file-system routes (next)
+ *  for every canonical screen, a `/_preview/<frame>` route for every verified frame
+ *  (lead, state, modal) — on Next at the routable `%5Fpreview` escape — every stub
+ *  indexed as a PLACEHOLDER (so 7d grades an edge to it `missing`), and sources that
+ *  parse. */
+async function gradeWebSkeleton(root: string, fw: 'react' | 'next', canonical: {
+  screens: Array<{ canonicalId: string; route: string; frameIds: string[]; states: Array<{ id: string; frameId: string }>; modals: Array<{ id: string; frameId: string }> }>;
+}, files: string[]): Promise<Check[]> {
+  const web = await import('../../src/relay-server/passes/web-app');
+  const { webPreviewRoute } = await import('../../src/relay-server/agent-packet');
+  const checks: Check[] = [];
+  const routesRel = fw === 'react' ? 'src/router/routes.ts' : 'lib/routes.ts';
+  const table = exists(root, routesRel) ? web.parseRouteTable(read(root, routesRel)) : null;
+  const noConst = canonical.screens.filter((c) => !table?.routeToConst.has(c.route)).map((c) => `${c.canonicalId}(${c.route})`);
+  checks.push(chk('sk.route-table', !!table && noConst.length === 0, 'stub', `${routesRel} declares a ROUTES constant for every canonical route`, table ? (noConst.length ? `no constant for ${noConst.join(', ')}` : `${table.constToRoute.size} route constant(s)`) : `${routesRel} missing`));
+
+  const ix = await web.loadWebApp(root);
+  const unrouted: string[] = [];
+  const notPlaceholder: string[] = [];
+  for (const c of canonical.screens) {
+    const hit = ix ? web.resolveScreen(ix, c.canonicalId, c.frameIds) : null;
+    const served = !!hit && (fw === 'react'
+      ? [...web.parseRouteElements(read(root, 'src/App.tsx')).entries()].some(([k, comp]) => k === `ROUTES.${hit.routeConst}` && comp === hit.componentName)
+      : !!ix?.appDir && web.nextAppRoute(ix.appDir, hit.file) === c.route);
+    if (!served) unrouted.push(`${c.canonicalId}${hit ? ` (${path.relative(root, hit.file)})` : ' (unresolved)'}`);
+    if (!hit?.placeholder) notPlaceholder.push(c.canonicalId);
+  }
+  checks.push(chk('sk.router', !!ix && unrouted.length === 0, 'stub', fw === 'react' ? 'src/App.tsx <Routes> mounts each canonical screen at its ROUTES constant' : 'each canonical screen is an app-dir page served at its canonical route', unrouted.length ? `not routed: ${unrouted.join(', ')}` : `${canonical.screens.length} screen(s) routed`));
+  checks.push(chk('sk.placeholders', !!ix && notPlaceholder.length === 0, 'lie', 'every unbuilt stub is indexed as a placeholder by the shared resolver (never as a built screen)', notPlaceholder.length ? `indexed as built: ${notPlaceholder.join(', ')}` : 'all stubs are placeholders'));
+
+  const frames = canonical.screens.flatMap((c) => [c.states[0]?.frameId ?? c.frameIds[0], ...c.states.slice(1).map((s) => s.frameId), ...c.modals.map((m) => m.frameId)]).filter(Boolean) as string[];
+  const noPreview: string[] = [];
+  for (const f of frames) {
+    const route = webPreviewRoute(f);
+    if (fw === 'react') {
+      if (!new RegExp(`<Route\\s+path=["']${route}["']`).test(read(root, 'src/App.tsx'))) noPreview.push(route);
+    } else {
+      const page = path.join(root, 'app', '%5Fpreview', route.split('/').pop()!, 'page.tsx');
+      if (!fsSync.existsSync(page) || !ix?.appDir || web.nextAppRoute(ix.appDir, page) !== route) noPreview.push(route);
+    }
+  }
+  checks.push(chk('sk.previews', noPreview.length === 0, 'stub', `a /_preview/<frame> verify route for every lead/state/modal frame${fw === 'next' ? ' (app/%5Fpreview/<frame>/page.tsx — `_preview` is a private folder)' : ''}`, noPreview.length ? `missing: ${noPreview.join(', ')}` : `${frames.length} preview route(s)`));
+
+  const src: Record<string, string> = {};
+  for (const f of files) if (/\.(tsx?|jsx?)$/.test(f)) src[f] = read(root, f);
+  const syn = tsSyntaxErrors(src);
+  checks.push(chk('sk.syntax', syn.length === 0, 'lie', 'every generated source parses', syn.join(' | ') || `${Object.keys(src).length} file(s) ok`));
+  return checks;
 }
 
 async function phaseAssetPhase(): Promise<Cell[]> {

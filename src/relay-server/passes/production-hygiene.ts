@@ -121,6 +121,16 @@ async function hygieneWeb(projectRoot: string, dryRun: boolean): Promise<Hygiene
       if (!dryRun) await fs.rm(f, { force: true }).catch(() => {});
     }
   }
+  // The web skeleton's modal verify harness lives in src/_preview/ (never walked by
+  // listSourceFiles, like lib/_preview on Flutter). Its routes + imports were just
+  // stripped from App.tsx, so the directory is dead code: remove it whole.
+  const harnessDir = path.join(ix.pipelineRoot, '_preview');
+  if (ix.kind === 'react' && fsSync.existsSync(harnessDir)) {
+    const harness = await fs.readdir(harnessDir).catch(() => [] as string[]);
+    result.previewFilesRemoved += harness.length;
+    result.filesScanned += harness.length;
+    if (!dryRun) await fs.rm(harnessDir, { recursive: true, force: true }).catch(() => {});
+  }
 
   // ── Report (never delete) unreferenced asset symbols ────────────────────────
   result.unreferencedAssets = await countUnreferencedAssets(ix, ix.resourcesFile, warnings);

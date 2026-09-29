@@ -20,6 +20,7 @@ import * as fs from 'fs/promises';
 import * as fsSync from 'fs';
 import * as path from 'path';
 import { webPreviewRoute } from './agent-packet';
+import { webThemePaths } from './web-skeleton';
 
 export interface DesignDigestInput {
   colors: string[];   // dominant hex colors, most-used first (e.g. "#12ae89")
@@ -33,6 +34,10 @@ export interface ThemeTokens {
   /** marker so generate is idempotent + the prompt can name the file. */
   themeFile: string;          // project-relative, e.g. lib/theme/app_theme.dart
   className: string;          // e.g. "AppTheme"
+  /** Web only: the CSS custom-property stylesheet beside the TS theme module. */
+  cssFile?: string;
+  /** Web only: how a screen imports the theme module (`@/lib/theme/theme`). */
+  importSpecifier?: string;
 }
 
 // ── Color role classification (deterministic, no LLM) ─────────────────────────
@@ -100,6 +105,75 @@ export function themeApiDescription(tokens: ThemeTokens): string {
   return out.join('\n');
 }
 
+// ── Web (react / next): a typed TS token object + CSS custom properties ───────
+// The web design system is ONE typed object — `export const AppTheme = { color,
+// font, spacing, radius } as const` (the exact shape token-cleanup-web parses) —
+// plus a stylesheet declaring the same tokens as CSS variables, imported once by the
+// app entry (react: src/main.tsx; next: app/layout.tsx — both written by the web
+// skeleton). The agent gets a web-worded contract, never the Dart API (PG-31).
+
+const WEB_SPACING = [4, 8, 12, 16, 20, 24, 32];
+const WEB_RADIUS = [8, 12, 16, 24];
+
+/** The web design-system contract injected into the React/Next agent's prompt. */
+export function webThemeApiDescription(tokens: ThemeTokens): string {
+  const t = tokens.className;
+  const out: string[] = [
+    `DESIGN SYSTEM — already generated: \`${tokens.themeFile}\` exports the typed token object \`${t}\` (import { ${t} } from '${tokens.importSpecifier ?? tokens.themeFile.replace(/\.ts$/, '')}'${tokens.importSpecifier?.startsWith('.') ? ' in a file under src/screens/ — adjust the relative path elsewhere' : ''}), and \`${tokens.cssFile ?? ''}\` declares the same tokens as CSS custom properties (already imported once by the app entry). IMPORT and USE these tokens; do NOT hardcode hex colours, px spacing or radii that duplicate them in style props or CSS — inline literals that match a token are a defect the review will flag.`,
+    `Colour tokens (\`${t}.color.<name>\` in style props / \`var(--color-<name>)\` in CSS):`,
+  ];
+  for (const c of tokens.colors) out.push(`- ${t}.color.${c.name} = ${c.hex}  (var(--color-${c.name}))`);
+  if (tokens.fontFamily) out.push(`Typeface: ${tokens.fontFamily} — \`${t}.font.family\` / var(--font-family), already set on <body>; do not re-declare it per screen.`);
+  out.push(`Spacing (px numbers for style props — padding, margin, gap): ${WEB_SPACING.map(n => `${t}.spacing.s${n}`).join(', ')} (var(--space-<n>) in CSS).`);
+  out.push(`Radius (borderRadius): ${WEB_RADIUS.map(n => `${t}.radius.r${n}`).join(', ')} (var(--radius-<n>) in CSS).`);
+  return out.join('\n');
+}
+
+const cssString = (s: string): string => s.replace(/['\\]/g, '');
+
+function renderWebThemeTs(tokens: ThemeTokens): string {
+  const colorLines = tokens.colors.map(c => `    ${c.name}: '${c.hex}',${c.comment.includes('neutral') ? ' // neutral' : ''}`).join('\n');
+  const family = tokens.fontFamily ? `'${cssString(tokens.fontFamily)}', system-ui, sans-serif` : 'system-ui, sans-serif';
+  return `// GENERATED (extract-first design system). Single source of truth for the
+// palette + type + spacing/radius. Screens MUST import these tokens instead of
+// hardcoding raw literals. The same tokens exist as CSS custom properties in
+// ${path.posix.basename(tokens.cssFile ?? 'theme.css')}. Safe to extend; do not duplicate tokens per screen.
+export const ${tokens.className} = {
+  color: {
+${colorLines || '    // (no dominant colors detected)'}
+  },
+  font: {
+    family: ${JSON.stringify(family)},
+  },
+  spacing: { ${WEB_SPACING.map(n => `s${n}: ${n}`).join(', ')} },
+  radius: { ${WEB_RADIUS.map(n => `r${n}: ${n}`).join(', ')} },
+} as const;
+
+export type ${tokens.className}Color = keyof typeof ${tokens.className}.color;
+`;
+}
+
+function renderWebThemeCss(tokens: ThemeTokens): string {
+  const family = tokens.fontFamily ? `'${cssString(tokens.fontFamily)}', system-ui, sans-serif` : 'system-ui, sans-serif';
+  const surface = tokens.colors.find(c => c.name.startsWith('surface'))?.name;
+  const ink = tokens.colors.find(c => c.name.startsWith('ink'))?.name;
+  return `/* GENERATED (extract-first design system) — CSS custom properties mirroring
+   ${tokens.className} in ${path.posix.basename(tokens.themeFile)}. Imported once by the app entry. */
+:root {
+${tokens.colors.map(c => `  --color-${c.name}: ${c.hex};`).join('\n')}${tokens.colors.length ? '\n' : ''}  --font-family: ${family};
+${WEB_SPACING.map(n => `  --space-${n}: ${n}px;`).join('\n')}
+${WEB_RADIUS.map(n => `  --radius-${n}: ${n}px;`).join('\n')}
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: var(--font-family);${surface ? `\n  background: var(--color-${surface});` : ''}${ink ? `\n  color: var(--color-${ink});` : ''}
+}
+`;
+}
+
 /** Render the Flutter theme source from tokens. */
 function renderFlutterTheme(tokens: ThemeTokens): string {
   const colorLines = tokens.colors.map(c => `  static const Color ${c.name} = Color(${argb(c.hex)}); // ${c.comment}`).join('\n');
@@ -149,12 +223,14 @@ export interface GenerateResult { themeFile: string; wrote: boolean; tokenCount:
 export async function generateDesignSystem(
   projectRoot: string, framework: string, digest: DesignDigestInput,
 ): Promise<GenerateResult> {
+  const fw = (framework || 'flutter').toLowerCase();
+  if (fw === 'react' || fw === 'next') return generateWebDesignSystem(projectRoot, fw, digest);
   const tokens = planThemeTokens(digest);
   const api = themeApiDescription(tokens);
-  // Flutter is the only target with a concrete renderer today; others get the API
-  // description only (the agent still imports a shared theme in that framework).
-  if ((framework || 'flutter').toLowerCase() !== 'flutter') {
-    return { themeFile: tokens.themeFile, wrote: false, tokenCount: tokens.colors.length, api, tokens };
+  if (fw !== 'flutter') {
+    // No renderer for this framework — say so in the recorded result; never hand
+    // it another framework's API as if a file existed.
+    return { themeFile: tokens.themeFile, wrote: false, tokenCount: tokens.colors.length, api: '', tokens };
   }
   const abs = path.join(projectRoot, tokens.themeFile);
   // Idempotent: only (over)write the STUB. A file that already defines our class is
@@ -170,6 +246,52 @@ export async function generateDesignSystem(
   await fs.writeFile(abs, renderFlutterTheme(tokens), 'utf8');
   // Best-effort: keep main.dart's theme wired if it exists and is the boilerplate.
   return { themeFile: tokens.themeFile, wrote: true, tokenCount: tokens.colors.length, api, tokens };
+}
+
+/** The recorded design-system contract (`.uix/design-system.json`): where the theme
+ *  module lives and what it exports, so the finalize token pass (7f) reads the theme
+ *  location from the pipeline instead of guessing paths. */
+export const DESIGN_SYSTEM_RECORD = path.join('.uix', 'design-system.json');
+
+async function generateWebDesignSystem(
+  projectRoot: string, framework: 'react' | 'next', digest: DesignDigestInput,
+): Promise<GenerateResult> {
+  const where = webThemePaths(projectRoot, framework);
+  const tokens: ThemeTokens = { ...planThemeTokens(digest, { themeFile: where.themeFile }), cssFile: where.cssFile, importSpecifier: where.importSpecifier };
+  const api = webThemeApiDescription(tokens);
+  const tsAbs = path.join(projectRoot, where.themeFile);
+  const cssAbs = path.join(projectRoot, where.cssFile);
+  const read = async (p: string): Promise<string> => { try { return await fs.readFile(p, 'utf8'); } catch { return ''; } };
+  const [curTs, curCss] = await Promise.all([read(tsAbs), read(cssAbs)]);
+  // Idempotent like the Flutter path: (over)write only an absent file or the web
+  // skeleton's stub; a theme that already defines the token object is ours from a
+  // prior pass or agent-extended — never clobber it.
+  const stub = (src: string): boolean => !src.trim() || src.includes('GENERATED SKELETON');
+  let wrote = false;
+  if (stub(curTs)) {
+    await fs.mkdir(path.dirname(tsAbs), { recursive: true });
+    await fs.writeFile(tsAbs, renderWebThemeTs(tokens), 'utf8');
+    wrote = true;
+  }
+  if (stub(curCss)) {
+    await fs.mkdir(path.dirname(cssAbs), { recursive: true });
+    await fs.writeFile(cssAbs, renderWebThemeCss(tokens), 'utf8');
+    wrote = true;
+  }
+  try {
+    const rec = {
+      framework, themeFile: where.themeFile, cssFile: where.cssFile, importSpecifier: where.importSpecifier,
+      symbol: tokens.className, groups: { color: 'color', spacing: 'spacing', radius: 'radius', font: 'font' },
+      colors: tokens.colors.map(c => ({ name: c.name, hex: c.hex })), fontFamily: tokens.fontFamily ?? null,
+    };
+    const recAbs = path.join(projectRoot, DESIGN_SYSTEM_RECORD);
+    const body = `${JSON.stringify(rec, null, 2)}\n`;
+    if (wrote || !fsSync.existsSync(recAbs)) {
+      await fs.mkdir(path.dirname(recAbs), { recursive: true });
+      await fs.writeFile(recAbs, body, 'utf8');
+    }
+  } catch { /* the record is advisory; the theme files are the contract */ }
+  return { themeFile: where.themeFile, wrote, tokenCount: tokens.colors.length, api, tokens };
 }
 
 /** Append the importable theme API to .uix/context.md once (so later screens that

@@ -148,6 +148,14 @@ export function stampHeader(src: string, canonicalId: string, route: string | nu
   return header + src;
 }
 
+/** A screen/modal file that is still the skeleton's stub — the web skeleton
+ *  (web-skeleton.ts) writes `TODO(build)` and renders `<PlaceholderScreen>` until the
+ *  per-screen build replaces the body. A header-stamped stub is NOT a built screen:
+ *  it is indexed `placeholder`, so 7d grades an edge to it `missing`, 7e skips it. */
+export function isSkeletonStub(src: string): boolean {
+  return /\bTODO\(build\)/.test(src) || /<PlaceholderScreen\b/.test(src);
+}
+
 // ── Route table (react) ──────────────────────────────────────────────────────
 
 /** Parse `export const ROUTES = { escrow: '/88-4361', … }`. */
@@ -476,7 +484,9 @@ export async function loadWebApp(projectRoot: string): Promise<WebAppIndex | nul
       ? routerDir ?? path.join(srcDir, 'screens')
       : firstExisting(projectRoot, 'src/screens', 'src/pages') ?? path.join(srcDir, 'screens'),
     componentsDir: firstExisting(projectRoot, ...under('components'), 'src/components', 'components') ?? path.join(pipelineRoot, 'components'),
-    routesFile: firstExisting(projectRoot, 'src/router/routes.ts', 'src/routes.ts'),
+    // react: src/router/routes.ts (the skeleton's table); next: <pipelineRoot>/lib/routes.ts
+    // — navigation constants only, the directories remain the routes.
+    routesFile: firstExisting(projectRoot, 'src/router/routes.ts', 'src/routes.ts', ...(kind === 'next' ? under('lib/routes.ts') : [])),
     routerFile: kind === 'react' ? firstExisting(projectRoot, 'src/App.tsx', 'src/app.tsx') : null,
     themeFile: firstExisting(projectRoot,
       ...under('lib/theme.ts', 'lib/theme/index.ts', 'lib/theme/theme.ts'),
@@ -518,7 +528,7 @@ export async function loadWebApp(projectRoot: string): Promise<WebAppIndex | nul
       routeConst: route ? index.routeToConst.get(route) ?? null : null,
       file: f,
       componentName: comp,
-      placeholder: false,
+      placeholder: isSkeletonStub(src),
     };
     index.byId.set(idCore(h.canonicalId), entry);
     if (route) index.byRoute.set(route, entry);
@@ -536,9 +546,10 @@ export async function loadWebApp(projectRoot: string): Promise<WebAppIndex | nul
       const placeholder = /^Placeholder/.test(component);
       const file = imports.get(component) ?? null;
       const core = routeCore(route);
-      if (!core) continue;
-      const existing = index.byId.get(core);
-      if (existing) { existing.placeholder = placeholder; existing.routeConst ??= routeConst; continue; }
+      // A semantic route (`/login`, the skeleton's shape) has no frame core: it joins
+      // the index by route only. A header already indexed it when present.
+      const existing = core ? index.byId.get(core) : index.byRoute.get(route);
+      if (existing) { existing.placeholder = existing.placeholder || placeholder; existing.routeConst ??= routeConst; continue; }
       if (!file && !placeholder) continue;
       const entry: WebScreenFile = {
         canonicalId: null, route, routeConst,
@@ -546,7 +557,7 @@ export async function loadWebApp(projectRoot: string): Promise<WebAppIndex | nul
         componentName: component,
         placeholder,
       };
-      index.byId.set(core, entry);
+      if (core) index.byId.set(core, entry);
       index.byRoute.set(route, entry);
     }
   }
