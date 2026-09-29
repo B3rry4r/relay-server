@@ -1,0 +1,230 @@
+# relay-server: CI, release tarball, and hot deploy onto the relay host.
+#
+#   build   (every push / PR): npm ci, tsc --noEmit, vitest, npm run build,
+#           npm run pack:release → release.tgz + manifest.json (artifact).
+#   deploy  (push to main / manual run, ONLY when RELAY_HOST_URL and
+#           RELAY_DEPLOY_TOKEN are both set — otherwise skipped): uploads
+#           release.tgz to the host API (POST /__host/releases) and follows the
+#           deploy until ACTIVE, or fails with the host's deploy log.
+#
+# A relay-server deploy does NOT restart the machine or the terminals: the
+# host installs the release beside the running one, health-checks it in
+# standby, drains the old one (runs resume) and switches. CLAUDE.md rule 2
+# (never push) applies until the Fly cutover; see relay-pty docs/DEPLOY-FLY.md.
+#
+# Repository settings used:
+#   secrets.RELAY_HOST_URL       https://<relay host app>.fly.dev
+#   secrets.RELAY_DEPLOY_TOKEN   the host's RELAY_DEPLOY_TOKEN (Bearer for /__host/*)
+
+name: relay-server
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      wait_idle:
+        description: Wait for running agent jobs to finish before switching (default drains in ~10 s and runs resume)
+        type: boolean
+        default: false
+      force:
+        description: Deploy even if this release id is on the host's bad list (crash loop)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: relay-server-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      release_id: ${{ steps.pack.outputs.release_id }}
+      can_deploy: ${{ steps.gate.outputs.can_deploy }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # The relay host image runs Node 22 (relay-pty Dockerfile).
+          node-version: 22
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - name: Typecheck
+        run: npx tsc --noEmit -p .
+      - name: Test (includes the parity ratchet)
+        env:
+          # GitHub's ubuntu image ships Chrome here; the visual-routes test uses it.
+          RELAY_CHROME_BIN: /usr/bin/google-chrome
+        run: |
+          export WORKSPACE="$RUNNER_TEMP/workspace"
+          mkdir -p "$WORKSPACE"
+          npx vitest run --dir test
+      - name: Build
+        run: npm run build
+      - name: Pack release
+        id: pack
+        run: |
+          if ! node -e "process.exit(require('./package.json').scripts?.['pack:release'] ? 0 : 1)"; then
+            echo "::error::package.json has no pack:release script (CONTRACTS §3: npm run pack:release → release.tgz + manifest.json)."
+            exit 1
+          fi
+          npm run pack:release
+          test -s release.tgz || { echo "::error::pack:release did not produce release.tgz"; exit 1; }
+          # The host reads manifest.json from INSIDE the tarball; keep a copy beside it.
+          if ! tar -tzf release.tgz | grep -qxE '(\./)?manifest\.json'; then
+            echo "::error::release.tgz has no top-level manifest.json"; exit 1
+          fi
+          if [ ! -f manifest.json ]; then
+            member="$(tar -tzf release.tgz | grep -xE '(\./)?manifest\.json' | head -n1)"
+            tar -xzOf release.tgz "$member" > manifest.extracted.json
+            mv manifest.extracted.json manifest.json
+          fi
+          id="$(jq -r '.id // empty' manifest.json)"
+          if ! [[ "$id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+            echo "::error::manifest.json id '$id' is not a valid release id"; exit 1
+          fi
+          sha256sum release.tgz | cut -d' ' -f1 > release.sha256
+          echo "release_id=$id" >> "$GITHUB_OUTPUT"
+          {
+            echo "### relay-server release \`$id\`"
+            echo '```json'
+            cat manifest.json
+            echo '```'
+            echo "sha256 \`$(cat release.sha256)\`, $(stat -c %s release.tgz) bytes"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: relay-server-release
+          path: |
+            release.tgz
+            manifest.json
+            release.sha256
+          if-no-files-found: error
+          retention-days: 30
+      - name: Deploy gate
+        id: gate
+        env:
+          RELAY_HOST_URL: ${{ secrets.RELAY_HOST_URL }}
+          RELAY_DEPLOY_TOKEN: ${{ secrets.RELAY_DEPLOY_TOKEN }}
+        run: |
+          if [ -n "$RELAY_HOST_URL" ] && [ -n "$RELAY_DEPLOY_TOKEN" ]; then
+            echo "can_deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "can_deploy=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::RELAY_HOST_URL / RELAY_DEPLOY_TOKEN are not set; the deploy job will be skipped."
+          fi
+
+  deploy:
+    needs: build
+    if: >-
+      needs.build.outputs.can_deploy == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment: production
+    concurrency:
+      group: relay-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: relay-server-release
+      - name: Deploy to the relay host and follow it to ACTIVE
+        env:
+          RELAY_HOST_URL: ${{ secrets.RELAY_HOST_URL }}
+          RELAY_DEPLOY_TOKEN: ${{ secrets.RELAY_DEPLOY_TOKEN }}
+          WAIT_IDLE: ${{ inputs.wait_idle && '1' || '' }}
+          FORCE: ${{ inputs.force && '1' || '' }}
+          BUSY_WAIT_SECS: "900"
+          DEPLOY_TIMEOUT_SECS: "1800"
+          POLL_SECS: "5"
+        run: |
+          set -euo pipefail
+          host="${RELAY_HOST_URL%/}"
+          id="$(jq -r .id manifest.json)"
+          sha="$(sha256sum release.tgz | cut -d' ' -f1)"
+          [ "$sha" = "$(cat release.sha256)" ] || { echo "::error::artifact sha256 mismatch"; exit 1; }
+          query=""
+          [ -n "$WAIT_IDLE" ] && query="waitIdle=1"
+          [ -n "$FORCE" ] && query="${query:+$query&}force=1"
+          url="$host/__host/releases${query:+?$query}"
+          echo "Deploying relay-server release $id (sha256 $sha) to $host"
+
+          # 1. Upload. 409 deploy_in_progress (someone else is deploying) → wait and retry.
+          busy_deadline=$((SECONDS + BUSY_WAIT_SECS))
+          while :; do
+            code="$(curl -sS -o resp.json -w '%{http_code}' -X POST "$url" \
+              -H "Authorization: Bearer $RELAY_DEPLOY_TOKEN" \
+              -H 'Content-Type: application/gzip' \
+              -H "X-Release-Id: $id" \
+              -H "X-Release-Sha256: $sha" \
+              --data-binary @release.tgz)" || code=000
+            error="$(jq -r '.error // empty' resp.json 2>/dev/null || true)"
+            if [ "$code" = 202 ]; then break; fi
+            if [ "$code" = 409 ] && [ "$error" = already_current ]; then
+              echo "Release $id is already current on the host; nothing to do."
+              echo "### relay-server \`$id\` was already current" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            retry=""
+            case "$code" in 000|502|503|504) retry=1 ;; 409) [ "$error" = deploy_in_progress ] && retry=1 ;; esac
+            if [ -n "$retry" ]; then
+              if [ "$SECONDS" -ge "$busy_deadline" ]; then
+                echo "::error::host still busy/unreachable after ${BUSY_WAIT_SECS}s (HTTP $code)"; cat resp.json 2>/dev/null || true; exit 1
+              fi
+              echo "HTTP $code ${error:-} — retrying in 20 s"
+              sleep 20
+              continue
+            fi
+            echo "::error::upload refused: HTTP $code"
+            cat resp.json 2>/dev/null || true
+            [ "$error" = release_bad ] && echo "::error::release $id is on the host's bad list; re-run with force if you really mean it."
+            exit 1
+          done
+          deploy_id="$(jq -r .deployId resp.json)"
+          echo "Accepted: deploy $deploy_id"
+
+          # 2. Follow the deploy until a terminal state; print new log lines as they come.
+          deadline=$((SECONDS + DEPLOY_TIMEOUT_SECS))
+          printed=0
+          state=""
+          while :; do
+            if curl -fsS -o deploy.json -H "Authorization: Bearer $RELAY_DEPLOY_TOKEN" "$host/__host/deploys/$deploy_id"; then
+              total="$(jq '.log | length' deploy.json)"
+              if [ "$total" -gt "$printed" ]; then
+                jq -r ".log[$printed:][]" deploy.json
+                printed="$total"
+              fi
+              state="$(jq -r .state deploy.json)"
+              case "$state" in
+                ACTIVE|FAILED|ROLLED_BACK) break ;;
+              esac
+            else
+              echo "(status poll failed — host swapping or unreachable; retrying)"
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "::error::deploy $deploy_id not finished after ${DEPLOY_TIMEOUT_SECS}s (last state ${state:-unknown})"; exit 1
+            fi
+            sleep "$POLL_SECS"
+          done
+
+          {
+            echo "### relay-server \`$id\` → **$state** (deploy \`$deploy_id\`)"
+            echo '```'
+            jq -r '.transitions[] | "\(.at)  \(.state)"' deploy.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$state" != ACTIVE ]; then
+            echo "::error::deploy $deploy_id ended $state: $(jq -r '.error // "no error message"' deploy.json)"
+            echo "---- full deploy log ----"
+            jq -r '.log[]' deploy.json
+            exit 1
+          fi
+          echo "Release $id is ACTIVE."
