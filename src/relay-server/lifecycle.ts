@@ -103,14 +103,25 @@ export function busySnapshot(): { runningJobs: number; activeRuns: number } {
 
 /**
  * Should this request be refused because the process is not (or no longer) the
- * active release? Run-mutating routes (CONTRACTS §3) and tunnel creation.
+ * active release? Run-mutating routes (CONTRACTS §3), every other state-changing
+ * /api/ai/* job (finalize-app, deepen-tokens, …: they spawn agents and write the
+ * project), and preview tunnels / servers.
+ *
+ * Express routing is case-insensitive and ignores a trailing slash, so this
+ * matches the same way (/i, optional '/'), on the percent-decoded path — a guard
+ * that is stricter about spelling than the router is a guard with a bypass.
  */
 export function isRunMutatingRequest(method: string, pathname: string): boolean {
   const m = method.toUpperCase();
-  if (m === 'GET' && /^\/api\/previews\/\d+\/tunnel\/?$/.test(pathname)) return true;
+  let p = pathname;
+  try { p = decodeURIComponent(pathname); } catch { /* malformed: match the raw path */ }
+  if (m === 'GET' && /^\/api\/previews\/\d+\/tunnel\/?$/i.test(p)) return true;
   if (m === 'GET' || m === 'HEAD' || m === 'OPTIONS') return false;
-  return /^\/api\/ai\/(runs(\/.*)?|prepare-and-run|build-screen|generate)\/?$/.test(pathname)
-    || /^\/api\/previews\/\d+\/serve\/?$/.test(pathname);
+  // Cancelling is always allowed: it only stops work this process owns.
+  if (/^\/api\/ai\/cancel\/?$/i.test(p)) return false;
+  return /^\/api\/ai(\/|$)/i.test(p)
+    || /^\/api\/previews\/\d+\/serve\/?$/i.test(p)
+    || /^\/api\/previews\/web(\/|$)/i.test(p);
 }
 
 /** Express middleware: 503 for run-mutating routes in standby or while draining. */

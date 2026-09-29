@@ -258,6 +258,13 @@ export interface RunLease {
   releaseId: string;
   pid: number;
   heartbeatAt: number; // epoch ms
+  // Identity of the holder beyond its pid (Linux; absent elsewhere / older leases).
+  // A pid alone is not an identity: after a machine restart pid namespaces start
+  // small and deterministic, so a dead holder's pid is often reused by some other
+  // live process. bootId = /proc/sys/kernel/random/boot_id of the holder's boot,
+  // startTime = field 22 of /proc/<pid>/stat (clock ticks since boot).
+  bootId?: string;
+  startTime?: string;
 }
 
 // P2: hard ceiling on concurrent screen workers, regardless of what the caller
@@ -859,24 +866,88 @@ export function currentReleaseId(): string {
   return (process.env.RELAY_RELEASE_ID || '').trim() || 'dev';
 }
 
-function pidAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return true; } catch (e) {
-    return (e as NodeJS.ErrnoException)?.code === 'EPERM';
+/** What a liveness probe knows about a pid. startTime null = unknown (no /proc). */
+export type ProcessProbeResult = { alive: boolean; startTime: string | null };
+export type ProcessProbe = (pid: number) => boolean | ProcessProbeResult;
+
+/** Field 22 of /proc/<pid>/stat (start time, clock ticks since boot) and whether it is a zombie. */
+function readProcStat(pid: number): { startTime: string; zombie: boolean } | null {
+  try {
+    const stat = fsSync.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    // comm (field 2) may contain spaces/parens: split after the LAST ')'.
+    const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+    // rest[0] is field 3 (state) → field 22 is rest[19].
+    const startTime = rest[19];
+    if (!startTime) return null;
+    return { startTime, zombie: rest[0] === 'Z' || rest[0] === 'X' };
+  } catch {
+    return null;
   }
+}
+
+/** Default probe: signal 0, refined by /proc when available (zombies are dead). */
+export function probeProcess(pid: number): ProcessProbeResult {
+  if (!Number.isInteger(pid) || pid <= 0) return { alive: false, startTime: null };
+  let alive: boolean;
+  try { process.kill(pid, 0); alive = true; } catch (e) {
+    alive = (e as NodeJS.ErrnoException)?.code === 'EPERM';
+  }
+  if (!alive) return { alive: false, startTime: null };
+  const stat = readProcStat(pid);
+  if (stat?.zombie) return { alive: false, startTime: stat.startTime };
+  return { alive: true, startTime: stat?.startTime ?? null };
+}
+
+let cachedBootId: string | null | undefined;
+/** This machine's boot id (Linux), or null where there is none. */
+export function currentBootId(): string | null {
+  if (cachedBootId === undefined) {
+    try { cachedBootId = fsSync.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() || null; } catch { cachedBootId = null; }
+  }
+  return cachedBootId;
+}
+
+let ownStartTime: string | null | undefined;
+function selfStartTime(): string | null {
+  if (ownStartTime === undefined) ownStartTime = readProcStat(process.pid)?.startTime ?? null;
+  return ownStartTime;
+}
+
+/**
+ * Is the process that wrote `lease` still the one running under its pid?
+ * False when the lease is from another boot, the pid is dead (or a zombie), or
+ * the pid now belongs to a process that started at a different time (reused).
+ */
+export function leaseHolderAlive(
+  lease: Pick<RunLease, 'pid' | 'bootId' | 'startTime'>,
+  probe: ProcessProbe = probeProcess,
+  bootId: string | null = currentBootId(),
+): boolean {
+  if (lease.bootId && bootId && lease.bootId !== bootId) return false;
+  const r = probe(lease.pid);
+  const res: ProcessProbeResult = typeof r === 'boolean' ? { alive: r, startTime: null } : r;
+  if (!res.alive) return false;
+  if (lease.startTime && res.startTime && lease.startTime !== res.startTime) return false;
+  return true;
 }
 
 /**
  * True when `run` is leased by ANOTHER process that is still alive and has
  * heart-beaten recently — i.e. resuming it here would double-run it. A lease held
- * by this very process, a stale heartbeat, or a dead pid is never "foreign live".
+ * by this very process, a stale heartbeat, a dead pid, a lease from a previous
+ * boot, or a pid now reused by a different process is never "foreign live".
  */
-export function isForeignLeaseLive(run: Pick<BuildRun, 'lease'>, now: number = Date.now(), alive: (pid: number) => boolean = pidAlive): boolean {
+export function isForeignLeaseLive(
+  run: Pick<BuildRun, 'lease'>,
+  now: number = Date.now(),
+  probe: ProcessProbe = probeProcess,
+  bootId: string | null = currentBootId(),
+): boolean {
   const lease = run.lease;
   if (!lease || typeof lease.pid !== 'number' || typeof lease.heartbeatAt !== 'number') return false;
   if (lease.pid === process.pid && lease.releaseId === currentReleaseId()) return false;
   if (now - lease.heartbeatAt > RUN_LEASE_STALE_MS) return false;
-  return alive(lease.pid);
+  return leaseHolderAlive(lease, probe, bootId);
 }
 
 type HeldLease = { projectId: string; runId: string; holders: number; timer: ReturnType<typeof setInterval> };
@@ -884,7 +955,12 @@ const heldLeases = new Map<string, HeldLease>();
 
 async function writeLease(projectId: string, runId: string): Promise<void> {
   await mutateRun(projectId, runId, (run) => {
-    run.lease = { releaseId: currentReleaseId(), pid: process.pid, heartbeatAt: Date.now() };
+    const bootId = currentBootId();
+    const startTime = selfStartTime();
+    run.lease = {
+      releaseId: currentReleaseId(), pid: process.pid, heartbeatAt: Date.now(),
+      ...(bootId ? { bootId } : {}), ...(startTime ? { startTime } : {}),
+    };
   });
 }
 

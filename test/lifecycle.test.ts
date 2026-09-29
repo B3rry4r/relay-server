@@ -30,7 +30,7 @@ import {
   resetLifecycleForTests,
 } from '../src/relay-server/lifecycle';
 import { stopAutoResumeSweep } from '../src/relay-server/ai-screen-loop';
-import { isForeignLeaseLive, RUN_LEASE_STALE_MS } from '../src/relay-server/build-run-store';
+import { currentBootId, isForeignLeaseLive, leaseHolderAlive, probeProcess, RUN_LEASE_STALE_MS } from '../src/relay-server/build-run-store';
 
 describe('lifecycle — run-mutating routes (503 in standby / draining)', () => {
   it.each([
@@ -48,6 +48,20 @@ describe('lifecycle — run-mutating routes (503 in standby / draining)', () => 
     ['GET', '/health', false],
     ['POST', '/api/auth/login', false],
     ['POST', '/api/ai/cancel', false],
+    // Express routing is case-insensitive and ignores a trailing slash: so is the guard.
+    ['POST', '/API/AI/RUNS', true],
+    ['POST', '/Api/Ai/Runs/run_1_x/Start', true],
+    ['POST', '/api/ai/runs/', true],
+    ['POST', '/api/ai/%72uns', true],
+    ['GET', '/API/PREVIEWS/5173/TUNNEL', true],
+    ['POST', '/API/PREVIEWS/5173/SERVE/', true],
+    ['POST', '/API/AI/CANCEL', false],
+    ['GET', '/API/AI/RUNS', false],
+    // Every other state-changing AI job spawns agents / writes the project.
+    ['POST', '/api/ai/finalize-app', true],
+    ['POST', '/api/ai/deepen-tokens', true],
+    ['POST', '/api/ai/runs/run_1_x/finalize', true],
+    ['POST', '/api/previews/web/proj', true],
   ])('%s %s → %s', (method, route, expected) => {
     expect(isRunMutatingRequest(method, route)).toBe(expected);
   });
@@ -63,6 +77,41 @@ describe('lifecycle — run lease liveness', () => {
   });
   it('a fresh lease held by another live pid is live', () => {
     expect(isForeignLeaseLive({ lease: { releaseId: 'old', pid: 4242, heartbeatAt: now - 1000 } }, now, () => true)).toBe(true);
+  });
+  // A machine restart inside the stale window: pid namespaces restart small and
+  // deterministic, so the dead holder's pid is often some other live process.
+  it('a lease from a previous boot is not live, even if its pid is alive now', () => {
+    const lease = { releaseId: 'old', pid: 4242, heartbeatAt: now - 1000, bootId: 'boot-before', startTime: '100' };
+    expect(isForeignLeaseLive({ lease }, now, () => ({ alive: true, startTime: '100' }), 'boot-now')).toBe(false);
+    expect(isForeignLeaseLive({ lease }, now, () => ({ alive: true, startTime: '100' }), 'boot-before')).toBe(true);
+  });
+  it('a pid reused by a process that started at another time is not the holder', () => {
+    const lease = { releaseId: 'old', pid: 4242, heartbeatAt: now - 1000, bootId: 'b', startTime: '100' };
+    expect(isForeignLeaseLive({ lease }, now, () => ({ alive: true, startTime: '999' }), 'b')).toBe(false);
+    // Unknown start time (no /proc) falls back to the pid check.
+    expect(isForeignLeaseLive({ lease }, now, () => ({ alive: true, startTime: null }), 'b')).toBe(true);
+    // Leases written before this field existed still work.
+    expect(isForeignLeaseLive({ lease: { releaseId: 'old', pid: 4242, heartbeatAt: now - 1000 } }, now, () => ({ alive: true, startTime: '5' }), 'b')).toBe(true);
+  });
+  it.runIf(process.platform === 'linux')('probeProcess reads the real start time; an exited pid is dead', async () => {
+    const me = probeProcess(process.pid);
+    expect(me.alive).toBe(true);
+    expect(me.startTime).toMatch(/^\d+$/);
+    expect(currentBootId()).toMatch(/[0-9a-f-]{36}/);
+    expect(leaseHolderAlive({ pid: process.pid, bootId: currentBootId() ?? undefined, startTime: me.startTime ?? undefined })).toBe(true);
+    expect(leaseHolderAlive({ pid: process.pid, bootId: currentBootId() ?? undefined, startTime: String(Number(me.startTime) + 1) })).toBe(false);
+    // A real other process: alive with its own start time; dead once it exits.
+    const child = spawn('sleep', ['30'], { stdio: 'ignore' });
+    const exited = new Promise((r) => child.once('exit', r));
+    const pid = child.pid!;
+    const other = probeProcess(pid);
+    expect(other.alive).toBe(true);
+    expect(other.startTime).toMatch(/^\d+$/);
+    expect(leaseHolderAlive({ pid, startTime: other.startTime ?? undefined })).toBe(true);
+    child.kill('SIGKILL');
+    await exited;
+    expect(probeProcess(pid).alive).toBe(false);
+    expect(leaseHolderAlive({ pid, startTime: other.startTime ?? undefined })).toBe(false);
   });
 });
 
@@ -155,6 +204,7 @@ describe('lifecycle — the real entrypoint under a host-style parent', () => {
       RELAY_RELEASE_ID: id,
       RELAY_SHUTDOWN_MS: '6000',
       RELAY_RUN_LEASE_HEARTBEAT_MS: '1000',
+      RELAY_RUN_LEASE_RECHECK_MS: '500',
       ...extra,
     });
     const child = spawn(VITE_NODE, ['src/index.ts'], { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
@@ -247,6 +297,11 @@ describe('lifecycle — the real entrypoint under a host-style parent', () => {
     const start = await fetch(`http://127.0.0.1:${a.port}/api/ai/runs/${RUN_ID}/start`, { method: 'POST', headers: auth, body: '{}' });
     expect(start.status).toBe(503);
     expect((await start.json()).error).toBe('release_standby');
+    // Express routes case-insensitively: an upper-case spelling must not slip past the guard.
+    for (const route of ['/API/AI/RUNS', `/Api/Ai/Runs/${RUN_ID}/START/`, '/api/ai/finalize-app']) {
+      const r = await fetch(`http://127.0.0.1:${a.port}${route}`, { method: 'POST', headers: auth, body: '{}' });
+      expect([route, r.status]).toEqual([route, 503]);
+    }
 
     expect((await get(a, '/__relay/busy')).status).toBe(401);
     expect((await get(a, '/__relay/busy', { authorization: `Bearer ${localToken()}` })).status).toBe(401);
@@ -273,10 +328,8 @@ describe('lifecycle — the real entrypoint under a host-style parent', () => {
     await sleep(1000);
     expect(agentPids().length).toBe(2);
     expect(readLog().match(/resuming interrupted run/g)?.length).toBe(1);
-    const bStop = await terminate(b);
-    expect(bStop.code).toBe(0);
 
-    // ── A: SIGTERM ────────────────────────────────────────────────────────────
+    // ── A: SIGTERM while B stays ACTIVE ────────────────────────────────────────
     const stopped = await terminate(a);
     expect(stopped.code).toBe(0);
     expect(stopped.ms).toBeLessThan(6000 + 1500);
@@ -284,25 +337,44 @@ describe('lifecycle — the real entrypoint under a host-style parent', () => {
     expect(a.out()).toMatch(/shutdown complete in \d+ ms — runs left resumable: run_1700000000000_lcy; agent groups killed: 1/);
     // The agent CLI AND the child it forked into its process group are gone.
     await waitFor(() => !aliveNotZombie(agentPid) && !aliveNotZombie(agentChildPid), 5000, `agent process group to die (${agentPid}:${procState(agentPid)} ${agentChildPid}:${procState(agentChildPid)} pgid ${fs.existsSync(`/proc/${agentPid}/stat`) ? fs.readFileSync(`/proc/${agentPid}/stat`, 'utf8') : '-'})\n${a.out()}`);
+    expect(readLog()).toContain('[run] interrupted by release swap (SIGTERM) — will resume');
+    // Nothing written after the freeze: no agent-failure lines from the kill.
+    const tail = (readLog().split('[run] interrupted by release swap')[1] ?? '').split('[run] resuming interrupted run')[0];
+    expect(tail).not.toMatch(/failed|error/i);
+
+    // ── B (still the active release) resumes the run it had to skip ──────────
+    // Regression (skeptic sk25): resumeInterruptedRuns runs once, at activation,
+    // so a run skipped for a live foreign lease used to stay stranded until the
+    // next deploy. B re-checks it and resumes it once A is gone — well inside
+    // the lease's stale window, since A exited.
+    await waitFor(() => agentPids().length >= 4, 15_000, `B to resume the run after A exited\n${b.out()}\n${readLog()}`);
+    expect(readLog()).toContain(`[run] resuming interrupted run — the release that held it (pid ${a.child.pid}) is gone`);
+    expect(readLog().match(/resuming interrupted run/g)?.length).toBe(2);
+    const bLease = readRun().lease;
+    expect(bLease).toMatchObject({ releaseId: 'rel-B', pid: b.child.pid });
+    if (process.platform === 'linux') expect(bLease).toMatchObject({ bootId: expect.any(String), startTime: expect.stringMatching(/^\d+$/) });
+    const [bAgent, bAgentChild] = agentPids().slice(2);
+    expect(aliveNotZombie(bAgent) && aliveNotZombie(bAgentChild)).toBe(true);
+
+    // ── B: SIGTERM ────────────────────────────────────────────────────────────
+    const bStop = await terminate(b);
+    expect(bStop.code).toBe(0);
+    await waitFor(() => !aliveNotZombie(bAgent) && !aliveNotZombie(bAgentChild), 5000, 'B agent group to die');
     const after = readRun();
     expect(after.status).toBe('running');
     expect(after.resumable).toBe(true);
     expect(after.lease).toBeUndefined();
     expect(after.screens[0].status).not.toBe('failed');
-    expect(readLog()).toContain('[run] interrupted by release swap (SIGTERM) — will resume');
-    // Nothing written after the freeze: no agent-failure lines from the kill.
-    const tail = readLog().split('[run] interrupted by release swap')[1] ?? '';
-    expect(tail).not.toMatch(/failed|error/i);
 
     // ── C: the next release resumes the run from where it stopped ─────────────
     const c = await startRelease('rel-C');
     await activate(c);
-    await waitFor(() => agentPids().length >= 4, 30_000, `C to resume the run\n${c.out()}`);
-    expect(readLog().match(/resuming interrupted run/g)?.length).toBe(2);
+    await waitFor(() => agentPids().length >= 6, 30_000, `C to resume the run\n${c.out()}`);
+    expect(readLog().match(/resuming interrupted run/g)?.length).toBe(3);
     expect(readRun().lease).toMatchObject({ releaseId: 'rel-C', pid: c.child.pid });
     const cStop = await terminate(c);
     expect(cStop.code).toBe(0);
-    const [p3, p4] = agentPids().slice(2);
+    const [p3, p4] = agentPids().slice(4);
     await waitFor(() => !aliveNotZombie(p3) && !aliveNotZombie(p4), 5000, 'second agent group to die');
     expect(readRun()).toMatchObject({ status: 'running', resumable: true });
   }, 180_000);

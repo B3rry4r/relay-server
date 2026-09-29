@@ -41,7 +41,7 @@ import {
   clampParallel,
   gateIsActive, pauseAtCheckpoint, approveCheckpoint, setRunResumable, setRunPrepDone, setRunFinalized,
   addAmendment, resolveAmendment, writeFrameMap, mutateRun,
-  acquireRunLease, releaseRunLease, isForeignLeaseLive,
+  acquireRunLease, releaseRunLease, isForeignLeaseLive, leaseHolderAlive, RUN_LEASE_STALE_MS,
   type ScreenSpec, type CheckpointGate, type BuildRun, type RunScreen, type AmendmentKind,
 } from './build-run-store';
 import { notify } from './notify';
@@ -3095,26 +3095,119 @@ export async function resumeInterruptedRuns(): Promise<void> {
         if (resumable && !isRunActive(r.id) && isForeignLeaseLive(r)) {
           // Host (CONTRACTS §3): another live relay-server process is orchestrating
           // this run right now (fresh lease) — resuming it here would double-run it.
-          console.warn(`[run] ${r.id}: not resuming — leased by live pid ${r.lease?.pid} (release ${r.lease?.releaseId})`);
+          // Not skipped for good: it is re-checked every RUN_LEASE_RECHECK_MS and
+          // resumed here as soon as that process is gone (or its lease goes stale).
+          console.warn(`[run] ${r.id}: not resuming — leased by live pid ${r.lease?.pid} (release ${r.lease?.releaseId}); will re-check`);
+          deferLeasedResume(projectId, r);
           continue;
         }
         if (resumable && !isRunActive(r.id)) {
-          // T15: a generation run (has figStorageKey) interrupted BEFORE prep
-          // finished (prepDone falsy) re-enters via prepAndRun so PREP + the asset
-          // pass actually re-run; otherwise jump straight into runAppLoop. Without
-          // this, a redeploy mid-prep resumed into runAppLoop with no specs/assets.
-          const needsPrep = !!r.figStorageKey && r.prepDone !== true;
-          if (needsPrep) {
-            void appendRunLog(projectId, r.id, '[run] resuming interrupted run after server restart (redeploy) — prep was not complete, re-running prep + asset pass');
-            void prepAndRun(projectId, r.id);
-          } else {
-            void appendRunLog(projectId, r.id, '[run] resuming interrupted run after server restart (redeploy)');
-            void runAppLoop(projectId, r.id);
-          }
+          startResume(projectId, r, 'after server restart (redeploy)');
         }
       }
     }
   } catch { /* boot resume is best-effort */ }
+}
+
+/**
+ * Resume one interrupted run. T15: a generation run (has figStorageKey)
+ * interrupted BEFORE prep finished (prepDone falsy) re-enters via prepAndRun so
+ * PREP + the asset pass actually re-run; otherwise jump straight into runAppLoop.
+ * Without this, a redeploy mid-prep resumed into runAppLoop with no specs/assets.
+ */
+function startResume(projectId: string, r: BuildRun, why: string): void {
+  const needsPrep = !!r.figStorageKey && r.prepDone !== true;
+  if (needsPrep) {
+    void appendRunLog(projectId, r.id, `[run] resuming interrupted run ${why} — prep was not complete, re-running prep + asset pass`);
+    void prepAndRun(projectId, r.id);
+  } else {
+    void appendRunLog(projectId, r.id, `[run] resuming interrupted run ${why}`);
+    void runAppLoop(projectId, r.id);
+  }
+}
+
+// ── Lease-deferred resumes ────────────────────────────────────────────────────
+// resumeInterruptedRuns runs ONCE, at activation. A run it skipped because another
+// live process held its lease (the previous release, still draining) must not be
+// stranded until the next deploy: the active release re-checks it here and resumes
+// it once the holder is gone — dead, its pid reused by another process, from a
+// previous boot — or its lease has not been live for RUN_LEASE_STALE_MS (a hung
+// holder). A holder that clears its lease on a graceful shutdown is waited for
+// until it exits, so the old agent is dead before the new one starts.
+export const RUN_LEASE_RECHECK_MS = Number(process.env.RELAY_RUN_LEASE_RECHECK_MS) || 3000;
+
+type DeferredResume = {
+  projectId: string;
+  holder: { pid: number; bootId?: string; startTime?: string };
+  /** Last time the holder's lease was seen fresh + live. */
+  leaseLiveAt: number;
+};
+const deferredResumes = new Map<string, DeferredResume>();
+let deferredTimer: ReturnType<typeof setInterval> | null = null;
+let deferredTicking = false;
+
+function deferLeasedResume(projectId: string, r: BuildRun, now: number = Date.now()): void {
+  const lease = r.lease!;
+  deferredResumes.set(r.id, {
+    projectId,
+    holder: { pid: lease.pid, bootId: lease.bootId, startTime: lease.startTime },
+    leaseLiveAt: now,
+  });
+  if (!deferredTimer) {
+    deferredTimer = setInterval(() => { void recheckDeferredResumes(); }, RUN_LEASE_RECHECK_MS);
+    if (typeof deferredTimer.unref === 'function') deferredTimer.unref();
+  }
+}
+
+/** Runs waiting on another process's lease (tests / diagnostics). */
+export function listDeferredResumes(): string[] {
+  return Array.from(deferredResumes.keys());
+}
+
+/**
+ * One pass over the lease-deferred runs: drop the ones that no longer need a
+ * resume, resume the ones whose holder is gone. Best-effort; never throws.
+ */
+export async function recheckDeferredResumes(
+  now: number = Date.now(),
+  holderAlive: (holder: DeferredResume['holder']) => boolean = (h) => leaseHolderAlive(h),
+): Promise<string[]> {
+  if (deferredTicking) return [];
+  deferredTicking = true;
+  const resumed: string[] = [];
+  try {
+    for (const [runId, d] of Array.from(deferredResumes.entries())) {
+      try {
+        const r = await getRun(d.projectId, runId);
+        if (!r || r.status !== 'running' || r.resumable !== true || isRunActive(runId)) {
+          deferredResumes.delete(runId); // finished, stopped, or already orchestrating here
+          continue;
+        }
+        if (r.lease && isForeignLeaseLive(r, now)) {
+          d.leaseLiveAt = now;
+          d.holder = { pid: r.lease.pid, bootId: r.lease.bootId, startTime: r.lease.startTime };
+          continue;
+        }
+        const holderGone = !holderAlive(d.holder);
+        if (!holderGone && now - d.leaseLiveAt < RUN_LEASE_STALE_MS) continue; // still shutting down
+        deferredResumes.delete(runId);
+        startResume(d.projectId, r, holderGone
+          ? `— the release that held it (pid ${d.holder.pid}) is gone`
+          : `— the release that held it (pid ${d.holder.pid}) stopped heart-beating ${Math.round((now - d.leaseLiveAt) / 1000)}s ago`);
+        resumed.push(runId);
+      } catch { /* keep it for the next tick */ }
+    }
+  } finally {
+    deferredTicking = false;
+    if (deferredResumes.size === 0 && deferredTimer) { clearInterval(deferredTimer); deferredTimer = null; }
+  }
+  return resumed;
+}
+
+function stopDeferredResumes(): void {
+  if (deferredTimer) clearInterval(deferredTimer);
+  deferredTimer = null;
+  deferredResumes.clear();
 }
 
 // ── Auto-resume sweep ─────────────────────────────────────────────────────────
@@ -3184,6 +3277,7 @@ export function startAutoResumeSweep(): void {
 export function stopAutoResumeSweep(): void {
   if (sweepTimer) clearInterval(sweepTimer);
   sweepTimer = null;
+  stopDeferredResumes(); // a draining release resumes nothing
 }
 export function isAutoResumeSweepRunning(): boolean {
   return sweepTimer !== null;
