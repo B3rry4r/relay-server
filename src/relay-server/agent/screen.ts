@@ -4,8 +4,15 @@
  * one question before any key is written: "is the CLI's permission prompt on
  * screen right now?" — and, for hook-less sessions, detects prompts itself.
  */
-import { Terminal } from '@xterm/headless';
+import type { Terminal as HeadlessTerminal } from '@xterm/headless';
 import type { AgentCli } from './types';
+
+// @xterm/headless 6.0.0 declares `"module": "lib/xterm.mjs"`, a file the package
+// does not ship. Bundler-style resolvers (vite-node, which runs src/index.ts in
+// tests) prefer `module` and fail; Node's require uses `main`
+// (lib-headless/xterm-headless.js), so load it through require.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const { Terminal } = require('@xterm/headless') as typeof import('@xterm/headless');
 
 export interface ScreenSignature {
   /** Every pattern must match the visible screen. */
@@ -59,7 +66,7 @@ export interface ScreenGuardOptions {
 }
 
 export class ScreenGuard {
-  private term: Terminal;
+  private term: HeadlessTerminal;
   private changeTimer: NodeJS.Timeout | null = null;
   private disposed = false;
   private opts: ScreenGuardOptions;
