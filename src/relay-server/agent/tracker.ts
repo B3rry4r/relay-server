@@ -28,7 +28,7 @@ import { isAnswerable, TerminalTimeline, type SessionState } from './reducer';
 import { CODEX_HOOK_REVIEW, commandUnderSignature, matchesPermission, SCREEN_SIGNATURES, ScreenGuard } from './screen';
 import type { PtyServiceLink } from './service-link';
 import { SpoolWatcher, type SpoolLine } from './spool';
-import { JsonlTailer } from './tail';
+import { JsonlTailer, readCompleteLines } from './tail';
 import type {
   AgentAck, AgentCli, AgentEvent, AgentSessionSummary, PermissionChoice, SessionCandidate,
 } from './types';
@@ -134,7 +134,7 @@ export class AgentTracker extends EventEmitter {
       changed: () => { void this.refreshTerminals(); },
     });
     await this.refreshTerminals();
-    this.spool.start();
+    this.spool.start((lines) => this.backfill(lines));
     const tick = this.opts.tickMs ?? 2000;
     this.tickTimer = setInterval(() => { void this.tick(); }, tick);
     this.tickTimer.unref?.();
@@ -286,8 +286,8 @@ export class AgentTracker extends EventEmitter {
       const agentPid = agentPidFromRecord({ ...record, cli });
       if (agentPid && verdict === 'hook') s.agentPid = agentPid;
       if (verdict === 'hook' && s.attribution !== 'hook') t.timeline.setAttribution(sid, 'hook');
-      if (verdict === 'detached' && s.attribution !== 'detached') {
-        t.timeline.setAttribution(sid, 'detached');
+      if (verdict === 'detached') {
+        if (s.attribution !== 'detached') t.timeline.setAttribution(sid, 'detached');
         events.push(...t.timeline.notice(s, 'detached-process', cli === 'codex'
           ? "Codex's shared background server is answering for this terminal, so Relay cannot tell which terminal it belongs to. Run `pkill -f 'codex app-server'` or restart Codex to enable per-terminal events."
           : 'This agent runs outside the terminal\'s process tree (tmux, screen, setsid or nohup). Relay shows its activity but will not send keys to it.', 'detached'));
@@ -298,6 +298,53 @@ export class AgentTracker extends EventEmitter {
     const transcriptPath = typeof payload.transcript_path === 'string' ? payload.transcript_path : '';
     if (s && transcriptPath && cli !== 'opencode') this.bindTranscript(t, s, transcriptPath);
     this.syncGuard(t);
+  }
+
+  /**
+   * Startup backfill (§6.4): the spool and the transcripts it points at are two
+   * logs of ONE session. Replaying them file-by-file would put every hook event
+   * after the whole transcript (a denied request would stay "pending" forever),
+   * so they are merged by timestamp first, then fed exactly like live input.
+   */
+  private backfill(lines: SpoolLine[]): void {
+    type Item = { at: number; order: number; run: () => void };
+    const items: Item[] = [];
+    const tailers: JsonlTailer[] = [];
+    let order = 0;
+    let lastSpoolAt = 0;
+    for (const line of lines) {
+      const at = Date.parse(String(line.record.at ?? ''));
+      lastSpoolAt = Number.isFinite(at) ? at : lastSpoolAt;
+      items.push({ at: lastSpoolAt, order: order++, run: () => this.onSpoolLine(line) });
+      const terminalId = typeof line.record.terminalId === 'string' && line.record.terminalId ? line.record.terminalId : line.fileKey;
+      const t = this.terminals.get(terminalId);
+      const cli = normalizeCli(line.record.cli);
+      const sid = spoolSessionId(line.record);
+      const payload = (line.record.payload && typeof line.record.payload === 'object' ? line.record.payload : {}) as Json;
+      const tp = typeof payload.transcript_path === 'string' ? payload.transcript_path : '';
+      if (!t || !cli || cli === 'opencode' || !sid || !tp) continue;
+      const safe = this.safeTranscriptPath(tp);
+      if (!safe || t.transcripts.has(safe)) continue;
+      const read = readCompleteLines(safe);
+      const binding: TranscriptBinding = { cli, sessionId: sid, tailer: null as unknown as JsonlTailer };
+      binding.tailer = new JsonlTailer(safe, {
+        startOffset: read?.endOffset ?? 0,
+        onLine: (l, offset) => this.onTranscriptLine(t, binding, l, offset),
+        onReset: (why) => this.log(`transcript ${safe} ${why} — re-reading from 0`),
+      });
+      t.transcripts.set(safe, binding);
+      tailers.push(binding.tailer);
+      let lastAt = lastSpoolAt;
+      for (const { line: l, offset } of read?.lines ?? []) {
+        let ts = NaN;
+        try { ts = Date.parse(String(JSON.parse(l)?.timestamp ?? '')); } catch { /* keep order */ }
+        lastAt = Number.isFinite(ts) ? ts : lastAt;
+        items.push({ at: lastAt, order: order++, run: () => this.onTranscriptLine(t, binding, l, offset) });
+      }
+    }
+    items.sort((a, b) => a.at - b.at || a.order - b.order);
+    for (const item of items) item.run();
+    for (const tailer of tailers) tailer.start();
   }
 
   // ---------------------------------------------------------------------------
@@ -316,13 +363,13 @@ export class AgentTracker extends EventEmitter {
   private bindTranscript(t: TermState, s: SessionState, file: string): void {
     const safe = this.safeTranscriptPath(file);
     if (!safe) return;
+    s.transcriptPath = safe;
+    s.transcriptBound = true;
     if (t.transcripts.has(safe)) {
       const b = t.transcripts.get(safe)!;
       if (b.sessionId === s.sessionId) return;
       b.tailer.stop();
     }
-    s.transcriptPath = safe;
-    s.transcriptBound = true;
     const cli = s.cli;
     const sessionId = s.sessionId;
     const binding: TranscriptBinding = { cli, sessionId, tailer: null as unknown as JsonlTailer };

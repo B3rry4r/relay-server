@@ -32,6 +32,8 @@ export class SpoolWatcher {
   private onLine: (line: SpoolLine) => void;
   private rotateBytes: number;
   private pollMs: number;
+  /** While set, lines are collected instead of dispatched (the startup backfill). */
+  private collecting: SpoolLine[] | null = null;
 
   constructor(dir: string, onLine: (line: SpoolLine) => void, opts: { rotateBytes?: number; pollMs?: number } = {}) {
     this.dir = dir;
@@ -40,9 +42,23 @@ export class SpoolWatcher {
     this.pollMs = opts.pollMs ?? 250;
   }
 
-  start(): void {
+  /**
+   * Start tailing. Everything already in the spool is handed to `onBackfill` in
+   * one batch (so the tracker can merge it with the transcripts by time) —
+   * without it, lines go to the per-line callback like live ones.
+   */
+  start(onBackfill?: (lines: SpoolLine[]) => void): void {
     try { fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 }); } catch { /* reported by the scan */ }
-    this.scan();
+    if (onBackfill) {
+      this.collecting = [];
+      try { this.scan(); } finally {
+        const lines = this.collecting;
+        this.collecting = null;
+        onBackfill(lines);
+      }
+    } else {
+      this.scan();
+    }
     this.timer = setInterval(() => this.scan(), this.pollMs);
     this.timer.unref?.();
     try {
@@ -88,7 +104,8 @@ export class SpoolWatcher {
         try { record = JSON.parse(line) as SpoolRecord; } catch { return; }
         if (!record || typeof record !== 'object') return;
         const terminalId = typeof record.terminalId === 'string' && record.terminalId ? record.terminalId : fileKey;
-        this.onLine({ record, fileKey, idBase: `${terminalId}:spool:${inode}:${offset}` });
+        const spoolLine: SpoolLine = { record, fileKey, idBase: `${terminalId}:spool:${inode}:${offset}` };
+        if (this.collecting) this.collecting.push(spoolLine); else this.onLine(spoolLine);
       },
     });
     this.tailers.set(key, tailer);

@@ -56,6 +56,25 @@ export class LineSplitter {
   }
 }
 
+/**
+ * Read the complete lines of a file (at most the last `maxBackfill` bytes,
+ * aligned to a line start) — the tracker's merged backfill after a restart.
+ * `endOffset` is where a live tailer continues (an unterminated last line is
+ * left for it).
+ */
+export function readCompleteLines(file: string, maxBackfill = DEFAULT_MAX_BACKFILL): { lines: Array<{ line: string; offset: number }>; endOffset: number } | null {
+  let data: Buffer;
+  try { data = fs.readFileSync(file); } catch { return null; }
+  let start = Math.max(0, data.length - maxBackfill);
+  if (start > 0) {
+    const nl = data.indexOf(0x0a, start);
+    start = nl === -1 ? data.length : nl + 1;
+  }
+  const splitter = new LineSplitter(start);
+  const lines = splitter.push(data.subarray(start));
+  return { lines, endOffset: splitter.offset };
+}
+
 export interface TailerOptions {
   /** Explicit start offset. Default: backfill at most `maxBackfill` bytes from the end. */
   startOffset?: number;
