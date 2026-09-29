@@ -76,7 +76,12 @@ Terminals live in the host and survive every relay-server deploy.
 - CI: `.github/workflows/release.yml` runs `tsc`, vitest (with the parity
   ratchet), `npm run build`, `pack:release` and uploads the artifact on every push/PR. On `main`
   (or a manual run) it `POST`s the tarball to `$RELAY_HOST_URL/__host/releases`
-  and follows the deploy until `ACTIVE`, failing with the host's deploy log. It is
+  and follows the deploy until `ACTIVE`, then keeps watching it for `STABLE_SECS`
+  (120 s). It fails with the host's deploy log on `FAILED`, on `ROLLED_BACK` (the host
+  rolls back a release that crash-loops after activation) and on any crash or down
+  period inside that window. A crash loop slower than the window is still rolled back
+  by the host, after the job has finished. The step's own script is tested against a
+  fake host in `test/deploy/release-deploy-step.test.ts`. The deploy job is
   **skipped** until the repo secrets `RELAY_HOST_URL` and `RELAY_DEPLOY_TOKEN` exist.
 - By hand: `relay-host deploy release.tgz --id <id>`; roll back with `relay-host rollback`.
 - Runbook (setup, secrets, the Railway→Fly migration, and the CLAUDE.md rule-2 text for

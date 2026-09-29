@@ -4,8 +4,10 @@
 #           npm run pack:release → release.tgz + manifest.json (artifact).
 #   deploy  (push to main / manual run, ONLY when RELAY_HOST_URL and
 #           RELAY_DEPLOY_TOKEN are both set — otherwise skipped): uploads
-#           release.tgz to the host API (POST /__host/releases) and follows the
-#           deploy until ACTIVE, or fails with the host's deploy log.
+#           release.tgz to the host API (POST /__host/releases), follows the
+#           deploy until ACTIVE, then watches it for STABLE_SECS; fails with the
+#           host's deploy log on FAILED, on ROLLED_BACK (crash loop after
+#           activation) or on any crash in that window.
 #
 # A relay-server deploy does NOT restart the machine or the terminals: the
 # host installs the release beside the running one, health-checks it in
@@ -136,7 +138,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: relay-server-release
-      - name: Deploy to the relay host and follow it to ACTIVE
+      - name: Deploy to the relay host, follow it to ACTIVE, then watch it
         env:
           RELAY_HOST_URL: ${{ secrets.RELAY_HOST_URL }}
           RELAY_DEPLOY_TOKEN: ${{ secrets.RELAY_DEPLOY_TOKEN }}
@@ -145,6 +147,13 @@ jobs:
           BUSY_WAIT_SECS: "900"
           DEPLOY_TIMEOUT_SECS: "1800"
           POLL_SECS: "5"
+          # After ACTIVE, keep watching this long. The host rolls back a
+          # release that crashes RELAY_CRASH_LIMIT (3) times within
+          # RELAY_CRASH_WINDOW_MS (10 min) of activation; with its 1 s / 2 s
+          # restart backoff a release that dies at or soon after startup is
+          # rolled back well inside 120 s. A slower loop is still rolled back
+          # by the host, after this job has finished.
+          STABLE_SECS: "120"
         run: |
           set -euo pipefail
           host="${RELAY_HOST_URL%/}"
@@ -195,13 +204,17 @@ jobs:
           deadline=$((SECONDS + DEPLOY_TIMEOUT_SECS))
           printed=0
           state=""
+          print_log() {
+            local total
+            total="$(jq '.log | length' deploy.json)"
+            if [ "$total" -gt "$printed" ]; then
+              jq -r ".log[$printed:][]" deploy.json
+              printed="$total"
+            fi
+          }
           while :; do
             if curl -fsS -o deploy.json -H "Authorization: Bearer $RELAY_DEPLOY_TOKEN" "$host/__host/deploys/$deploy_id"; then
-              total="$(jq '.log | length' deploy.json)"
-              if [ "$total" -gt "$printed" ]; then
-                jq -r ".log[$printed:][]" deploy.json
-                printed="$total"
-              fi
+              print_log
               state="$(jq -r .state deploy.json)"
               case "$state" in
                 ACTIVE|FAILED|ROLLED_BACK) break ;;
@@ -215,16 +228,103 @@ jobs:
             sleep "$POLL_SECS"
           done
 
+          # An older host can accept a same-id upload while it is restarting
+          # that release itself, then end the deploy FAILED "already current".
+          # Nothing was changed; that is the already_current outcome, but the
+          # host was restarting it, so it still has to pass the stability window.
+          noop=""
+          if [ "$state" = FAILED ] && [ "$(jq -r '.error // empty' deploy.json)" = "release $id is already current" ]; then
+            echo "Release $id is already current on the host (it was restarting it); checking it stays up."
+            noop=1
+            state=ACTIVE
+          fi
+
+          # 3. Stability window. ACTIVE is not the end of it: the host keeps
+          #    supervising the release, and one that crash-loops after
+          #    activation is rolled back later (the deploy record moves to
+          #    ROLLED_BACK and the id goes on the bad list). Watch the record
+          #    and /__host/status for STABLE_SECS and fail on a rollback, on the
+          #    host no longer running this id, or on any crash / down period
+          #    (a first release has no previous to roll back to, so a crash
+          #    loop there never shows up as ROLLED_BACK).
+          unstable=""
+          STABLE_SECS="${STABLE_SECS:-120}"
+          if [ "$state" = ACTIVE ] && [ "$STABLE_SECS" -gt 0 ]; then
+            echo "Release $id is ACTIVE; watching it for ${STABLE_SECS}s (crash loop → host rollback)"
+            stable_until=$((SECONDS + STABLE_SECS))
+            hard_deadline=$((stable_until + STABLE_SECS))
+            max_crashes=0
+            seen_down=""
+            while :; do
+              polled=""
+              if curl -fsS -o deploy.json -H "Authorization: Bearer $RELAY_DEPLOY_TOKEN" "$host/__host/deploys/$deploy_id" &&
+                 curl -fsS -o status.json -H "Authorization: Bearer $RELAY_DEPLOY_TOKEN" "$host/__host/status"; then
+                polled=1
+                print_log
+                [ -z "$noop" ] && state="$(jq -r .state deploy.json)"
+                if [ "$state" != ACTIVE ]; then
+                  unstable="deploy record moved to $state: $(jq -r '.error // "no error message"' deploy.json)"; break
+                fi
+                if jq -e --arg id "$id" '(.bad // []) | index($id) != null' status.json >/dev/null; then
+                  unstable="the host put $id on its bad list"; break
+                fi
+                current="$(jq -r '.current // "none"' status.json)"
+                if [ "$current" != "$id" ]; then
+                  unstable="the host's current release is now $current"; break
+                fi
+                crashes="$(jq -r --arg id "$id" 'if .active.id == $id then (.active.crashes // 0) else 0 end' status.json)"
+                # A deploy resets the host's crash count at activation; the
+                # no-op path counts only crashes after it started watching.
+                [ -n "$noop" ] && [ -z "${base_crashes:-}" ] && base_crashes="$crashes"
+                crashes=$((crashes - ${base_crashes:-0}))
+                if [ "$crashes" -gt "$max_crashes" ]; then
+                  max_crashes="$crashes"
+                  echo "::warning::$id crashed $crashes time(s) since activation; the host is restarting it"
+                fi
+                down="$(jq -r '.down.reason // empty' status.json)"
+                if [ -n "$down" ] && [ -z "$seen_down" ]; then
+                  seen_down="$down"
+                  echo "::warning::host reports no active release: $down"
+                fi
+              else
+                echo "(status poll failed — host swapping or unreachable; retrying)"
+              fi
+              if [ -n "$polled" ] && [ "$SECONDS" -ge "$stable_until" ]; then break; fi
+              if [ "$SECONDS" -ge "$hard_deadline" ]; then
+                unstable="host unreachable at the end of the ${STABLE_SECS}s stability window"; break
+              fi
+              sleep "$POLL_SECS"
+            done
+            if [ -z "$unstable" ] && [ "$max_crashes" -gt 0 ]; then
+              unstable="$id crashed $max_crashes time(s) within ${STABLE_SECS}s of activation"
+            fi
+            if [ -z "$unstable" ] && [ -n "$seen_down" ]; then
+              unstable="$id went down within ${STABLE_SECS}s of activation: $seen_down"
+            fi
+            if [ -z "$unstable" ] && ! jq -e --arg id "$id" '.active.id == $id and .active.mode == "active" and .down == null' status.json >/dev/null; then
+              unstable="$id is not the running, active release at the end of the stability window"
+            fi
+          fi
+
           {
-            echo "### relay-server \`$id\` → **$state** (deploy \`$deploy_id\`)"
+            echo "### relay-server \`$id\` → **${unstable:+UNSTABLE, }$state** (deploy \`$deploy_id\`)"
             echo '```'
             jq -r '.transitions[] | "\(.at)  \(.state)"' deploy.json
             echo '```'
+            if [ -n "$unstable" ]; then echo "Stability window: $unstable"; fi
           } >> "$GITHUB_STEP_SUMMARY"
-          if [ "$state" != ACTIVE ]; then
-            echo "::error::deploy $deploy_id ended $state: $(jq -r '.error // "no error message"' deploy.json)"
+          if [ "$state" != ACTIVE ] || [ -n "$unstable" ]; then
+            if [ -n "$unstable" ]; then
+              echo "::error::release $id did not stay healthy after activation: $unstable"
+            else
+              echo "::error::deploy $deploy_id ended $state: $(jq -r '.error // "no error message"' deploy.json)"
+            fi
             echo "---- full deploy log ----"
             jq -r '.log[]' deploy.json
+            if [ -f status.json ]; then
+              echo "---- host status ----"
+              jq '{current, previous, bad, active, down, history: .history[-5:]}' status.json
+            fi
             exit 1
           fi
-          echo "Release $id is ACTIVE."
+          echo "Release $id is ACTIVE and stayed up for ${STABLE_SECS}s."
