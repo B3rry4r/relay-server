@@ -2,7 +2,8 @@
  * token-cleanup-web.ts — Phase 7f for react + next.
  *
  * Flutter substitutes `Color(0xFF1A1A1A)` → `AppTheme.ink` and strips dead private
- * consts. The web design system is `src/theme/theme.ts`:
+ * consts. The web design system is the theme module Pre-flight recorded in
+ * `.uix/design-system.json` (react `src/theme/theme.ts`, next `<root>/lib/theme/theme.ts`):
  *
  *   export const AppTheme = {
  *     color:   { ink: '#1a1a1a', … },
@@ -22,7 +23,8 @@ import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import path from 'node:path';
 
-import { listSourceFiles, ensureNamedImport, importPathBetween, stillReferenced } from './web-app';
+import { loadWebApp, listWebSources, ensureNamedImport, importPathBetween, stillReferenced } from './web-app';
+import { DESIGN_SYSTEM_RECORD } from '../design-system';
 
 export interface WebThemeModel {
   themeFile: string;
@@ -56,9 +58,27 @@ export interface WebTokenResult {
 
 const THEME_RELS = ['src/theme/theme.ts', 'src/theme/index.ts', 'src/theme.ts'];
 
+/** Where the web theme module lives, most authoritative first (PG-18):
+ *   1. the design-system contract Pre-flight recorded (`.uix/design-system.json`
+ *      `themeFile` — `src/theme/theme.ts` on react, `<root>/lib/theme/theme.ts` on
+ *      next, CONTRACTS §5);
+ *   2. the shared resolver's `themeFile` (web-app.ts — every §5 location);
+ *   3. the legacy react locations (THEME_RELS). */
+export function locateWebTheme(projectRoot: string, resolverThemeFile?: string | null): string | null {
+  try {
+    const rec = JSON.parse(fsSync.readFileSync(path.join(projectRoot, DESIGN_SYSTEM_RECORD), 'utf-8')) as { themeFile?: unknown };
+    if (typeof rec.themeFile === 'string' && /\.(ts|tsx|js)$/.test(rec.themeFile)) {
+      const abs = path.join(projectRoot, rec.themeFile);
+      if (fsSync.existsSync(abs)) return abs;
+    }
+  } catch { /* no record (older run / hand-made app) */ }
+  if (resolverThemeFile && fsSync.existsSync(resolverThemeFile)) return resolverThemeFile;
+  return THEME_RELS.map((r) => path.join(projectRoot, r)).find((p) => fsSync.existsSync(p)) ?? null;
+}
+
 /** Parse the nested `export const AppTheme = { color: {...}, radius: {...} }` object. */
-export function parseWebTheme(projectRoot: string): WebThemeModel | null {
-  const themeFile = THEME_RELS.map((r) => path.join(projectRoot, r)).find((p) => fsSync.existsSync(p));
+export function parseWebTheme(projectRoot: string, resolverThemeFile?: string | null): WebThemeModel | null {
+  const themeFile = locateWebTheme(projectRoot, resolverThemeFile);
   if (!themeFile) return null;
   return parseWebThemeSource(fsSync.readFileSync(themeFile, 'utf-8'), themeFile);
 }
@@ -188,8 +208,9 @@ export async function deepenWebTokens(projectRoot: string, opts: WebTokenOptions
     changes: [], rejected: [], filesScanned: 0,
   };
 
-  const theme = parseWebTheme(projectRoot);
-  if (!theme) return { ...empty, skippedReason: `no web theme module with an exported token object (looked for ${THEME_RELS.join(', ')})` };
+  const ix = await loadWebApp(projectRoot);
+  const theme = parseWebTheme(projectRoot, ix?.themeFile ?? null);
+  if (!theme) return { ...empty, skippedReason: `no web theme module with an exported token object (looked in ${DESIGN_SYSTEM_RECORD}, the resolver's theme locations and ${THEME_RELS.join(', ')})` };
 
   const result: WebTokenResult = {
     ...empty,
@@ -203,12 +224,14 @@ export async function deepenWebTokens(projectRoot: string, opts: WebTokenOptions
     changes: [], rejected: [],
   };
 
-  const srcDir = path.join(projectRoot, 'src');
-  const files = (await listSourceFiles(srcDir)).filter((f) => f !== theme.themeFile);
+  // Every resolver source root (src/, app/, components/, lib/, pages/) — a Next app's
+  // screens live under app/, never only src/ (PG-18). Previews are not walked.
+  const roots = ix?.sourceRoots ?? [path.join(projectRoot, 'src')];
+  const files = (await listWebSources({ sourceRoots: roots })).filter((f) => f !== theme.themeFile);
   const targets = opts.onlyFiles?.length ? files.filter((f) => opts.onlyFiles!.includes(path.basename(f))) : files;
 
   result.filesScanned = targets.length;
-  if (targets.length === 0) result.skippedReason = `no source files to scan under ${rel(projectRoot, srcDir)}/`;
+  if (targets.length === 0) result.skippedReason = `no source files to scan under ${roots.map((r) => rel(projectRoot, r) || '.').join(', ')}`;
   for (const file of targets) {
     const before = await fs.readFile(file, 'utf-8').catch(() => '');
     if (!before) continue;

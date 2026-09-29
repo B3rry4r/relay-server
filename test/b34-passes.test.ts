@@ -79,3 +79,24 @@ describe('7h productionHygiene (PG-25, PG-26)', () => {
     expect(fsSync.existsSync(path.join(root, 'lib', '_preview'))).toBe(false);
   });
 });
+
+// ── 7f ────────────────────────────────────────────────────────────────────────
+import { deepenWebTokens, locateWebTheme } from '../src/relay-server/passes/token-cleanup-web';
+
+describe('7f web tokens find the theme the design-system contract recorded (PG-18)', () => {
+  it('next: .uix/design-system.json themeFile wins; app/ pages are rewritten; run 2 is a no-op', async () => {
+    const root = await fixture('next');
+    await fs.mkdir(path.join(root, 'lib', 'theme'), { recursive: true });
+    await fs.rename(path.join(root, 'lib', 'theme.ts'), path.join(root, 'lib', 'theme', 'theme.ts'));
+    await fs.writeFile(path.join(root, '.uix', 'design-system.json'), JSON.stringify({ framework: 'next', themeFile: 'lib/theme/theme.ts' }));
+    expect(locateWebTheme(root)).toBe(path.join(root, 'lib', 'theme', 'theme.ts'));
+    const r = await deepenWebTokens(root, {});
+    expect(r.themeFile).toBe('lib/theme/theme.ts');
+    const home = await fs.readFile(path.join(root, 'app', '(tabs)', '10-2', 'page.tsx'), 'utf8');
+    expect(home).toMatch(/import \{ AppTheme \} from '\.\.\/\.\.\/\.\.\/lib\/theme\/theme';/);
+    expect(home).toMatch(/fill=\{AppTheme\.color\.brand\}/);
+    expect(home).toMatch(/^\/\/ canonicalId: c_10_2 route: \/10-2\n'use client';/);
+    const again = await deepenWebTokens(root, {});
+    expect(again.changes).toEqual([]);
+  });
+});
