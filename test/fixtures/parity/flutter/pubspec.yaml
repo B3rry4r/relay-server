@@ -1,0 +1,14 @@
+name: parity_fixture
+description: Framework-parity fixture (flutter). Planted work for every Phase-7 pass.
+publish_to: 'none'
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_svg: ^2.0.10
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/icons/
+    - assets/images/
