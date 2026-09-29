@@ -1,7 +1,9 @@
 import type { Express } from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
-import { createTerminalEnv, requireAuth, extractRequestToken, isValidToken, readStringParam, resolveWorkspace } from './runtime';
+import { createTerminalEnv, requireAuth, readStringParam, resolveWorkspace, getProjectsRoot } from './runtime';
+import { childProcessEnv } from './auth/secrets';
+import { isProtectedPort, protectedPortReason } from './protected-ports';
 import { getWorkspaceHealth } from './monitoring';
 import {
   buildQuickSwitchProjects,
@@ -18,6 +20,21 @@ import { getTunnelUrl, closeTunnel, listTunnels } from './tunnel-manager';
 import { listFlutterPreviewServers, stopFlutterPreviewServer, startStaticPreviewServer } from './flutter-preview-server';
 import { buildWebOutput, detectProjectKind, readWebPreviewRoute } from './web-preview';
 
+/**
+ * A static server may serve a project dir or the projects root, never the
+ * workspace root, the relay dir, or anything containing `.relay/state`.
+ */
+export function isSafeStaticServeDir(dir: string, workspace = resolveWorkspace()): boolean {
+  const resolved = path.resolve(dir);
+  const ws = path.resolve(workspace);
+  const relayRoot = path.join(ws, '.relay');
+  if (resolved === ws || resolved === path.parse(resolved).root) return false;
+  if (resolved === relayRoot || resolved.startsWith(`${relayRoot}${path.sep}`)) return false;
+  // Serving an ANCESTOR of the workspace would expose it too.
+  if (ws.startsWith(`${resolved}${path.sep}`)) return false;
+  return true;
+}
+
 // Kept for flutter-routes compatibility — now delegates to closeTunnel.
 export function invalidatePortTargetCache(port: number): void {
   closeTunnel(port);
@@ -30,7 +47,12 @@ export function registerCoreRoutes(app: Express): void {
       service: 'terminal-backend',
       status: 'ok',
       transport: {
-        httpAuthHeader: 'x-auth-token',
+        // Sign in at POST /api/auth/login {secret} → {token}; send the session
+        // token as `Authorization: Bearer <token>` (or x-auth-token) and as the
+        // socket handshake's auth.token. Query-string tokens are not accepted.
+        login: '/api/auth/login',
+        httpAuthHeader: 'authorization',
+        httpAuth: ['Authorization: Bearer <session token>', 'x-auth-token: <session token>'],
         socketAuthField: 'auth.token',
         socketPath: '/socket.io',
       },
@@ -51,13 +73,8 @@ export function registerCoreRoutes(app: Express): void {
     res.json({ version });
   });
 
-  app.get('/api/auth/validate', (req, res) => {
-    if (!isValidToken(extractRequestToken(req))) {
-      res.status(401).json({ error: 'unauthorized', message: 'A valid auth token is required.' });
-      return;
-    }
-    res.json({ authenticated: true });
-  });
+  // /api/auth/* (login, session, sessions, logout, rotate, login-link) live in
+  // auth/routes.ts.
 
   app.get('/api/bootstrap/status', requireAuth, async (_req, res) => {
     res.json(await getWorkspaceHealth());
@@ -107,7 +124,8 @@ export function registerCoreRoutes(app: Express): void {
 
   // List all active ports, including any already-running tunnel URLs.
   app.get('/api/previews', requireAuth, async (_req, res) => {
-    const ports = await listListeningPorts();
+    // Relay's own/internal ports are never offered as previews (they cannot be tunnelled).
+    const ports = (await listListeningPorts()).filter((port) => !isProtectedPort(port));
     const tunnelByPort = new Map(listTunnels().map(t => [t.port, t.url]));
     res.json({
       previews: ports.map((port) => ({
@@ -212,6 +230,14 @@ export function registerCoreRoutes(app: Express): void {
       res.status(400).json({ error: 'invalid_port', message: 'Port must be between 1 and 65535.' });
       return;
     }
+    const protectedReason = protectedPortReason(port);
+    if (protectedReason) {
+      res.status(403).json({
+        error: 'port_protected',
+        message: `Port ${port} is ${protectedReason}; it is never exposed through a public tunnel.`,
+      });
+      return;
+    }
     const ports = await listListeningPorts();
     if (!ports.includes(port)) {
       res.status(502).json({
@@ -240,10 +266,33 @@ export function registerCoreRoutes(app: Express): void {
     });
   });
 
+  // Start a plain static file server on a port. It serves a PROJECT directory
+  // (body.projectId) or, by default, the projects root — never the workspace root,
+  // which holds .relay/state (sessions, local token, git credentials). Bound to
+  // loopback; expose it through /api/previews/:port/tunnel if needed.
   app.post('/api/previews/:port/serve', requireAuth, async (req, res) => {
     const port = Number(req.params.port);
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
       res.status(400).json({ error: 'invalid_port', message: 'Port must be between 1 and 65535.' });
+      return;
+    }
+    const protectedReason = protectedPortReason(port);
+    if (protectedReason) {
+      res.status(403).json({ error: 'port_protected', message: `Port ${port} is ${protectedReason}.` });
+      return;
+    }
+    const requestedProject = typeof req.body?.projectId === 'string' ? req.body.projectId : '';
+    let serveDir = getProjectsRoot();
+    if (requestedProject) {
+      const projectRoot = resolveProjectRoot(requestedProject);
+      if (!projectRoot || !await exists(projectRoot)) {
+        res.status(404).json({ error: 'project_not_found', message: 'Project not found.' });
+        return;
+      }
+      serveDir = projectRoot;
+    }
+    if (!isSafeStaticServeDir(serveDir)) {
+      res.status(400).json({ error: 'unsafe_directory', message: 'Refusing to serve the workspace root or relay state.' });
       return;
     }
     const ports = await listListeningPorts();
@@ -251,12 +300,12 @@ export function registerCoreRoutes(app: Express): void {
       res.json({ ok: true, port, message: 'Port already in use.' });
       return;
     }
-    const workspace = resolveWorkspace();
+    await fs.promises.mkdir(serveDir, { recursive: true });
     const { spawn } = await import('node:child_process');
-    spawn('python3', ['-m', 'http.server', String(port)], {
-      cwd: workspace, detached: true, stdio: 'ignore',
-    });
-    res.json({ ok: true, port, message: `Preview server starting on port ${port}` });
+    spawn('python3', ['-m', 'http.server', String(port), '--bind', '127.0.0.1', '--directory', serveDir], {
+      cwd: serveDir, detached: true, stdio: 'ignore', env: childProcessEnv(),
+    }).unref();
+    res.json({ ok: true, port, directory: serveDir, message: `Preview server starting on port ${port}` });
   });
 
   app.get('/api/workspace/health', requireAuth, async (_req, res) => {

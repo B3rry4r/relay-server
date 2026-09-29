@@ -7,7 +7,6 @@ import { registerCoreRoutes } from './relay-server/core-routes';
 import { registerAIRoutes } from './relay-server/ai-routes';
 import { registerContextRoutes } from './relay-server/context-routes';
 import { registerFlutterRoutes } from './relay-server/flutter-routes';
-import { getScreenSession } from './relay-server/flutter-screen';
 import { registerGitRoutes } from './relay-server/git-routes';
 import { registerVisualRoutes } from './relay-server/visual-routes';
 import { registerScreenLoopRoutes, resumeInterruptedRuns, startAutoResumeSweep } from './relay-server/ai-screen-loop';
@@ -22,7 +21,13 @@ import {
 } from './relay-server/socket';
 import { registerToolRoutes } from './relay-server/tool-routes';
 import { ensureRelayRuntimeAssets } from './relay-server/tooling';
-import { resolveWorkspace } from './relay-server/runtime';
+import { resolveWorkspace, setRelayApiUrl } from './relay-server/runtime';
+import { clearLegacyCookie, createAuthRuntime } from './relay-server/auth';
+import { buildCorsOptions, logOriginPolicy } from './relay-server/auth/cors';
+import { registerAuthRoutes } from './relay-server/auth/routes';
+import { authStatePaths, writeFileAtomic } from './relay-server/auth/state';
+import { registerProtectedPort, unregisterProtectedPort } from './relay-server/protected-ports';
+import { uixProxyMiddleware } from './relay-server/uix';
 import {
   createPtyBridgeFactory,
   isPtyBridgeEnabled,
@@ -86,13 +91,39 @@ export function defaultPtyFactory(options: {
   });
 }
 
+/** `trust proxy` setting: RELAY_TRUST_PROXY overrides the 'loopback' default. */
+function trustProxySetting(): boolean | number | string {
+  const raw = (process.env.RELAY_TRUST_PROXY || '').trim();
+  if (!raw) return 'loopback';
+  if (raw === 'true') return true;
+  if (raw === 'false') return false;
+  if (/^\d+$/.test(raw)) return Number(raw);
+  return raw;
+}
+
 export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): RelayServer {
   const app = express();
   const httpServer = createServer(app);
+  // Only a proxy on loopback (the front door) may supply the client IP via
+  // X-Forwarded-For; used by the login rate limiter (req.ip).
+  app.set('trust proxy', trustProxySetting());
+
+  const auth = createAuthRuntime();
+  logOriginPolicy(auth.originPolicy);
+  const corsOptions = buildCorsOptions(auth.originPolicy);
+
   const io = new SocketIOServer(httpServer, {
     cors: {
-      origin: true,
-      credentials: true,
+      origin: corsOptions.origin,
+      credentials: false,
+    },
+    // Browsers always send Origin on a WebSocket/polling handshake: refuse one
+    // that is not allowlisted (cross-site WebSocket hijacking). Non-browser
+    // clients (mcp-server.mjs, relay-pty bridge, tests) send none.
+    allowRequest: (req, callback) => {
+      const origin = req.headers.origin;
+      if (!origin || auth.originPolicy.isAllowed(origin)) { callback(null, true); return; }
+      callback('origin not allowed', false);
     },
     // Keep connections alive through Railway's proxy (60s idle timeout).
     // pingInterval must be well below the proxy idle timeout so the connection
@@ -116,23 +147,23 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
     connectTimeout: 30000,
   });
 
-  const corsOptions: cors.CorsOptions = {
-    origin: (origin, callback) => {
-      // Allow requests with no origin (curl, mobile apps, server-to-server)
-      // and any origin — the relay server authenticates via token, not origin.
-      callback(null, true);
-    },
-    credentials: true,
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'x-auth-token'],
-    optionsSuccessStatus: 204,
-  };
-
-  // Handle OPTIONS preflight for every route BEFORE any other middleware.
+  // Order matters:
+  //  1. CORS (allowlist) — also answers every preflight, so a 401 below still
+  //     carries CORS headers for an allowlisted origin.
+  //  2. Clear the legacy raw-secret cookie (never read).
+  //  3. DEFAULT-DENY authentication: nothing below runs without a credential
+  //     unless the route is on the public allowlist (auth/index.ts).
+  //  4. /api/uix/* streaming proxy (before any body parser).
+  //  5. Body parsers (a tiny limit for the public login endpoints).
   app.options('*', cors(corsOptions));
   app.use(cors(corsOptions));
+  app.use(clearLegacyCookie);
+  app.use(auth.authenticate);
+  app.use('/api/uix', uixProxyMiddleware);
+  app.use(['/api/auth/login', '/api/auth/login-link/exchange'], express.json({ limit: '16kb' }));
   app.use(express.json({ limit: '50mb' }));
 
+  registerAuthRoutes(app, auth);
   registerCoreRoutes(app);
   registerAIRoutes(app);
   registerContextRoutes(app);
@@ -142,7 +173,10 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
   registerGitRoutes(app);
   registerVisualRoutes(app);
   registerScreenLoopRoutes(app);
+  auth.installSocketAuth(io);
   registerSocketHandlers(io, ptyFactory);
+
+  let listeningPort = 0;
 
   return {
     app,
@@ -181,33 +215,20 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
         httpServer.keepAliveTimeout = 65000; // 65 s — just above Railway's 60 s
         httpServer.headersTimeout = 70000;   // must be > keepAliveTimeout
 
-        // Proxy WebSocket upgrades for Flutter screen sessions.
-        // noVNC connects to /api/projects/:id/flutter/screen/websocket
-        // and we pipe it straight to the session's local websockify port.
-        httpServer.on('upgrade', (req, socket, head) => {
-          const match = req.url?.match(/^\/api\/projects\/([^/]+)\/flutter\/screen\/websocket/);
-          if (!match) return; // let socket.io handle other upgrades
-          const projectId = decodeURIComponent(match[1]);
-          const session = getScreenSession(projectId);
-          if (!session) { socket.destroy(); return; }
-          import('node:net').then(({ createConnection }) => {
-            const upstream = createConnection({ host: '127.0.0.1', port: session.wsPort }, () => {
-              // Forward the raw HTTP upgrade request to websockify
-              const CRLF = '\r\n';
-              const reqLine = req.method + ' ' + req.url + ' HTTP/1.1' + CRLF;
-              const headers = Object.entries(req.headers)
-                .map(([k, v]) => k + ': ' + (Array.isArray(v) ? v.join(', ') : v))
-                .join(CRLF);
-              upstream.write(reqLine + headers + CRLF + CRLF);
-              if (head.length > 0) upstream.write(head);
-              upstream.pipe(socket);
-              socket.pipe(upstream);
-            });
-            upstream.on('error', () => socket.destroy());
-            socket.on('error', () => upstream.destroy());
-          });
-        });
+        // (The unauthenticated raw `upgrade` proxy to the Flutter-screen VNC
+        // websockify was removed: nothing starts a screen session —
+        // startScreenSession has no caller in relay-server, relay-web or
+        // mcp-server.mjs — so the only upgrades served are socket.io's, which
+        // are authenticated by io.use.)
       });
+
+      const address = httpServer.address();
+      listeningPort = address && typeof address === 'object' ? address.port : port;
+      registerProtectedPort(listeningPort, "relay's own API port");
+      setRelayApiUrl(`http://127.0.0.1:${listeningPort}`);
+      try {
+        writeFileAtomic(authStatePaths().apiUrl, `http://127.0.0.1:${listeningPort}\n`, 0o644);
+      } catch { /* the relay-auth CLI falls back to RELAY_API_URL / PORT */ }
 
       // Resume any full-app build run that was interrupted by this restart
       // (e.g. a redeploy) so it keeps building server-side. Best-effort.
@@ -217,10 +238,11 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
       // persisted resumeAt + a poll, not a long in-process timer). Best-effort.
       startAutoResumeSweep();
 
-      const address = httpServer.address();
-      return address && typeof address === 'object' ? address.port : port;
+      return listeningPort;
     },
     async stop() {
+      auth.dispose();
+      if (listeningPort) unregisterProtectedPort(listeningPort);
       if (!isRemotePtyEnabled()) {
         // Embedded mode only — in remote mode the relay-pty service owns the
         // sessions and MUST NOT have them persisted/closed from here.

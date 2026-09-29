@@ -26,11 +26,13 @@ import type { ScreenSpec } from './build-run-store';
 import { emitResources, canEmitResources } from './resources-emit';
 import { renameAssetsSemantic } from './asset-naming';
 import type { AIModel } from './ai-adapters';
+import { getHarnessUixBase, uixBaseUrl, uixFetch } from './uix';
 
 // ── env knobs ─────────────────────────────────────────────────────────────────
 // UIX base — where the IR / svg-assets / asset bytes live. Configurable so a
 // staging UIX can be targeted; defaults to production.
-export const UIX_BASE_URL = (process.env.UIX_BASE_URL || 'https://uix-production.up.railway.app').replace(/\/+$/, '');
+// (UIX_URL is the contract name; UIX_BASE_URL is still honoured — see uix.ts.)
+export const UIX_BASE_URL = uixBaseUrl();
 // The built render-harness dir (relay-web's vite build output). Defaults to the
 // relay-web dist; override when the harness builds elsewhere.
 const HARNESS_DIR = process.env.HARNESS_DIR || '/workspace/projects/relay-web/dist';
@@ -77,7 +79,7 @@ export interface ExtractedAsset { hash: string; storageKey: string; url: string;
 /** GET /api/v1/figma/ir/data — the full compact IR (nodes/links/frames). */
 export async function getIrData(figStorageKey: string): Promise<IrData | null> {
   try {
-    const r = await fetch(`${UIX_BASE_URL}/api/v1/figma/ir/data?figStorageKey=${encodeURIComponent(figStorageKey)}`);
+    const r = await uixFetch(`/api/v1/figma/ir/data?figStorageKey=${encodeURIComponent(figStorageKey)}`);
     if (!r.ok) return null;
     const d = await r.json() as IrData;
     return d && d.nodes ? d : null;
@@ -87,7 +89,7 @@ export async function getIrData(figStorageKey: string): Promise<IrData | null> {
 /** POST /api/v1/figma/ir { figStorageKey, nodeId } — one frame's IR tree notation. */
 export async function getNodeTree(figStorageKey: string, nodeId: string): Promise<string> {
   try {
-    const r = await fetch(`${UIX_BASE_URL}/api/v1/figma/ir`, {
+    const r = await uixFetch(`/api/v1/figma/ir`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ figStorageKey, nodeId }),
     });
@@ -101,7 +103,7 @@ export async function getNodeTree(figStorageKey: string, nodeId: string): Promis
 export async function getSvgAssets(figStorageKey: string, nodeId?: string): Promise<SvgAsset[]> {
   try {
     const q = nodeId ? `?nodeId=${encodeURIComponent(nodeId)}` : '';
-    const r = await fetch(`${UIX_BASE_URL}/api/v1/figma/svg-assets/${encodeURIComponent(figStorageKey)}${q}`);
+    const r = await uixFetch(`/api/v1/figma/svg-assets/${encodeURIComponent(figStorageKey)}${q}`);
     if (!r.ok) return [];
     const d = await r.json() as { assets?: SvgAsset[] };
     return (d.assets ?? []).map(a => ({ ...a, url: toAbsoluteAssetUrl(a.url) }));
@@ -112,7 +114,7 @@ export async function getSvgAssets(figStorageKey: string, nodeId?: string): Prom
  *  its raster image-fill assets (the client gets these from the upload payload). */
 export async function getUploadAssets(figStorageKey: string): Promise<ExtractedAsset[]> {
   try {
-    const r = await fetch(`${UIX_BASE_URL}/api/v1/figma/uploads`);
+    const r = await uixFetch(`/api/v1/figma/uploads`);
     if (!r.ok) return [];
     const d = await r.json() as { uploads?: Array<{ figStorageKey?: string; assets?: ExtractedAsset[] }> };
     const rec = (d.uploads ?? []).find(u => u.figStorageKey === figStorageKey);
@@ -126,7 +128,7 @@ export async function ensureIrComplete(
   figStorageKey: string, figmaUrl: string, onStatus?: (s: string) => void, timeoutMs = 180_000,
 ): Promise<void> {
   try {
-    await fetch(`${UIX_BASE_URL}/api/v1/figma/ir/complete`, {
+    await uixFetch(`/api/v1/figma/ir/complete`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ figStorageKey, figmaUrl }),
     });
@@ -135,7 +137,7 @@ export async function ensureIrComplete(
   while (Date.now() - start < timeoutMs) {
     let status = 'running';
     try {
-      const r = await fetch(`${UIX_BASE_URL}/api/v1/figma/ir/complete/status?figStorageKey=${encodeURIComponent(figStorageKey)}`);
+      const r = await uixFetch(`/api/v1/figma/ir/complete/status?figStorageKey=${encodeURIComponent(figStorageKey)}`);
       const d = r.ok ? await r.json() as { status?: string } : { status: 'absent' };
       status = d.status ?? 'absent';
     } catch { /* transient — keep polling */ }
@@ -272,7 +274,7 @@ async function renderFrameReferenceEx(args: {
     + `?fig=${encodeURIComponent(args.figStorageKey)}`
     + `&frame=${encodeURIComponent(args.frameId)}`
     + `&scale=${args.scale}`
-    + `&base=${encodeURIComponent(UIX_BASE_URL)}`;
+    + `&base=${encodeURIComponent(await getHarnessUixBase())}`;
   // The harness draws the frame to a canvas whose backing size is ALREADY the device
   // pixels (fw*scale × fh*scale) and that canvas IS the page. So capture the window at
   // those device pixels at scale 1 (NOT scale=args.scale + fullPage, which forces a
@@ -342,7 +344,7 @@ export async function renderNodeReference(args: {
     + `&frame=${encodeURIComponent(args.frameId)}`
     + `&node=${encodeURIComponent(args.nodeId)}`
     + `&scale=${scale}`
-    + `&base=${encodeURIComponent(UIX_BASE_URL)}`;
+    + `&base=${encodeURIComponent(await getHarnessUixBase())}`;
   const dw = Math.max(1, Math.round(args.width * scale));
   const dh = Math.max(1, Math.round(args.height * scale));
   // Funnel through the SAME render semaphore as frame renders so node re-rasterizes
@@ -519,7 +521,7 @@ export async function localizeFrameAssets(
   ): Promise<void> => {
     const key = `${dir}/${name}`;
     if (seen.has(key)) return;
-    const res = await fetch(url);
+    const res = await uixFetch(url);
     if (!res.ok) throw new Error(`fetch ${url} ${res.status}`);
     const bytes = Buffer.from(await res.arrayBuffer());
     await writeBytes(dir, name, bytes);
@@ -559,7 +561,7 @@ export async function localizeFrameAssets(
     if (!bytes) {
       // Harness unavailable (no Chrome / no dist) — fall back to the UIX raster so
       // the asset is at least present; mark it not-repaired.
-      const res = await fetch(fallbackUrl);
+      const res = await uixFetch(fallbackUrl);
       if (!res.ok) throw new Error(`fetch ${fallbackUrl} ${res.status}`);
       bytes = Buffer.from(await res.arrayBuffer());
       repaired = false;
@@ -658,7 +660,7 @@ export async function localizeFrameAssets(
     const needBytes = dim === 0 || dim < ILLUSTRATION_MIN_DIM;
     if (needBytes) {
       try {
-        const res = await fetch(s.url);
+        const res = await uixFetch(s.url);
         if (res.ok) {
           const svgText = await res.text();
           complexPaint = svgHasComplexPaint(svgText);

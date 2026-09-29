@@ -5,7 +5,6 @@ import {
   createTerminalEnv,
   exists,
   getRelayTerminalSessionsPath,
-  isValidToken,
   readJsonFile,
   resolveProjectRoot,
   resolveShell,
@@ -172,7 +171,7 @@ export function createTerminalSession(
       command: resolveShell(),
       cols: DEFAULT_COLS,
       cwd,
-      env: createTerminalEnv(workspaceRoot),
+      env: createTerminalEnv(workspaceRoot, { profile: 'shell' }),
       rows: DEFAULT_ROWS,
     });
   } catch {
@@ -264,16 +263,9 @@ export function registerSocketHandlers(
     }
   });
 
-  io.use((socket, next) => {
-    const authToken = typeof socket.handshake.auth.token === 'string'
-      ? socket.handshake.auth.token
-      : '';
-    if (!isValidToken(authToken)) {
-      next(new Error('Unauthorized'));
-      return;
-    }
-    next();
-  });
+  // Handshake authentication is installed by createRelayServer (auth/index.ts
+  // installSocketAuth) BEFORE these handlers: every socket that reaches
+  // 'connection' carries socket.data.auth.
 
   io.on('connection', (socket) => {
     const workspaceRoot = resolveWorkspace();

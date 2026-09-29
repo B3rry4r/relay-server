@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { rewritePreviewHtml, rewritePreviewHtmlWithAuth, rewritePreviewText } from '../src/relay-server/preview-html';
+import * as previewHtml from '../src/relay-server/preview-html';
+import { rewritePreviewHtml, rewritePreviewText } from '../src/relay-server/preview-html';
 
 describe('preview HTML rewriting', () => {
   it('routes Vite HTML assets and inline module imports through the preview base', () => {
@@ -29,23 +30,34 @@ describe('preview HTML rewriting', () => {
     expect(html).toContain("window.fetch = async (...args)");
     expect(html).toContain('window.XMLHttpRequest = function RelayXMLHttpRequest()');
     expect(html).toContain("statusText: 'Resource failed to load'");
-    expect(html).toContain('Node.prototype.appendChild = function relayAppendChild(child)');
-    expect(html).toContain('Element.prototype.append = function relayAppend(...nodes)');
+    // The bridge only reports to the parent; it no longer patches DOM insertion to
+    // rewrite URLs (that existed solely to append ?token=).
+    expect(html).not.toContain('Node.prototype.appendChild');
+    expect(html).not.toContain('Element.prototype.setAttribute =');
   });
 
-  it('keeps auth on browser-managed preview assets', () => {
-    const html = rewritePreviewHtmlWithAuth(`
+  it('never injects query-string auth; a path capability in <base href> carries access instead', () => {
+    // audit §6 item 23: the ?token= rewriting (withPreviewAuth / relayPreviewAuthQuery)
+    // is gone. The capability lives in the path, so <base href> hands it to every
+    // relative asset, including DDC's dynamically inserted scripts.
+    const base = '/flutter-preview/demo/c/lz3k9q0.0b7c1d2e-1111-4222-8333-944445555666.AbCdEfGhIjKlMnOpQrStUv/';
+    const html = rewritePreviewHtml(`
       <html>
         <head>
+          <base href="/">
           <link rel="manifest" href="manifest.json" />
-          <script src="/src/main.tsx"></script>
+          <script src="flutter_bootstrap.js" async></script>
         </head>
       </html>
-    `, '/preview/5179/', 'token=test-token');
+    `, base);
 
-    expect(html).toContain('href="/preview/5179/manifest.json?token=test-token"');
-    expect(html).toContain('src="/preview/5179/src/main.tsx?token=test-token"');
-    expect(html).toContain('const relayPreviewAuthQuery = "token=test-token"');
+    expect(html).toContain(`<base href="${base}">`);
+    expect(html).toContain(`href="${base}manifest.json"`);
+    expect(html).toContain(`src="${base}flutter_bootstrap.js"`);
+    expect(html).not.toMatch(/token=/);
+    expect(html).not.toContain('relayPreviewAuthQuery');
+    expect(Object.keys(previewHtml)).not.toContain('rewritePreviewHtmlWithAuth');
+    expect(Object.keys(previewHtml)).not.toContain('rewritePreviewTextWithAuth');
   });
 
   it('routes Vite module imports through the preview path', () => {

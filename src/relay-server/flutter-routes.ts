@@ -1,4 +1,4 @@
-import type { Express } from 'express';
+import type { Express, Request } from 'express';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { execFile as execFileCallback } from 'node:child_process';
@@ -16,6 +16,21 @@ import { installManagedTool, listManagedToolStatuses } from './tooling-managemen
 import { rewritePreviewHtml } from './preview-html';
 import { startFlutterPreviewServer, stopFlutterPreviewServer, getFlutterPreviewPort } from './flutter-preview-server';
 import { getTunnelUrl } from './tunnel-manager';
+import { previewBindingFor } from './auth';
+import { mintPreviewCap } from './auth/preview-cap';
+
+/**
+ * The relay-served preview URL for the CALLER: `/flutter-preview/<id>/c/<cap>/index.html`
+ * where <cap> is a 12 h path capability bound to the caller's session (revoking the
+ * session kills it). The iframe needs no header; every asset inherits the cap via
+ * the rewritten <base href>.
+ */
+function previewIndexUrlFor(req: Request, projectId: string): string {
+  const binding = previewBindingFor(req.auth);
+  if (!binding) return '';
+  const { cap } = mintPreviewCap(projectId, binding);
+  return `/flutter-preview/${encodeURIComponent(projectId)}/c/${cap}/index.html`;
+}
 
 const execFile = promisify(execFileCallback);
 
@@ -126,8 +141,8 @@ export function registerFlutterRoutes(app: Express): void {
         buildDir,
         // Direct iframe URL — bypasses relay-server's HTTP origin entirely
         previewTunnelUrl: tunnelUrl,
-        // Legacy proxied path (kept for fallback/compat)
-        previewIndexUrl: `/flutter-preview/${projectId}/index.html`,
+        // Relay-served fallback, under a session-bound path capability.
+        previewIndexUrl: previewIndexUrlFor(req, projectId),
         outputFiles: await fs.readdir(buildDir),
         message: stdout + stderr,
       });
@@ -166,7 +181,7 @@ export function registerFlutterRoutes(app: Express): void {
       ready: true,
       buildDir,
       previewTunnelUrl: tunnelUrl,
-      previewIndexUrl: `/flutter-preview/${projectId}/index.html`,
+      previewIndexUrl: previewIndexUrlFor(req, projectId),
     });
   });
 
@@ -177,14 +192,18 @@ export function registerFlutterRoutes(app: Express): void {
     res.json({ ok: true });
   });
 
-  // ── Static file serving — NO AUTH ──────────────────────────────────────
-  // These routes are intentionally public. The build output is static HTML/JS/CSS —
-  // there is nothing sensitive in it, and adding auth causes every asset request
-  // (dart_sdk.js, main.dart.js, etc.) to fail or stall. The project ID in the URL
-  // is enough to namespace the files.
-
-  app.get('/flutter-preview/:projectId/*', async (req, res) => {
+  // ── Static file serving — PATH CAPABILITY ─────────────────────────────
+  // An iframe cannot send a header and a Flutter web build is dozens of requests
+  // (plus DDC-injected scripts), so the preview is served under a multi-use,
+  // project-scoped, 12 h capability in the PATH. The default-deny middleware
+  // verifies <cap> for <projectId> BEFORE this handler runs (auth/index.ts) and
+  // sets req.auth = { via: 'preview-cap', projectId }.
+  app.get('/flutter-preview/:projectId/c/:cap/*', async (req, res) => {
     const projectId = readStringParam(req.params.projectId);
+    const cap = readStringParam(req.params.cap);
+    if (req.auth?.via !== 'preview-cap' || req.auth.projectId !== projectId) {
+      res.status(403).send('Forbidden'); return;
+    }
     const projectRoot = resolveProjectRoot(projectId);
     const rawParam = (req.params as unknown as Record<string, string | string[]>)[0];
     const filePath = Array.isArray(rawParam) ? rawParam.join('/') : (rawParam || 'index.html');
@@ -193,15 +212,15 @@ export function registerFlutterRoutes(app: Express): void {
       res.status(404).send('Project not found'); return;
     }
 
-    const buildDir = path.join(projectRoot, 'build', 'web');
+    const buildDir = path.resolve(path.join(projectRoot, 'build', 'web'));
     const requestedFile = path.resolve(path.join(buildDir, filePath));
 
-    // Path traversal guard
-    if (!requestedFile.startsWith(path.resolve(buildDir))) {
+    // Path traversal guard (with the separator: `build/web2` must not pass).
+    if (requestedFile !== buildDir && !requestedFile.startsWith(`${buildDir}${path.sep}`)) {
       res.status(403).send('Forbidden'); return;
     }
 
-    if (!await exists(requestedFile)) {
+    if (!await exists(requestedFile) || (await fs.stat(requestedFile)).isDirectory()) {
       res.status(404).send('Not found'); return;
     }
 
@@ -228,6 +247,8 @@ export function registerFlutterRoutes(app: Express): void {
     res.set('Cache-Control', 'no-cache');
     // Never set X-Frame-Options — we want iframe embedding to work
     res.removeHeader('X-Frame-Options');
+    // The capability is in the URL: never leak it to third parties via Referer.
+    res.set('Referrer-Policy', 'no-referrer');
 
     // For HTML files, rewrite the <base href> so that all asset paths
     // (dart_sdk.js, main.dart.js, flutter.js, etc.) resolve relative to
@@ -236,7 +257,7 @@ export function registerFlutterRoutes(app: Express): void {
     // asset request go to /{asset} → 404, because the files are actually
     // served under /flutter-preview/:projectId/{asset}.
     if (ext === '.html') {
-      const baseHref = `/flutter-preview/${encodeURIComponent(projectId)}/`;
+      const baseHref = `/flutter-preview/${encodeURIComponent(projectId)}/c/${cap}/`;
       const raw = await fs.readFile(requestedFile, 'utf-8');
       const rewritten = rewritePreviewHtml(raw, baseHref);
       res.set('Content-Type', 'text/html; charset=utf-8');
