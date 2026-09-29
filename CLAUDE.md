@@ -22,11 +22,14 @@ an earlier phase, without replaying the agent.
 
 Every push auto-deploys on Railway and restarts the container, which cuts the
 user's embedded terminals. Commit locally and hand the user the trigger. For
-run-state fixes, use the local API against the running server instead:
+run-state fixes, use the local API against the running server instead. Terminals
+and agents do not inherit `AUTH_TOKEN` or `PORT`; use the box-local token (it is
+accepted only over loopback) and `RELAY_API_URL`:
 
 ```
-eval "$(tr '\0' '\n' < /proc/1/environ | grep -E '^(PORT|AUTH_TOKEN)=' | sed 's/^/export /')"
-curl -s -H "Authorization: Bearer $AUTH_TOKEN" "127.0.0.1:$PORT/api/ai/runs?projectId=<id>"
+TOKEN="$(cat "${RELAY_LOCAL_TOKEN_FILE:-/workspace/.relay/state/local-token}")"
+API="${RELAY_API_URL:-$(cat /workspace/.relay/state/api-url)}"
+curl -s -H "Authorization: Bearer $TOKEN" "$API/api/ai/runs?projectId=<id>"
 ```
 
 A redeploy **resumes** running runs (`resumeInterruptedRuns`), so mark a run

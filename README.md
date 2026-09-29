@@ -6,7 +6,7 @@ The frontend should live in a separate codebase and connect to this service over
 
 ## Features
 
-- Token-based backend auth validation
+- Session auth: owner password → revocable session tokens, default-deny API (see **Auth** below)
 - Socket.IO terminal transport
 - One PTY per client connection
 - Workspace-scoped shell environment
@@ -25,18 +25,66 @@ Run the backend:
 
 ```sh
 mkdir -p /tmp/relay-workspace
-AUTH_TOKEN=change-this-token WORKSPACE=/tmp/relay-workspace PORT=3012 npm start
+AUTH_TOKEN='a-long-local-dev-secret' WORKSPACE=/tmp/relay-workspace PORT=3012 npm start
 ```
 
 Useful checks:
 
 ```sh
-curl http://localhost:3012/
 curl http://localhost:3012/health
-curl -H 'x-auth-token: change-this-token' http://localhost:3012/api/auth/validate
+TOKEN=$(curl -s -H 'content-type: application/json' -d '{"secret":"a-long-local-dev-secret"}' \
+  http://localhost:3012/api/auth/login | node -pe 'JSON.parse(require("fs").readFileSync(0)).token')
+curl -H "Authorization: Bearer $TOKEN" http://localhost:3012/api/auth/session
 ```
 
-The live context bridge is available at `POST /api/context/snapshot` with the Relay auth token. The web client uses it to render the current workspace, terminal, Git, preview, and Flutter state as one JSON snapshot.
+The live context bridge is available at `POST /api/context/snapshot` (authenticated like every other API route). The web client uses it to render the current workspace, terminal, Git, preview, and Flutter state as one JSON snapshot.
+
+## Auth
+
+Every route is **default-deny** (the middleware runs before all routes in
+`createRelayServer`); the only public routes are `GET /`, `GET /health`,
+`GET /api/version`, `POST /api/auth/login`, `POST /api/auth/login-link/exchange`,
+CORS preflights, and `/flutter-preview/:projectId/c/:cap/*` (a path capability).
+
+| Credential | Where | Accepted |
+|---|---|---|
+| Owner secret | env `AUTH_TOKEN_HASH` (scrypt, `relay-auth hash-secret`) or `AUTH_TOKEN` (≥ 16 chars, deprecated) | only at `POST /api/auth/login`. Relay refuses to boot without one. Changing it logs every session out. |
+| Session token `rs_…` | browser: localStorage `relay.session.v2`; tools: `RELAY_TOKEN` | `Authorization: Bearer` or `x-auth-token`, socket `auth.token`. Browser sessions: 30 d / 7 d idle. API sessions: 90 d. |
+| Local token | `$WORKSPACE/.relay/state/local-token` (0600) | only from loopback with no forwarding headers; never at login |
+| Legacy raw `AUTH_TOKEN` | old clients | as a Bearer/`x-auth-token`/socket token until first boot + 14 days (`RELAY_LEGACY_TOKEN_UNTIL` overrides; `off` closes it). Logged as `legacy-token-use`. |
+
+There is no query-string (`?token=`) and no cookie auth. The old `relay_auth_token`
+cookie is cleared on sight.
+
+Endpoints: `POST /api/auth/login {secret, label?}` → `{token, session}` ·
+`GET /api/auth/session` (alias `/api/auth/validate`) · `POST /api/auth/logout` ·
+`GET /api/auth/sessions` · `POST /api/auth/sessions {label, kind:'api', ttlDays?}` ·
+`DELETE /api/auth/sessions/:id` · `POST /api/auth/sessions/revoke-all {keepCurrent?}` ·
+`POST /api/auth/session/rotate` · `POST /api/auth/login-link` →
+`POST /api/auth/login-link/exchange {code}`. Failed logins back off per client IP
+(1 s doubling to 60 s, never a hard lock; loopback exempt).
+
+On the box, `relay-auth` (installed into `$RELAY_HOME/bin`) uses the local token:
+
+```sh
+relay-auth login-link          # one-time sign-in link for relay-web (break-glass, 5 min)
+relay-auth sessions            # list
+relay-auth revoke <id>|--all   # revoke + disconnect sockets
+relay-auth mint --label mcp    # api session token for MCP / UIX (shown once)
+relay-auth local-token --rotate
+printf '%s' "$SECRET" | relay-auth hash-secret   # → AUTH_TOKEN_HASH value
+```
+
+Browsers: set `RELAY_ALLOWED_ORIGINS` to the relay-web origin(s) (comma list;
+`RELAY_WEB_ORIGIN_PATTERN=https://*.fly.dev` also matches one-label hosts). If it is
+unset only `http://localhost:5173` is allowed and a warning is logged at boot.
+Behind a proxy, `trust proxy` is `loopback` (override with `RELAY_TRUST_PROXY`).
+
+Secrets (`AUTH_TOKEN`, `AUTH_TOKEN_HASH`, `RELAY_PTY_TOKEN`, `RELAY_DEPLOY_TOKEN`,
+`UIX_SERVICE_TOKEN`, `RELAY_TOKEN`) are moved out of `process.env` at boot and are
+never passed to terminals, agents or any other child process (`PORT`, `FLY_*` and
+the release variables are stripped too). UIX is called with `UIX_SERVICE_TOKEN`;
+the browser reaches UIX only through `ALL /api/uix/*`.
 
 ## MCP bridge
 
@@ -45,8 +93,14 @@ Relay also ships a standalone MCP server for local clients and agents.
 Run it with:
 
 ```sh
-RELAY_BACKEND_URL=http://127.0.0.1:8080 AUTH_TOKEN=change-this-token npm run mcp
+# on the relay box: the local-token file is used automatically
+npm run mcp
+# anywhere else: an api session minted with `relay-auth mint --label mcp`
+RELAY_BACKEND_URL=https://relay.example.com RELAY_TOKEN=rs_… npm run mcp
 ```
+
+Credential order: `RELAY_TOKEN` → the local-token file → `AUTH_TOKEN` (legacy window
+only, with a warning). UIX tools go through relay's `/api/uix` proxy.
 
 It exposes tools for:
 
@@ -70,7 +124,9 @@ npm test
 1. Create a Railway project for the backend.
 2. Add a persistent volume and mount it at `/workspace`.
 3. Set the required environment variables:
-   - `AUTH_TOKEN`
+   - `AUTH_TOKEN_HASH` (preferred; `relay-auth hash-secret`) or `AUTH_TOKEN` (≥ 16 chars)
+   - `RELAY_ALLOWED_ORIGINS` (the relay-web origin)
+   - `UIX_URL` + `UIX_SERVICE_TOKEN`
    - `WORKSPACE=/workspace`
 4. Ensure `railway.toml` is present in the repo root.
 5. Deploy and watch the startup logs for workspace bootstrap output.
