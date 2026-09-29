@@ -63,6 +63,7 @@ import { webScreenSlot, webModalSlots } from './web-skeleton';
 import type { FigFrame, FlowGraph } from './agent-packet';
 import { computePreflight } from './preflight';
 import { reconcileScreen, reconcileSummary, type ReconcileResult } from './reconcile';
+import { componentContract, componentReuseBlock } from './component-contract';
 import { finalizeApp, runAnalyzeGate, analyzeGateEnabled } from './passes/finalize';
 import { planFlowRequeue } from './passes/flow-requeue';
 import { planInteractionRequeue } from './passes/interaction-audit';
@@ -601,12 +602,15 @@ export function buildAppPlan(run: import('./build-run-store').BuildRun, canonica
   // P4: design-system summary + shared-component inventory (from compact digests).
   const digest = buildDesignDigest(run);
   if (digest.colors.length || digest.fonts.length) {
-    out.push(`DESIGN SYSTEM — a real theme file (lib/theme/app_theme.dart, class \`AppTheme\`) is GENERATED before screens build. IMPORT \`AppTheme.<token>\` for colors/spacing/radius/typeface; a raw Color(0x..)/fontSize/EdgeInsets literal that duplicates a token is a DEFECT the review flags. The exact symbol list is in .uix/context.md ("Design system (importable)").`);
+    const fwPlan = (run.framework || 'flutter').toLowerCase();
+    out.push(fwPlan === 'react' || fwPlan === 'next'
+      ? `DESIGN SYSTEM — a real typed theme module (\`AppTheme\`, plus the same tokens as CSS custom properties) is GENERATED before screens build. IMPORT \`AppTheme.<group>.<token>\` (or use \`var(--…)\` in CSS) for colours/spacing/sizes/radius/typeface; a raw hex / px literal that duplicates a token is a DEFECT the review flags. The exact symbol list is in .uix/context.md ("Design system (importable)").`
+      : `DESIGN SYSTEM — a real theme file (lib/theme/app_theme.dart, class \`AppTheme\`) is GENERATED before screens build. IMPORT \`AppTheme.<token>\` for colors/spacing/sizes/radius/typeface; a raw Color(0x..)/fontSize/EdgeInsets literal that duplicates a token is a DEFECT the review flags. The exact symbol list is in .uix/context.md ("Design system (importable)").`);
     if (digest.colors.length) out.push(`- Palette behind the tokens (most-used): ${digest.colors.join(', ')}`);
     if (digest.fonts.length) out.push(`- Typeface(s): ${digest.fonts.join(', ')}`);
   }
   if (digest.components.length) {
-    out.push(`SHARED COMPONENT INVENTORY (these recur across multiple screens — build each ONCE as a reusable widget and reuse it; do NOT re-implement per screen):`);
+    out.push(`SHARED COMPONENT INVENTORY (these recur across multiple screens — build each ONCE as a public component at the path the SHARED COMPONENTS block names, and reuse it; do NOT re-implement per screen):`);
     for (const c of digest.components) out.push(`- ${c.name} (used in ${c.screens} screens)`);
   }
   if (run.flow?.entryFrameId) {
@@ -699,29 +703,64 @@ async function readContextSlice(projectRoot: string): Promise<string> {
  * + the screens index from context.md. Kept as its own block so each screen builds
  * against a SHARED contract instead of re-inventing names per session.
  */
-function buildComponentApiSurface(run: import('./build-run-store').BuildRun, canonical?: Canonical): string {
+function buildComponentApiSurface(run: import('./build-run-store').BuildRun, canonical?: Canonical, projectRoot?: string): string {
   const out: string[] = [
     `CANONICAL API SURFACE — the shared route/screen names every screen MUST build against (do NOT invent variants of these names; reuse them verbatim so cross-screen navigation resolves):`,
   ];
   // ONE route scheme — canonical routes when canonicalized (audit A.3), else legacy.
   if (canonical) {
     for (const cs of canonical.screens) out.push(`- route ${cs.route}  ⟶  screen "${cs.name}" (canonicalId ${cs.canonicalId})`);
-    if (canonical.components.length) {
-      for (const c of canonical.components) out.push(`- component ${c.name} (import from lib/components/)`);
-    }
   } else {
     for (const s of run.screens) out.push(`- route ${routeNameFor(s.frameName)}  ⟶  screen "${s.frameName}"`);
   }
-  // Component OWNERSHIP (option 3, Fix #1): recurring UI (from the digest) must be
-  // extracted ONCE into lib/components/ and imported — not re-implemented per screen.
-  // We can't author the widget bodies deterministically (that's the per-screen
-  // agent's job), so we assign ownership + name them, and the review flags re-impl.
+  // Component OWNERSHIP (readability F1): ONE authoritative location + class name per
+  // shared component (component-contract.ts) — the same block the canonical context
+  // points at — plus what earlier screens ALREADY BUILT on disk (packet-level reuse:
+  // a later screen imports the real widget instead of re-implementing it privately).
+  // Canonical components when canonicalized; else the recurring names from the digest.
   const digest = buildDesignDigest(run);
-  if (digest.components.length) {
-    out.push(`SHARED WIDGETS — these recur across multiple screens; the FIRST screen that renders one CREATES it as a public widget in lib/components/<name>.dart and EXPORTS it, and every other screen IMPORTS it. Re-implementing one of these inline (a private _Foo widget duplicated across screens) is a DEFECT the review flags:`);
-    for (const c of digest.components) out.push(`- ${c.name} (seen in ${c.screens} screens → lib/components/${c.name.replace(/[^A-Za-z0-9]/g, '')}.dart)`);
-  }
+  const comps = canonical?.components.length
+    ? canonical
+    : { components: digest.components.map(c => ({ id: `cmp_${c.name}`, frameId: '', name: c.name })) };
+  const reuse = componentReuseBlock(projectRoot, run.framework || 'flutter', comps);
+  if (reuse) out.push(reuse);
   return out.join('\n');
+}
+
+/**
+ * THEME TOKENS (readability F4) — the reconciliation gate flags inline colour /
+ * type literals, so the agent is told, in its framework's idiom, to use the
+ * generated tokens. The old block was Dart-only for every framework and said
+ * "NEVER inline, request a token instead" — agents obeyed by minting one
+ * screen-named, single-use token per literal (Ping: 47 colours, 19 used once, 54
+ * near-duplicate pairs). A new token now needs a ROLE name and ≥2 real uses; a
+ * one-off value stays a local, named value in the one file that uses it.
+ */
+export function themeTokenRules(framework: string): string {
+  const fw = (framework || 'flutter').toLowerCase();
+  const web = fw === 'react' || fw === 'next';
+  return [
+    `THEME TOKENS — MANDATORY (the reconciliation gate flags inline type/colour literals):`,
+    web
+      ? `- Use the generated theme for ALL colour, type, spacing, size and radius values: \`AppTheme.color.<role>\`, \`AppTheme.spacing.s<n>\`, \`AppTheme.size.<role>\`, \`AppTheme.radius.<role>\` in style props, or the matching CSS variables (\`var(--color-<role>)\`, \`var(--space-<n>)\`, \`var(--size-<role>)\`, \`var(--radius-<role>)\`) in CSS. Never a raw hex, and never a Tailwind arbitrary value (\`bg-[#12ae89]\`, \`text-[16px]\`, \`rounded-[50px]\`) for a value the theme has.`
+      : `- Use the generated AppTheme for ALL text, colour, spacing, size and radius values: AppTheme text-style helpers for every Text, \`AppTheme.<role>\` colours, \`AppTheme.s<n>\` spacing, the size tokens (icon/avatar/button heights) and radius tokens (incl. \`AppTheme.radiusPill\` / StadiumBorder for pills). Import lib/theme/app_theme.dart. Never inline a TextStyle(...), GoogleFonts.*(), Color(0x........) or Colors.* literal in a screen.`,
+    `- The token names are in the established project contract above (.uix/context.md). Tokens are named by ROLE (textPrimary, textMuted, surfaceMuted, buttonHeight, radiusPill) — never by screen ("settingsBg", "cardListInk") and never with a counter ("neutral3", "ink2").`,
+    `- A value the theme lacks: if it recurs (≥2 uses across the app), add ONE role-named token (and reuse it); if it is a genuine one-off, keep it as a named local constant in the single file that uses it. Never mint a single-use token, and never add a near-duplicate of an existing colour (within a few RGB steps) — use the existing token.`,
+  ].join('\n');
+}
+
+/** Readability F6 (provenance-free comments) + F8 (real assets, never hand-drawn
+ *  copies) — rules every framework's agent gets. */
+export function codeHygieneRules(framework: string): string {
+  const fw = (framework || 'flutter').toLowerCase();
+  const web = fw === 'react' || fw === 'next';
+  return [
+    `SOURCE HYGIENE — the code is handed to a product team; it must read like hand-written code:`,
+    `- Comments describe BEHAVIOUR (what a widget does, why a choice was made). NEVER provenance: no frame numbers ("frame 61"), no IR/Figma layer names ("IR \"Ellipse 2797\"", "Rectangle 24"), no node or modal ids (283:1967, m_313_9543), no design pixel sizes ("27×27"), no "added by /route" notes, no "matches the reference". Keep the \`// canonicalId:\` header line exactly as the skeleton wrote it.`,
+    web
+      ? `- Icons and illustrations: use the exported asset through the resources module (\`<img src={assets.x} />\`). NEVER hand-draw an icon/illustration that exists in public/assets as inline <svg> path code or CSS shapes.`
+      : `- Icons and illustrations: use the exported asset (\`SvgPicture.asset(AppAssets.x)\` — flutter_svg is a project dependency — or \`Image.asset\`). NEVER hand-draw an icon/illustration that exists in assets/ with a CustomPainter or stacked shapes.`,
+  ].join('\n');
 }
 
 /**
@@ -732,11 +771,11 @@ function buildComponentApiSurface(run: import('./build-run-store').BuildRun, can
  * body is identical so serial-shared-session and fresh-session builds converge on
  * the same design language.
  */
-function buildWrittenContract(
+export function buildWrittenContract(
   run: import('./build-run-store').BuildRun, appPlan: string, contextSlice: string, freshSession: boolean,
-  canonical?: Canonical,
+  canonical?: Canonical, projectRoot?: string,
 ): string {
-  const parts: string[] = [appPlan, buildComponentApiSurface(run, canonical)];
+  const parts: string[] = [appPlan, buildComponentApiSurface(run, canonical, projectRoot)];
   if (contextSlice) {
     parts.push(
       [
@@ -754,12 +793,10 @@ function buildWrittenContract(
   // screens into needs-review. Tell the agent, authoritatively, to use AppTheme tokens.
   // (The exact token names live in .uix/context.md / lib/theme/app_theme.dart, already
   // injected above via the established contract.)
-  parts.push([
-    `THEME TOKENS — MANDATORY (the reconciliation gate REJECTS inline type/colour literals):`,
-    `- Use the generated AppTheme for ALL text and colour: AppTheme text-style helpers for every Text, AppTheme colour tokens for every colour. Import lib/theme/app_theme.dart.`,
-    `- NEVER inline a TextStyle(...), GoogleFonts.*(), Color(0x........), or Colors.* literal in a screen — these are flagged and the screen is sent back for review.`,
-    `- The available token names are in the established project contract above (.uix/context.md). If a token you genuinely need is missing, request it via the amendment protocol below rather than inlining a literal.`,
-  ].join('\n'));
+  parts.push(themeTokenRules(run.framework || 'flutter'));
+  // Readability F6 + F8: comments describe behaviour, never provenance; real assets,
+  // never hand-drawn copies of them. Both are framework-agnostic.
+  parts.push(codeHygieneRules(run.framework || 'flutter'));
   // P5 (RFC §4.8): AMENDMENT PROTOCOL. The plan is append-only + namespace-locked,
   // NOT frozen — but the agent must not silently invent routes/components. When a
   // route/component it genuinely needs is missing from the plan above, it REQUESTS
@@ -867,7 +904,7 @@ export function modalPresentationHint(
  * + presentation hint + presenter contract — the payload the agent needs to build
  * the variant for real instead of inventing a placeholder.
  */
-export function buildCanonicalContext(canonical: Canonical, cs: CanonicalScreen, runScreens?: RunScreen[], framework = 'flutter'): string {
+export function buildCanonicalContext(canonical: Canonical, cs: CanonicalScreen, runScreens?: RunScreen[], framework = 'flutter', projectRoot?: string): string {
   const web = isWebFramework(framework);
   const next = framework === 'next';
   // Web: the slot the web skeleton generated for this screen (PG-02) — the agent
@@ -951,10 +988,11 @@ export function buildCanonicalContext(canonical: Canonical, cs: CanonicalScreen,
     out.push(`This screen shares template "${cs.templateRef}" with ${sibs.length} sibling screen(s) — extract the shared layout into a reusable widget + thin per-screen config.`);
   }
   if (canonical.components.length) {
-    const dir = web ? (next ? 'components/' : 'src/components/') : 'lib/components/';
-    out.push(web
-      ? `Shared components (create each ONCE in ${dir} — or import it from there when an earlier screen already did — and reuse it; don't re-invent): ${canonical.components.map(c => c.name).join(', ')}.`
-      : `Shared components available (import from ${dir} — reuse, don't re-invent): ${canonical.components.map(c => c.name).join(', ')}.`);
+    // Same slots as the SHARED COMPONENTS block of the written contract (one
+    // authoritative path + class per component, component-contract.ts) — the two
+    // blocks used to name different paths, and this one offered write-locked stubs.
+    const slots = componentContract(canonical, framework, projectRoot);
+    out.push(`Shared components (ONE location each — import it when an earlier screen already built it, otherwise create it there; never a private per-screen copy; see SHARED COMPONENTS below): ${slots.map(sl => `${sl.className} (${sl.file})`).join(', ')}.`);
   }
   return out.join('\n');
 }
@@ -2068,7 +2106,7 @@ async function buildRunScreen(
   // Read the written contract FRESH per screen — earlier screens append to
   // .uix/context.md, so each screen sees the latest established tokens/components.
   const contextSlice = await readContextSlice(projectRoot);
-  let contract = buildWrittenContract(run, appPlan, contextSlice, fresh, canonical);
+  let contract = buildWrittenContract(run, appPlan, contextSlice, fresh, canonical, projectRoot);
   // T12 (RFC v2 §3 Phase 5/6): inject the AppAssets symbol inventory so the agent
   // references real exported assets via `AppAssets.<x>` from the START — never the
   // raw 'assets/...' literals in the IR (those point at pre-rename/deduped files
@@ -2079,7 +2117,7 @@ async function buildRunScreen(
   // route-slot context so the agent builds ONE widget instead of per-variant pages.
   // P1-core: run.screens rides along so each folded state/modal block carries its
   // OWN reference image path + bounded IR + presentation hint (not just a name).
-  if (canonicalCtx) contract = `${buildCanonicalContext(canonicalCtx.canonical, canonicalCtx.screen, run.screens, run.framework)}\n\n— — —\n${contract}`;
+  if (canonicalCtx) contract = `${buildCanonicalContext(canonicalCtx.canonical, canonicalCtx.screen, run.screens, run.framework, projectRoot)}\n\n— — —\n${contract}`;
   // P4: strip [preview:…] + RLE repeated siblings from the agent-facing IR.
   const cleanPacket = hygieneIR(screen.spec.packet) ?? screen.spec.packet;
   const sreq: BuildScreenReq = {
@@ -2858,10 +2896,10 @@ async function retryScreenLoop(projectId: string, runId: string, frameId: string
     const contextSlice = await readContextSlice(projectRoot);
     // T12: a corrected-retry must also see the AppAssets inventory (so a re-build
     // emits symbols, not raw paths).
-    let contract = `${await assetInventoryBlock(projectRoot)}${buildWrittenContract(run, appPlan, contextSlice, run.freshSessions === true, canonical)}`;
+    let contract = `${await assetInventoryBlock(projectRoot)}${buildWrittenContract(run, appPlan, contextSlice, run.freshSessions === true, canonical, projectRoot)}`;
     // P1-core: a canonical lead's retry also carries its states/modals payload
     // (reference paths + IR + presentation hints) — same contract as the build.
-    if (canonical && canonScreen) contract = `${buildCanonicalContext(canonical, canonScreen, run.screens, run.framework)}\n\n— — —\n${contract}`;
+    if (canonical && canonScreen) contract = `${buildCanonicalContext(canonical, canonScreen, run.screens, run.framework, projectRoot)}\n\n— — —\n${contract}`;
     // The human correction is authoritative and injected up-front so the fresh pass
     // acts on it (the previous automated discrepancies didn't converge).
     const correction = `HUMAN CORRECTION (authoritative — the automated loop did NOT converge; apply this specific guidance):\n${note}`;

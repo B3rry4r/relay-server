@@ -40,6 +40,7 @@ import * as fs from 'fs/promises';
 import * as fsSync from 'fs';
 import * as path from 'path';
 import { planSemanticScreens, computeTabCluster, type Canonical } from './canonicalize';
+import { componentContract } from './component-contract';
 
 export interface ReconcileFlag {
   /** machine code so the UI / logs can group: 'unbacked-route' | 'new-route' |
@@ -192,11 +193,9 @@ export async function reconcileScreen(opts: {
   // Shared widgets: when components exist, at least one should be referenced (a
   // soft signal — some screens legitimately use none, so it's low severity).
   if (canonical.components.length) {
-    const usesAny = canonical.components.some(c => {
-      const cls = (c.name.replace(/[^a-zA-Z0-9]+/g, ' ').trim().split(/\s+/)
-        .map(w => w.charAt(0).toUpperCase() + w.slice(1)).join('') || 'Screen') + 'Widget';
-      return text.includes(cls);
-    });
+    // The class names come from the component contract (one authoritative name per
+    // component — the skeleton no longer writes `<Name>Widget` stubs).
+    const usesAny = componentContract(canonical, 'flutter').some(c => new RegExp(`\\b${c.className}\\b`).test(text));
     if (!usesAny) {
       flags.push({ code: 'no-shared-widgets', severity: 'low',
         message: `references none of the shared components — confirm it isn't re-implementing a shared widget inline.` });

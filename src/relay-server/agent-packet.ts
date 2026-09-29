@@ -148,7 +148,7 @@ function bootstrapSteps(framework: string, fwLabel: string, flow: FlowGraph, ass
     isWeb
       // Web (CONTRACTS §5): assets live in public/assets/ and are SERVED at /assets/….
       ? `${hasNav ? 5 : 4}. The design's real assets (${assetCount} files) are already in public/assets/icons/ (SVG) and public/assets/images/ (raster), served at /assets/icons/… and /assets/images/…. Reference them through the generated resources module (\`assets.<symbol>\` — its values are those served URLs; \`<img src={assets.x} />\`) — the IR tree's "assets/..." paths name the same files; do NOT invent placeholder icons or redraw images.`
-      : `${hasNav ? 5 : 4}. The design's real assets (${assetCount} files) are already in assets/icons/ (SVG) and assets/images/ (raster). Reference these actual files for icons/images — the IR tree's "assets/..." paths point at them; do NOT invent placeholder icons.`,
+      : `${hasNav ? 5 : 4}. The design's real assets (${assetCount} files) are already in assets/icons/ (SVG) and assets/images/ (raster). Reference these actual files for icons/images — the IR tree's "assets/..." paths point at them; do NOT invent placeholder icons. SVGs render with \`SvgPicture.asset\` (flutter_svg is already in pubspec.yaml); NEVER hand-draw an icon or illustration that exists in assets/ with a CustomPainter or stacked shapes.`,
   ] : [];
   return [
     isWeb
@@ -198,7 +198,7 @@ export function buildAgentPacket(input: AgentPacketInput): string {
     ``,
     ...(refImagePath ? [
       `Reference render (pixel-accurate image of the target screen): ${refImagePath}`,
-      `OPEN this image first with your file-reading tool and treat it as the visual ground truth — match its layout, proportions, spacing and colours. Use the IR tree below for exact values (hex colours, text, sizes).`,
+      `OPEN this image first with your file-reading tool and treat it as the visual ground truth — match its layout, proportions, spacing and colours. Use the IR tree below for exact values (hex colours, text, sizes) — expressed through the generated theme tokens: a value that equals (or is within 1px / a few RGB steps of) a token IS that token. The IR's layer names, node ids and frame numbers are for YOU to read — never copy them into identifiers or comments.`,
       ``,
     ] : []),
     // DEMO DATA rule — sits next to the exact-values instruction on purpose: "use

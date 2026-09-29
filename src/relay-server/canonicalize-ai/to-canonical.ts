@@ -100,10 +100,18 @@ export function aiModelToCanonical(model: CanonicalModel): Canonical {
   }
 
   // ── components → build component entries (their own canonical ids, no route) ─
-  const components: BuildComponent[] = (model.components ?? []).map((c, i) => {
-    // The AI model's components are keyed by canonicalName (a recurring widget), not a
-    // frame — they have no frameId. Synthesize a stable id; they don't enter frameMap.
-    const id = 'cmp_' + String(c.canonicalName).replace(/[^a-zA-Z0-9]+/g, '_') + (i ? `_${i}` : '');
+  // The AI model's components are keyed by canonicalName (a recurring widget), not a
+  // frame — they have no frameId. Synthesize a stable id from the name ALONE: the old
+  // `+ (i ? `_${i}` : '')` put a counter on every component after the first
+  // (cmp_avatar_1 … cmp_toggle_24), and that counter leaked into file and class names.
+  // A suffix is added only when two components really share a name. They don't enter
+  // frameMap.
+  const usedIds = new Set<string>();
+  const components: BuildComponent[] = (model.components ?? []).map((c) => {
+    const base = 'cmp_' + (String(c.canonicalName ?? '').replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'component');
+    let id = base;
+    for (let n = 2; usedIds.has(id); n++) id = `${base}_${n}`;
+    usedIds.add(id);
     return { id, frameId: '', name: c.canonicalName };
   });
 

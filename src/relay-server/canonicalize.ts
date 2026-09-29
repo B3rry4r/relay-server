@@ -894,10 +894,35 @@ function tabLabelFor(name: string): string {
  *  - lib/app_router.dart : MaterialApp with onGenerateRoute over the table
  *  - lib/theme/app_theme.dart : a theme/token stub (filled by the digest planner)
  *  - lib/screens/<slug>.dart : a write-locked stub per canonical screen
- *  - lib/components/<id>.dart : an empty shared-component stub per component
+ *  - (no component files: components are a contract, see component-contract.ts)
  * Stubs are intentionally minimal + clearly marked so per-screen builds replace
  * the screen body while keeping the route slot + imports stable.
  */
+/** flutter_svg is a GUARANTEED dependency of a pipeline Flutter app (readability F8):
+ *  the design's icons ship as SVG, and without the package an agent cannot render
+ *  them — Ping hand-drew 32 icons as CustomPainter code instead. Adds the dependency
+ *  under `dependencies:` when it is missing; never touches a pubspec that has it.
+ *  Returns true when pubspec.yaml was changed. */
+export const FLUTTER_SVG_CONSTRAINT = '^2.0.10+1';
+export async function ensureFlutterSvgDependency(projectRoot: string): Promise<boolean> {
+  const file = path.join(projectRoot, 'pubspec.yaml');
+  let src: string;
+  try { src = await fs.readFile(file, 'utf-8'); } catch { return false; }
+  if (/^\s+flutter_svg\s*:/m.test(src)) return false;
+  const depLine = /^dependencies:[ \t]*\n/m.exec(src);
+  if (!depLine) return false;
+  const after = depLine.index + depLine[0].length;
+  const sdkFlutter = /^([ \t]+)flutter:[ \t]*\n[ \t]+sdk:[ \t]*flutter[ \t]*\n/m.exec(src.slice(after));
+  // Only when that `flutter: sdk: flutter` entry is the FIRST thing in the block
+  // (not the dev_dependencies one further down).
+  const inBlock = sdkFlutter && !/^\S/m.test(src.slice(after, after + sdkFlutter.index));
+  const indent = inBlock ? sdkFlutter![1] : '  ';
+  const insertAt = inBlock ? after + sdkFlutter!.index + sdkFlutter![0].length : after;
+  const next = `${src.slice(0, insertAt)}${indent}flutter_svg: ${FLUTTER_SVG_CONSTRAINT}\n${src.slice(insertAt)}`;
+  await fs.writeFile(file, next, 'utf-8');
+  return true;
+}
+
 export async function generateFlutterSkeleton(projectRoot: string, canonical: Canonical): Promise<SkeletonResult> {
   const libDir = path.join(projectRoot, 'lib');
   const screensDir = path.join(libDir, 'screens');
@@ -908,6 +933,7 @@ export async function generateFlutterSkeleton(projectRoot: string, canonical: Ca
   await fs.mkdir(themeDir, { recursive: true });
 
   const files: string[] = [];
+  if (await ensureFlutterSvgDependency(projectRoot)) files.push('pubspec.yaml');
   const routes: SkeletonResult['routes'] = [];
   // SEMANTIC plan: file base / class / route const / route PATH for every screen,
   // derived from the human name (machine/frame-code names fall back to `screen`),
@@ -947,23 +973,12 @@ class ${className} extends StatelessWidget {
     routes.push({ canonicalId: c.canonicalId, route: c.route, className, routeConst: sem.routeConst, file: rel });
   }
 
-  // Shared-component stubs.
-  for (const cmp of canonical.components) {
-    const className = pascal(cmp.name) + 'Widget';
-    const rel = path.join('lib', 'components', `${cmp.id}.dart`);
-    const stub = `// GENERATED SKELETON — shared component stub (write-locked API surface).
-// componentId: ${cmp.id}
-import 'package:flutter/material.dart';
-
-class ${className} extends StatelessWidget {
-  const ${className}({super.key});
-  @override
-  Widget build(BuildContext context) => const SizedBox.shrink();
-}
-`;
-    try { await fs.access(path.join(projectRoot, rel)); }
-    catch { await fs.writeFile(path.join(projectRoot, rel), stub, 'utf-8'); files.push(rel); }
-  }
+  // Shared components: NO stub files (readability F1). A write-locked
+  // `SizedBox.shrink()` stub per component (cmp_<name>_<i>.dart, class <Name>Widget)
+  // gave agents nothing to reuse — every screen re-implemented the UI privately and
+  // 25 dead stubs shipped. The component contract (component-contract.ts) names the
+  // ONE path + class each component lives at; the first screen that renders one
+  // creates it there, later screens are told it exists (componentReuseBlock).
 
   // P2: APP SHELL for the tab cluster. `kind:'tab'` edges are ONE persistent
   // bottom-nav shell: the tab screens live side-by-side in an IndexedStack behind
