@@ -91,8 +91,25 @@ describe('ensureScreenPreviewEntry variants', () => {
     expect(code).toContain('showModal_313_9647(context);');
   });
 
-  it('returns undefined for non-flutter frameworks and missing screen files', async () => {
-    expect(await ensureScreenPreviewEntry(root, 'react', '1:1', { variant: { kind: 'state', id: 'x' } })).toBeUndefined();
+  it('returns undefined for a flutter screen file that does not exist', async () => {
     expect(await ensureScreenPreviewEntry(root, 'flutter', '9:9', { variant: { kind: 'state', id: 'x' } })).toBeUndefined();
+    expect(await ensureScreenPreviewEntry(root, 'flutter', '9:9')).toBeUndefined();
+    // Nothing is written for a screen that was never built.
+    await expect(fs.readdir(path.join(root, 'lib', '_preview'))).rejects.toThrow();
+  });
+
+  // 45564b6: web has no entrypoint FILE — the preview entry is the deterministic
+  // ROUTE the agent is contractually required to register (webPreviewRoute). The
+  // old `undefined` parked every web variant as "screen file not found". A route
+  // that was never registered is caught downstream by the screenshot compare (the
+  // catch-all renders a different screen), not reported as built here.
+  it('web frameworks get the deterministic preview ROUTE (variant frame selects it) and write no file', async () => {
+    for (const fw of ['react', 'next']) {
+      expect(await ensureScreenPreviewEntry(root, fw, '1:1')).toBe('/_preview/1-1');
+      expect(await ensureScreenPreviewEntry(root, fw, '1:1', { variant: { kind: 'state', id: 'x' } })).toBe('/_preview/1-1');
+      expect(await ensureScreenPreviewEntry(root, fw, '1:1', { variant: { kind: 'modal', id: 'm_2_5', frameId: '2:5' } }))
+        .toBe('/_preview/2-5');
+    }
+    await expect(fs.readdir(path.join(root, 'lib', '_preview'))).rejects.toThrow();
   });
 });
