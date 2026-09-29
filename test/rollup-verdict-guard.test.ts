@@ -64,7 +64,31 @@ describe('BUG 1 — resolveRollupVerdict (fault-safe rollup)', () => {
     const r = resolveRollupVerdict(allPending, EXPECTED);
     expect(r.verdict).toBe('fault');
     expect(r.built).toBe(0);
-    expect(r.blocking).toBe(0);
+    // c07fc7f: unbuilt (pending/building) screens count as blocking — but a run with
+    // NOTHING built and nothing to review is still a fault (resumable), not a park.
+    expect(r.unbuilt).toBe(30);
+    expect(r.blocking).toBe(30);
+  });
+
+  it('(c3) partially built with unbuilt screens left → PARK (c07fc7f: unbuilt is not a pass)', () => {
+    const partial = run(
+      ...Array<Status>(16).fill('done'),
+      ...Array<Status>(3).fill('pending'),
+      ...Array<Status>(11).fill('building'),
+    );
+    const r = resolveRollupVerdict(partial, EXPECTED);
+    expect(r.verdict).toBe('park-needs-review');
+    expect(r.built).toBe(16);
+    expect(r.unbuilt).toBe(14);
+    expect(r.needsReview).toBe(0);
+    expect(r.blocking).toBe(14);
+  });
+
+  it('(c4) zero built but screens awaiting review → PARK for the human, not a fault', () => {
+    const r = resolveRollupVerdict(run(...Array<Status>(EXPECTED).fill('needs-review')), EXPECTED);
+    expect(r.verdict).toBe('park-needs-review');
+    expect(r.built).toBe(0);
+    expect(r.blocking).toBe(30);
   });
 
   it('(d) blocking>0 (needs-review / failed) with full count → PARK at needs-review (unchanged)', () => {
