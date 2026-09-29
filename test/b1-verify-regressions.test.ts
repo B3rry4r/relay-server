@@ -72,14 +72,13 @@ describe('#2 a skip names the unsupported layout, never absent input', () => {
     expect(r.report.findings.find((f) => f.file === 'lib/screens/screen_10_3.dart' && f.element === 'Resolve')).toMatchObject({ screenCanonicalId: 'c_10_3', severity: 'high' });
   });
 
-  it('extractComponents on Next with locally-declared components: names PG-07, not "no declarations found"', async () => {
+  it('extractComponents on Next with locally-declared components: the pages under app/ are read (PG-07), never "no declarations found"', async () => {
     const root = await copyFixture('next');
     expect(await fs.readFile(path.join(root, 'app', '10-3', 'page.tsx'), 'utf8')).toMatch(/^function SectionHeading\b/m);
     const r = await extractComponents('p', { projectRoot: root, dryRun: true, noAiConfirm: true });
-    expect(r.skippedReason).toMatch(/pages under app\/ were not read/);
-    expect(r.skippedReason).toMatch(/PG-07/);
-    expect(r.skippedReason).not.toMatch(/no local component declarations found/);
-    expect(honestSkipReason(r.skippedReason!)).toBe(true);
+    expect(r.skippedReason).toBeUndefined();
+    expect(r.scanned).toBeGreaterThan(0);
+    expect(r.extracted.map((e) => e.componentPath)).toContain('components/SectionHeading.tsx');
   });
 
   it('the harness predicate rejects the two old reasons', () => {

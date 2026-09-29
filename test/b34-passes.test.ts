@@ -100,3 +100,55 @@ describe('7f web tokens find the theme the design-system contract recorded (PG-1
     expect(again.changes).toEqual([]);
   });
 });
+
+// ── 7a ────────────────────────────────────────────────────────────────────────
+import { extractComponents } from '../src/relay-server/passes/component-extraction';
+import { __test as xweb } from '../src/relay-server/passes/component-extraction-web';
+
+describe('7a web extraction writes self-sufficient modules (PG-07, PG-08)', () => {
+  it('react: an exported duplicate is re-exported once; carried imports are re-pathed; unused screen imports dropped; importers repointed', async () => {
+    const root = await fixture('react');
+    // Another module imports the screen's exported Badge — it must follow the hoist.
+    await fs.writeFile(path.join(root, 'src', 'screens', 'Extra.tsx'), "import { Badge } from './IPhone1415Pro57Screen';\nexport const X = () => <Badge label=\"x\" />;\n");
+    const r = await extractComponents('p', { projectRoot: root, noAiConfirm: true });
+    expect(r.extracted.map((e) => e.name).sort()).toEqual(['Badge', 'SearchGlyph', 'SectionHeading']);
+    const badge = await fs.readFile(path.join(root, 'src', 'components', 'Badge.tsx'), 'utf8');
+    expect(badge).toMatch(/^export function Badge\(/m);
+    expect(badge).not.toMatch(/export\s+export/);
+    expect(badge).not.toMatch(/import React/);   // react-jsx + noUnusedLocals: an unused React import fails tsc
+    expect(await fs.readFile(path.join(root, 'src', 'components', 'SearchGlyph.tsx'), 'utf8')).toMatch(/import \{ assets \} from '\.\.\/resources\/assets';/);
+    const settings = await fs.readFile(path.join(root, 'src', 'screens', 'IPhone1415Pro57Screen.tsx'), 'utf8');
+    expect(settings).not.toMatch(/resources\/assets/);          // only SearchGlyph used it
+    expect(await fs.readFile(path.join(root, 'src', 'screens', 'Home', 'HomeScreen.tsx'), 'utf8')).toMatch(/resources\/assets/);   // still used (bannerKey)
+    expect(await fs.readFile(path.join(root, 'src', 'screens', 'Extra.tsx'), 'utf8')).toMatch(/import \{ Badge \} from '\.\.\/components\/Badge';/);
+    expect(r.rejected[0].reason).toMatch(/near-duplicate/);
+    const again = await extractComponents('p', { projectRoot: root, noAiConfirm: true });
+    expect(again.extracted).toEqual([]);
+  });
+
+  it('next: pages are read, the component lands in components/ with use client, a helper-dependent body bails with a reason', async () => {
+    const root = await fixture('next');
+    const r = await extractComponents('p', { projectRoot: root, noAiConfirm: true });
+    expect(r.componentsDir).toBe(path.join(root, 'components'));
+    const heading = await fs.readFile(path.join(root, 'components', 'SectionHeading.tsx'), 'utf8');
+    expect(heading.startsWith("'use client';\n")).toBe(true);
+    const settings = await fs.readFile(path.join(root, 'app', '10-3', 'page.tsx'), 'utf8');
+    expect(settings).toMatch(/^\/\/ canonicalId: c_10_3 route: \/10-3\n'use client';/);
+    expect(settings).not.toMatch(/^function SectionHeading/m);
+
+    const root2 = await fixture('next');
+    for (const f of ['app/(tabs)/10-2/page.tsx', 'app/10-3/page.tsx']) {
+      const p = path.join(root2, f);
+      await fs.writeFile(p, (await fs.readFile(p, 'utf8')).replace('function SectionHeading', 'const GAP = 8;\nfunction SectionHeading').replace('marginBottom: 8', 'marginBottom: GAP'));
+    }
+    const r2 = await extractComponents('p', { projectRoot: root2, noAiConfirm: true });
+    expect(r2.rejected.find((x) => x.names.includes('SectionHeading'))?.reason).toMatch(/uses `GAP` declared in/);
+    expect(fsSync.existsSync(path.join(root2, 'components', 'SectionHeading.tsx'))).toBe(false);
+  });
+
+  it('import bindings round-trip (default, named, aliased, namespace, type)', () => {
+    const b = xweb.parseImportBindings("import React, { useState as uS, type FC } from 'react';\nimport * as z from './z';\nimport type { T } from '@/t';\n");
+    expect(b.map((x) => `${x.local}<${x.imported}${x.typeOnly ? ':t' : ''}`)).toEqual(['React<default', 'uS<useState', 'FC<FC:t', 'z<*', 'T<T:t']);
+    expect(xweb.dropImportBindings("import React, { useState as uS } from \"react\";\nconst a = 1;\n", new Set(['uS']))).toBe("import React from \"react\";\nconst a = 1;\n");
+  });
+});

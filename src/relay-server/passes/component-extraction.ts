@@ -33,7 +33,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as fsSync from 'fs';
 import type { AIModel } from '../ai-adapters';
-import { collectWebWidgets, extractWebGroup } from './component-extraction-web';
+import { collectWebWidgets, extractWebGroup, webComponentsDir, webScreenFiles } from './component-extraction-web';
 import { detectFramework, type Framework } from './framework';
 import { loadWebApp } from './web-app';
 
@@ -155,7 +155,9 @@ export interface ExtractorStrategy {
     chosenName: string,
     kind: string,
     dryRun: boolean,
-  ): Promise<ExtractedComponent | null>;
+  ): Promise<ExtractedComponent | null | { bail: string }>;
+  /** Absolute components dir when it depends on the app layout (web: the resolver's). */
+  componentsDirFor?(projectRoot: string): Promise<string>;
 }
 
 // ── Canonical naming guide ───────────────────────────────────────────────────
@@ -177,18 +179,10 @@ async function readCanonicalComponents(projectRoot: string): Promise<CanonicalCo
  *  verify #2: a Next app with locally-declared components under app/ was reported
  *  "no local component declarations found"). */
 async function emptyCollectionReason(projectRoot: string, framework: string): Promise<string> {
-  if (framework === 'next') {
-    // The web strategy reads <root>/src/screens only (collectWebWidgets); Next pages
-    // are App Router / Pages Router files.
-    const ix = await loadWebApp(projectRoot);
-    const router = ix?.appDir ?? ix?.pagesDir ?? null;
-    const rel = router ? path.relative(projectRoot, router).split(path.sep).join('/') : 'app';
-    return `the web strategy collects local components only from src/screens/; this Next app's pages under ${rel}/ were not read — component extraction for Next pages is not implemented (PG-07)`;
-  }
-  if (framework === 'react') {
-    const screens = path.join(projectRoot, 'src', 'screens');
-    if (!fsSync.existsSync(screens)) return 'no src/screens/ directory — the react strategy reads local components from src/screens/ only; nothing was read';
-    return 'no local (non-exported) component declarations found in src/screens/ — nothing to compare';
+  if (framework === 'react' || framework === 'next') {
+    const files = await webScreenFiles(projectRoot);
+    if (!files.length) return 'the resolver indexed no built screen file (no header-stamped screen, route table entry or page) — nothing was read';
+    return `no JSX component declarations found in the ${files.length} screen file(s) the resolver indexed — nothing to compare`;
   }
   return `no local widget declarations found to compare (the ${framework} strategy collected 0 candidates)`;
 }
@@ -270,10 +264,10 @@ export async function extractComponents(projectId: string, opts: ExtractOptions)
         continue;
       }
       const result = await strategy.extractGroup(projectRoot, group, chosen, kind, false);
-      if (!result) {
+      if (!result || 'bail' in result) {
         // Strategy bailed without writing; nothing to roll back, but restore to be safe.
         await guard.restore(token).catch(() => { /* best-effort */ });
-        rejected.push({ names: group.map((g) => g.localName), reason: 'strategy bailed (unsafe to merge)' });
+        rejected.push({ names: group.map((g) => g.localName), reason: result && 'bail' in result ? result.bail : 'strategy bailed (unsafe to merge)' });
         continue;
       }
       const built = await guard.buildOk();
@@ -287,15 +281,15 @@ export async function extractComponents(projectId: string, opts: ExtractOptions)
     }
 
     const result = await strategy.extractGroup(projectRoot, group, chosen, kind, !!opts.dryRun);
-    if (result) extracted.push(result);
-    else rejected.push({ names: group.map((g) => g.localName), reason: 'strategy bailed (unsafe to merge)' });
+    if (result && !('bail' in result)) extracted.push(result);
+    else rejected.push({ names: group.map((g) => g.localName), reason: result && 'bail' in result ? result.bail : 'strategy bailed (unsafe to merge)' });
   }
 
   return {
     framework,
     extracted,
     rejected,
-    componentsDir: path.join(projectRoot, strategy.componentsDirName),
+    componentsDir: strategy.componentsDirFor ? await strategy.componentsDirFor(projectRoot) : path.join(projectRoot, strategy.componentsDirName),
     dryRun: !!opts.dryRun,
     scanned: units.length,
   };
@@ -1288,16 +1282,17 @@ function snake(s: string): string { return (s ?? '').replace(/([a-z0-9])([A-Z])/
 function escapeRe(s: string): string { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
 // =============================================================================
-// React strategy (seam only — Phase 7a ships flutter; react contract is stubbed)
+// Web strategy (react + next) — component-extraction-web.ts
 // =============================================================================
 
 const webStrategy = (framework: Framework): ExtractorStrategy => ({
   framework,
   componentsDirName: path.join('src', 'components'),
   collectWidgets: (projectRoot, onlyFiles) => collectWebWidgets(projectRoot, onlyFiles),
+  componentsDirFor: (projectRoot) => webComponentsDir(projectRoot),
   extractGroup: async (projectRoot, group, chosenName, kind, dryRun) => {
     const r = await extractWebGroup(projectRoot, group, chosenName, kind, dryRun);
-    if (!r) return null;
+    if ('bail' in r) return r;
     return {
       name: r.name,
       kind: r.kind,
