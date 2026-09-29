@@ -189,3 +189,30 @@ describe('serveDir on a Next static export (PG-33)', () => {
     } finally { spa.close(); }
   });
 });
+
+describe('live web preview server on a Next static export (PG-33, same defect)', () => {
+  it('/settings serves settings.html, an unknown route is the 404 page, a Vite SPA keeps its fallback', async () => {
+    const { startStaticPreviewServer, stopFlutterPreviewServer } = await import('../src/relay-server/flutter-preview-server');
+    const out = path.join(root, 'out');
+    await fs.mkdir(path.join(out, '_next'), { recursive: true });
+    await fs.writeFile(path.join(out, 'index.html'), '<html><head></head><body>ROOT</body></html>');
+    await fs.writeFile(path.join(out, 'settings.html'), '<html><head></head><body>SETTINGS</body></html>');
+    await fs.writeFile(path.join(out, '404.html'), '<html><head></head><body>NF</body></html>');
+    const port = await startStaticPreviewServer('b56-live', out);
+    try {
+      const s = await fetch(`http://127.0.0.1:${port}/settings`);
+      expect(s.status).toBe(200);
+      expect(await s.text()).toMatch(/SETTINGS/);
+      const n = await fetch(`http://127.0.0.1:${port}/nope`);
+      expect(n.status).toBe(404);
+      expect(await n.text()).toMatch(/NF/);
+    } finally { await stopFlutterPreviewServer('b56-live'); }
+    await fs.rm(path.join(out, '_next'), { recursive: true });
+    const p2 = await startStaticPreviewServer('b56-live2', out);
+    try {
+      const r = await fetch(`http://127.0.0.1:${p2}/users/7`);
+      expect(r.status).toBe(200);
+      expect(await r.text()).toMatch(/ROOT/);
+    } finally { await stopFlutterPreviewServer('b56-live2'); }
+  });
+});

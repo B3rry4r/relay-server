@@ -84,6 +84,23 @@ function makeStaticHandler(buildDir: string) {
       let stat;
       try { stat = await fs.stat(filePath); }
       catch {
+        // A Next static export writes one document PER ROUTE (`settings.html`); the
+        // SPA fallback below served the ROOT page for /settings (PG-33, same defect
+        // as the verify server). Try `<path>.html` first, and on an export (`_next/`)
+        // a route with no document is a 404, never the root page.
+        const routeDoc = path.extname(relPath) ? null : `${filePath.replace(/[\\/]+$/, '')}.html`;
+        if (routeDoc && routeDoc.startsWith(root + path.sep) && await pathExists(routeDoc)) {
+          filePath = routeDoc;
+          stat = await fs.stat(routeDoc);
+        } else if (await pathExists(path.join(root, '_next'))) {
+          const nf = path.join(root, '404.html');
+          const body = await pathExists(nf) ? rewritePreviewHtml(await fs.readFile(nf, 'utf-8'), '/') : 'Not found';
+          res.writeHead(404, { 'Content-Type': await pathExists(nf) ? 'text/html; charset=utf-8' : 'text/plain; charset=utf-8' });
+          res.end(body);
+          return;
+        }
+      }
+      if (!stat) {
         // SPA fallback: serve index.html so client-side routing works
         const indexPath = path.join(root, 'index.html');
         if (await pathExists(indexPath)) {
