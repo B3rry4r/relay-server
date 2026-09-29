@@ -1,0 +1,64 @@
+[
+ {
+  "kind": "session.start",
+  "at": "2026-09-29T12:35:26.820Z",
+  "sessionId": "50ff84e1-b5d4-4b2b-8a08-57b2d742f064",
+  "transcriptPath": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/claude/home/.claude/projects/-tmp-claude-0--home-user-48ce78b7-4980-5add-a5f1-fc3a87f883f5-scratchpad-cli-research-runs-claude-proj/50ff84e1-b5d4-4b2b-8a08-57b2d742f064.jsonl",
+  "cwd": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/claude/proj",
+  "model": "claude-opus-5-5[1m]",
+  "source": "hook",
+  "cli": "claude"
+ },
+ {
+  "kind": "status",
+  "at": "2026-09-29T12:35:30.207Z",
+  "sessionId": "50ff84e1-b5d4-4b2b-8a08-57b2d742f064",
+  "transcriptPath": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/claude/home/.claude/projects/-tmp-claude-0--home-user-48ce78b7-4980-5add-a5f1-fc3a87f883f5-scratchpad-cli-research-runs-claude-proj/50ff84e1-b5d4-4b2b-8a08-57b2d742f064.jsonl",
+  "state": "working",
+  "source": "hook",
+  "cli": "claude"
+ },
+ {
+  "kind": "permission.request",
+  "at": "2026-09-29T12:35:30.529Z",
+  "sessionId": "50ff84e1-b5d4-4b2b-8a08-57b2d742f064",
+  "transcriptPath": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/claude/home/.claude/projects/-tmp-claude-0--home-user-48ce78b7-4980-5add-a5f1-fc3a87f883f5-scratchpad-cli-research-runs-claude-proj/50ff84e1-b5d4-4b2b-8a08-57b2d742f064.jsonl",
+  "tool": "Bash",
+  "title": "Create a demo file",
+  "input": {
+   "command": "touch relay-demo.txt",
+   "description": "Create a demo file"
+  },
+  "source": "hook",
+  "cli": "claude"
+ },
+ {
+  "kind": "permission.resolved",
+  "at": "2026-09-29T12:35:31.756Z",
+  "sessionId": "50ff84e1-b5d4-4b2b-8a08-57b2d742f064",
+  "transcriptPath": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/claude/home/.claude/projects/-tmp-claude-0--home-user-48ce78b7-4980-5add-a5f1-fc3a87f883f5-scratchpad-cli-research-runs-claude-proj/50ff84e1-b5d4-4b2b-8a08-57b2d742f064.jsonl",
+  "outcome": "allowed-or-not-needed",
+  "toolUseId": "toolu_mock_0001",
+  "source": "hook",
+  "cli": "claude"
+ },
+ {
+  "kind": "turn.end",
+  "at": "2026-09-29T12:35:31.811Z",
+  "sessionId": "50ff84e1-b5d4-4b2b-8a08-57b2d742f064",
+  "transcriptPath": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/claude/home/.claude/projects/-tmp-claude-0--home-user-48ce78b7-4980-5add-a5f1-fc3a87f883f5-scratchpad-cli-research-runs-claude-proj/50ff84e1-b5d4-4b2b-8a08-57b2d742f064.jsonl",
+  "reason": "done",
+  "lastText": "Found the files.\n\n```relay-summary\ntitle: Listed workspace\n- ran `ls -la`\n- 3 entries\n```\n\n```relay-choices\nquestion: What next?\n1. Run tests\n2. Open README\n```",
+  "source": "hook",
+  "cli": "claude"
+ },
+ {
+  "kind": "session.end",
+  "at": "2026-09-29T12:35:34.758Z",
+  "sessionId": "50ff84e1-b5d4-4b2b-8a08-57b2d742f064",
+  "transcriptPath": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/claude/home/.claude/projects/-tmp-claude-0--home-user-48ce78b7-4980-5add-a5f1-fc3a87f883f5-scratchpad-cli-research-runs-claude-proj/50ff84e1-b5d4-4b2b-8a08-57b2d742f064.jsonl",
+  "reason": "prompt_input_exit",
+  "source": "hook",
+  "cli": "claude"
+ }
+]

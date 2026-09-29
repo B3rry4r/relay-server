@@ -1,0 +1,82 @@
+[
+ {
+  "kind": "user.message",
+  "at": "2026-09-29T12:20:51.010Z",
+  "text": "create the demo file"
+ },
+ {
+  "kind": "assistant.thinking",
+  "at": "2026-09-29T12:20:51.411Z",
+  "text": "Plan: create the file with touch."
+ },
+ {
+  "kind": "assistant.text",
+  "at": "2026-09-29T12:20:51.812Z",
+  "text": "I'll create the file.",
+  "blocks": [],
+  "final": false
+ },
+ {
+  "kind": "tool.call",
+  "at": "2026-09-29T12:20:51.812Z",
+  "toolUseId": "toolu_fake_1790684451812",
+  "tool": "Bash",
+  "toolKind": "shell",
+  "title": "Create a demo file",
+  "input": {
+   "command": "touch relay-demo.txt",
+   "description": "Create a demo file"
+  }
+ },
+ {
+  "kind": "tool.result",
+  "at": "2026-09-29T12:20:52.210Z",
+  "toolUseId": "toolu_fake_1790684451812",
+  "ok": true,
+  "summary": "(Bash completed with no output)",
+  "output": "(Bash completed with no output)"
+ },
+ {
+  "kind": "assistant.text",
+  "at": "2026-09-29T12:20:52.245Z",
+  "text": "Created the file.\n\n```relay-summary\ntitle: Created demo file\n- ran `touch relay-demo.txt`\n```\n\n```relay-choices\nquestion: What next?\n1. Run the tests\n2. Commit the change\n```",
+  "blocks": [
+   {
+    "kind": "summary",
+    "fields": {
+     "title": "Created demo file"
+    },
+    "items": [
+     {
+      "text": "ran `touch relay-demo.txt`"
+     }
+    ],
+    "raw": "title: Created demo file\n- ran `touch relay-demo.txt`"
+   },
+   {
+    "kind": "choices",
+    "fields": {
+     "question": "What next?"
+    },
+    "items": [
+     {
+      "n": 1,
+      "text": "Run the tests"
+     },
+     {
+      "n": 2,
+      "text": "Commit the change"
+     }
+    ],
+    "raw": "question: What next?\n1. Run the tests\n2. Commit the change"
+   }
+  ],
+  "final": true
+ },
+ {
+  "kind": "turn.end",
+  "at": "2026-09-29T12:20:52.276Z",
+  "reason": "done",
+  "durationMs": 1200
+ }
+]

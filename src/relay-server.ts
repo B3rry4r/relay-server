@@ -10,6 +10,7 @@ import { registerFlutterRoutes } from './relay-server/flutter-routes';
 import { registerGitRoutes } from './relay-server/git-routes';
 import { registerVisualRoutes } from './relay-server/visual-routes';
 import { registerScreenLoopRoutes, stopAutoResumeSweep } from './relay-server/ai-screen-loop';
+import { createAgentRuntime } from './relay-server/agent';
 import { busySnapshot, isUnderHost, lifecycleGuard, startLifecycle } from './relay-server/lifecycle';
 import { registerProjectRoutes } from './relay-server/project-routes';
 import {
@@ -196,6 +197,9 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
   registerScreenLoopRoutes(app);
   auth.installSocketAuth(io);
   registerSocketHandlers(io, ptyFactory);
+  // Agent view (agent-display-spec): agent:* events on this io for every
+  // authenticated socket, including Option-B (noTerminals) sockets.
+  const agents = createAgentRuntime(io);
 
   let listeningPort = 0;
 
@@ -212,6 +216,12 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
         console.log(`[relay] remote PTY mode — terminal sessions owned by ${getRemotePtyUrl() || '(RELAY_PTY_URL NOT SET!)'}`);
       } else {
         await restoreTerminalSessions(ptyFactory);
+      }
+      try {
+        await agents.start();
+      } catch (error) {
+        // the Agent view is an overlay: it must never keep the server from booting
+        console.error('[agent] tracker failed to start:', error);
       }
 
       await new Promise<void>((resolve, reject) => {
@@ -264,6 +274,7 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
       return listeningPort;
     },
     async stop() {
+      agents.stop();
       auth.dispose();
       stopAutoResumeSweep();
       if (listeningPort) unregisterProtectedPort(listeningPort);

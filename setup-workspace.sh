@@ -309,6 +309,34 @@ else
   record_status nvm "ready"
 fi
 
+# ── Relay Agent view: guide + event hooks for claude / codex / gemini / opencode ──
+# (agent-display-spec §10). MUST run after the Gemini selectedType block above:
+# that block rewrites ~/.gemini/settings.json wholesale when the key is missing,
+# which would drop the hooks until the next boot. Idempotent (marked blocks,
+# Relay-owned hook entries only, unchanged files are not rewritten) and never
+# fatal for the bootstrap. RELAY_AGENT_GUIDE=off removes the guide blocks.
+RELAY_AGENT_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/agent"
+RELAY_AGENT_INSTALLER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/relay-agent-install.mjs"
+if [[ -d "$RELAY_AGENT_SRC" && -f "$RELAY_AGENT_INSTALLER" ]] && has_command node; then
+  if ! cmp -s "$RELAY_AGENT_SRC/relay-agent-hook" "$RELAY_BIN_DIR/relay-agent-hook"; then
+    install -m 0755 "$RELAY_AGENT_SRC/relay-agent-hook" "$RELAY_BIN_DIR/relay-agent-hook"
+  fi
+  mkdir -p "$RELAY_STATE_DIR/agent-events"
+  chmod 0700 "$RELAY_STATE_DIR/agent-events" 2>/dev/null || true
+  agent_rc=0
+  HOME="$WORKSPACE" node "$RELAY_AGENT_INSTALLER" \
+    --home "$WORKSPACE" --guide "$RELAY_AGENT_SRC/RELAY-AGENT-GUIDE.md" \
+    --hook "$RELAY_BIN_DIR/relay-agent-hook" --plugin "$RELAY_AGENT_SRC/opencode-relay-agent.js" \
+    || agent_rc=$?
+  case "$agent_rc" in
+    0) record_status agent_display "ready" ;;
+    3) record_status agent_display "partial" ;;
+    *) echo "[bootstrap] agent display install failed (non-fatal)" >&2; record_status agent_display "failed" ;;
+  esac
+else
+  record_status agent_display "skipped"
+fi
+
 if [[ "$BOOTSTRAP_COMPLETE" -eq 1 ]]; then
   touch "$BOOTSTRAP_FLAG"
   record_status bootstrap "complete"

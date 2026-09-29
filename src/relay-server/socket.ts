@@ -4,6 +4,7 @@ import { DEFAULT_COLS, DEFAULT_ROWS } from './types';
 import {
   createTerminalEnv,
   exists,
+  getRelayStateRoot,
   getRelayTerminalSessionsPath,
   readJsonFile,
   resolveProjectRoot,
@@ -21,7 +22,9 @@ import { subscribeJobLog } from './ai-job-log';
 import { subscribeRunEvents } from './run-events';
 import { watchProject, type ProjectWatcher } from './project-watcher';
 import { attachRemoteTerminalProxy, isRemotePtyEnabled } from './remote-pty';
+import { ptyHub, setEmbeddedPtyAccess } from './agent/pty-hub';
 import fsSync from 'node:fs';
+import path from 'node:path';
 
 const activeShells = new Map<string, PtyLike>();
 const terminalSessions = new Map<string, TerminalSession>();
@@ -39,6 +42,19 @@ const MAX_SCROLLBACK_BYTES = 1024 * 1024;
 // on the next reconnect a new listener is registered on the dying process and
 // fires ~80ms later, producing the "terminal force-closed on reopen" bug.
 const persistentExitHandlers = new Map<string, { dispose(): void }>();
+
+// Agent view (agent-display-spec §6.2): every embedded terminal's output is
+// tapped for the tracker's ScreenGuard independently of any browser socket, and
+// the tracker writes permission answers by terminal id.
+const agentOutputTaps = new Map<string, { dispose(): void }>();
+setEmbeddedPtyAccess({
+  write: (terminalId, data) => {
+    const shell = activeShells.get(terminalId);
+    if (!shell) return false;
+    try { shell.write(data); return true; } catch { return false; }
+  },
+  scrollback: (terminalId) => scrollbackBuffers.get(terminalId)?.toString() ?? terminalSessions.get(terminalId)?.scrollback ?? '',
+});
 
 // Check whether the underlying OS process is still running (signal 0 = no-op).
 // `pid` is OPTIONAL on PtyLike: a PTY that does not expose one (an injected
@@ -185,7 +201,12 @@ export function createTerminalSession(
       cwd,
       // RELAY_TERMINAL_ID (CONTRACTS §3): lets a program in the shell (an agent
       // CLI's hooks, relay tools) say which terminal it runs in.
-      env: { ...createTerminalEnv(workspaceRoot, { profile: 'shell' }), RELAY_TERMINAL_ID: terminalId },
+      // RELAY_AGENT_SPOOL: where relay-agent-hook appends (agent-display-spec §5.1).
+      env: {
+        ...createTerminalEnv(workspaceRoot, { profile: 'shell' }),
+        RELAY_TERMINAL_ID: terminalId,
+        RELAY_AGENT_SPOOL: path.join(getRelayStateRoot(workspaceRoot), 'agent-events'),
+      },
       rows: DEFAULT_ROWS,
     });
   } catch {
@@ -203,7 +224,10 @@ export function createTerminalSession(
   activeShells.set(terminalId, shell);
   terminalSessions.set(terminalId, session);
   scrollbackBuffers.set(terminalId, new ScrollbackBuffer(MAX_SCROLLBACK_BYTES));
+  const tap = shell.onData((data: string) => ptyHub.output(terminalId, data));
+  if (tap) agentOutputTaps.set(terminalId, tap);
   schedulePersistTerminalState();
+  ptyHub.changed();
 
   return session;
 }
@@ -216,15 +240,21 @@ export function closeTerminalSession(terminalId: string, skipPersist = false): v
   exitHandler?.dispose();
 
   const shell = activeShells.get(terminalId);
+  const known = terminalSessions.has(terminalId);
   activeShells.delete(terminalId);
   terminalSessions.delete(terminalId);
   scrollbackBuffers.delete(terminalId);
+  agentOutputTaps.get(terminalId)?.dispose();
+  agentOutputTaps.delete(terminalId);
   if (shell) {
     shell.kill();
   }
   if (!skipPersist) {
     schedulePersistTerminalState();
   }
+  // skipPersist = server shutdown (the terminal is restored on the next boot, so
+  // its agent spool is kept); otherwise the terminal is gone for good.
+  if (known) ptyHub.closed(terminalId, skipPersist ? 'shutdown' : 'closed');
 }
 
 export function closeAllTerminalSessions(skipPersist = false): void {
@@ -659,7 +689,10 @@ export function registerSocketHandlers(
       if (lastResize.get(id) === key) return; // identical for this terminal — skip
       lastResize.set(id, key);
       const shell = activeShells.get(id);
-      if (shell) shell.resize(cols, rows);
+      if (shell) {
+        shell.resize(cols, rows);
+        ptyHub.resized(id, cols, rows);
+      }
     });
 
     socket.on('cd', async (payload: { path: string; projectId?: string }) => {

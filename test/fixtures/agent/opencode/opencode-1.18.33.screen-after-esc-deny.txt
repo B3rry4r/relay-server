@@ -1,0 +1,34 @@
+                                                                                                    
+  ┃                                                                                                 
+  ┃  $ touch relay-demo.txt                                                                         
+  ┃                                                                                                 
+  ┃  (no output)                                                                                    
+  ┃                                                                                                 
+                                                                                                    
+     Created the file.                                                                              
+                                                                                                    
+     title: Created demo file                                                                       
+     - ran `touch relay-demo.txt`                                                                   
+                                                                                                    
+     ▣  Build · Mock Model · 3.9s                                                                   
+                                                                                                    
+  ┃                                                                                                 
+  ┃  do it again                                                                                    
+  ┃                                                                                                 
+                                                                                                    
+     + Thought: 5ms                                                                                 
+                                                                                                    
+     I'll create the file.                                                                          
+                                                                                                    
+     $ touch relay-demo.txt                                                                         
+                                                                                                    
+     ▣  Build · Mock Model                                                                          
+                                                                                                    
+  ┃                                                                                                 
+  ┃                                                                                                 
+  ┃                                                                                                 
+  ┃  Build · Mock Model Mock                                                                        
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀  
+   /tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli- 120 ctrl+p         
+   research/runs/opencode/proj                                                       commands       
+                                                                                                    

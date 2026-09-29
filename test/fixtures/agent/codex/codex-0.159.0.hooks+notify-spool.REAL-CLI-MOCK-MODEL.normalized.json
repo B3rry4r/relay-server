@@ -1,0 +1,96 @@
+[
+ {
+  "kind": "session.start",
+  "at": "2026-09-29T12:12:03.381Z",
+  "sessionId": "01a0ed14-2315-78d0-9201-06d971a6dd46",
+  "transcriptPath": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/codex/home/.codex/sessions/2026/09/29/rollout-2026-09-29T12-11-55-01a0ed14-2315-78d0-9201-06d971a6dd46.jsonl",
+  "cwd": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/codex/proj",
+  "model": "mock-model",
+  "source": "hook",
+  "cli": "codex"
+ },
+ {
+  "kind": "status",
+  "at": "2026-09-29T12:12:03.418Z",
+  "sessionId": "01a0ed14-2315-78d0-9201-06d971a6dd46",
+  "transcriptPath": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/codex/home/.codex/sessions/2026/09/29/rollout-2026-09-29T12-11-55-01a0ed14-2315-78d0-9201-06d971a6dd46.jsonl",
+  "state": "working",
+  "source": "hook",
+  "cli": "codex"
+ },
+ {
+  "kind": "permission.request",
+  "at": "2026-09-29T12:12:03.568Z",
+  "sessionId": "01a0ed14-2315-78d0-9201-06d971a6dd46",
+  "transcriptPath": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/codex/home/.codex/sessions/2026/09/29/rollout-2026-09-29T12-11-55-01a0ed14-2315-78d0-9201-06d971a6dd46.jsonl",
+  "tool": "Bash",
+  "title": "Create the demo file?",
+  "input": {
+   "command": "touch relay-demo.txt",
+   "description": "Create the demo file?"
+  },
+  "source": "hook",
+  "cli": "codex"
+ },
+ {
+  "kind": "permission.resolved",
+  "at": "2026-09-29T12:12:05.136Z",
+  "sessionId": "01a0ed14-2315-78d0-9201-06d971a6dd46",
+  "transcriptPath": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/codex/home/.codex/sessions/2026/09/29/rollout-2026-09-29T12-11-55-01a0ed14-2315-78d0-9201-06d971a6dd46.jsonl",
+  "outcome": "allowed-or-not-needed",
+  "toolUseId": "call_mock_1",
+  "source": "hook",
+  "cli": "codex"
+ },
+ {
+  "kind": "turn.end",
+  "at": "2026-09-29T12:12:05.239Z",
+  "sessionId": "01a0ed14-2315-78d0-9201-06d971a6dd46",
+  "transcriptPath": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/codex/home/.codex/sessions/2026/09/29/rollout-2026-09-29T12-11-55-01a0ed14-2315-78d0-9201-06d971a6dd46.jsonl",
+  "reason": "done",
+  "lastText": "Created the file.\n\n```relay-summary\ntitle: Created demo file\n- ran `touch relay-demo.txt`\n```",
+  "source": "hook",
+  "cli": "codex"
+ },
+ {
+  "kind": "status",
+  "at": "2026-09-29T12:12:07.602Z",
+  "sessionId": "01a0ed14-2315-78d0-9201-06d971a6dd46",
+  "transcriptPath": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/codex/home/.codex/sessions/2026/09/29/rollout-2026-09-29T12-11-55-01a0ed14-2315-78d0-9201-06d971a6dd46.jsonl",
+  "state": "working",
+  "source": "hook",
+  "cli": "codex"
+ },
+ {
+  "kind": "permission.request",
+  "at": "2026-09-29T12:12:07.734Z",
+  "sessionId": "01a0ed14-2315-78d0-9201-06d971a6dd46",
+  "transcriptPath": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/codex/home/.codex/sessions/2026/09/29/rollout-2026-09-29T12-11-55-01a0ed14-2315-78d0-9201-06d971a6dd46.jsonl",
+  "tool": "Bash",
+  "title": "Create the demo file?",
+  "input": {
+   "command": "touch relay-demo.txt",
+   "description": "Create the demo file?"
+  },
+  "source": "hook",
+  "cli": "codex"
+ },
+ {
+  "kind": "turn.end",
+  "at": "2026-09-29T12:12:09.279Z",
+  "sessionId": "01a0ed14-2315-78d0-9201-06d971a6dd46",
+  "transcriptPath": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/codex/home/.codex/sessions/2026/09/29/rollout-2026-09-29T12-11-55-01a0ed14-2315-78d0-9201-06d971a6dd46.jsonl",
+  "reason": "interrupted",
+  "source": "hook",
+  "cli": "codex"
+ },
+ {
+  "kind": "session.end",
+  "at": "2026-09-29T12:12:13.291Z",
+  "sessionId": "01a0ed14-2315-78d0-9201-06d971a6dd46",
+  "transcriptPath": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/codex/home/.codex/sessions/2026/09/29/rollout-2026-09-29T12-11-55-01a0ed14-2315-78d0-9201-06d971a6dd46.jsonl",
+  "reason": "other",
+  "source": "hook",
+  "cli": "codex"
+ }
+]
