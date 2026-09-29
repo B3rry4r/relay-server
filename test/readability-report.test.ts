@@ -81,6 +81,13 @@ describe('readability-report — flutter fixture', () => {
     expect(t.reachability.sample).toEqual(['lib/components/cmp_other_17.dart']);
   });
 
+  it('measures theme vocabulary sprawl (tokens used once / never / near-duplicates)', () => {
+    expect(t.theme).toEqual({
+      themeFiles: 1, colorTokens: 2, unusedColorTokens: 1, singleUseColorTokens: 1,
+      nearDuplicatePairs: 0, numericSuffixTokens: 1, // ink2
+    });
+  });
+
   it('never runs external tools when told not to', () => {
     expect(r.diagnostics.ran).toBe(false);
   });
@@ -128,6 +135,12 @@ describe('readability-report — react fixture', () => {
   it('finds the duplicated JSX subtree and the repeated local component', () => {
     expect(t.duplication.groups).toBe(1);
     expect(t.repeatedPrivateWidgets.top[0]).toEqual({ name: 'BackButton', files: 2 });
+  });
+
+  it('parses an inline object theme (AppTheme.color.brand used once, ink never)', () => {
+    expect(t.theme.colorTokens).toBe(2);
+    expect(t.theme.singleUseColorTokens).toBe(1);
+    expect(t.theme.unusedColorTokens).toBe(1);
   });
 
   it('reports files unreachable from src/main.tsx', () => {

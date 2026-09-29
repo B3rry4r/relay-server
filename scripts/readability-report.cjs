@@ -832,6 +832,38 @@ function dartExportedNames(root, fromRel, uri, ctx, depth = 0) {
   return out;
 }
 
+// ── theme sprawl ──────────────────────────────────────────────────────────────
+// "0 inline colours" is hollow if every literal was just renamed into the theme
+// under a screen-scoped name (txnInk, adDark, histBg). Measure the vocabulary:
+// how many colour tokens, how many are used once or never, how many are
+// near-duplicates of another token (RGB distance < 16).
+function themeSprawl(root, files) {
+  const themeFiles = files.filter((f) => f.category === 'theme').map((f) => f.path);
+  const tokens = [];
+  for (const rel of themeFiles) {
+    const src = fs.readFileSync(path.join(root, rel), 'utf8');
+    for (const mm of src.matchAll(/static\s+const\s+Color\s+(\w+)\s*=\s*(?:const\s+)?Color\(0x([0-9A-Fa-f]{8})\)/g)) tokens.push({ name: mm[1], hex: mm[2].slice(2).toLowerCase() });
+    for (const mm of src.matchAll(/['"]?([A-Za-z_$][\w$-]*)['"]?\s*:\s*['"]#([0-9A-Fa-f]{6})(?:[0-9A-Fa-f]{2})?['"]/g)) tokens.push({ name: mm[1], hex: mm[2].toLowerCase() });
+  }
+  if (!themeFiles.length) return { themeFiles: 0, colorTokens: 0, reason: 'no theme file found' };
+  let body = '';
+  for (const f of files) if (f.category !== 'theme' && f.category !== 'preview') body += fs.readFileSync(path.join(root, f.path), 'utf8');
+  const uses = (n) => (body.match(new RegExp(`\\.${n.replace(/\$/g, '\\$')}\\b`, 'g')) || []).length;
+  const rgb = (h) => [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16));
+  const dist = (a, b) => Math.sqrt(rgb(a).reduce((acc, v, i) => acc + (v - rgb(b)[i]) ** 2, 0));
+  let nearDuplicatePairs = 0;
+  for (let i = 0; i < tokens.length; i++) for (let j = i + 1; j < tokens.length; j++) if (dist(tokens[i].hex, tokens[j].hex) < 16) nearDuplicatePairs++;
+  const useCounts = tokens.map((t) => ({ name: t.name, uses: uses(t.name) }));
+  return {
+    themeFiles: themeFiles.length,
+    colorTokens: tokens.length,
+    unusedColorTokens: useCounts.filter((u) => u.uses === 0).length,
+    singleUseColorTokens: useCounts.filter((u) => u.uses === 1).length,
+    nearDuplicatePairs,
+    numericSuffixTokens: tokens.filter((t) => isNumericSuffixName(t.name)).length,
+  };
+}
+
 // ── duplication grouping ──────────────────────────────────────────────────────
 
 function groupDuplicates(allCands) {
@@ -1010,6 +1042,7 @@ function analyzeProject(root, opts = {}) {
   totals.reachability = roots.length
     ? { entryRoots: roots.length, unreachableFiles: unreachable.length, unreachableLoc: files.filter((f) => f.metrics.unreachable).reduce((a, f) => a + f.metrics.loc, 0), sample: unreachable.slice(0, 30) }
     : { entryRoots: 0, unreachableFiles: null, reason: 'no entrypoint found (lib/main.dart, src/main.*, app/**/page.*)' };
+  totals.theme = themeSprawl(root, files);
   totals.repeatedPrivateWidgets = {
     names: repeatedPrivate.length,
     redundantDefinitions: repeatedPrivate.reduce((a, x) => a + x.files - 1, 0),
@@ -1052,6 +1085,7 @@ function summarize(report) {
     ['hand-drawn painters/svg', `${t.handDrawn}`],
     ['private widgets / repeated names', `${t.privateWidgets} / ${t.repeatedPrivateWidgets.names} (+${t.repeatedPrivateWidgets.redundantDefinitions} redundant defs)`],
     ['stub bodies / unreachable files', `${t.stubBody} / ${t.reachability.unreachableFiles ?? 'n/a'}${t.reachability.unreachableLoc != null ? ` (${t.reachability.unreachableLoc} loc)` : ''}`],
+    ['theme colours (unused/1-use/near-dup pairs)', t.theme.themeFiles ? `${t.theme.colorTokens} (${t.theme.unusedColorTokens}/${t.theme.singleUseColorTokens}/${t.theme.nearDuplicatePairs})` : 'no theme file'],
     ['comments noise (leak/code/todo)', `${t.comments.noise} (${t.comments.figmaLeak}/${t.comments.commentedOutCode}/${t.comments.todo})`],
     ['diagnostics', report.diagnostics.ran ? JSON.stringify(report.diagnostics) : `skipped: ${report.diagnostics.reason}`],
   ];
