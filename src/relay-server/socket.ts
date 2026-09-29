@@ -42,10 +42,18 @@ const MAX_SCROLLBACK_BYTES = 1024 * 1024;
 const persistentExitHandlers = new Map<string, { dispose(): void }>();
 
 // Check whether the underlying OS process is still running (signal 0 = no-op).
+// `pid` is OPTIONAL on PtyLike: a PTY that does not expose one (an injected
+// factory, a bridge that proxies elsewhere) has no probe-able liveness, so it is
+// presumed alive and its death is detected through onExit. Treating "no pid" as
+// "dead" closed every such terminal on bind and auto-respawned another pid-less
+// one, which was also "dead" — an unbounded close/respawn loop.
 function isShellAlive(shell: PtyLike): boolean {
   const pid = shell.pid;
-  if (!pid) return false;
-  try { process.kill(pid, 0); return true; } catch { return false; }
+  if (!pid) return true;
+  try { process.kill(pid, 0); return true; } catch (error) {
+    // EPERM = the process exists but belongs to another user: alive.
+    return (error as NodeJS.ErrnoException)?.code === 'EPERM';
+  }
 }
 let lastSelectedTerminalId: string | null = null;
 let persistTimer: NodeJS.Timeout | null = null;
