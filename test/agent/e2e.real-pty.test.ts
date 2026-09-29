@@ -93,7 +93,8 @@ describe.skipIf(PTY_UNAVAILABLE !== null)('Agent view E2E: fake agent in a real 
     for (const c of clients.splice(0)) c.disconnect();
     for (const s of servers.splice(0)) await s.stop();
     for (const key of ['PORT', 'AUTH_TOKEN', 'WORKSPACE', 'SHELL']) delete process.env[key];
-    fs.rmSync(workspace, { recursive: true, force: true });
+    // the killed shell may still be writing (.bash_history on SIGHUP): retry ENOTEMPTY
+    fs.rmSync(workspace, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   async function start() {

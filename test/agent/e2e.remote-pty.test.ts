@@ -110,7 +110,8 @@ describe.skipIf(SKIP !== null)('Agent view E2E: remote PTY (relay-pty on loopbac
       if (pty.exitCode === null) pty.kill('SIGKILL');
     }
     pty = null;
-    fs.rmSync(workspace, { recursive: true, force: true });
+    // the killed shell may still be writing (.bash_history on SIGHUP): retry ENOTEMPTY
+    fs.rmSync(workspace, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
 
   async function relay() {
