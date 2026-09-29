@@ -11,7 +11,8 @@
     "start": "npm run build && node dist/src/index.js",
     "mcp": "node mcp-server.mjs",
     "test": "vitest run --dir test",
-    "pack:release": "node scripts/pack-release.mjs"
+    "pack:release": "node scripts/pack-release.mjs",
+    "e2e:host-real": "node scripts/e2e-host-real.mjs"
   },
   "license": "Apache-2.0",
   "dependencies": {
