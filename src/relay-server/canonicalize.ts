@@ -700,12 +700,13 @@ export async function cleanOrphanScreens(projectRoot: string, canonical: Canonic
 // .uix/refs, .uix/asset-map.json, the .fig/inputs, and .uix/canonical.json (canon
 // rewrites it anyway).
 //
-// Non-flutter: NO-OP for now — the web skeleton (web-skeleton.ts) marks its files
-// `GENERATED SKELETON`, but a web clean slate (PG-34) is not implemented yet; we
-// never guess another framework's surface.
+// react / next (PG-34): web-skeleton.nukeWebAppSurface removes the generated
+// surface by what the pipeline itself stamped — `// canonicalId:` screen headers,
+// pipeline markers (GENERATED SKELETON, design system, asset pass, preview entries)
+// and the verify preview routes — never an unmarked (hand-authored) file.
 //
 // Idempotent + robust: a missing dir/file is fine and never throws.
-export interface NukeResult { removedDirs: string[]; removedFiles: string[]; skipped?: string }
+export interface NukeResult { removedDirs: string[]; removedFiles: string[]; skipped?: string; warnings?: string[] }
 
 /** The per-build code reports under .uix/ a restart must drop so a stale report
  *  doesn't make a gated pass (e.g. finalize) skip on the rebuild. */
@@ -718,14 +719,37 @@ const NUKE_UIX_REPORTS = [
   'last-gen.json',
 ] as const;
 
+async function removeStaleUixReports(projectRoot: string, removedFiles: string[]): Promise<void> {
+  for (const name of NUKE_UIX_REPORTS) {
+    const rel = path.join('.uix', name);
+    const abs = path.join(projectRoot, rel);
+    try {
+      const existed = await fs.stat(abs).then(() => true, () => false);
+      if (existed) { await fs.rm(abs, { force: true }); removedFiles.push(rel); }
+    } catch { /* best-effort */ }
+  }
+}
+
 export async function nukeGeneratedAppSurface(
   projectRoot: string, framework: string,
 ): Promise<NukeResult> {
   const removedDirs: string[] = [];
   const removedFiles: string[] = [];
-  if ((framework || 'flutter').toLowerCase() !== 'flutter') {
-    // No web clean slate yet — don't guess any other framework's generated surface.
-    return { removedDirs, removedFiles, skipped: `non-flutter (${framework}) — the web restart clean slate is not implemented yet (PG-34); nothing removed` };
+  const fw = (framework || 'flutter').toLowerCase();
+  if (fw === 'react' || fw === 'next') {
+    const { nukeWebAppSurface } = await import('./web-skeleton');
+    const w = await nukeWebAppSurface(projectRoot).catch((e: Error) => ({ removed: [] as string[], prunedDirs: [] as string[], keptImporting: [] as string[], error: e.message }));
+    removedFiles.push(...w.removed);
+    removedDirs.push(...w.prunedDirs);
+    await removeStaleUixReports(projectRoot, removedFiles);
+    const warnings = [
+      ...('error' in w ? [`web clean slate failed part-way: ${(w as { error: string }).error}`] : []),
+      ...w.keptImporting.map((f) => `${f} is not pipeline-generated (no header/marker) and was kept, but it imports a removed generated file`),
+    ];
+    return { removedDirs, removedFiles, ...(warnings.length ? { warnings } : {}) };
+  }
+  if (fw !== 'flutter') {
+    return { removedDirs, removedFiles, skipped: `framework '${framework}' has no generated-surface contract — nothing removed` };
   }
   // 1. The entire generated lib/ tree.
   const libDir = path.join(projectRoot, 'lib');
@@ -737,14 +761,7 @@ export async function nukeGeneratedAppSurface(
     }
   } catch { /* best-effort: a missing/locked lib never fails the restart */ }
   // 2. Stale per-build code reports under .uix/.
-  for (const name of NUKE_UIX_REPORTS) {
-    const rel = path.join('.uix', name);
-    const abs = path.join(projectRoot, rel);
-    try {
-      const existed = await fs.stat(abs).then(() => true, () => false);
-      if (existed) { await fs.rm(abs, { force: true }); removedFiles.push(rel); }
-    } catch { /* best-effort */ }
-  }
+  await removeStaleUixReports(projectRoot, removedFiles);
   return { removedDirs, removedFiles };
 }
 

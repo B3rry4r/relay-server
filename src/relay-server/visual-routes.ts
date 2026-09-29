@@ -320,7 +320,7 @@ export async function captureUrlTiles(
 // Serve a directory over an ephemeral localhost port; returns { url, close }.
 // Exported for the screen-build loop, which serves a real project's build/web
 // output to screenshot a generated screen against its reference render.
-export async function serveDir(dir: string): Promise<{ url: string; close: () => void; observedPath: () => string | null }> {
+export async function serveDir(dir: string): Promise<{ url: string; close: () => void; observedPath: () => string | null; servedDocument: (route: string) => string | null }> {
   const types: Record<string, string> = {
     '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css',
     '.json': 'application/json', '.png': 'image/png', '.wasm': 'application/wasm',
@@ -351,6 +351,10 @@ export async function serveDir(dir: string): Promise<{ url: string; close: () =>
   // screen, the screenshot is of the WRONG screen and must fail LOUD rather than be
   // scored — a plausible-but-wrong capture makes the harness blame the model's code.
   let observedPath: string | null = null;
+  // path → the document file served for it (`_preview/10-3.html`, `index.html`, or
+  // `404`). See the SPA fallback below.
+  const servedDocs = new Map<string, string>();
+  const isNextExport = fsSync.existsSync(path.join(dir, '_next'));
   const releaseHold = () => {
     if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
     if (holdRes) { try { holdRes.setHeader('Content-Type', 'image/gif'); holdRes.end(TINY_GIF); } catch { /* ignore */ } holdRes = null; }
@@ -423,24 +427,55 @@ export async function serveDir(dir: string): Promise<{ url: string; close: () =>
       // SPA never reached the target screen, and its catch-all route (`* → default`)
       // captured EVERY non-default screen AS the default one — so every screen but
       // the entry scored ~0 against its own reference and churned to needs-review.
+      //
+      // A Next.js static export is NOT a SPA: it writes one HTML document PER ROUTE
+      // (`out/_preview/10-3.html`, or `out/_preview/10-3/index.html` with
+      // trailingSlash). The SPA fallback served the ROOT page for those, and since
+      // the URL stayed /_preview/10-3 the identity beacon agreed — every Next screen
+      // was scored against the wrong screen, silently (PG-33). So an extension-less
+      // path tries `<path>.html` and `<path>/index.html` BEFORE falling back, and on a
+      // Next export (an `_next/` dir) a route with no document is a 404, never the
+      // root page. The document actually served is recorded per path so the caller
+      // can assert identity on the FILE, not only on location.pathname.
       const diskFile = path.join(dir, rel === '/' ? 'index.html' : rel);
       if (!diskFile.startsWith(dir)) { res.statusCode = 404; res.end(); return; }
-      const isClientRoute = rel !== '/' && rel !== '/index.html' && !path.extname(rel);
-      const serveIndex = rel === '/' || rel === '/index.html' || (isClientRoute && !fsSync.existsSync(diskFile));
-      if (serveIndex) {
-        const indexFile = path.join(dir, 'index.html');
-        if (!fsSync.existsSync(indexFile)) { res.statusCode = 404; res.end(); return; }
-        let html = await fs.readFile(indexFile, 'utf8');
+      const isFile = (p: string): boolean => { try { return fsSync.statSync(p).isFile(); } catch { return false; } };
+      const sendHtml = async (file: string, status = 200): Promise<void> => {
+        let html = await fs.readFile(file, 'utf8');
         // Inject the readiness gate only for generated apps that ship localized
         // assets; the reference-render harness has none and is left untouched.
         if (fsSync.existsSync(path.join(dir, 'assets', 'icons')) || fsSync.existsSync(path.join(dir, 'assets', 'images'))) {
           html = html.includes('</head>') ? html.replace('</head>', `${READY_GATE}</head>`) : READY_GATE + html;
         }
+        res.statusCode = status;
         res.setHeader('Content-Type', 'text/html');
         res.end(html);
+      };
+      const isClientRoute = rel !== '/' && rel !== '/index.html' && !path.extname(rel);
+      if (isClientRoute && !isFile(diskFile)) {
+        const bare = diskFile.replace(/\/+$/, '');
+        const doc = [`${bare}.html`, path.join(bare, 'index.html')].find(isFile);
+        if (doc) {
+          servedDocs.set(rel, path.relative(dir, doc).split(path.sep).join('/'));
+          await sendHtml(doc);
+          return;
+        }
+        if (isNextExport) {
+          servedDocs.set(rel, '404');
+          const nf = path.join(dir, '404.html');
+          if (isFile(nf)) { await sendHtml(nf, 404); return; }
+          res.statusCode = 404; res.end(); return;
+        }
+      }
+      const serveIndex = rel === '/' || rel === '/index.html' || (isClientRoute && !isFile(diskFile));
+      if (serveIndex) {
+        const indexFile = path.join(dir, 'index.html');
+        if (!fsSync.existsSync(indexFile)) { res.statusCode = 404; res.end(); return; }
+        servedDocs.set(rel, 'index.html');
+        await sendHtml(indexFile);
         return;
       }
-      if (!fsSync.existsSync(diskFile)) { res.statusCode = 404; res.end(); return; }
+      if (!isFile(diskFile)) { res.statusCode = 404; res.end(); return; }
       res.setHeader('Content-Type', types[path.extname(diskFile)] || 'application/octet-stream');
       res.end(await fs.readFile(diskFile));
     } catch { res.statusCode = 500; res.end(); }
@@ -451,7 +486,10 @@ export async function serveDir(dir: string): Promise<{ url: string; close: () =>
     server.listen(0, '127.0.0.1', () => { server.removeListener('error', reject); resolve(); });
   });
   const port = (server.address() as { port: number }).port;
-  return { url: `http://127.0.0.1:${port}/index.html`, close: () => server.close(), observedPath: () => observedPath };
+  return {
+    url: `http://127.0.0.1:${port}/index.html`, close: () => server.close(), observedPath: () => observedPath,
+    servedDocument: (route: string) => servedDocs.get(route) ?? null,
+  };
 }
 
 // ── Web (React + Vite) scratch-build screenshot ──────────────────────────────

@@ -1290,6 +1290,15 @@ async function renderPreview(
       // the fix loop rewrite CORRECT code until it gives up. Fail loud instead, with a
       // message the fix agent can act on.
       if (route && !out.error) {
+        // A multi-page static export (Next `output: 'export'`) serves one document
+        // per route; the URL — and so the beacon — stays on the requested route even
+        // when no document exists for it. Assert on the DOCUMENT served (PG-33).
+        const doc = srv.servedDocument(route);
+        if (doc === '404' || (doc === 'index.html' && fsSync.existsSync(path.join(outDir, '_next')))) {
+          return {
+            error: `preview route ${route} is not in the static export — ${doc === '404' ? 'no document' : 'only the ROOT page'} was served for it, so the screenshot would be of the WRONG screen. On Next the preview page lives at app/%5Fpreview/<id>/page.tsx (a folder named _preview is private and never routed).`,
+          };
+        }
         const seen = srv.observedPath();
         if (seen && seen !== route) {
           return {
@@ -3480,6 +3489,7 @@ export function registerScreenLoopRoutes(app: Express): void {
                 `[run] restart — clean slate: snapshot ${snapshotSha ? snapshotSha.slice(0, 8) : '(clean tree, HEAD recoverable)'}, ` +
                 `removed ${removedCount} generated file(s); regenerating from scratch`);
             }
+            for (const w of nuked.warnings ?? []) await appendRunLog(projectId, runId, `[run] restart — clean slate WARNING: ${w}`);
           } catch (e) {
             // Nuke is best-effort + never throws, but belt+braces: never break the handler.
             await appendRunLog(projectId, runId, `[run] restart — clean-slate nuke error (non-fatal): ${(e as Error).message}`);

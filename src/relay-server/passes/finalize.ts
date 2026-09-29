@@ -1079,6 +1079,13 @@ export interface AnalyzeGateResult {
   repairAttempted: boolean;
   /** True when the gate passes: 0 errors, or unmeasurable (never block blind). */
   ok: boolean;
+  /** The framework whose checker the gate measured with. */
+  framework?: Framework;
+  /** The checker (`flutter analyze`, `typescript@5.x (node_modules)`), when it ran. */
+  tool?: string;
+  /** Set when the gate could not re-measure after a repair and therefore did not
+   *  park the run on a stale count — the caller records this reason in the run. */
+  unmeasured?: string;
 }
 
 /** Gate on/off switch. Default ON; env RELAY_ANALYZE_GATE=off|0|false or a run
@@ -1090,13 +1097,48 @@ export function analyzeGateEnabled(run?: { analyzeGate?: boolean }, env: NodeJS.
   return true;
 }
 
+type GateMeasure = { total: number; errors: number; errorLines: string[]; tool?: string } | null;
+
+/** The framework's own ERROR measure: flutter → `flutter analyze`; react/next → the
+ *  project's own `tsc --noEmit` over every tsconfig it builds (PG-36). Null when the
+ *  checker cannot run (reason in `why`). */
+async function measureErrorsFor(framework: Framework, projectRoot: string, env?: NodeJS.ProcessEnv, why?: (r: string) => void): Promise<GateMeasure> {
+  if (framework === 'react' || framework === 'next') {
+    const t = await webTypecheck(projectRoot, framework, env);
+    if (!t.ok) { why?.(t.reason); return null; }
+    return { total: t.errors, errors: t.errors, errorLines: t.lines, tool: t.tool };
+  }
+  const a = await flutterAnalyze(projectRoot, env);
+  if (!a) why?.(flutterBin() ? '`flutter analyze` produced no output' : `flutter SDK not found (${safeFlutterRoot()}/bin/flutter)`);
+  return a ? { ...a, tool: 'flutter analyze' } : null;
+}
+
+/** The repair prompt, in the idiom of the framework's checker. */
+function gateRepairPrompt(framework: Framework, n: number, lines: string[]): string {
+  const web = framework === 'react' || framework === 'next';
+  const head = web
+    ? `The ${framework === 'next' ? 'Next.js' : 'React (Vite)'} TypeScript project in the current directory has ${n} TypeScript ERROR(S) (run the project's own compiler, \`node_modules/.bin/tsc --noEmit -p .\`, to see them).`
+    : `The Flutter project in the current directory has ${n} analyzer ERROR(S) (run \`flutter analyze\` to see them).`;
+  const what = web ? 'TypeScript errors' : 'analyzer errors';
+  return [
+    head,
+    `Fix these ${n} ${what}, change nothing else — no refactors, no style changes, no new features. Warnings${web ? ', lint findings' : '/infos'} are out of scope.`,
+    ...(lines.length ? [`The errors:`, ...lines.map((l) => `  ${l}`)] : []),
+    `When done, output a one-line summary of what you fixed.`,
+  ].join('\n');
+}
+
 /**
- * Measure analyzer ERRORS and, when >0 and a model is available, make ONE bounded
- * repair attempt then re-measure. Warnings/infos never gate. When the live
- * analyzer is unavailable (no flutter SDK / non-flutter project) the measurement
- * falls back to `initialErrors` (the finalize report's persisted finalErrors);
- * when NOTHING is measurable the gate passes — it never blocks blind.
- * `analyze` is an injection seam for tests; production uses flutterAnalyze.
+ * Measure ERRORS with the framework's own checker (flutter analyze / the project's
+ * tsc) and, when >0 and a model is available, make ONE bounded repair attempt then
+ * RE-MEASURE with the same checker. Warnings/infos never gate. When the live checker
+ * is unavailable at the start, the measurement falls back to `initialErrors` (the
+ * finalize report's persisted finalErrors, measured by the same checker); when
+ * NOTHING is measurable the gate passes — it never blocks blind. After a repair the
+ * gate never keeps a stale count it cannot re-measure: that parked a web run
+ * needs-review forever even when the repair worked (PG-36) — it reports
+ * `unmeasured` with the reason instead.
+ * `analyze` is an injection seam for tests; production measures per framework.
  */
 export async function runAnalyzeGate(opts: {
   projectRoot: string;
@@ -1107,52 +1149,65 @@ export async function runAnalyzeGate(opts: {
   /** Persisted finalErrors from the finalize report — the fallback measurement
    *  when the live analyzer is unavailable. */
   initialErrors?: number | null;
+  /** Override detection (tests); production detects from the project. */
+  framework?: Framework;
   analyze?: (projectRoot: string, env?: NodeJS.ProcessEnv) => Promise<{ total: number; errors: number; errorLines: string[] } | null>;
 }): Promise<AnalyzeGateResult> {
   const log = opts.log ?? (() => { /* no-op */ });
-  const analyze = opts.analyze ?? flutterAnalyze;
+  const framework = opts.framework ?? await detectFramework(opts.projectRoot);
+  let lastWhy = '';
+  const analyze: (root: string, env?: NodeJS.ProcessEnv) => Promise<GateMeasure> = opts.analyze
+    ?? ((root, env) => measureErrorsFor(framework, root, env, (r) => { lastWhy = r; }));
+  const checker = framework === 'react' || framework === 'next' ? 'tsc' : 'analyzer';
 
   const a = await analyze(opts.projectRoot, opts.env).catch(() => null);
   const initialErrors = a?.errors ?? opts.initialErrors ?? null;
-  let errorLines = a?.errorLines ?? [];
+  const errorLines = a?.errorLines ?? [];
+  const tool = (a as { tool?: string } | null)?.tool;
 
   if (initialErrors == null) {
-    log(`[finalize] analyze gate: analyzer unavailable — gate passes (cannot measure)`);
-    return { errors: null, initialErrors: null, repairAttempted: false, ok: true };
+    log(`[finalize] analyze gate (${framework}): ${checker} unavailable${lastWhy ? ` (${lastWhy})` : ''} — gate passes (cannot measure)`);
+    return { errors: null, initialErrors: null, repairAttempted: false, ok: true, framework, ...(lastWhy ? { unmeasured: lastWhy } : {}) };
   }
   if (initialErrors === 0) {
-    return { errors: 0, initialErrors: 0, repairAttempted: false, ok: true };
+    return { errors: 0, initialErrors: 0, repairAttempted: false, ok: true, framework, ...(tool ? { tool } : {}) };
   }
 
   // >0 errors. ONE bounded repair attempt when a model + runner are available;
   // skip gracefully (straight to the verdict) when not.
   let errors: number | null = initialErrors;
   let repairAttempted = false;
+  let unmeasured: string | undefined;
   if (opts.model && opts.runModel) {
     repairAttempted = true;
-    log(`[finalize] analyze gate: ${initialErrors} analyzer error(s) — one bounded AI repair attempt (model=${opts.model})`);
-    const listed = errorLines.slice(0, 40);
-    const prompt = [
-      `The Flutter project in the current directory has ${initialErrors} analyzer ERROR(S) (run \`flutter analyze\` to see them).`,
-      `Fix these ${initialErrors} analyzer errors, change nothing else — no refactors, no style changes, no new features. Warnings/infos are out of scope.`,
-      ...(listed.length ? [`The errors:`, ...listed.map((l) => `  ${l}`)] : []),
-      `When done, output a one-line summary of what you fixed.`,
-    ].join('\n');
+    log(`[finalize] analyze gate (${framework}): ${initialErrors} ${checker} error(s) — one bounded AI repair attempt (model=${opts.model})`);
+    const prompt = gateRepairPrompt(framework, initialErrors, errorLines.slice(0, 40));
     try {
       await opts.runModel(opts.model, prompt, opts.env ?? process.env, opts.projectRoot, { format: 'text' });
     } catch (e) {
       log(`[finalize] analyze gate: repair attempt failed (non-fatal): ${(e as Error).message}`);
     }
+    lastWhy = '';
     const b = await analyze(opts.projectRoot, opts.env).catch(() => null);
-    // Unmeasurable after a repair → keep the initial count (conservative: still
-    // parked; a later resume with a working analyzer re-measures).
-    errors = b?.errors ?? errors;
-    log(`[finalize] analyze gate: post-repair analyze — ${b ? `${b.errors} error(s)` : 'unavailable (keeping pre-repair count)'}`);
+    if (b) {
+      errors = b.errors;
+      log(`[finalize] analyze gate (${framework}): post-repair ${checker} — ${b.errors} error(s)`);
+    } else {
+      // The repair ran and nothing can re-measure it. Keeping the pre-repair count
+      // would park the run forever (a resume cannot measure either); blocking on a
+      // number that may be stale is blocking blind. Record why instead.
+      errors = null;
+      unmeasured = `the ${checker} could not re-measure after the repair${lastWhy ? `: ${lastWhy}` : ''} — pre-repair count was ${initialErrors}`;
+      log(`[finalize] analyze gate (${framework}): WARNING ${unmeasured}; not parking on a stale count`);
+    }
   } else {
-    log(`[finalize] analyze gate: ${initialErrors} analyzer error(s), no model/runner — skipping repair attempt`);
+    log(`[finalize] analyze gate (${framework}): ${initialErrors} ${checker} error(s), no model/runner — skipping repair attempt`);
   }
 
-  return { errors, initialErrors, repairAttempted, ok: errors === 0 };
+  return {
+    errors, initialErrors, repairAttempted, ok: errors === null || errors === 0, framework,
+    ...(tool ? { tool } : {}), ...(unmeasured ? { unmeasured } : {}),
+  };
 }
 
 // ── small utils ────────────────────────────────────────────────────────────────

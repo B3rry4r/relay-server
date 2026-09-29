@@ -745,10 +745,20 @@ async function phaseSkeletonAndRestart(): Promise<Cell[]> {
     const diff = diffSnaps(before, await snapshot(root));
     const removedScreens = diff.filter((d) => d.change === 'removed').length;
     const ok = removedScreens > 0;
+    const rstChecks = [chk('rst.clean-slate', ok, 'stub', 'restart removes the previously generated surface so the rebuild does not mix old+new files', `removed ${removedScreens} file(s); skipped=${(r as { skipped?: string }).skipped ?? 'no'}`)];
+    if (fw !== 'flutter') {
+      // Web has no single generated dir to drop: the clean slate is by marker. The
+      // stamped screens must go; an unmarked hand-written module must stay.
+      const s = SCREEN[fw];
+      const stampedLeft = [s.login, s.home, s.settings, s.profile].filter((f) => exists(root, f));
+      const hand = fw === 'react' ? 'src/modal/modalController.ts' : 'components/modalController.ts';
+      rstChecks.push(chk('rst.stamped-removed', stampedLeft.length === 0, 'stub', 'every header-stamped generated screen is removed', stampedLeft.join(', ') || 'all removed'));
+      rstChecks.push(chk('rst.hand-kept', exists(root, hand), 'lie', 'an unmarked (hand-authored) module is never deleted', exists(root, hand) ? `${hand} kept` : `${hand} DELETED`));
+      if (fw === 'next') rstChecks.push(chk('rst.previews', !exists(root, 'app/_preview') && !exists(root, 'app/%5Fpreview'), 'stub', 'verify preview routes are removed', exists(root, 'app/_preview') ? 'app/_preview left' : 'removed'));
+    }
     cells.push({
       pass: 'restart clean-slate (nukeGeneratedAppSurface)', framework: fw, reported: null, files: diff.slice(0, 40),
-      checks: [chk('rst.clean-slate', ok, 'stub', 'restart removes the previously generated surface so the rebuild does not mix old+new files', `removed ${removedScreens} file(s); skipped=${(r as { skipped?: string }).skipped ?? 'no'}`)],
-      cell_status: ok ? 'IMPLEMENTED' : 'STUB', notes: [],
+      checks: rstChecks, cell_status: classify(null, rstChecks), notes: [],
     });
     // Run the skeleton generator for this framework on an EMPTY project + the fixture
     // canonical, then grade what it wrote: one header-stamped stub per canonical screen
@@ -911,11 +921,27 @@ async function phaseResolveCanonical(): Promise<Cell[]> {
     const beforeScreens = JSON.parse(read(root, '.uix/canonical.json')).screens.length;
     const c = await resolveCanonicalFromCode(projectId, { projectRoot: root, noAi: true });
     const afterScreens = JSON.parse(read(root, '.uix/canonical.json')).screens?.length ?? 0;
+    // The design has exactly c_10_1..c_10_5; a verify preview or a redirect-only root
+    // page derived as a "screen" would put a harness page into the app's canonical.
+    const want = new Set(['c_10_1', 'c_10_2', 'c_10_3', 'c_10_4', 'c_10_5']);
+    const foreign = c.screens.map((x) => x.canonicalId).filter((id) => !want.has(id));
+    const m9 = c.modals.find((m) => m.canonicalId === 'm_10_9');
+    // An app with NO screens left (every source root gone): the empty derivation must
+    // not be written over the real canonical.json.
+    const bare = await copyFixture(fw, 'resolve-empty');
+    for (const d of fw === 'flutter' ? ['lib/screens'] : ['src', 'app', 'components']) await fs.rm(path.join(bare.root, d), { recursive: true, force: true });
+    const canonBefore = read(bare.root, '.uix/canonical.json');
+    const ce = await resolveCanonicalFromCode(bare.projectId, { projectRoot: bare.root, noAi: true }) as typeof c & { persisted?: boolean; skippedReason?: string };
+    const canonAfter = read(bare.root, '.uix/canonical.json');
     const checks = [
       chk('rc.screens', c.screens.length >= 4, 'stub', 'screens derived from the emitted code (≥4 built screens)', `derived ${c.screens.length} screen(s): ${c.screens.map((s) => s.canonicalId).join(', ')}; warnings: ${c.warnings.join(' | ')}`),
       chk('rc.edges', c.flow.edges.length > 0, 'stub', 'flow edges derived from navigation calls', `${c.flow.edges.length} edge(s)`),
       chk('rc.no-clobber', afterScreens >= Math.min(beforeScreens, c.screens.length) && !(c.screens.length === 0 && beforeScreens > 0 && afterScreens === 0), 'lie', 'an unimplemented strategy never overwrites a real canonical.json with an empty one',
         `canonical.json screens before=${beforeScreens} after=${afterScreens}; backup=${exists(root, '.uix/canonical.frames.json.bak')}`),
+      chk('rc.only-design-screens', foreign.length === 0, 'lie', 'no verify preview / redirect-only root page is derived as a screen of the app', foreign.join(', ') || 'only c_10_1..c_10_5'),
+      chk('rc.modal-bound', m9?.baseCanonicalId === 'c_10_2', 'stub', 'the modal home presents (m_10_9) is derived with its base screen c_10_2', m9 ? `m_10_9 base=${m9.baseCanonicalId || '(none)'}` : `no m_10_9 (modals: ${c.modals.map((m) => m.canonicalId).join(', ') || 'none'})`),
+      chk('rc.empty-not-persisted', ce.screens.length > 0 || (canonAfter === canonBefore && ce.persisted === false && !!ce.skippedReason), 'lie', 'an app with no screens left derives an empty canonical that is NOT written over canonical.json (skipped + reason)',
+        `derived ${ce.screens.length} screen(s); canonical.json ${canonAfter === canonBefore ? 'unchanged' : 'OVERWRITTEN'}; persisted=${ce.persisted}; reason=${ce.skippedReason ?? '(none)'}`),
     ];
     cells.push({ pass: 'resolve-canonical', framework: fw, reported: null, files: [], checks, cell_status: classify(null, checks), notes: [] });
   }
@@ -959,9 +985,31 @@ async function phaseAnalyzeGate(): Promise<Cell[]> {
     });
     const prompt = prompts[0] ?? '';
     const wrongIdiom = fw !== 'flutter' && /flutter analyze|Flutter project/.test(prompt);
+    let live: Check | null = null;
+    if (fw !== 'flutter') {
+      // A minimal real TS project (relay-server's own typescript linked in as the
+      // project's compiler) with 2 planted type errors; the "repair" fixes the file.
+      // The gate must measure 2 with tsc, then RE-MEASURE 0 after the repair.
+      const tp = await fs.mkdtemp(path.join(os.tmpdir(), `parity-gate-${fw}-`));
+      await fs.mkdir(path.join(tp, 'node_modules'), { recursive: true });
+      await fs.symlink(path.dirname(require.resolve('typescript/package.json')), path.join(tp, 'node_modules', 'typescript'));
+      await fs.writeFile(path.join(tp, 'package.json'), JSON.stringify({ name: 'gate', private: true, dependencies: fw === 'next' ? { next: '16', react: '19' } : { react: '19' } }));
+      await fs.writeFile(path.join(tp, 'tsconfig.json'), JSON.stringify({ compilerOptions: { strict: true, noEmit: true, lib: ['es2020'], types: [] }, include: ['src/**/*.ts'] }));
+      await fs.mkdir(path.join(tp, 'src'), { recursive: true });
+      await fs.writeFile(path.join(tp, 'src', 'a.ts'), "export const n: number = 'x';\nexport const s: string = 1;\n");
+      const lp: string[] = [];
+      const lg = await runAnalyzeGate({
+        projectRoot: tp, model: 'claude' as never,
+        runModel: async (_m, p) => { lp.push(p); await fs.writeFile(path.join(tp, 'src', 'a.ts'), "export const n: number = 1;\nexport const s: string = 'x';\n"); return { text: 'fixed' }; },
+      });
+      live = chk('g.tsc-live', lg.initialErrors === 2 && lg.errors === 0 && lg.ok && lg.repairAttempted && /TS2322/.test(lp[0] ?? ''), 'lie', "the gate measures with the project's own tsc (2 planted errors, listed in the prompt) and re-measures 0 after the repair",
+        `initial=${lg.initialErrors} after=${lg.errors} ok=${lg.ok} tool=${lg.tool ?? '?'} prompt lists TS2322: ${/TS2322/.test(lp[0] ?? '')}`);
+      await fs.rm(tp, { recursive: true, force: true });
+    }
     const checks = [
       chk('g.measures', fw === 'flutter' || g.errors !== 2 || !g.repairAttempted, 'lie', 'after a repair the gate RE-MEASURES with this framework\'s checker (tsc for web) instead of keeping the stale count', `errors=${g.errors} initial=${g.initialErrors} repairAttempted=${g.repairAttempted} ok=${g.ok}`),
       chk('g.prompt-idiom', !wrongIdiom, 'lie', "the repair prompt names this framework's checker", prompt.split('\n')[0]?.slice(0, 160) ?? '(no prompt)'),
+      ...(live ? [live] : []),
     ];
     cells.push({ pass: 'analyze-gate (P3 completion gate)', framework: fw, reported: null, files: [], checks, cell_status: classify(null, checks), notes: fw === 'flutter' ? ['flutter SDK absent here: live analyze → null, fallback path exercised'] : [] });
   }
@@ -977,17 +1025,32 @@ async function phaseVerifyServing(): Promise<Cell[]> {
   await fs.mkdir(path.join(out, '_preview'), { recursive: true });
   await fs.writeFile(path.join(out, 'index.html'), '<html><body>ROOT PAGE</body></html>');
   await fs.writeFile(path.join(out, '_preview', '10-3.html'), '<html><body>SETTINGS PREVIEW</body></html>');
+  // trailingSlash: true writes out/_preview/10-4/index.html; a real export also has
+  // _next/ + 404.html — a route with no document must never render the ROOT page.
+  await fs.mkdir(path.join(out, '_preview', '10-4'), { recursive: true });
+  await fs.writeFile(path.join(out, '_preview', '10-4', 'index.html'), '<html><body>PROFILE PREVIEW</body></html>');
+  await fs.mkdir(path.join(out, '_next'), { recursive: true });
+  await fs.writeFile(path.join(out, '404.html'), '<html><body>NOT FOUND</body></html>');
   const srv = await serveDir(out);
-  let body = '';
+  let body = ''; let body4 = ''; let bodyMissing = ''; let missingStatus = 0; let doc = '';
   try {
-    const res = await fetch(`${srv.url.replace(/\/index\.html$/, '').replace(/\/$/, '')}/_preview/10-3`);
-    body = await res.text();
+    const base = srv.url.replace(/\/index\.html$/, '').replace(/\/$/, '');
+    body = await (await fetch(`${base}/_preview/10-3`)).text();
+    body4 = await (await fetch(`${base}/_preview/10-4`)).text();
+    const m = await fetch(`${base}/_preview/10-9`);
+    missingStatus = m.status; bodyMissing = await m.text();
+    doc = srv.servedDocument('/_preview/10-9') ?? '(none)';
   } finally { srv.close(); }
-  const ok = /SETTINGS PREVIEW/.test(body);
+  const strip = (b: string) => b.replace(/<[^>]+>/g, '').trim();
+  const vChecks = [
+    chk('v.next-export-route', /SETTINGS PREVIEW/.test(body), 'lie', 'GET /_preview/10-3 on a Next `output:"export"` build serves out/_preview/10-3.html (the screen under test)', `served: ${strip(body)}`),
+    chk('v.next-trailing-slash', /PROFILE PREVIEW/.test(body4), 'lie', 'GET /_preview/10-4 serves out/_preview/10-4/index.html (trailingSlash export)', `served: ${strip(body4)}`),
+    chk('v.next-missing-route', missingStatus === 404 && !/ROOT PAGE/.test(bodyMissing) && doc === '404', 'lie', 'a preview route with no exported document is a 404 (identity: servedDocument=404), never the ROOT page', `HTTP ${missingStatus} served: ${strip(bodyMissing)}; servedDocument=${doc}`),
+  ];
   return [{
     pass: 'verify serving (/_preview/<id> on a static export)', framework: 'next', reported: null, files: [],
-    checks: [chk('v.next-export-route', ok, 'lie', 'GET /_preview/10-3 on a Next `output:"export"` build serves out/_preview/10-3.html (the screen under test)', `served: ${body.replace(/<[^>]+>/g, '').trim()}`)],
-    cell_status: ok ? 'IMPLEMENTED' : 'LIES',
+    checks: vChecks,
+    cell_status: classify(null, vChecks),
     notes: ['the identity assertion compares location.pathname only; the URL stays /_preview/10-3 while the ROOT page renders, so the wrong screen is scored silently'],
   }];
 }

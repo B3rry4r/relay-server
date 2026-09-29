@@ -19,6 +19,7 @@ import { deepenTokensAndCleanup } from './passes/token-cleanup';
 import { finalizeApp } from './passes/finalize';
 import { resolveCanonicalFromCode } from './passes/resolve-canonical';
 import { runAssetPhaseOnBuild } from './passes/asset-phase';
+import { detectFramework } from './passes/framework';
 import { ensureProjectGit } from './version-control';
 import { createRun, setRunPhase, appendRunLog, setRunStatus, setRunResumable } from './build-run-store';
 
@@ -775,8 +776,11 @@ export function registerAIRoutes(app: Express): void {
     // 'resolve', no buildable screens) up-front so it appears in the Runs panel with
     // streamed phases + log exactly like a generation build. The synchronous JSON
     // response below is unchanged for automation; the run is the watchable surface.
+    // The run records the framework actually being resolved (PG-27: it said
+    // 'flutter' for every react/next resolve).
+    const resolveFw = await detectFramework(projectRoot);
     const resolveRun = await createRun(projectId, {
-      kind: 'resolve', framework: 'flutter',
+      kind: 'resolve', framework: resolveFw === 'unknown' ? 'flutter' : resolveFw,
       model: model ?? 'none', verify: false,
       screens: [],
     });
@@ -826,6 +830,24 @@ export function registerAIRoutes(app: Express): void {
         warnings: canonical.warnings,
       };
       rlog(`[resolve] canonical from code — ${summary.screens} screen(s), ${summary.modals} modal(s) (${summary.modalsWithBase} bound), ${summary.components} component(s), mapping ${Math.round(summary.mappingRate * 100)}%`);
+
+      // An empty derivation was NOT persisted — the existing canonical stands, and
+      // there is nothing resolved to run the asset phase / finalize against. Report
+      // `skipped` + the reason instead of finalizing against nothing (PG-27).
+      if (!canonical.persisted && canonical.skippedReason) {
+        rlog(`[resolve] SKIPPED — ${canonical.skippedReason}`);
+        if (runId) {
+          setResolvePhase(projectId, runId, 'Canonicalize-from-code', 'skipped (0 screens resolved)', true);
+          await setRunStatus(projectId, runId, 'stopped');
+          await setRunResumable(projectId, runId, false);
+        }
+        res.json({
+          ...(runId ? { runId } : {}),
+          status: 'skipped', reason: canonical.skippedReason, framework: canonical.framework,
+          canonical: summary,
+        });
+        return;
+      }
 
       // PHASE 2 — asset phase. BETWEEN canonical-resolve and finalize: semantic-rename
       // the existing on-disk assets, emit the resources file + asset-map, and re-point

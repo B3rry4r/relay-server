@@ -38,3 +38,51 @@ export async function detectFramework(projectRoot: string): Promise<Framework> {
   if (fsSync.existsSync(path.join(projectRoot, 'pubspec.yaml'))) return 'flutter';
   return (await detectWebKindFromPackage(projectRoot)) ?? 'unknown';
 }
+
+// ── web layout contract (CONTRACTS §5) ────────────────────────────────────────
+
+const isDirSync = (p: string): boolean => { try { return fsSync.statSync(p).isDirectory(); } catch { return false; } };
+
+/** Where pipeline-owned web files live, relative to the project: react (Vite) →
+ *  `src`; next → the app dir's parent (`src` when the app dir is `src/app` and
+ *  there is no root `app/`, else `.`). Mirrors web-app.loadWebApp's pipelineRoot. */
+export function webPipelineRootRel(projectRoot: string, framework: string): string {
+  if ((framework || '').toLowerCase() !== 'next') return 'src';
+  if (isDirSync(path.join(projectRoot, 'app'))) return '.';
+  if (isDirSync(path.join(projectRoot, 'src', 'app'))) return 'src';
+  return '.';
+}
+
+/** The generated resources module for a web framework (project-relative, POSIX):
+ *  react → `src/resources/assets.ts`; next → `<root>/lib/resources/assets.ts`. */
+export function webResourcesRel(projectRoot: string, framework: string): string {
+  if ((framework || '').toLowerCase() === 'next') {
+    const pr = webPipelineRootRel(projectRoot, 'next');
+    return pr === '.' ? 'lib/resources/assets.ts' : `${pr}/lib/resources/assets.ts`;
+  }
+  return 'src/resources/assets.ts';
+}
+
+const WEB_FRAMEWORKS = new Set(['react', 'next', 'vite', 'web', 'ts']);
+export const isWebFramework = (framework: string): boolean => WEB_FRAMEWORKS.has((framework || '').toLowerCase());
+
+/** Where localized design assets live (project-relative): a web server serves only
+ *  `public/`, so react/next assets live in `public/assets/{icons,images}` (served at
+ *  `/assets/…`); flutter bundles `assets/` (declared in pubspec). */
+export function assetBaseDir(framework: string): string {
+  return isWebFramework(framework) ? 'public/assets' : 'assets';
+}
+
+/** A web asset's served URL from its project-relative path:
+ *  `public/assets/icons/x.svg` → `/assets/icons/x.svg`. */
+export function webServedUrl(relPath: string): string {
+  const p = String(relPath || '').replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '').replace(/^public\//, '');
+  return `/${p}`;
+}
+
+/** The one key every spelling of a web asset path shares — the IR's opaque
+ *  `assets/icons/x.svg`, the served `/assets/icons/x.svg` and the on-disk
+ *  `public/assets/icons/x.svg` all reach the same file. */
+export function webAssetKey(p: string): string {
+  return webServedUrl(p).slice(1);
+}
