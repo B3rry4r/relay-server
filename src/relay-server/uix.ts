@@ -95,6 +95,7 @@ function getBrowserProxy(): httpProxy {
   });
   proxy.on('proxyReq', (proxyReq) => {
     for (const name of STRIP_REQUEST_HEADERS) proxyReq.removeHeader(name);
+
     const token = serviceToken();
     if (token) proxyReq.setHeader(UIX_SERVICE_HEADER, token);
   });
@@ -121,7 +122,21 @@ function getBrowserProxy(): httpProxy {
 export function uixProxyMiddleware(req: ExpressRequest, res: ExpressResponse, next: NextFunction): void {
   if (!req.auth) { next(); return; } // defensive: authenticate runs first and 401s
   // Express strips the mount path: req.url is now `/api/v1/…`.
-  getBrowserProxy().web(req, res, { target: uixBaseUrl() }, (error) => next(error));
+  //
+  // Scrub the incoming headers HERE, not only in the 'proxyReq' hook:
+  // http-proxy never emits 'proxyReq' for a request carrying
+  // `Expect: 100-continue` (curl sends it for any body > 1 MB), so such a
+  // request used to reach UIX with the relay Bearer token and WITHOUT the
+  // service token — UIX refused it and the upload died with EPIPE (found by the
+  // A2 live .fig upload). Node already answered the 100-continue to our client,
+  // so the header must not be forwarded either.
+  delete req.headers.expect;
+  for (const name of STRIP_REQUEST_HEADERS) delete req.headers[name];
+  const token = serviceToken();
+  getBrowserProxy().web(req, res, {
+    target: uixBaseUrl(),
+    ...(token ? { headers: { [UIX_SERVICE_HEADER]: token } } : {}),
+  }, (error) => next(error));
 }
 
 // ── loopback proxy for the headless render harness ──────────────────────────

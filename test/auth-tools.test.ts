@@ -251,6 +251,32 @@ describe('UIX proxies and service token', () => {
     expect(uix.seen[1].headers['x-uix-service-token']).toBe('uix-svc-secret');
   }, 30_000);
 
+  it('an `Expect: 100-continue` upload (curl > 1 MB) still gets the service token and never forwards the session', async () => {
+    const uix = await mockUix();
+    const { base } = await h.boot({ UIX_URL: uix.url, UIX_SERVICE_TOKEN: 'uix-svc-secret', RELAY_ALLOWED_ORIGINS: 'https://relay-web.example.com' });
+    const { token } = await h.login(base);
+    const body = Buffer.alloc(3 * 1024 * 1024, 0x61);
+    const { status, text } = await new Promise<{ status: number; text: string }>((resolve, reject) => {
+      const u = new URL(`${base}/api/uix/api/v1/figma/upload`);
+      const req = http.request({
+        hostname: u.hostname, port: u.port, path: u.pathname, method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/octet-stream', 'content-length': body.length, expect: '100-continue' },
+      }, (res) => {
+        let t = '';
+        res.on('data', (c) => { t += c; });
+        res.on('end', () => resolve({ status: res.statusCode!, text: t }));
+      });
+      req.on('continue', () => req.end(body)); // body only after relay's 100 Continue, like curl
+      req.on('error', reject);
+    });
+    expect(status).toBe(200);
+    expect(JSON.parse(text).received).toBe(body.length);
+    const got = uix.seen[0];
+    expect(got.headers['x-uix-service-token']).toBe('uix-svc-secret');
+    expect(got.headers.authorization).toBeUndefined();
+    expect(got.headers.expect).toBeUndefined();
+  }, 30_000);
+
   it('uixFetch adds the token only for the UIX origin', async () => {
     const uix = await mockUix();
     const other = await mockUix();
