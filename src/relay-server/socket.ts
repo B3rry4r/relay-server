@@ -55,6 +55,16 @@ function isShellAlive(shell: PtyLike): boolean {
     return (error as NodeJS.ErrnoException)?.code === 'EPERM';
   }
 }
+// Terminal ids are `<socketId>-<ms timestamp>`. Two terminals created in the same
+// millisecond (a connect + an immediate terminal:create, or a burst of creates)
+// used to get the SAME id: the second overwrote the first in the session maps,
+// orphaning a live PTY that was never killed. Keep the format, but make the
+// timestamp part strictly monotonic so ids never collide within this process.
+let lastTerminalIdStamp = 0;
+function nextTerminalId(socketId: string): string {
+  lastTerminalIdStamp = Math.max(Date.now(), lastTerminalIdStamp + 1);
+  return `${socketId}-${lastTerminalIdStamp}`;
+}
 let lastSelectedTerminalId: string | null = null;
 let persistTimer: NodeJS.Timeout | null = null;
 let restorePromise: Promise<void> | null = null;
@@ -451,7 +461,7 @@ export function registerSocketHandlers(
       // a terminal.  Explicit user-initiated closes (terminal:close event) already
       // handle this case themselves; here we cover unexpected exits.
       if (terminalSessions.size === 0 && socket.connected) {
-        const newId = socket.id + '-' + Date.now();
+        const newId = nextTerminalId(socket.id);
         const session = createTerminalSession(newId, ptyFactory, workspaceRoot, workspaceRoot);
         if (session) {
           selectedTerminalId = newId;
@@ -493,7 +503,7 @@ export function registerSocketHandlers(
       // does clear+reseed on the client), since all of them now stream live.
       for (const session of existing) replayTerminal(session.id);
     } else {
-      const terminalId = socket.id + '-' + Date.now();
+      const terminalId = nextTerminalId(socket.id);
       const session = createTerminalSession(terminalId, ptyFactory, workspaceRoot, workspaceRoot);
 
       if (session) {
@@ -513,7 +523,7 @@ export function registerSocketHandlers(
     }
 
     socket.on('terminal:create', (_payload: { cwd?: string; run?: string }) => {
-      const terminalId = socket.id + '-' + Date.now();
+      const terminalId = nextTerminalId(socket.id);
       const targetCwd = _payload?.cwd || workspaceRoot;
       const session = createTerminalSession(terminalId, ptyFactory, targetCwd, workspaceRoot);
 
@@ -561,7 +571,7 @@ export function registerSocketHandlers(
 
       if (terminalSessions.size === 0) {
         // No terminals left — spawn a fresh one so the user always has a shell.
-        const newId = socket.id + '-' + Date.now();
+        const newId = nextTerminalId(socket.id);
         const session = createTerminalSession(newId, ptyFactory, workspaceRoot, workspaceRoot);
         if (session) {
           selectedTerminalId = newId;

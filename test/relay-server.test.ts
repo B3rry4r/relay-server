@@ -1089,6 +1089,39 @@ chmod +x "$PROFILE/bin/$NAME"
     expect(String(calls[1]?.env.PATH)).toContain(`${ws}/.relay/tools/npm-global/bin`);
   });
 
+  it('gives every terminal a distinct id even when several are created in the same millisecond', async () => {
+    process.env.PORT = '0';
+    process.env.AUTH_TOKEN = 'test-token';
+
+    const ptys: FakePty[] = [];
+    const relay = createRelayServer(() => {
+      const pty = new FakePty();
+      ptys.push(pty);
+      return pty;
+    });
+    servers.push(relay);
+    const port = await relay.start();
+    const client = await connectClient(port, 'test-token');
+    clients.push(client);
+
+    // Three creates in one burst land within the same millisecond on the server.
+    client.emit('terminal:create', {});
+    client.emit('terminal:create', {});
+    client.emit('terminal:create', {});
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const response = await request(`http://127.0.0.1:${port}`)
+      .get('/api/terminals')
+      .set('x-auth-token', 'test-token');
+
+    expect(ptys).toHaveLength(4);
+    const ids = response.body.terminals.map((terminal: { id: string }) => terminal.id);
+    expect(new Set(ids).size).toBe(4);
+    // No PTY was orphaned by an id collision (overwritten in the session map but
+    // still running, unreachable and never killed).
+    expect(ptys.every((pty) => !pty.killed)).toBe(true);
+  });
+
   it('emits structured shell transcript events alongside raw output', async () => {
     process.env.PORT = '0';
     process.env.AUTH_TOKEN = 'test-token';
