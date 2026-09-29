@@ -192,6 +192,17 @@ async function waitForLog(runId: string, needle: string, timeoutMs = 20000): Pro
   }
 }
 
+/** The log line is appended BEFORE the status write (several awaits apart), so under
+ *  load reading the run right after the line races the write. Poll the status. */
+async function waitForStatus(runId: string, status: string, timeoutMs = 10000): Promise<BuildRun | null> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const run = await getRun(PROJECT_ID, runId);
+    if (run?.status === status || Date.now() > deadline) return run;
+    await new Promise(r => setTimeout(r, 50));
+  }
+}
+
 beforeEach(async () => {
   tmpWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), 'p3gate-'));
   process.env.WORKSPACE = tmpWorkspace;
@@ -218,7 +229,7 @@ describe('P3 analyze gate through the run', () => {
 
     expect(log).toContain('[finalize] 17 analyzer error(s) remain — run NOT complete');
     expect(log).not.toContain('[run] complete');
-    const run = await getRun(PROJECT_ID, runId);
+    const run = await waitForStatus(runId, 'needs-review');
     expect(run?.status).toBe('needs-review');
     expect(run?.finalized ?? false).toBe(false);   // NOT finalize-complete
   }, 30000);
@@ -233,7 +244,7 @@ describe('P3 analyze gate through the run', () => {
 
     expect(log).toContain('[run] complete');
     expect(log).not.toContain('run NOT complete');
-    const run = await getRun(PROJECT_ID, runId);
+    const run = await waitForStatus(runId, 'done');
     expect(run?.status).toBe('done');
     expect(run?.finalized).toBe(true);
   }, 30000);
@@ -249,7 +260,7 @@ describe('P3 analyze gate through the run', () => {
 
     expect(log).toContain('[finalize] analyze gate OFF');
     expect(log).toContain('[run] complete');
-    const run = await getRun(PROJECT_ID, runId);
+    const run = await waitForStatus(runId, 'done');
     expect(run?.status).toBe('done');
     expect(run?.finalized).toBe(true);
   }, 30000);
