@@ -1337,6 +1337,46 @@ async function phaseReadabilityHygiene(): Promise<Cell[]> {
   return cells;
 }
 
+/** F9 + F7: finalize-report.json carries a before/after readability block and the
+ *  warn-only screen gate, and a mutating pass that changed nothing on run 2 says
+ *  `skipped: no-op` instead of `applied` (the Ping finalize: "5 applied", empty diff). */
+async function phaseReadabilityReport(): Promise<Cell[]> {
+  const { finalizeApp } = await import('../../src/relay-server/passes/finalize');
+  const cells: Cell[] = [];
+  const MUTATING = ['extractComponents', 'applyModalOverlays', 'repointAssetUsage', 'renameSemantic', 'deepenTokensAndCleanup', 'productionHygiene'];
+  for (const fw of FRAMEWORKS) {
+    const { projectId, root } = await copyFixture(fw, 'readability-report');
+    const r1 = await finalizeApp(projectId, { projectRoot: root, skipBuildCheck: true });
+    const s1 = await snapshot(root);
+    const r2 = await finalizeApp(projectId, { projectRoot: root, skipBuildCheck: true });
+    const s2 = await snapshot(root);
+    const d2 = diffSnaps(s1, s2, /^\.uix\//);
+    let persisted: { readability?: { before?: unknown; after?: unknown; gate?: { status?: string } } } | null = null;
+    try { persisted = JSON.parse(read(root, '.uix/finalize-report.json')); } catch { /* none */ }
+    const rd1 = r1.readability;
+    const rd2 = r2.readability;
+    const fakeApplied = r2.passes.filter((p) => MUTATING.includes(p.name) && p.status === 'applied');
+    const noops = r2.passes.filter((p) => p.noop);
+    const badNoop = noops.filter((p) => p.status !== 'skipped' || !/^no-op/.test(p.reason ?? ''));
+    const checks = [
+      chk('rr.measured', !!rd1?.before && !!rd1?.after && !rd1?.unmeasured, 'stub', 'finalize measures readability before and after the passes', rd1 ? (rd1.unmeasured ?? `before.loc=${rd1.before?.loc} after.loc=${rd1.after?.loc}`) : 'no readability block'),
+      chk('rr.delta', !!rd1 && !rd1.unchanged && Object.keys(rd1.delta).length > 0, 'lie', 'run 1 changed the app, and the delta says what moved', rd1 ? JSON.stringify(rd1.delta) : 'n/a'),
+      chk('rr.unchanged-visible', !!rd2 && rd2.unchanged === true && Object.keys(rd2.delta).length === 0, 'lie', 'run 2 changed nothing, and the report says readability is UNCHANGED', rd2 ? JSON.stringify({ unchanged: rd2.unchanged, delta: rd2.delta }) : 'n/a'),
+      chk('rr.run2-no-files', d2.length === 0, 'lie', 'run 2 changes no source file', d2.map((d) => `${d.change}:${d.file}`).join(', ') || 'none'),
+      chk('rr.no-op-honest', fakeApplied.length === 0, 'lie', 'no mutating pass is recorded `applied` on a run that changed nothing', fakeApplied.map((p) => `${p.name} ${JSON.stringify(p.counts)}`).join(' | ') || `none; no-op: ${noops.map((p) => p.name).join(', ')}`),
+      chk('rr.no-op-reason', noops.length > 0 && badNoop.length === 0, 'lie', 'each no-op is `skipped` with a "no-op: … examined …" reason', noops.map((p) => `${p.name}: ${p.reason}`).join(' | ') || 'no no-op recorded'),
+      chk('rr.gate', rd1?.gate?.status === 'ran', 'stub', 'the warn-only readability gate ran over the screens and is recorded', JSON.stringify(rd1?.gate ?? null).slice(0, 400)),
+      chk('rr.persisted', !!persisted?.readability?.before && persisted?.readability?.gate?.status === 'ran', 'lie', '.uix/finalize-report.json carries the readability block', persisted?.readability ? 'present' : 'absent'),
+    ];
+    cells.push({
+      pass: 'finalize readability delta + honest no-op (F7/F9)', framework: fw,
+      reported: { status: r2.passes.map((p) => `${p.name}:${p.status}${p.noop ? '(no-op)' : ''}`).join(', '), counts: {}, warnings: [] },
+      files: [], checks, cell_status: classify(null, checks), notes: [],
+    });
+  }
+  return cells;
+}
+
 // ── toolchain probe (what the passes / gates would spawn) ──────────────────
 
 function probeTools(): Record<string, string> {
@@ -1417,6 +1457,7 @@ export async function runParity(opts: { log?: (m: string) => void; /** debug: ru
     ['finalize×2', phaseFinalizeTwice],
     ['finalize-dryrun', phaseFinalizeDryRun],
     ['readability-hygiene', phaseReadabilityHygiene],
+    ['readability-report', phaseReadabilityReport],
   ];
   for (const [name, fn] of phases) {
     if (opts.only && !name.includes(opts.only)) continue;

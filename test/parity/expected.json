@@ -75,5 +75,8 @@
   "finalize dryRun | next": "IMPLEMENTED",
   "readability hygiene: stub components + provenance comments (F1/F6) | flutter": "IMPLEMENTED",
   "readability hygiene: stub components + provenance comments (F1/F6) | react": "IMPLEMENTED",
-  "readability hygiene: stub components + provenance comments (F1/F6) | next": "IMPLEMENTED"
+  "readability hygiene: stub components + provenance comments (F1/F6) | next": "IMPLEMENTED",
+  "finalize readability delta + honest no-op (F7/F9) | flutter": "IMPLEMENTED",
+  "finalize readability delta + honest no-op (F7/F9) | react": "IMPLEMENTED",
+  "finalize readability delta + honest no-op (F7/F9) | next": "IMPLEMENTED"
 }

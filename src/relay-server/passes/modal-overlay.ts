@@ -108,6 +108,10 @@ export interface ModalTransform {
   trigger: { element?: string; wired: 'rewrote-push' | 'wired-dead' | 'none'; how: 'deterministic' | 'ai' | 'none' };
   /** Router route const that was removed (if any). */
   removedRoute?: string;
+  /** false when the modal was only CREDITED (already presented; nothing written) —
+   *  the web converter credits a presenter the build already calls and edits only
+   *  when it strips the modal's dead route. Undefined = the transform wrote source. */
+  edited?: boolean;
 }
 
 export interface ModalOverlaySkip {
@@ -1255,6 +1259,7 @@ const webStrategy = (framework: Framework): ModalStrategy => ({
         // rewrites a trigger, so it must not claim it did (PG-10).
         trigger: { wired: 'none', how: 'none' },
         ...(t.removedRoute ? { removedRoute: t.removedRoute } : {}),
+        edited: !!t.removedRoute,
       },
     };
   },

@@ -53,6 +53,7 @@ import { runProductionHygiene } from './production-hygiene';
 import { renameSemantic } from './semantic-rename';
 import { deepenTokensAndCleanup } from './token-cleanup';
 import { detectFramework, type Framework } from './framework';
+import { measureReadability, readabilityDelta, projectReadabilityGate, type ReadabilityDeltaBlock } from '../readability';
 import { ensureProjectGit, snapshotBeforeMutation, rollbackTo, commitCheckpoint } from '../version-control';
 
 // ── Public contract ──────────────────────────────────────────────────────────
@@ -140,6 +141,16 @@ export interface PassReport {
    *  nothing to do; a guarded skip is a pass that would have lied (the parity
    *  harness's fz.no-zero-applied fails on it). */
   guarded?: boolean;
+  /** true when a MUTATING pass examined real input and changed nothing (F9): it is
+   *  recorded `skipped` with a "no-op" reason, never `applied` — an idempotent
+   *  clean re-run and a pass that fixed everything must not read the same. */
+  noop?: boolean;
+}
+
+/** Readability before/after the passes (readability F9) + the warn-only screen gate (F7). */
+export interface FinalizeReadability extends ReadabilityDeltaBlock {
+  /** warn-only readability findings over the finished screens (never blocks). */
+  gate: { status: 'ran'; screens: number; warnings: number; byCode: Record<string, number>; sample: string[] } | { status: 'skipped'; reason: string };
 }
 
 export interface FinalizeReport {
@@ -161,6 +172,8 @@ export interface FinalizeReport {
   /** What the build-safety gate could actually run. A gate that could not run says
    *  so here with a reason — it never reads as a clean typecheck (PG-37). */
   gate: FinalizeGate;
+  /** Readability metrics before/after the passes + the warn-only screen gate (F7/F9). */
+  readability?: FinalizeReadability;
   /** Path the report was written to (null when noReport / write failed). */
   reportPath: string | null;
 }
@@ -184,6 +197,9 @@ export interface FinalizeGate {
 
 interface PassDef {
   name: PassName;
+  /** The pass rewrites source (vs. a report-only audit). A mutating pass that
+   *  changed nothing is recorded as a no-op skip (F9). */
+  mutates: boolean;
   /** Run the pass with the shared finalize opts; return counts + warnings. The
    *  `proof` collector is swapped in per pass to tally AI firing. `ctx` carries
    *  orchestrator capabilities a pass may opt into (e.g. the per-group build guard
@@ -198,18 +214,28 @@ export interface PassOutcome {
   counts: Record<string, number>;
   warnings: string[];
   skipped?: string;
+  /** How many edits the pass made (or would make, in a dry run). A mutating pass
+   *  reporting 0 is a no-op (F9). Undefined for report-only passes. */
+  changed?: number;
 }
 
 /** Settle a pass outcome into its recorded status. Safety net: a pass that reports
  *  nothing it looked at did not "apply" anything — recording it `applied` is exactly
  *  how six stubs finalized green (PG-01). When the net (not the pass) produced the
  *  skip, `guarded` says so: the pass itself would have claimed `applied`. */
-export function settlePassOutcome(out: PassOutcome): { skipReason: string | undefined; guarded: boolean } {
-  if (out.skipped) return { skipReason: out.skipped, guarded: false };
+export function settlePassOutcome(out: PassOutcome): { skipReason: string | undefined; guarded: boolean; noop: boolean } {
+  if (out.skipped) return { skipReason: out.skipped, guarded: false, noop: false };
   if (Object.values(out.counts).every((v) => !v)) {
-    return { skipReason: 'examined no input — every count is zero (the pass reported nothing it looked at)', guarded: true };
+    return { skipReason: 'examined no input — every count is zero (the pass reported nothing it looked at)', guarded: true, noop: false };
   }
-  return { skipReason: undefined, guarded: false };
+  // F9: a mutating pass that looked at real input and changed NOTHING did not
+  // "apply" — the Ping finalize reported renameSemantic/deepenTokens `applied` with
+  // zero edits while `git diff -- lib` was empty. Say what it examined instead.
+  if (out.changed === 0) {
+    const examined = Object.entries(out.counts).filter(([, v]) => v).map(([k, v]) => `${k}=${v}`).join(', ');
+    return { skipReason: `no-op: nothing to change (already clean) — examined ${examined}`, guarded: false, noop: true };
+  }
+  return { skipReason: undefined, guarded: false, noop: false };
 }
 
 /** Orchestrator-provided capabilities a pass may use during a real run. */
@@ -269,6 +295,7 @@ function noAi(opts: FinalizeOptions): boolean {
 const PASSES: PassDef[] = [
   {
     name: 'extractComponents',
+    mutates: true,
     run: async (projectId, opts, proof, ctx) => {
       const r = await extractComponents(projectId, {
         projectRoot: opts.projectRoot,
@@ -286,11 +313,13 @@ const PASSES: PassDef[] = [
         counts: { scanned: r.scanned, extracted: r.extracted.length, rejected: r.rejected.length },
         warnings: r.rejected.map((x) => `rejected ${x.names.join('/')}: ${x.reason}`),
         skipped: r.skippedReason,
+        changed: r.extracted.length,
       };
     },
   },
   {
     name: 'applyModalOverlays',
+    mutates: true,
     run: async (projectId, opts, proof) => {
       const r = await applyModalOverlays(projectId, {
         projectRoot: opts.projectRoot,
@@ -304,11 +333,14 @@ const PASSES: PassDef[] = [
         counts: { transformed: r.transformed.length, skipped: r.skipped.length },
         warnings: r.skipped.map((s) => `${s.name}: ${s.reason}`),
         skipped: r.skippedReason,
+        // a web modal that was only credited (already presented) wrote nothing.
+        changed: r.transformed.filter((t) => t.edited !== false).length,
       };
     },
   },
   {
     name: 'repointAssetUsage',
+    mutates: true,
     run: async (projectId, opts, proof) => {
       const r = await repointAssetUsage(projectId, {
         projectRoot: opts.projectRoot,
@@ -322,11 +354,15 @@ const PASSES: PassDef[] = [
         counts: { filesScanned: r.filesScanned, repointed: r.repointed.length, skipped: r.skipped.length },
         warnings: [...r.warnings, ...r.skipped.map((s) => `${s.file}: ${s.what} — ${s.reason}`)],
         skipped: r.skippedReason,
+        changed: r.repointed.length,
       };
     },
   },
   {
     name: 'verifyFlowWiring',
+    // Its product is the edge-by-edge report (auto-fixes are a side benefit), so a
+    // run that fixed nothing still produced its verdicts.
+    mutates: false,
     run: async (projectId, opts, proof) => {
       const r = await verifyFlowWiring(projectId, {
         projectRoot: opts.projectRoot,
@@ -360,6 +396,7 @@ const PASSES: PassDef[] = [
   },
   {
     name: 'renameSemantic',
+    mutates: true,
     run: async (projectId, opts, proof) => {
       const r = await renameSemantic(projectId, {
         projectRoot: opts.projectRoot,
@@ -374,11 +411,13 @@ const PASSES: PassDef[] = [
         counts: { renamed: s.renamed, skipped: s.skipped, filesTouched: s.filesTouched },
         warnings: r.report.skipped.map((sk) => `${sk.canonicalId}: ${sk.reason}`),
         skipped: r.skippedReason,
+        changed: s.renamed,
       };
     },
   },
   {
     name: 'deepenTokensAndCleanup',
+    mutates: true,
     run: async (projectId, opts, proof) => {
       const r = await deepenTokensAndCleanup(projectId, {
         projectRoot: opts.projectRoot,
@@ -403,11 +442,13 @@ const PASSES: PassDef[] = [
         },
         warnings: r.report.rejected.map((rej) => `${rej.file}: ${rej.kind} ${rej.literal} — ${rej.reason}`),
         skipped: r.report.skippedReason,
+        changed: sub.colors + sub.textStyles + sub.spacing + sub.radius + rem.imports + rem.consts + rem.methods,
       };
     },
   },
   {
     name: 'auditInteractions',
+    mutates: false,
     run: async (projectId, opts) => {
       // Report-only: it never mutates source, so it is not build-gated. The loop
       // requeues HIGH findings to needs-review (planInteractionRequeue) so the
@@ -429,6 +470,7 @@ const PASSES: PassDef[] = [
   },
   {
     name: 'productionHygiene',
+    mutates: true,
     run: async (_projectId, opts) => {
       const r = await runProductionHygiene({ projectRoot: opts.projectRoot, dryRun: opts.dryRun });
       return {
@@ -443,6 +485,7 @@ const PASSES: PassDef[] = [
         },
         warnings: r.warnings,
         skipped: r.skippedReason,
+        changed: r.previewRoutesRemoved + r.previewFilesRemoved + (r.placeholderRemoved ? 1 : 0) + r.stubComponentsRemoved + r.commentsStripped,
       };
     },
   },
@@ -522,6 +565,11 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
   } else if (!opts.dryRun) {
     log(`[finalize] build-check disabled (framework=${framework}: ${notBuildable}) — only a THROWING pass is rolled back`);
   }
+
+  // F9: readability BEFORE any pass (the metrics script, all three frameworks). The
+  // report records the before/after delta, so "5 applied" with an unchanged tree is
+  // visible as exactly that.
+  const readabilityBefore = measureReadability(projectRoot, framework);
 
   // VERSION-CONTROL SNAPSHOTS (RFC §9.3): replace the fragile /tmp byte-snapshots
   // with git. .git lives UNDER the project in /workspace (persistent), so a snapshot
@@ -624,16 +672,17 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
 
     let skipReason: string | undefined;
     let guarded = false;
+    let noop = false;
     try {
       const out = await def.run(projectId, opts, proof, ctx);
       counts = out.counts;
       warnings = out.warnings;
-      ({ skipReason, guarded } = settlePassOutcome(out));
+      ({ skipReason, guarded, noop } = settlePassOutcome(def.mutates ? out : { ...out, changed: undefined }));
     } catch (e) {
       threw = e as Error;
     }
     const okStatus: PassStatus = skipReason ? 'skipped' : 'applied';
-    const okExtra = skipReason ? { reason: skipReason, ...(guarded ? { guarded: true } : {}) } : {};
+    const okExtra = skipReason ? { reason: skipReason, ...(guarded ? { guarded: true } : {}), ...(noop ? { noop: true } : {}) } : {};
     const aiProof: PassAiProof = {
       available: proof.available,
       fired: proof.calls > 0,
@@ -723,10 +772,30 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
     log(`[finalize] final analyze: ${finalAnalyze ?? 'n/a'} issue(s), ${finalErrors ?? 'n/a'} error(s) (baseline ${baselineAnalyze ?? 'n/a'} issue(s), ${baselineErrors ?? 'n/a'} error(s))`);
   }
 
+  // F9 + F7: readability AFTER, the delta, and the warn-only screen gate.
+  const readabilityAfter = opts.dryRun ? readabilityBefore : measureReadability(projectRoot, framework);
+  const delta: ReadabilityDeltaBlock = opts.dryRun
+    ? { ...readabilityDelta(readabilityBefore, readabilityAfter), unchanged: false, unmeasured: 'dry run — nothing was written, so there is no "after"' }
+    : readabilityDelta(readabilityBefore, readabilityAfter);
+  const pg = projectReadabilityGate(projectRoot, framework);
+  const byCode: Record<string, number> = {};
+  if (pg.ok) for (const f of pg.findings) byCode[f.code] = (byCode[f.code] ?? 0) + 1;
+  const readability: FinalizeReadability = {
+    ...delta,
+    gate: pg.ok
+      ? { status: 'ran', screens: pg.screens, warnings: pg.findings.length, byCode, sample: pg.findings.slice(0, 20).map((f) => `${f.file}: ${f.message}`) }
+      : { status: 'skipped', reason: pg.reason },
+  };
+  if (delta.unmeasured) log(`[finalize] ${opts.dryRun ? '' : 'WARNING: '}readability not measured — ${delta.unmeasured}`);
+  else if (delta.unchanged) log(`[finalize] readability: UNCHANGED by this finalize (${delta.after?.loc ?? '?'} LOC, magic ${delta.after?.magicNumbers ?? '?'}, figma-leak comments ${delta.after?.figmaLeakComments ?? '?'})`);
+  else log(`[finalize] readability: ${Object.entries(delta.delta).map(([k, v]) => `${k} ${(delta.before as any)?.[k]}→${(delta.after as any)?.[k]}`).join(', ')}`);
+  if (pg.ok && pg.findings.length) log(`[finalize] readability gate (warn-only): ${pg.findings.length} finding(s) over ${pg.screens} screen(s) — ${Object.entries(byCode).map(([k, v]) => `${k}×${v}`).join(', ')}`);
+
   const applied = passReports.filter((p) => p.status === 'applied').length;
   const reverted = passReports.filter((p) => p.status === 'reverted').length;
   const skipped = passReports.filter((p) => p.status === 'skipped').length;
-  log(`[finalize] done — ${applied} applied, ${reverted} reverted, ${skipped} skipped`);
+  const noops = passReports.filter((p) => p.noop).length;
+  log(`[finalize] done — ${applied} applied, ${reverted} reverted, ${skipped} skipped${noops ? ` (${noops} no-op)` : ''}`);
 
   const report: FinalizeReport = {
     version: 1,
@@ -740,6 +809,7 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
     baselineErrors,
     finalErrors,
     gate,
+    readability,
     reportPath: null,
   };
 
