@@ -23,7 +23,7 @@ import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import path from 'node:path';
 
-import { loadWebApp, listWebSources, ensureNamedImport, importPathBetween, stillReferenced } from './web-app';
+import { loadWebApp, listWebSources, ensureNamedImport, importSpecFor, stillReferenced } from './web-app';
 import { DESIGN_SYSTEM_RECORD } from '../design-system';
 
 export interface WebThemeModel {
@@ -251,7 +251,7 @@ export async function deepenWebTokens(projectRoot: string, opts: WebTokenOptions
       result.changes.push({ file: relFile, kind: 'spacing', from, to });
     });
 
-    if (src !== before) src = ensureNamedImport(src, theme.themeSymbol, importPathBetween(file, theme.themeFile));
+    if (src !== before) src = ensureNamedImport(src, theme.themeSymbol, importSpecFor(file, theme.themeFile, src));
 
     const pruned = removeDeadImports(src);
     src = pruned.src;

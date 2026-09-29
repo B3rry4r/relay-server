@@ -93,7 +93,7 @@ describe('7f web tokens find the theme the design-system contract recorded (PG-1
     const r = await deepenWebTokens(root, {});
     expect(r.themeFile).toBe('lib/theme/theme.ts');
     const home = await fs.readFile(path.join(root, 'app', '(tabs)', '10-2', 'page.tsx'), 'utf8');
-    expect(home).toMatch(/import \{ AppTheme \} from '\.\.\/\.\.\/\.\.\/lib\/theme\/theme';/);
+    expect(home).toMatch(/import \{ AppTheme \} from '@\/lib\/theme\/theme';/);   // the page already imports via @/ — the alias is reused
     expect(home).toMatch(/fill=\{AppTheme\.color\.brand\}/);
     expect(home).toMatch(/^\/\/ canonicalId: c_10_2 route: \/10-2\n'use client';/);
     const again = await deepenWebTokens(root, {});
@@ -303,5 +303,17 @@ describe('7e rename: react components/files/keys, Next directories, headers in t
     expect(rweb.syncHeader("// canonicalId: c_1_2 route: /1-2\n'use client';\n", 'c_1_2', '/x').src).toBe("// canonicalId: c_1_2 route: /x\n'use client';\n");
     expect(rweb.syncHeader("'use client';\n", 'c_1_2', '/x')).toEqual({ src: "// canonicalId: c_1_2 route: /x\n'use client';\n", stamped: true });
     expect(rweb.replaceRouteLiteral("push('/10-3'); push('/10-3/edit'); push('/10-30')", '/10-3', '/settings')).toBe("push('/settings'); push('/settings/edit'); push('/10-30')");
+  });
+});
+
+describe('ensureNamedImport keeps a directive prologue first (found by the real next build gate)', () => {
+  it("inserts after 'use client' when the module has no imports yet", async () => {
+    const { ensureNamedImport } = await import('../src/relay-server/passes/web-app');
+    const src = "'use client';\n// extracted by relay-server phase 7a\n\nexport function A() { return null; }\n";
+    const out = ensureNamedImport(src, 'AppTheme', '../lib/theme');
+    expect(out.startsWith("'use client';\nimport { AppTheme } from '../lib/theme';\n")).toBe(true);
+    const hdr = "// canonicalId: c_1 route: /x\n'use client';\nexport default function P() { return null; }\n";
+    expect(ensureNamedImport(hdr, 'X', './x').split('\n').slice(0, 3)).toEqual(['// canonicalId: c_1 route: /x', "'use client';", "import { X } from './x';"]);
+    expect(ensureNamedImport('const a = 1;\n', 'X', './x')).toBe("import { X } from './x';\nconst a = 1;\n");
   });
 });

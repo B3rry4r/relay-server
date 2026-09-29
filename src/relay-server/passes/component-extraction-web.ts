@@ -21,7 +21,7 @@ import fsSync from 'node:fs';
 import path from 'node:path';
 
 import {
-  loadWebApp, listSourceFiles, listWebSources, resolveSpecifier, ensureNamedImport, importPathBetween, escapeRe, stillReferenced,
+  loadWebApp, listSourceFiles, listWebSources, resolveSpecifier, ensureNamedImport, importPathBetween, importSpecFor, escapeRe, stillReferenced,
 } from './web-app';
 
 export interface WebWidgetUnit {
@@ -371,7 +371,7 @@ export async function extractWebGroup(
       // Imports only the hoisted body used, now unreferenced in this screen.
       const drop = new Set([...(perFileUsedImports.get(file) ?? [])].filter((n) => !stillReferenced(src, n)));
       src = dropImportBindings(src, drop);
-      if (stillReferenced(src, name)) src = ensureNamedImport(src, name, importPathBetween(file, componentPath));
+      if (stillReferenced(src, name)) src = ensureNamedImport(src, name, importSpecFor(file, componentPath, src));
       await fs.writeFile(file, src.replace(/\n{3,}/g, '\n\n'), 'utf-8');
       // A hoisted component that was EXPORTED from the screen may be imported by
       // other modules: point them at the shared file.
@@ -405,7 +405,7 @@ async function repointImporters(projectRoot: string, screenFile: string, oldName
     for (const b of hit) {
       if (b.local !== name) src = src.replace(new RegExp(`\\b${escapeRe(b.local)}\\b`, 'g'), name);
     }
-    src = ensureNamedImport(src, name, importPathBetween(f, componentPath));
+    src = ensureNamedImport(src, name, importSpecFor(f, componentPath, src));
     await fs.writeFile(f, src, 'utf-8');
   }
 }

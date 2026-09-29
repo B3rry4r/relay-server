@@ -827,6 +827,28 @@ export function importPathBetween(fromFile: string, toFile: string): string {
   return rel;
 }
 
+/** The specifier a module should use to import `toFile`: the tsconfig alias the
+ *  module ALREADY uses (`@/components/X` in a file that imports `@/…`), else the
+ *  relative path. The alias is only chosen when it resolves back to `toFile`. */
+export function importSpecFor(fromFile: string, toFile: string, src: string): string {
+  const relative = importPathBetween(fromFile, toFile);
+  const cfg = pathConfigFor(fromFile);
+  if (!cfg) return relative;
+  const used = [...src.matchAll(/from\s*['"]([^'"]+)['"]/g)].map((m) => m[1]).filter((x) => !x.startsWith('.'));
+  for (const a of cfg.aliases) {
+    if (!a.hasStar || !used.some((u) => u.startsWith(a.prefix))) continue;
+    for (const t of a.targets) {
+      const [head, tail] = t.split('*');
+      const bare = toFile.replace(/\.(tsx|ts|jsx|js)$/, '');
+      if (!bare.startsWith(head) || !bare.endsWith(tail ?? '')) continue;
+      const star = bare.slice(head.length, bare.length - (tail ?? '').length).split(path.sep).join('/');
+      const spec = `${a.prefix}${star}${a.suffix}`;
+      if (resolveSpecifier(fromFile, spec) === toFile) return spec;
+    }
+  }
+  return relative;
+}
+
 /** Add `import { name } from 'spec'` when absent; merge into an existing brace import. */
 export function ensureNamedImport(src: string, name: string, spec: string): string {
   const existing = new RegExp(`import\\s*\\{([^}]*)\\}\\s*from\\s*['"]${escapeRe(spec)}['"]`).exec(src);
@@ -839,7 +861,13 @@ export function ensureNamedImport(src: string, name: string, spec: string): stri
   if (new RegExp(`from\\s*['"]${escapeRe(spec)}['"]`).test(src)) return src;
   const lastImport = [...src.matchAll(/^import\s.*$/gm)].pop();
   const line = `import { ${name} } from '${spec}';`;
-  if (!lastImport) return `${line}\n${src}`;
+  if (!lastImport) {
+    // Never above a directive prologue: `'use client'` must stay the first statement
+    // or Next rejects the module (comments before it are fine).
+    const prologue = /^(?:\s*(?:\/\/[^\n]*|\/\*[\s\S]*?\*\/))*\s*(?:(['"])use (?:client|server|strict)\1;?[ \t]*(?:\n|$))+/.exec(src);
+    if (prologue) return `${src.slice(0, prologue[0].length).replace(/\n?$/, '\n')}${line}\n${src.slice(prologue[0].length)}`;
+    return `${line}\n${src}`;
+  }
   const at = lastImport.index! + lastImport[0].length;
   return `${src.slice(0, at)}\n${line}${src.slice(at)}`;
 }
