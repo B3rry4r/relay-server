@@ -78,7 +78,8 @@ describe('collectModals (8b)', () => {
   // locally, the pass must see all 13 nested modals (this is the run that shipped
   // 13/13 broken). Skipped on machines without the fixture.
   const PING_CANON = '/workspace/projects/Ping/.uix/runs/run_1783030771326_20xpn.canonical.json';
-  it.skipIf(!fsSync.existsSync(PING_CANON))('finds all 13 modals in the real Ping canonical', async () => {
+  it('finds all 13 modals in the real Ping canonical', async (ctx) => {
+    ctx.skip(!fsSync.existsSync(PING_CANON), `NEEDS_EXTERNAL: the real Ping canonical fixture ${PING_CANON} is not on this machine (present on the relay volume after a Ping run).`);
     const canon = JSON.parse(await fs.readFile(PING_CANON, 'utf8'));
     const all = collectModals(canon);
     expect(all).toHaveLength(13);

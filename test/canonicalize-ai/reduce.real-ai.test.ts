@@ -38,8 +38,9 @@ const FLOW: ReduceFlow = {
 
 const RUN = process.env.RUN_REAL_AI === '1';
 
-(RUN ? describe : describe.skip)('Phase 1c full real-AI pipeline (Ping 8 frames)', () => {
-  it('1a→1b→1c produces a coherent canonical model', async () => {
+describe('Phase 1c full real-AI pipeline (Ping 8 frames)', () => {
+  it('1a→1b→1c produces a coherent canonical model', async (ctx) => {
+    ctx.skip(!RUN, 'NEEDS_EXTERNAL: spawns a logged-in claude CLI (tokens, slow) and reads the Ping IR from UIX (UIX_BASE_URL). Opt in with RUN_REAL_AI=1.');
     const descriptors: FrameDescriptor[] = [];
     for (const f of FRAMES) {
       const { descriptor, rendered } = await describeFrame(PROJECT, FIG, f, { modelId: 'sonnet' });

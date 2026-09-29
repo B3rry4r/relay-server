@@ -39,8 +39,9 @@ const FLOW: ReduceFlow = {
 
 const RUN = process.env.RUN_REAL_AI === '1';
 
-(RUN ? describe : describe.skip)('RFC T3 real-AI seam (Ping 4 frames)', () => {
-  it('aiCanonicalize → adapter produces a valid build Canonical with AI fired', async () => {
+describe('RFC T3 real-AI seam (Ping 4 frames)', () => {
+  it('aiCanonicalize → adapter produces a valid build Canonical with AI fired', async (ctx) => {
+    ctx.skip(!RUN, 'NEEDS_EXTERNAL: spawns a logged-in claude CLI (tokens, slow) and reads the Ping IR from UIX (UIX_BASE_URL). Opt in with RUN_REAL_AI=1.');
     const runId = `t3-seam-${Date.now()}`;
     const result = await aiCanonicalize(PROJECT, FIG, FRAMES, FLOW, { runId, modelId: 'sonnet' });
 
