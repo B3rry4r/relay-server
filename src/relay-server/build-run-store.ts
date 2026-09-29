@@ -810,6 +810,10 @@ export async function putAsset(projectId: string, logicalKey: string, bytes: Buf
 
 // ── Durable, replayable run log ────────────────────────────────────────────────
 export async function appendRunLog(projectId: string, runId: string, line: string): Promise<void> {
+  // Graceful shutdown: after the freeze, lines come only from the error paths of
+  // the agents we just killed ("status=error", "retrying") — noise that would read
+  // as a failure in a run that is merely interrupted and resumable.
+  if (runWritesFrozen) return;
   // T18: PUSH the line live the instant it's written so prep/canon/assets (which
   // have no per-CLI job, so never streamed over ai:progress) stream in real time.
   // Best-effort + before the file write so a slow/failing disk write can't delay

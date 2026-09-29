@@ -1,5 +1,5 @@
 import { type Express } from 'express';
-import { execFile, type ChildProcess } from 'node:child_process';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { sanitizeChildEnv } from './auth/secrets';
 import { randomUUID } from 'node:crypto';
 import { promisify } from 'node:util';
@@ -95,7 +95,12 @@ export function runningJobCount(): number {
  * `graceMs`). Resolves once every group leader has exited or `graceMs + 1s` has
  * passed. Returns how many groups were signalled.
  */
+let acceptingJobs = true;
+/** Test helper. */
+export function resumeAcceptingJobsForTests(): void { acceptingJobs = true; }
+
 export async function killAllJobs(graceMs = 2500): Promise<number> {
+  acceptingJobs = false;
   const children = Array.from(liveAgentChildren);
   const exits = children.map((child) => new Promise<void>((resolve) => {
     if (child.exitCode !== null || child.signalCode !== null) { resolve(); return; }
@@ -114,6 +119,71 @@ export async function killAllJobs(graceMs = 2500): Promise<number> {
     }
   }
   return children.length;
+}
+
+/**
+ * execFile-compatible runner that REALLY makes the child a process-group leader.
+ *
+ * `promisify(execFile)(…, {detached:true})` does NOT detach (Node's execFile never
+ * forwards `detached` to spawn — verified: the child kept the parent's pgid), so
+ * every `process.kill(-pid)` in killJob failed with ESRCH and fell back to killing
+ * the CLI alone: its npm / flutter / build descendants survived every Stop, and
+ * would survive a release swap. This spawns with `detached:true` and reproduces
+ * execFile's contract: resolves {stdout, stderr} on exit 0; rejects an Error
+ * carrying stdout/stderr/code/signal/killed otherwise; `timeout` and `maxBuffer`
+ * kill the whole group (SIGTERM, then SIGKILL after 2.5 s).
+ */
+export function spawnAgentProcess(
+  file: string,
+  args: string[],
+  options: { env: NodeJS.ProcessEnv; cwd: string; timeout: number; maxBuffer: number },
+): Promise<{ stdout: string; stderr: string }> & { child: ChildProcess } {
+  const child = spawn(file, args, { env: options.env, cwd: options.cwd, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
+  const promise = new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+    const out: Buffer[] = [];
+    const err: Buffer[] = [];
+    let size = 0;
+    let killed = false;
+    let failure: (Error & Record<string, unknown>) | null = null;
+    const killGroup = (reason: string, code?: string) => {
+      if (killed) return;
+      killed = true;
+      const e = new Error(reason) as Error & Record<string, unknown>;
+      if (code) e.code = code;
+      failure = e;
+      const pid = child.pid;
+      try { if (pid) process.kill(-pid, 'SIGTERM'); else child.kill('SIGTERM'); } catch { try { child.kill('SIGTERM'); } catch { /* gone */ } }
+      const t = setTimeout(() => { try { if (pid) process.kill(-pid, 'SIGKILL'); } catch { /* gone */ } }, 2500);
+      t.unref?.();
+    };
+    const timer = options.timeout > 0
+      ? setTimeout(() => killGroup(`Command timed out after ${options.timeout} ms: ${file}`, 'ETIMEDOUT'), options.timeout)
+      : null;
+    timer?.unref?.();
+    const collect = (sink: Buffer[]) => (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > options.maxBuffer) { killGroup('stdout/stderr maxBuffer length exceeded', 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER'); return; }
+      sink.push(chunk);
+    };
+    child.stdout?.on('data', collect(out));
+    child.stderr?.on('data', collect(err));
+    child.once('error', (error) => {
+      if (timer) clearTimeout(timer);
+      Object.assign(error, { stdout: Buffer.concat(out).toString('utf8'), stderr: Buffer.concat(err).toString('utf8'), cmd: file });
+      reject(error);
+    });
+    child.once('close', (code, signal) => {
+      if (timer) clearTimeout(timer);
+      const stdout = Buffer.concat(out).toString('utf8');
+      const stderr = Buffer.concat(err).toString('utf8');
+      if (code === 0 && !failure) { resolve({ stdout, stderr }); return; }
+      const e = failure ?? (new Error(`Command failed: ${[file, ...args].join(' ').slice(0, 500)}\n${stderr}`) as Error & Record<string, unknown>);
+      Object.assign(e, { stdout, stderr, cmd: file, killed: killed || signal !== null, signal: signal ?? (failure ? 'SIGTERM' : null) });
+      if (e.code === undefined) e.code = code;
+      reject(e);
+    });
+  });
+  return Object.assign(promise, { child });
 }
 
 // Timeout for non-agent AI generation calls. Was 2 min, but the heavy-AI canon
@@ -219,14 +289,15 @@ export async function runModel(
   // Resolve the absolute binary path (login-shell aware) so installs on a
   // profile-only PATH are found — otherwise execFile ENOENTs → false "not installed".
   const binPath = (await resolveBin(adapter.bin, env, cwd)) ?? adapter.bin;
-  // `detached: true` makes the CLI a process-group leader so cancellation can
-  // kill the whole tree (the CLI + any npm/build children it spawns).
-  const promise = execFileAsync(binPath, args, {
+  // The CLI runs as a process-GROUP leader so cancellation and a graceful
+  // shutdown kill the whole tree (the CLI + any npm/build children it spawns).
+  // Graceful shutdown: after killAllJobs no new agent may start (an orchestrator
+  // retrying the call it just lost would otherwise spawn a fresh CLI that outlives
+  // this release).
+  if (!acceptingJobs) throw new Error('relay-server is shutting down — agent call refused (the run resumes on the next release)');
+  const promise = spawnAgentProcess(binPath, args, {
     env, cwd, timeout: opts.agent ? AI_AGENT_TIMEOUT_MS : AI_TIMEOUT_MS, maxBuffer: 32 * 1024 * 1024,
-    // `detached` is honoured by execFile at runtime (forwarded to spawn) but is
-    // absent from its options type — cast so we can group-kill on cancel.
-    detached: true,
-  } as Parameters<typeof execFileAsync>[2]);
+  });
   // Close the child's stdin immediately. The prompt is passed via argv, so the
   // CLIs (claude -p, gemini -p, …) have nothing to read from stdin — but if the
   // pipe is left open they BLOCK on it: claude warns "no stdin data received in
