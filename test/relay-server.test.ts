@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile as execFileCallback } from 'node:child_process';
 import { promisify } from 'node:util';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
 import { io as createClient, type Socket } from 'socket.io-client';
 import { createRelayServer, FakePty, type PtyFactory, type RelayServer } from '../src/relay-server';
@@ -1104,11 +1104,22 @@ chmod +x "$PROFILE/bin/$NAME"
     const client = await connectClient(port, 'test-token');
     clients.push(client);
 
-    // Three creates in one burst land within the same millisecond on the server.
-    client.emit('terminal:create', {});
-    client.emit('terminal:create', {});
-    client.emit('terminal:create', {});
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Three creates handled within the same millisecond on the server. The clock
+    // is pinned so this is deterministic rather than depending on scheduling:
+    // any id scheme derived from Date.now() alone collides on every run.
+    // (setTimeout is not driven by Date.now, so the wait below is real time.)
+    const frozenNow = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(frozenNow);
+    try {
+      client.emit('terminal:create', {});
+      client.emit('terminal:create', {});
+      client.emit('terminal:create', {});
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      // All three creates were handled while the clock was pinned.
+      expect(ptys).toHaveLength(4);
+    } finally {
+      clock.mockRestore();
+    }
 
     const response = await request(`http://127.0.0.1:${port}`)
       .get('/api/terminals')
