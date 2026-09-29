@@ -307,8 +307,12 @@ export class TerminalTimeline {
 
       case 'tool.call': {
         const toolUseId = String(raw.toolUseId ?? '');
-        if (!toolUseId || s.toolCalls.has(toolUseId)) { this.markSeen(id); break; }
-        s.toolCalls.set(toolUseId, { input: raw.input, resolved: s.toolResults.has(toolUseId), order: s.callOrder++ });
+        const known = toolUseId ? s.toolCalls.get(toolUseId) : undefined;
+        // the same OPEN call seen again (opencode `running` twice, a re-read) is one card;
+        // an id reused after its result (mock models, id-recycling CLIs) is a new call
+        if (!toolUseId || (known && !known.resolved)) { this.markSeen(id); break; }
+        if (known) s.toolResults.delete(toolUseId);
+        s.toolCalls.set(toolUseId, { input: raw.input, resolved: false, order: s.callOrder++ });
         s.lastWasTurnEnd = false;
         out.push(this.push(s, id, meta.source, at, {
           kind: 'tool.call', toolUseId, tool: String(raw.tool ?? ''), toolKind: raw.toolKind ?? 'other',

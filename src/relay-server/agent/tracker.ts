@@ -292,10 +292,11 @@ export class AgentTracker extends EventEmitter {
           ? "Codex's shared background server is answering for this terminal, so Relay cannot tell which terminal it belongs to. Run `pkill -f 'codex app-server'` or restart Codex to enable per-terminal events."
           : 'This agent runs outside the terminal\'s process tree (tmux, screen, setsid or nohup). Relay shows its activity but will not send keys to it.', 'detached'));
       }
-      const transcriptPath = typeof payload.transcript_path === 'string' ? payload.transcript_path : '';
-      if (transcriptPath && cli !== 'opencode') this.bindTranscript(t, s, transcriptPath);
     }
     this.emitEvents(t, events);
+    // bind AFTER emitting: the transcript backfill emits synchronously (seq order = emit order)
+    const transcriptPath = typeof payload.transcript_path === 'string' ? payload.transcript_path : '';
+    if (s && transcriptPath && cli !== 'opencode') this.bindTranscript(t, s, transcriptPath);
     this.syncGuard(t);
   }
 
@@ -548,9 +549,13 @@ export class AgentTracker extends EventEmitter {
           s = r.session;
           s.agentPid = f.pid;
           events.push(...r.emitted);
-          if (!ambiguous && candidates.length === 1) this.bindTranscript(t, s, candidates[0].transcriptPath);
           if (f.cli === 'codex') events.push(...t.timeline.notice(s, 'codex-hooks-untrusted', CODEX_TRUST_MESSAGE, `pid:${f.pid}`));
           else events.push(...t.timeline.notice(s, 'hooks-missing', HOOKS_MISSING_MESSAGE, `pid:${f.pid}`));
+          if (!ambiguous && candidates.length === 1) {
+            // emit what we have first: the transcript backfill below emits synchronously
+            this.emitEvents(t, events.splice(0));
+            this.bindTranscript(t, s, candidates[0].transcriptPath);
+          }
         }
         if (ambiguous && s.attribution !== 'ambiguous') t.timeline.setAttribution(s.sessionId, 'ambiguous');
         if (ambiguous) {
