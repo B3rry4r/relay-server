@@ -28,6 +28,7 @@
 // present) renames nothing new and re-points nothing — a near no-op, build green.
 // =============================================================================
 
+import { parseFlutterAnalyzeOutput } from './flutter-analyze-output';
 import * as fs from 'fs/promises';
 import * as fsSync from 'fs';
 import * as path from 'path';
@@ -477,12 +478,10 @@ async function flutterAnalyze(
   if (!flutter) return null;
   const raw = await runCmd(flutter, ['analyze', '--no-pub'], projectRoot, env).catch(() => null);
   if (raw == null) return null;
-  const errors = (raw.match(/^\s*error\s+•/gm) || []).length;
-  if (/no issues found/i.test(raw)) return { total: 0, errors: 0 };
-  const summ = /(\d+)\s+issues?\s+found/.exec(raw);
-  if (summ) return { total: Number(summ[1]), errors };
-  const total = (raw.match(/^\s*(error|warning|info)\s+•/gm) || []).length;
-  return { total, errors };
+  // A crashed / git-refused SDK prints no analysis: that is "could not measure",
+  // never "0 issues" (shared parser with the finalize gate).
+  const a = parseFlutterAnalyzeOutput(raw);
+  return a ? { total: a.total, errors: a.errors } : null;
 }
 
 async function flutterBuildWebOk(projectRoot: string, env?: NodeJS.ProcessEnv): Promise<{ ok: boolean; error?: string }> {

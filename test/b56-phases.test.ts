@@ -227,6 +227,39 @@ describe('analyze gate is framework-aware (PG-36)', () => {
     expect((bad as { lines: string[] }).lines[0]).toMatch(/^app\/live\/page\.ts\(1,7\): error TS2322/);
   });
 
+  it('flutter: an SDK that dies before analyzing (git "dubious ownership", exit 128) is "could not measure", never 0 issues', async () => {
+    // Seen on the real resolve-app E2E: HOME=$WORKSPACE has no global gitconfig, the
+    // root-owned SDK refuses to run, and the old parser read "no issue lines" as
+    // {total:0, errors:0} — the gate said `ran` and would pass any broken tree.
+    const { parseFlutterAnalyzeOutput } = await import('../src/relay-server/passes/flutter-analyze-output');
+    const dubious = [
+      "fatal: detected dubious ownership in repository at '/opt/sdk/flutter'",
+      'To add an exception for this directory, call:',
+      '',
+      '\tgit config --global --add safe.directory /opt/sdk/flutter',
+    ].join('\n');
+    expect(parseFlutterAnalyzeOutput(dubious)).toBeNull();
+    expect(parseFlutterAnalyzeOutput('')).toBeNull();
+    expect(parseFlutterAnalyzeOutput('Analyzing app...\nNo issues found! (ran in 1.2s)\n')).toEqual({ total: 0, errors: 0, errorLines: [] });
+    const two = "Analyzing app...\n\n  error • Undefined name 'x' • lib/a.dart:3:5 • undefined_identifier\n   info • Prefer const • lib/b.dart:1:1 • prefer_const_constructors\n\n2 issues found. (ran in 2.0s)\n";
+    expect(parseFlutterAnalyzeOutput(two)).toMatchObject({ total: 2, errors: 1 });
+
+    // Through the gate, with a real (fake) SDK binary that fails like the real one.
+    const ws = path.join(root, 'ws');
+    await write('ws/.relay/tools/flutter/bin/flutter', `#!/bin/sh\nprintf '%s\\n' "fatal: detected dubious ownership in repository at '/opt/sdk/flutter'" >&2\nexit 128\n`);
+    await fs.chmod(path.join(ws, '.relay/tools/flutter/bin/flutter'), 0o755);
+    await write('app/pubspec.yaml', 'name: app\n');
+    const prev = process.env.WORKSPACE;
+    process.env.WORKSPACE = ws;
+    try {
+      const g = await runAnalyzeGate({ projectRoot: path.join(root, 'app'), framework: 'flutter' });
+      expect(g).toMatchObject({ errors: null, initialErrors: null, ok: true, repairAttempted: false });
+      expect(g.unmeasured).toMatch(/printed no analysis .*dubious ownership/);
+    } finally {
+      if (prev === undefined) delete process.env.WORKSPACE; else process.env.WORKSPACE = prev;
+    }
+  });
+
   it('nextHasTypegen: only Next >= 15.5', async () => {
     const { nextHasTypegen } = await import('../src/relay-server/passes/finalize');
     for (const [v, want] of [['14.2.5', false], ['15.4.9', false], ['15.5.0', true], ['16.3.7', true]] as const) {

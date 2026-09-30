@@ -34,6 +34,7 @@
 // This module ONLY orchestrates — it never reimplements pass internals.
 // =============================================================================
 
+import { parseFlutterAnalyzeOutput, flutterAnalyzeFailure, type FlutterAnalysis } from './flutter-analyze-output';
 import * as fs from 'fs/promises';
 import * as fsSync from 'fs';
 import * as path from 'path';
@@ -870,7 +871,7 @@ async function analyzeErrorsFor(
   if (framework === 'flutter') {
     const a = await flutterAnalyze(projectRoot, env);
     hook?.typecheck(a ? { status: 'ran', tool: 'flutter analyze' }
-      : { status: 'skipped', reason: flutterBin() ? '`flutter analyze` produced no output' : `flutter SDK not found (${safeFlutterRoot()}/bin/flutter)` });
+      : { status: 'skipped', reason: flutterBin() ? (lastFlutterAnalyzeFailure ?? '`flutter analyze` produced no output') : `flutter SDK not found (${safeFlutterRoot()}/bin/flutter)` });
     return a ? { total: a.total, errors: a.errors } : null;
   }
   if (framework === 'react' || framework === 'next') {
@@ -1078,19 +1079,19 @@ export async function webBuildOk(projectRoot: string, env?: NodeJS.ProcessEnv): 
 /** Run `flutter analyze` and return BOTH the total issue count (for the report)
  *  and the ERROR count (the gate keys on errors, not total — see the gate), plus
  *  the raw `error •` lines (the analyze-gate repair prompt lists them). Null
- *  when flutter is unavailable. Mirrors asset-phase.flutterAnalyze. */
-async function flutterAnalyze(projectRoot: string, env?: NodeJS.ProcessEnv): Promise<{ total: number; errors: number; errorLines: string[] } | null> {
+ *  when flutter is unavailable OR its output is not an analysis (a crashed or
+ *  git-refused SDK is never "0 issues" — parseFlutterAnalyzeOutput); the reason is
+ *  kept in `lastFlutterAnalyzeFailure` for the gate report. */
+let lastFlutterAnalyzeFailure: string | null = null;
+async function flutterAnalyze(projectRoot: string, env?: NodeJS.ProcessEnv): Promise<FlutterAnalysis | null> {
+  lastFlutterAnalyzeFailure = null;
   const flutter = flutterBin();
   if (!flutter) return null;
-  const raw = await runCmd(flutter, ['analyze', '--no-pub'], projectRoot, env).catch(() => null);
+  const raw = await runCmd(flutter, ['analyze', '--no-pub'], projectRoot, env).catch((e: Error) => { lastFlutterAnalyzeFailure = String(e?.message ?? e).slice(0, 200); return null; });
   if (raw == null) return null;
-  const errorLines = (raw.match(/^\s*error\s+•.*$/gm) || []).map((l) => l.trim());
-  const errors = errorLines.length;
-  if (/no issues found/i.test(raw)) return { total: 0, errors: 0, errorLines: [] };
-  const summ = /(\d+)\s+issues?\s+found/.exec(raw);
-  if (summ) return { total: Number(summ[1]), errors, errorLines };
-  const total = (raw.match(/^\s*(error|warning|info)\s+•/gm) || []).length;
-  return { total, errors, errorLines };
+  const a = parseFlutterAnalyzeOutput(raw);
+  if (!a) lastFlutterAnalyzeFailure = `\`flutter analyze\` printed no analysis (no summary, no issue line) — not a real check: ${flutterAnalyzeFailure(raw)}`;
+  return a;
 }
 
 /** Back-compat total-only count (used for the report fields baseline/finalAnalyze). */
@@ -1238,7 +1239,7 @@ async function measureErrorsFor(framework: Framework, projectRoot: string, env?:
     return { total: t.errors, errors: t.errors, errorLines: t.lines, tool: t.tool };
   }
   const a = await flutterAnalyze(projectRoot, env);
-  if (!a) why?.(flutterBin() ? '`flutter analyze` produced no output' : `flutter SDK not found (${safeFlutterRoot()}/bin/flutter)`);
+  if (!a) why?.(flutterBin() ? (lastFlutterAnalyzeFailure ?? '`flutter analyze` produced no output') : `flutter SDK not found (${safeFlutterRoot()}/bin/flutter)`);
   return a ? { ...a, tool: 'flutter analyze' } : null;
 }
 
