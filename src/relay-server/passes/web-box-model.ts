@@ -117,6 +117,8 @@ const FORM_TAGS: Record<string, { borderBox: boolean }> = {
   button: { borderBox: true }, select: { borderBox: true },   // border-box in every UA sheet
   input: { borderBox: false }, textarea: { borderBox: false }, // content-box in standards mode
 };
+/** display values whose box is exactly the width/height it is given (plus padding/border). */
+const STADIUM_SAFE_DISPLAY = /^(block|flex|grid|inline-block|inline-flex|inline-grid|flow-root)$/;
 const UA_PAD_MAX = 8;
 const UA_BORDER_MAX = 3;
 
@@ -223,7 +225,7 @@ function blockMayGrow(decls: Array<[string, string]>): boolean {
     }
     if (/^min-(width|height|block-size|inline-size)$/.test(p)) { if (!ZERO_LEN.test(v) && v !== 'auto' && v !== 'initial') return true; continue; }
     if (p === 'box-sizing') { if (v !== 'border-box') return true; continue; }
-    if (p === 'display') { if (!/^(block|flex|grid|inline-block|inline-flex|inline-grid|flow-root|none)$/.test(v)) return true; continue; }
+    if (p === 'display') { if (v !== 'none' && !STADIUM_SAFE_DISPLAY.test(v)) return true; continue; }
     if (p === 'flex' || p === 'flex-grow') { if (!/^(none|0|0(\.0+)?\s+[\d.]+\s+auto|initial)$/.test(v)) return true; continue; }
     if (p === 'flex-basis') { if (v !== 'auto') return true; continue; }
     if (important && /^(width|height|block-size|inline-size)$/.test(p)) return true;
@@ -347,8 +349,14 @@ export function stadiumIsExact(src: string, open: number, body: string, r: numbe
   if (!owners) return false;
   const bs = e.get('boxSizing')?.replace(/['"`\s]/g, '');
   if (bs != null && bs !== 'border-box' && bs !== 'content-box') return false;
+  // ALLOW-list, not a deny-list: only display values whose box honours
+  // width/height as set. `table` / `inline-table` / `table-cell` / `table-row`
+  // grow to fit their content (Chromium: a `display: table` 200x40 box with an
+  // 80-high child paints 200x80, so 9999 turns its r=20 corners into a stadium),
+  // `inline` / `contents` / `none` ignore width/height or draw no box, and
+  // `list-item`, `ruby`, a ternary or a variable are not provable.
   const display = e.get('display')?.replace(/['"`\s]/g, '');
-  if (display === 'inline' || display === 'contents' || display === 'none') return false;
+  if (display != null && !STADIUM_SAFE_DISPLAY.test(display)) return false;
   // padding + border per side [top, right, bottom, left]; null = the style does not set that side
   const pad: Array<number | null> = [null, null, null, null];
   const brd: Array<number | null> = [null, null, null, null];

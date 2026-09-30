@@ -57,6 +57,22 @@ describe('F5 web pill: only a stadium the browser already paints', () => {
     expect(pills('<div style={{ height: 40, width: 100, borderRadius: 50, flex: 1 }} />')).toEqual([50]);
     expect(pills("<div style={{ height: 40, width: 100, borderRadius: 20, flex: '0 0 auto' }} />")).toEqual([20]);
   });
+  it('display is an allow-list: table boxes grow to their content (Chromium: 200x40 table with an 80-high child paints 200x80)', () => {
+    for (const d of ['table', 'inline-table', 'table-cell', 'table-row', 'table-caption', 'list-item', 'inline', 'contents', 'none', 'ruby']) {
+      expect([d, pills(`<div style={{ display: '${d}', height: 40, borderRadius: 20, width: 200 }}><div style={{ height: 80 }} /></div>`)]).toEqual([d, []]);
+    }
+    // Not provable: a ternary / a variable.
+    expect(pills("<div style={{ display: open ? 'flex' : 'table', height: 40, borderRadius: 20, width: 200 }} />")).toEqual([]);
+    expect(pills('<div style={{ display: shown, height: 40, borderRadius: 20, width: 200 }} />')).toEqual([]);
+    for (const d of ['block', 'flex', 'grid', 'inline-block', 'inline-flex', 'inline-grid', 'flow-root']) {
+      expect([d, pills(`<div style={{ display: '${d}', height: 40, borderRadius: 20, width: 200 }} />`)]).toEqual([d, [20]]);
+    }
+    // A global rule that makes the element a table grows it too.
+    const btn = '<button style={{ height: 40, borderRadius: 20, width: 200 }}>x</button>';
+    expect(pills(btn, { cssMayGrow: cssMayGrowFrom(['button { display: table }']) })).toEqual([]);
+    expect(pills(btn, { cssMayGrow: cssMayGrowFrom(['button { display: inline-flex }']) })).toEqual([20]);
+  });
+
   it('a style object outside JSX is judged on every element that uses it', () => {
     expect(pills('const chip = { height: 40, borderRadius: 20 };')).toEqual([]);
     expect(pills('const chip = { height: 40, borderRadius: 20 };', { borderBox: true })).toEqual([]);   // no use: element unknown
