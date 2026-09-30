@@ -36,6 +36,7 @@ import type { AIModel } from '../ai-adapters';
 import { collectWebWidgets, extractWebGroup, webComponentsDir, webScreenFiles } from './component-extraction-web';
 import { detectFramework, type Framework } from './framework';
 import { loadWebApp } from './web-app';
+import { componentClassName } from '../component-contract';
 
 // ── Public contract ──────────────────────────────────────────────────────────
 
@@ -137,6 +138,8 @@ export interface WidgetUnit {
   source: string;
   /** Normalized structural signature (identifiers/strings/literals stripped). */
   signature: string;
+  /** Flutter StatefulWidget: the paired State class (its source is in `source`). */
+  stateName?: string;
 }
 
 export interface ExtractorStrategy {
@@ -164,11 +167,29 @@ export interface ExtractorStrategy {
 
 interface CanonicalComponent { canonicalName: string; kind: string; usedIn?: string[]; count?: number }
 
+/** Readability F2: `.uix/canonical.json` comes in TWO shapes — the canonicalize-ai
+ *  reduce shape `{canonicalName, kind}` and the persisted build shape
+ *  `{id, frameId, name}` (canonicalize.ts / to-canonical.ts). Reading only the first
+ *  made every name '' on real runs, and `lower.includes('')` matched every group
+ *  onto the first component (the Ping crash, then the silent mis-naming). Both are
+ *  normalised here; an entry with no usable name is dropped. */
+export function normalizeCanonicalComponents(raw: unknown): CanonicalComponent[] {
+  const list = raw && typeof raw === 'object' && Array.isArray((raw as { components?: unknown }).components)
+    ? (raw as { components: unknown[] }).components : [];
+  const out: CanonicalComponent[] = [];
+  for (const c of list) {
+    if (!c || typeof c !== 'object') continue;
+    const o = c as Record<string, unknown>;
+    const name = [o.canonicalName, o.name].find((v) => typeof v === 'string' && v.trim()) as string | undefined;
+    if (!name || !/[A-Za-z]{3,}/.test(name)) continue;
+    out.push({ canonicalName: name.trim(), kind: typeof o.kind === 'string' ? o.kind : '' });
+  }
+  return out;
+}
+
 async function readCanonicalComponents(projectRoot: string): Promise<CanonicalComponent[]> {
   try {
-    const raw = await fs.readFile(path.join(projectRoot, '.uix', 'canonical.json'), 'utf8');
-    const parsed = JSON.parse(raw) as { components?: CanonicalComponent[] };
-    return Array.isArray(parsed.components) ? parsed.components : [];
+    return normalizeCanonicalComponents(JSON.parse(await fs.readFile(path.join(projectRoot, '.uix', 'canonical.json'), 'utf8')));
   } catch {
     return [];
   }
@@ -210,28 +231,30 @@ export async function extractComponents(projectId: string, opts: ExtractOptions)
     };
   }
 
-  // Group by exact normalized structural signature. Cross-file, name-agnostic.
-  const bySig = new Map<string, WidgetUnit[]>();
-  for (const u of units) {
-    const arr = bySig.get(u.signature) ?? [];
-    arr.push(u);
-    bySig.set(u.signature, arr);
-  }
-
   const canonical = await readCanonicalComponents(projectRoot);
   const extracted: ExtractedComponent[] = [];
   const rejected: ExtractResult['rejected'] = [];
+  const componentsDir = strategy.componentsDirFor ? await strategy.componentsDirFor(projectRoot) : path.join(projectRoot, strategy.componentsDirName);
+  // F2: every target is UNIQUE — two groups used to both write
+  // lib/components/back_button.dart (the second overwrote the first, whose screens
+  // then imported the other group's body). Names taken this run + names already
+  // defined by a public class/component in the project are never reused.
+  const definedAt = await existingPublicNames(projectRoot, framework);
+  const takenThisRun = new Set<string>();
+  /** A name is free unless this run used it or the project defines it OUTSIDE the
+   *  group's own units (an exported duplicate being lifted is its own definition). */
+  const nameFree = (n: string, group: WidgetUnit[]): boolean => {
+    if (takenThisRun.has(n)) return false;
+    const files = definedAt.get(n);
+    if (!files) return true;
+    return [...files].every((f) => group.some((u) => path.resolve(u.file) === path.resolve(f) && u.localName.replace(/^_+/, '') === n));
+  };
+  const attempted = new Set<string>();
+  const groupKey = (g: WidgetUnit[]): string => g.map((u) => `${u.file}::${u.localName}::${u.source.length}:${hashText(u.source)}`).sort().join('|');
+  let scanned = units.length;
 
-  for (const [, groupAll] of bySig) {
-    // A group is widgets in DIFFERENT files (same file re-declaring a name is a
-    // parse artifact, not a duplicate to lift). Dedupe by file, keep all.
-    const group = groupAll;
-    if (group.length < minOcc) continue;
-    // All occurrences must not already be the same single private name in one
-    // file — require ≥2 distinct files.
-    const distinctFiles = new Set(group.map((g) => g.file));
-    if (distinctFiles.size < minOcc) continue;
-
+  /** One group: name it, extract it (build-guarded on a real run), record the outcome. */
+  const processGroup = async (group: WidgetUnit[]): Promise<boolean> => {
     // AI confirmation for near-matches: signatures match structurally, but the
     // SOURCE differs (different literals/styles). If sources are byte-identical
     // (modulo whitespace) we trust the deterministic match. Otherwise confirm.
@@ -240,12 +263,15 @@ export async function extractComponents(projectId: string, opts: ExtractOptions)
       const ok = await confirmEquivalent(group, opts);
       if (!ok.equivalent) {
         rejected.push({ names: group.map((g) => g.localName), reason: ok.reason || 'AI: not semantically equivalent' });
-        continue;
+        return false;
       }
     }
-
     const kind = inferKind(group, canonical);
-    const chosen = chooseName(group, canonical);
+    const chosen = candidateNames(group, canonical, framework).find((n) => nameFree(n, group));
+    if (!chosen) {
+      rejected.push({ names: group.map((g) => g.localName), reason: `every candidate name (${candidateNames(group, canonical, framework).join(', ')}) is already a component/class in the project — not merged under a colliding name` });
+      return false;
+    }
 
     // PER-GROUP BUILD SAFETY (T32). With a guard injected (real run), snapshot the
     // clean tree, write THIS group, build-check it, and revert only this group if it
@@ -258,41 +284,100 @@ export async function extractComponents(projectId: string, opts: ExtractOptions)
       try {
         token = await guard.snapshot();
       } catch {
-        // No snapshot point → cannot guarantee per-group rollback; skip this group
-        // rather than risk an unrevertable bad merge (the outer gate still applies).
         rejected.push({ names: group.map((g) => g.localName), reason: 'per-group snapshot unavailable — skipped (no rollback point)' });
-        continue;
+        return false;
       }
       const result = await strategy.extractGroup(projectRoot, group, chosen, kind, false);
       if (!result || 'bail' in result) {
-        // Strategy bailed without writing; nothing to roll back, but restore to be safe.
         await guard.restore(token).catch(() => { /* best-effort */ });
         rejected.push({ names: group.map((g) => g.localName), reason: result && 'bail' in result ? result.bail : 'strategy bailed (unsafe to merge)' });
-        continue;
+        return false;
       }
       const built = await guard.buildOk();
-      if (built.ok) {
-        extracted.push(result);
-      } else {
-        await guard.restore(token).catch(() => { /* best-effort */ });
-        rejected.push({ names: group.map((g) => g.localName), reason: `extraction regressed the build (${built.reason ?? 'build check failed'}) — group reverted, others kept` });
-      }
-      continue;
+      if (built.ok) { extracted.push(result); takenThisRun.add(result.name); return true; }
+      await guard.restore(token).catch(() => { /* best-effort */ });
+      rejected.push({ names: group.map((g) => g.localName), reason: `extraction regressed the build (${built.reason ?? 'build check failed'}) — group reverted, others kept` });
+      return false;
     }
-
     const result = await strategy.extractGroup(projectRoot, group, chosen, kind, !!opts.dryRun);
-    if (result && !('bail' in result)) extracted.push(result);
-    else rejected.push({ names: group.map((g) => g.localName), reason: result && 'bail' in result ? result.bail : 'strategy bailed (unsafe to merge)' });
+    if (result && !('bail' in result)) { extracted.push(result); takenThisRun.add(result.name); return true; }
+    rejected.push({ names: group.map((g) => g.localName), reason: result && 'bail' in result ? result.bail : 'strategy bailed (unsafe to merge)' });
+    return false;
+  };
+
+  // F2: on a real run the units are RE-COLLECTED after every extraction, so a group
+  // whose body used a private sibling that has just been lifted (`_PasscodeDots`
+  // → `_Dot`, now the shared `Dot`) is compared again on the rewritten source
+  // instead of bailing forever on a stale copy. A dry run writes nothing, so one
+  // pass over the collected units is the whole answer.
+  let current = units;
+  for (let round = 0; round < 64; round++) {
+    const groups = groupUnits(current, minOcc).filter((g) => !attempted.has(groupKey(g)));
+    if (!groups.length) break;
+    let changed = false;
+    for (const group of groups) {
+      attempted.add(groupKey(group));
+      const ok = await processGroup(group);
+      if (ok && !opts.dryRun) { changed = true; break; }   // sources changed → re-collect
+    }
+    if (!changed || opts.dryRun) break;
+    current = await strategy.collectWidgets(projectRoot, opts.onlyFiles);
+    scanned = Math.max(scanned, current.length);
   }
+  // A group that was retried after a re-collect and then succeeded is not "rejected".
+  const extractedNames = new Set(extracted.flatMap((e) => e.fromPrivateNames.map((n) => `${n}`)));
+  const finalRejected = rejected.filter((r, i) => !(r.reason.startsWith('references a private') && r.names.every((n) => extractedNames.has(n))) && rejected.findIndex((x) => x.reason === r.reason && x.names.join() === r.names.join()) === i);
 
   return {
     framework,
     extracted,
-    rejected,
-    componentsDir: strategy.componentsDirFor ? await strategy.componentsDirFor(projectRoot) : path.join(projectRoot, strategy.componentsDirName),
+    rejected: finalRejected,
+    componentsDir,
     dryRun: !!opts.dryRun,
-    scanned: units.length,
+    scanned,
   };
+}
+
+/** Group units by exact normalized structural signature (cross-file, name-agnostic);
+ *  a group needs ≥ minOcc members in ≥ minOcc distinct files. */
+function groupUnits(units: WidgetUnit[], minOcc: number): WidgetUnit[][] {
+  const bySig = new Map<string, WidgetUnit[]>();
+  for (const u of units) {
+    const arr = bySig.get(u.signature) ?? [];
+    arr.push(u);
+    bySig.set(u.signature, arr);
+  }
+  return [...bySig.values()].filter((g) => g.length >= minOcc && new Set(g.map((u) => u.file)).size >= minOcc);
+}
+
+function hashText(s: string): string {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
+
+/** Public class / component names already defined in the project (never reused as
+ *  an extraction target). Flutter: every public top-level class under lib/; web:
+ *  every exported PascalCase function/const in the source tree. */
+async function existingPublicNames(projectRoot: string, framework: string): Promise<Map<string, Set<string>>> {
+  const web = framework === 'react' || framework === 'next';
+  const roots = web ? ['src', 'app', 'components', 'lib'] : ['lib'];
+  const names = new Map<string, Set<string>>();
+  const walk = async (dir: string): Promise<void> => {
+    let entries: fsSync.Dirent[];
+    try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const abs = path.join(dir, e.name);
+      if (e.isDirectory()) { if (!/^(node_modules|\.next|_preview|%5Fpreview|\.dart_tool|build)$/.test(e.name)) await walk(abs); continue; }
+      if (!(web ? /\.(tsx?|jsx?)$/ : /\.dart$/).test(e.name)) continue;
+      let src = '';
+      try { src = await fs.readFile(abs, 'utf8'); } catch { continue; }
+      const re = web ? /^export\s+(?:default\s+)?(?:function|const|class)\s+([A-Z]\w*)/gm : /^(?:abstract\s+)?class\s+([A-Z]\w*)/gm;
+      for (const m of src.matchAll(re)) names.set(m[1], (names.get(m[1]) ?? new Set()).add(abs));
+    }
+  };
+  for (const r of roots) await walk(path.join(projectRoot, r));
+  return names;
 }
 
 function getStrategy(fw: Framework): ExtractorStrategy | null {
@@ -305,21 +390,39 @@ function getStrategy(fw: Framework): ExtractorStrategy | null {
 
 /** Pick the shared component name: prefer a canonical mapping, else derive from
  *  the most common private name (stripped of the leading underscore). */
-function chooseName(group: WidgetUnit[], canonical: CanonicalComponent[]): string {
-  const base = mostCommon(group.map((g) => (g.localName ?? '').replace(/^_+/, '')));
-  // Map onto a canonical component by name affinity (case-insensitive contains).
-  const lower = base.toLowerCase();
-  const hit = canonical.find((c) => {
-    const cn = (c.canonicalName ?? '').toLowerCase();
-    return cn === lower || cn.includes(lower) || lower.includes(cn);
-  });
-  if (hit) return pascal(hit.canonicalName || base);
-  return pascal(base);
+/** Name affinity between a group's local name and a canonical component name.
+ *  Never on an empty / too-short name (an empty string is contained in every name). */
+function canonicalAffinity(local: string, canonicalName: string): boolean {
+  const a = local.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const b = canonicalName.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (a.length < 3 || b.length < 3) return false;
+  // The canonical name wins only when it is at least as specific as the local one
+  // (`_PinField` → canonical `pinField`); a generic canonical (`card`, `icon`,
+  // `button`) never overrides a specific local name (`_TxnCard`, `_LinkBankButton`).
+  return a === b || b.includes(a);
+}
+
+/** Candidate public names for a group, best first: the canonical mapping, then the
+ *  group's own local names by frequency. Each is made SDK-safe (a name that would
+ *  shadow a framework widget — Flutter's BackButton, React's Fragment — gets the
+ *  `App` prefix, the same rule the component contract uses). */
+export function candidateNames(group: Array<Pick<WidgetUnit, 'localName'>>, canonical: CanonicalComponent[], framework: string): string[] {
+  const locals = group.map((g) => (g.localName ?? '').replace(/^_+/, '')).filter(Boolean);
+  const counts = new Map<string, number>();
+  for (const l of locals) counts.set(l, (counts.get(l) ?? 0) + 1);
+  const byFreq = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([n]) => n);
+  const out: string[] = [];
+  const base = byFreq[0] ?? 'Component';
+  const hit = canonical.find((c) => canonicalAffinity(base, c.canonicalName));
+  if (hit) out.push(hit.canonicalName);
+  out.push(...byFreq);
+  const names = out.map((n) => componentClassName(pascal(n) || 'Component', framework)).filter(Boolean);
+  return [...new Set(names)];
 }
 
 function inferKind(group: WidgetUnit[], canonical: CanonicalComponent[]): string {
   const base = mostCommon(group.map((g) => (g.localName ?? '').replace(/^_+/, ''))).toLowerCase();
-  const hit = canonical.find((c) => { const cn = (c.canonicalName ?? '').toLowerCase(); return cn.includes(base) || base.includes(cn); });
+  const hit = canonical.find((c) => canonicalAffinity(base, c.canonicalName));
   if (hit?.kind) return hit.kind;
   if (/button|pill|cta/.test(base)) return 'button';
   if (/field|input|otp|pin/.test(base)) return 'input';
@@ -429,6 +532,10 @@ const flutterStrategy: ExtractorStrategy = {
       // also means the lifted component never dangles on a screen-local const.
       const consts = collectFileConsts(src);
       for (const cls of parseDartWidgetClasses(src)) {
+        // F2: only PRIVATE widgets are per-screen copies. A public class in a screen
+        // file is the screen itself (Ping: ReturningUserPasswordScreen +
+        // WelcomeBackLoginScreen were lifted as a "component").
+        if (!cls.name.startsWith('_')) continue;
         cls.source = inlineConsts(cls.source, consts);
         cls.buildBody = inlineConsts(cls.buildBody, consts);
         // Only StatelessWidgets carry their own build() body. StatefulWidgets
@@ -436,7 +543,7 @@ const flutterStrategy: ExtractorStrategy = {
         // yield an EMPTY body → spurious collisions. Skip empty signatures.
         const sig = dartStructuralSignature(cls.buildBody);
         if (!cls.buildBody.trim() || !sig.trim()) continue;
-        units.push({ localName: cls.name, file: abs, source: cls.source, signature: sig });
+        units.push({ localName: cls.name, file: abs, source: cls.source, signature: cls.stateName ? `STATEFUL ${sig}` : sig, ...(cls.stateName ? { stateName: cls.stateName } : {}) });
       }
     }
     return units;
@@ -447,7 +554,7 @@ const flutterStrategy: ExtractorStrategy = {
   },
 };
 
-interface DartClass { name: string; source: string; buildBody: string; }
+interface DartClass { name: string; source: string; buildBody: string; /** StatefulWidget: its State class name. */ stateName?: string; }
 
 /** Map of top-level `const TYPE _name = <literal>;` in a file. */
 function collectFileConsts(src: string): Map<string, string> {
@@ -474,7 +581,7 @@ export function parseDartWidgetClasses(src: string): DartClass[] {
   const out: DartClass[] = [];
   // Phase 7a targets StatelessWidgets (their build() body lives in the class).
   // StatefulWidgets keep build() in a separate State class — out of scope.
-  const classRe = /^class\s+([A-Za-z_][A-Za-z0-9_]*)\s+extends\s+(StatelessWidget)\b/gm;
+  const classRe = /^class\s+([A-Za-z_][A-Za-z0-9_]*)\s+extends\s+(StatelessWidget|StatefulWidget)\b/gm;
   let m: RegExpExecArray | null;
   while ((m = classRe.exec(src)) !== null) {
     const name = m[1];
@@ -483,8 +590,21 @@ export function parseDartWidgetClasses(src: string): DartClass[] {
     const end = matchBrace(src, braceStart);
     if (end < 0) continue;
     const source = src.slice(m.index, end + 1);
-    const buildBody = extractBuildBody(source);
-    out.push({ name, source, buildBody });
+    if (m[2] === 'StatelessWidget') {
+      out.push({ name, source, buildBody: extractBuildBody(source) });
+      continue;
+    }
+    // F2 StatefulWidget path: the build() lives in the `State<Name>` class. The unit
+    // is the PAIR (widget + state), fingerprinted by the state's build body. Only a
+    // pair that is identical across screens (modulo its own names) is lifted.
+    const stRe = new RegExp(`^class\\s+([A-Za-z_][A-Za-z0-9_]*)\\s+extends\\s+State<${escapeRe(name)}>`, 'm');
+    const sm = stRe.exec(src);
+    if (!sm) continue;
+    const sOpen = src.indexOf('{', sm.index);
+    const sEnd = sOpen >= 0 ? matchBrace(src, sOpen) : -1;
+    if (sEnd < 0) continue;
+    const stateSource = src.slice(sm.index, sEnd + 1);
+    out.push({ name, source: `${source}\n\n${stateSource}`, buildBody: extractBuildBody(stateSource), stateName: sm[1] });
   }
   return out;
 }
@@ -555,7 +675,7 @@ async function extractFlutterGroup(
   chosenName: string,
   kind: string,
   dryRun: boolean,
-): Promise<ExtractedComponent | null> {
+): Promise<ExtractedComponent | { bail: string }> {
   // Build the shared component from the FIRST occurrence's source, made public:
   //  - rename class _Foo → ChosenName
   //  - add `super.key`
@@ -564,16 +684,20 @@ async function extractFlutterGroup(
   //    every occurrence uses the identical literal value.
   const usedIn = group.map((g) => relPath(projectRoot, g.file));
   const fromPrivateNames = [...new Set(group.map((g) => g.localName))];
+  const componentPath = path.join('lib', 'components', `${snake(chosenName)}.dart`);
+  const absComponent = path.join(projectRoot, componentPath);
+  // F2: never overwrite an existing file (an agent-built component or an earlier
+  // group's output) — a second writer silently re-bodied the first group's screens.
+  if (fsSync.existsSync(absComponent)) return { bail: `${componentPath} already exists — never overwritten (choose another name or merge by hand)` };
+
+  if (group.some((g) => g.stateName)) return extractFlutterStatefulGroup(projectRoot, group, chosenName, kind, dryRun, componentPath);
 
   // Identify per-occurrence differing tokens to parameterize. We diff the
   // bodies token-wise; positions that differ across occurrences and are
   // data/style values (strings, colors, theme getters, file-local consts)
   // become parameters.
   const plan = planParameterization(projectRoot, group);
-  if (!plan) return null; // structures didn't actually align — bail safe.
-
-  const componentPath = path.join('lib', 'components', `${snake(chosenName)}.dart`);
-  const absComponent = path.join(projectRoot, componentPath);
+  if ('bail' in plan) return plan; // structures didn't actually align — bail safe, with the reason.
 
   // Resolve imports the lifted body needs for any PUBLIC symbol it references that
   // is NOT core flutter — sibling components (Disc), shared widgets (PingButton),
@@ -603,6 +727,55 @@ async function extractFlutterGroup(
     componentPath,
     parameterizedFields: plan.params.map((p) => p.name),
     occurrences: group.length,
+  };
+}
+
+/** F2 StatefulWidget path: lift an IDENTICAL widget + State pair (modulo its own
+ *  names). No parameterisation — state logic that differs per screen is not a
+ *  shared component, and a structural diff inside a State is never merged. */
+async function extractFlutterStatefulGroup(
+  projectRoot: string, group: WidgetUnit[], chosenName: string, kind: string, dryRun: boolean, componentPath: string,
+): Promise<ExtractedComponent | { bail: string }> {
+  if (!group.every((g) => g.stateName)) return { bail: 'mixes a StatefulWidget with a StatelessWidget — not merged' };
+  const norm = (g: WidgetUnit): string => g.source
+    .replace(new RegExp(`\\b${escapeRe(g.stateName!)}\\b`, 'g'), '__STATE__')
+    .replace(new RegExp(`\\b${escapeRe(g.localName)}\\b`, 'g'), '__SELF__')
+    .replace(/\/\/[^\n]*/g, '').replace(/\s+/g, ' ').trim();
+  if (new Set(group.map(norm)).size > 1) return { bail: 'stateful copies are not identical (only identical StatefulWidget + State pairs are lifted)' };
+  const own = new Set(group.flatMap((g) => [g.localName, g.stateName!]));
+  const g0 = group[0];
+  const declared = new Set([...g0.source.matchAll(/\b(_[A-Za-z0-9_]+)\s*(?:\(|=>|=|;|\{)/g)].map((m) => m[1]));
+  const foreign = [...new Set((g0.source.match(/\b_[A-Za-z0-9_]+\b/g) || []).filter((p) => !own.has(p) && !declared.has(p)))];
+  if (foreign.length) return { bail: `references a private sibling (${foreign.slice(0, 3).join(', ')}) that would not resolve in lib/components — retried once that sibling is lifted` };
+  const stateName = `_${chosenName}State`;
+  const body = g0.source
+    .replace(new RegExp(`\\b${escapeRe(g0.stateName!)}\\b`, 'g'), stateName)
+    .replace(new RegExp(`\\b${escapeRe(g0.localName)}\\b`, 'g'), chosenName);
+  const absComponent = path.join(projectRoot, componentPath);
+  const symbolIndex = await buildSymbolIndex(projectRoot);
+  const imports = [
+    "import 'package:flutter/material.dart';",
+    ...(/\bSvgPicture\b/.test(body) ? ["import 'package:flutter_svg/flutter_svg.dart';"] : []),
+    ...(/\bAppTheme\b/.test(body) ? ["import '../theme/app_theme.dart';"] : []),
+    ...resolveBodyImports(body, absComponent, projectRoot, symbolIndex).filter((i) => !i.includes('app_theme.dart') && !i.includes('flutter_svg')),
+  ];
+  const source = [`// ${chosenName} — shared component (Phase 7a extraction), lifted from identical per-screen copies.`, ...imports, '', body, ''].join('\n');
+  if (!dryRun) {
+    await fs.mkdir(path.dirname(absComponent), { recursive: true });
+    await fs.writeFile(absComponent, source, 'utf8');
+    for (const g of group) {
+      let src = await fs.readFile(g.file, 'utf8');
+      src = removeClass(src, g.stateName!);
+      src = removeClass(src, g.localName);
+      src = src.replace(new RegExp(`\\b${escapeRe(g.localName)}\\s*\\(`, 'g'), `${chosenName}(`);
+      src = ensureImport(src, importPathFromScreen(componentPath));
+      src = pruneDeadDeclarations(src, projectRoot, symbolIndex);
+      await fs.writeFile(g.file, src, 'utf8');
+    }
+  }
+  return {
+    name: chosenName, kind, fromPrivateNames: [...new Set(group.map((g) => g.localName))],
+    usedIn: group.map((g) => relPath(projectRoot, g.file)), componentPath, parameterizedFields: [], occurrences: group.length,
   };
 }
 
@@ -694,6 +867,8 @@ interface ParamPlan {
   callArgs: Map<string, Record<string, string>>;
   /** File-local const identifiers that were lifted into params (per file). */
   liftedConsts: Map<string, string[]>;
+  /** The lifted constructor is `const` (mirrors the private original). */
+  constCtor: boolean;
 }
 
 interface SpanParam {
@@ -722,9 +897,17 @@ interface SpanParam {
  *     span text (file-local consts inlined).
  * Returns null (refuse) on any structural divergence.
  */
-function planParameterization(projectRoot: string, group: WidgetUnit[]): ParamPlan | null {
+function planParameterization(projectRoot: string, group: WidgetUnit[]): ParamPlan | { bail: string } {
   const bodies = group.map((g) => extractBuildBody(g.source));
   const ctors = group.map((g) => parseExistingCtorParams(g.source));
+  // F2: members besides the constructor, the fields and build() (a `_tap(...)`
+  // helper, a getter, a static const) travel with the widget — they must be the
+  // same in every copy, and the private names they declare are the widget's own.
+  const extras = group.map((g) => classExtraMembers(g.source, g.localName));
+  const norm = (xs: string[], own: string): string => xs.map((x) => x.replace(new RegExp(`\\b${escapeRe(own)}\\b`, 'g'), '__SELF__').replace(/\s+/g, ' ').trim()).join('\n');
+  const extraNorm = extras.map((x, i) => norm(x, group[i].localName));
+  if (new Set(extraNorm).size > 1) return { bail: 'the copies differ outside build() (helper methods/getters are not identical) — not merged' };
+  const memberPrivates = new Set(extras[0].flatMap((x) => [...x.matchAll(/\b(_[A-Za-z0-9_]+)\s*(?:\(|=>|=|;|\{)/g)].map((m) => m[1])));
 
   // GUARD: refuse to lift a widget whose build body references file-local PRIVATE
   // identifiers (other `_Widget`s / helpers / consts that survived inlining) —
@@ -733,14 +916,16 @@ function planParameterization(projectRoot: string, group: WidgetUnit[]): ParamPl
   // here — each group is one widget kind). This keeps the refactor safe rather
   // than producing a component that references an undefined sibling.
   const ownNames = new Set(group.map((g) => g.localName));
-  for (const body of bodies) {
-    const privs = body.match(/\b_[A-Za-z0-9_]+\b/g) || [];
-    if (privs.some((p) => !ownNames.has(p))) return null;
+  for (let i = 0; i < bodies.length; i++) {
+    const privs = [...(bodies[i].match(/\b_[A-Za-z0-9_]+\b/g) || []), ...extras[i].flatMap((x) => x.match(/\b_[A-Za-z0-9_]+\b/g) || [])];
+    const foreign = [...new Set(privs.filter((p) => !ownNames.has(p) && !memberPrivates.has(p)))];
+    if (foreign.length) return { bail: `references a private sibling (${foreign.slice(0, 3).join(', ')}) that would not resolve in lib/components — retried once that sibling is lifted` };
   }
 
+  const themeTypes = themeMemberTypes(projectRoot);
   const streams = bodies.map(tokenizeDart);
   const len = streams[0].length;
-  if (!streams.every((s) => s.length === len)) return null;
+  if (!streams.every((s) => s.length === len)) return { bail: 'build() bodies differ in length after normalisation — not the same widget' };
 
   const base = streams[0];
   const existingParamNames = new Set(ctors[0].flatMap((c) => c.name));
@@ -750,13 +935,13 @@ function planParameterization(projectRoot: string, group: WidgetUnit[]): ParamPl
   for (let i = 0; i < len; i++) {
     const texts = streams.map((s) => s[i].text);
     if (new Set(texts).size > 1) {
-      if (!streams.every((s) => isValueToken(s[i]))) return null;
+      if (!streams.every((s) => isValueToken(s[i]))) return { bail: `the copies differ structurally at '${streams.map((s) => s[i].text).join("' / '")}' — not merged` };
       diffIdx.push(i);
     }
   }
   if (diffIdx.length === 0) {
     // Byte-identical structure & values: pure duplicate, no params.
-    return makePlan(group, base, bodies[0], ctors[0], []);
+    return makePlan(group, base, bodies[0], ctors[0], [], extras[0]);
   }
 
   // 2) expand each diff token to its enclosing argument-expression span (token
@@ -782,7 +967,7 @@ function planParameterization(projectRoot: string, group: WidgetUnit[]): ParamPl
       const txt = bodies[gi].slice(s[lo].start, s[hi].end).trim();
       perFile.set(unitKey(group[gi]), txt);
     }
-    const ptype = dartTypeForSpan([...perFile.values()]);
+    const ptype = dartTypeForSpan([...perFile.values()], themeTypes, argKeyFor(base, lo));
     // CONTRACTS §5: the parameter is named after the named argument it feeds
     // (`color:` → `color`), never `p0`. Collisions get a numeric suffix.
     const taken = new Set([...existingParamNames, ...spanParams.map((x) => x.name)]);
@@ -793,7 +978,7 @@ function planParameterization(projectRoot: string, group: WidgetUnit[]): ParamPl
     spanParams.push({ name: pname, type: ptype, baseSpan: [base[lo].start, base[hi].end], perFile });
   }
 
-  return makePlan(group, base, bodies[0], ctors[0], spanParams);
+  return makePlan(group, base, bodies[0], ctors[0], spanParams, extras[0]);
 }
 
 function makePlan(
@@ -802,7 +987,19 @@ function makePlan(
   baseBody: string,
   existing: DartCtorParam[],
   spanParams: SpanParam[],
+  extraMembers: string[] = [],
 ): ParamPlan {
+  // Mirror the original constructor: an explicit non-const `_Foo(...)` stays
+  // non-const; otherwise the lifted constructor is const.
+  const src0 = group[0].source;
+  const ctorRe = new RegExp(`^\\s*(const\\s+)?${escapeRe(group[0].localName)}\\s*\\(`, 'm');
+  const ctorM = ctorRe.exec(src0);
+  const hadCtor = !!ctorM;
+  const constCtor = hadCtor ? !!ctorM![1] : true;
+  // A public widget needs a key parameter (use_key_in_widget_constructors), so a
+  // constructor is always emitted; when that makes a caller const-able the per-group
+  // guard sees the new lint and reverts the group rather than ship it.
+  const omitCtor = false;
   // Keyed by unit (file::localName) so co-located distinct members stay distinct.
   const callArgs = new Map<string, Record<string, string>>();
   const liftedConsts = new Map<string, string[]>();
@@ -819,9 +1016,9 @@ function makePlan(
   const params: DartCtorParam[] = spanParams.map((s) => ({ name: s.name, type: s.type, required: true, positional: false }));
 
   const componentSource = (name: string, extraImports: (body: string) => string[]): string =>
-    buildFlutterComponentFromSpans(name, baseBody, existing, spanParams, extraImports);
+    buildFlutterComponentFromSpans(name, baseBody, existing, spanParams, extraImports, extraMembers.map((x) => x.replace(new RegExp(`\\b${escapeRe(group[0].localName)}\\b`, 'g'), name)), { omitCtor, constCtor });
 
-  return { params, componentSource, callArgs, liftedConsts };
+  return { params, componentSource, callArgs, liftedConsts, constCtor: omitCtor ? false : constCtor };
 }
 
 /** Token-index range [lo,hi] of the argument expression enclosing token i, at i's
@@ -924,8 +1121,44 @@ function mergeRanges(ranges: Array<[number, number]>): Array<[number, number]> {
   return out;
 }
 
-function dartTypeForSpan(values: string[]): string {
+/** The declared type of every static member of the project theme class
+ *  (`static const Color brand` → Color, `static TextStyle button18(...)` → TextStyle). */
+function themeMemberTypes(projectRoot: string): Map<string, string> {
+  const out = new Map<string, string>();
+  let src = '';
+  try { src = fsSync.readFileSync(path.join(projectRoot, 'lib', 'theme', 'app_theme.dart'), 'utf8'); } catch { return out; }
+  const cls = /class\s+([A-Za-z_]\w*)\s*\{/.exec(src)?.[1] ?? 'AppTheme';
+  for (const m of src.matchAll(/static\s+(?:const\s+|final\s+)?([A-Z][A-Za-z0-9_<>?]*)\s+(?:get\s+)?([A-Za-z_]\w*)\s*(?=[=(;,])/g)) out.set(`${cls}.${m[2]}`, m[1]);
+  // multi-assign `static const double s4 = 4, s8 = 8;`
+  for (const m of src.matchAll(/static\s+const\s+(double|int)\s+((?:[A-Za-z_]\w*\s*=\s*[^,;]+,?\s*)+);/g)) {
+    for (const pm of m[2].matchAll(/([A-Za-z_]\w*)\s*=/g)) out.set(`${cls}.${pm[1]}`, m[1]);
+  }
+  return out;
+}
+
+/** The named argument a span feeds (`style: <span>` → 'style'), or null. */
+function argKeyFor(toks: Tok[], lo: number): string | null {
+  const t1 = toks[lo - 1]; const t2 = toks[lo - 2];
+  return t1?.text === ':' && t2?.kind === 'id' ? t2.text : null;
+}
+
+const KEY_TYPES: Array<[RegExp, string]> = [
+  [/^(style|textStyle|labelStyle|hintStyle)$/, 'TextStyle'],
+  [/^(color|backgroundColor|foregroundColor|borderColor|fillColor|iconColor|shadowColor|surfaceTintColor|activeColor|inactiveColor|thumbColor|trackColor)$/, 'Color'],
+  [/^(width|height|size|radius|elevation|spacing|thickness|strokeWidth|fontSize|letterSpacing|opacity|dimension)$/, 'double'],
+  [/^(padding|margin)$/, 'EdgeInsetsGeometry'],
+  [/^(borderRadius)$/, 'BorderRadiusGeometry'],
+  [/^(icon)$/, 'IconData'],
+  [/^(label|text|title|subtitle|semanticLabel|hintText|labelText)$/, 'String'],
+  [/^(onTap|onPressed|onChanged|onSubmitted|onLongPress)$/, 'VoidCallback'],
+];
+
+function dartTypeForSpan(values: string[], themeTypes: Map<string, string> = new Map(), key: string | null = null): string {
   const v0 = values.map((v) => v.trim().replace(/^const\s+/, ''));
+  // 1) the theme knows its own members' types (AppTheme.button18(..) is a TextStyle
+  //    even though its argument mentions a colour token).
+  const themed = v0.map((v) => /^([A-Z]\w*\.[A-Za-z_]\w*)\s*(\(|$)/.exec(v)).map((m) => (m ? themeTypes.get(m[1]) : undefined));
+  if (themed.every(Boolean) && new Set(themed).size === 1) return themed[0]!;
   if (v0.every((v) => /^['"]/.test(v))) return 'String';
   // Bare hex literal (e.g. `0xFFf5f5f5` inside an outer `Color(...)`): the call
   // site supplies the int and the body wraps it (`Color(p0)`).
@@ -940,10 +1173,13 @@ function dartTypeForSpan(values: string[]): string {
   if (v0.every((v) => /^(AppTheme|Theme)?\.?(grotesk|montserrat|inter)\s*\(/.test(v)) || /TextStyle\(/.test(joined)) return 'TextStyle';
   if (v0.every((v) => /^FontWeight\./.test(v))) return 'FontWeight';
   if (v0.every((v) => /^Icons\./.test(v))) return 'IconData';
-  if (/^Color\(/.test(v0[0]) || v0.every((v) => /\.(brand|ink\d?|surface|hint|muted|neutral\d?|helper|success|error|warning)\b/.test(v)) || /Fill\b|fill\b/.test(joined)) return 'Color';
   if (v0.every((v) => /^EdgeInsets/.test(v))) return 'EdgeInsetsGeometry';
   if (v0.every((v) => /^BorderRadius\./.test(v))) return 'BorderRadius';
   if (v0.every((v) => /^Radius\./.test(v))) return 'Radius';
+  // 2) the argument the span feeds says what it is (`style:` is a TextStyle).
+  const byKey = key ? KEY_TYPES.find(([re]) => re.test(key))?.[1] : undefined;
+  if (byKey) return byKey;
+  if (/^Color\(/.test(v0[0]) || v0.every((v) => /^[A-Z]\w*\.(brand|ink\d?|surface|hint|muted|neutral\d?|helper|success|error|warning)$/.test(v)) || /Fill\b|fill\b/.test(joined)) return 'Color';
   return 'dynamic';
 }
 
@@ -1077,6 +1313,8 @@ function buildFlutterComponentFromSpans(
   existing: DartCtorParam[],
   spanParams: SpanParam[],
   extraImports: (body: string) => string[],
+  extraMembers: string[] = [],
+  ctorOpts: { omitCtor?: boolean; constCtor?: boolean } = {},
 ): string {
   // Replace spans right-to-left so offsets stay valid.
   let body = baseBody;
@@ -1106,11 +1344,14 @@ function buildFlutterComponentFromSpans(
 
   // Positional params first, then a `{ }` named block (Dart syntax).
   let ctorSig: string;
-  if (positional.length > 0) {
+  const kw = ctorOpts.constCtor === false ? '' : 'const ';
+  if (ctorOpts.omitCtor) {
+    ctorSig = '';
+  } else if (positional.length > 0) {
     const pos = positional.map((p) => `this.${p.name}`).join(', ');
-    ctorSig = `  const ${name}(${pos}, {\n${named.map((n) => `    ${n},`).join('\n')}\n  });`;
+    ctorSig = `  ${kw}${name}(${pos}, {\n${named.map((n) => `    ${n},`).join('\n')}\n  });`;
   } else {
-    ctorSig = `  const ${name}({\n${named.map((n) => `    ${n},`).join('\n')}\n  });`;
+    ctorSig = `  ${kw}${name}({\n${named.map((n) => `    ${n},`).join('\n')}\n  });`;
   }
 
   const fieldLines = [...positional, ...namedExisting, ...namedNew]
@@ -1120,12 +1361,12 @@ function buildFlutterComponentFromSpans(
   // Emit only the imports the component actually uses (the body — call-site
   // values stay on the screen, so they don't count here). flutter/material is
   // always needed (StatelessWidget/Widget/BuildContext).
-  const usesSvg = /\bSvgPicture\b/.test(body);
-  const usesTheme = /\bAppTheme\b/.test(body);
+  const usesSvg = /\bSvgPicture\b/.test(body) || extraMembers.some((x) => /\bSvgPicture\b/.test(x));
+  const usesTheme = /\bAppTheme\b/.test(body) || extraMembers.some((x) => /\bAppTheme\b/.test(x));
   // Any OTHER public symbol the body references (sibling components like Disc,
   // shared widgets like PingButton) is resolved to its lib/ defining file and
   // imported — otherwise the lifted file references undefined symbols.
-  const resolved = extraImports(body).filter(
+  const resolved = extraImports([body, ...extraMembers].join('\n')).filter(
     (imp) => !imp.includes('app_theme.dart') && !imp.includes('flutter_svg'),
   );
   const imports = [
@@ -1141,17 +1382,57 @@ function buildFlutterComponentFromSpans(
     ...imports,
     '',
     `class ${name} extends StatelessWidget {`,
-    ctorSig,
-    '',
-    fieldLines,
-    '',
+    ...(ctorSig ? [ctorSig, ''] : []),
+    ...(fieldLines ? [fieldLines, ''] : []),
     '  @override',
     '  Widget build(BuildContext context) {',
     `    ${body}`,
     '  }',
+    ...extraMembers.flatMap((x) => ['', `  ${x.trim()}`]),
     '}',
     '',
   ].join('\n');
+}
+
+/** Members of a widget class other than its constructor, its `final` fields and
+ *  build() — returned verbatim (helper methods, getters, static consts). */
+export function classExtraMembers(classSource: string, className: string): string[] {
+  const open = classSource.indexOf('{');
+  const close = open >= 0 ? matchBrace(classSource, open) : -1;
+  if (close < 0) return [];
+  const body = classSource.slice(open + 1, close);
+  // Split into top-level members: a member ends at a depth-0 `;` or at the `}`
+  // closing its own depth-1 block (a method body), strings respected.
+  const members: string[] = [];
+  let depth = 0; let cur = ''; let inStr: string | null = null;
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i];
+    cur += c;
+    if (inStr) { if (c === inStr && body[i - 1] !== '\\') inStr = null; continue; }
+    if (c === "'" || c === '"') { inStr = c; continue; }
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') {
+      depth--;
+      if (depth === 0 && c === '}') {
+        // `=> {...};` or a method body; a trailing `;` belongs to it only for arrow/collection bodies
+        const rest = body.slice(i + 1);
+        const semi = /^\s*;/.exec(rest);
+        if (semi) { cur += semi[0]; i += semi[0].length; }
+        members.push(cur); cur = '';
+      }
+    } else if (c === ';' && depth === 0) { members.push(cur); cur = ''; }
+  }
+  const ctorRe = new RegExp(`^(?:const\\s+)?${escapeRe(className)}\\s*\\(`);
+  return members
+    .map((m) => m.trim())
+    .filter((m) => {
+      const code = m.replace(/^(?:\s*\/\/[^\n]*\n)+/, '').replace(/^\s*@override\s*/, '').trim();
+      if (!code) return false;
+      if (ctorRe.test(code)) return false;
+      if (/^Widget\s+build\s*\(/.test(code)) return false;
+      if (/^(?:late\s+)?final\s+[^=;(]+;$/.test(code)) return false;   // a plain field
+      return true;
+    });
 }
 
 // ── Per-file rewrite: drop private class, rewrite call sites, add import ──────
@@ -1282,15 +1563,21 @@ function rewriteCallSites(
     if (close < 0) continue;
     // Strip a trailing comma so we don't emit `...,, p0:` (a parse error).
     const inner = src.slice(openIdx + 1, close).trim().replace(/,\s*$/, '');
-    const mergedInner = [inner, ...extra].filter(Boolean).join(', ');
+    // New args go BEFORE a trailing child:/children: (sort_child_properties_last).
+    const parts = splitTopLevelArgs(inner);
+    const childAt = parts.findIndex((a) => /^(child|children)\s*:/.test(a.trim()));
+    const mergedParts = childAt >= 0 ? [...parts.slice(0, childAt), ...extra, ...parts.slice(childAt)] : [...parts, ...extra];
+    const mergedInner = mergedParts.map((a) => a.trim()).filter(Boolean).join(', ');
     // Preserve `const` when the original call was const AND we added no runtime
     // params (params/theme getters are non-const) AND the existing args are all
     // const-safe. Dropping const where it was valid regresses prefer_const_
     // constructors (an analyze info bump); keeping it where it's now invalid
     // would be an error. A param-free lift (e.g. const MastercardLogo()) stays
     // const; a parameterized one drops it.
-    const wasConst = !!m[1];
-    const keepConst = wasConst && extra.length === 0 && constSafeArgs(mergedInner);
+    // The lifted component has a const constructor: a call whose arguments are all
+    // constant expressions is written `const` (prefer_const_constructors), unless it
+    // already sits in a const context (unnecessary_const).
+    const keepConst = plan.constCtor && constSafeArgs(mergedInner) && (!!m[1] || !inConstContext(src, m.index));
     const prefix = keepConst ? 'const ' : '';
     out += src.slice(last, m.index) + `${prefix}${componentName}(${mergedInner})`;
     last = close + 1;
@@ -1310,7 +1597,51 @@ function constSafeArgs(inner: string): boolean {
   // A lowercase identifier used as a call/getter (theme.grotesk(), foo.bar) is
   // runtime. Capitalized ctors and Type.staticConst are const-safe.
   if (/\b[a-z][A-Za-z0-9_]*\s*[(.]/.test(inner)) return false;
+  // A bare lowercase / private identifier in VALUE position (`child: glyph`,
+  // `onTap: _submit`) is a runtime value; named-arg keys (`label:`), members after
+  // a dot (`AppTheme.brand`) and true/false/null are not.
+  const code = inner.replace(/'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"/g, "''");
+  for (const m of code.matchAll(/(?<![.\w$])([a-z_][A-Za-z0-9_]*)\b(?!\s*:)/g)) {
+    if (!/^(true|false|null|const)$/.test(m[1])) return false;
+  }
+  if (/=>|\{/.test(code)) return false;   // closures are never const
   return true;
+}
+
+/** True when the position sits inside an enclosing `const X(...)` / `const [...]`
+ *  expression (so a nested constructor is implicitly const). Walks outward through
+ *  unmatched brackets; a block `{` that is not a const literal ends the search. */
+function inConstContext(src: string, at: number): boolean {
+  let depth = 0;
+  for (let i = at - 1; i >= 0; i--) {
+    const c = src[i];
+    if (c === ')' || c === ']' || c === '}') { depth++; continue; }
+    if (c === '(' || c === '[' || c === '{') {
+      if (depth > 0) { depth--; continue; }
+      const before = src.slice(Math.max(0, i - 120), i);
+      if (/\bconst\s+[A-Za-z_][\w.]*(?:<[^>]*>)?\s*$/.test(before) || /\bconst\s*(?:<[^>]*>)?\s*$/.test(before)) return true;
+      if (c === '{') return false;
+    }
+    if (c === ';' && depth === 0) return false;
+  }
+  return false;
+}
+
+/** Split an argument list on its top-level commas (brackets and strings respected). */
+function splitTopLevelArgs(s: string): string[] {
+  const out: string[] = [];
+  let depth = 0; let inStr: string | null = null; let cur = '';
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) { cur += c; if (c === inStr && s[i - 1] !== '\\') inStr = null; continue; }
+    if (c === "'" || c === '"') { inStr = c; cur += c; continue; }
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') depth--;
+    if (c === ',' && depth === 0) { out.push(cur); cur = ''; continue; }
+    cur += c;
+  }
+  if (cur.trim()) out.push(cur);
+  return out;
 }
 
 function matchParen(s: string, open: number): number {

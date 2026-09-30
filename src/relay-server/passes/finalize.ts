@@ -437,13 +437,18 @@ const PASSES: PassDef[] = [
           textStyles: sub.textStyles,
           spacing: sub.spacing,
           radius: sub.radius,
+          sizes: sub.sizes ?? 0,
+          renamedRefs: sub.renamed ?? 0,
+          tokensAdded: r.report.vocabulary?.added.length ?? 0,
+          tokensRenamed: r.report.vocabulary?.renamed.length ?? 0,
           removedImports: rem.imports,
           removedConsts: rem.consts,
           removedClasses: rem.methods,
         },
         warnings: r.report.rejected.map((rej) => `${rej.file}: ${rej.kind} ${rej.literal} — ${rej.reason}`),
         skipped: r.report.skippedReason,
-        changed: sub.colors + sub.textStyles + sub.spacing + sub.radius + rem.imports + rem.consts + rem.methods,
+        changed: sub.colors + sub.textStyles + sub.spacing + sub.radius + (sub.sizes ?? 0) + (sub.renamed ?? 0)
+          + (r.report.vocabulary?.added.length ?? 0) + (r.report.vocabulary?.renamed.length ?? 0) + rem.imports + rem.consts + rem.methods,
       };
     },
   },
@@ -621,6 +626,8 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
   // moves, unused-import warnings are pruned) — those must NOT force a revert, but a
   // real ERROR (undefined name, invalid constant, broken build) still does.
   let lastGoodErrors = baselineErrors;
+  // Total analyzer issues of the last good tree (the extraction guard's lint bar).
+  let lastGoodTotal = baselineAnalyze;
 
   for (const def of PASSES) {
     if (refuseNoGit) break;   // T11 #4 — refused above; do not mutate without rollback.
@@ -651,6 +658,9 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
     // (`lastGoodErrors` at the moment this pass starts), so one bad group reverts in
     // isolation while safe groups persist. Captured by value below.
     const budgetAtPassStart = lastGoodErrors;
+    // F2: a lift must not add analyzer issues either (lints included) — the running
+    // total starts at the tree this pass received and moves only with accepted groups.
+    let groupTotalBudget: number | null = lastGoodTotal;
     const ctx: PassRunCtx = {
       makeExtractGroupGuard: (): ExtractGroupGuard | null => {
         if (!buildCheckable || !gitReady) return null;
@@ -663,9 +673,16 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
             if (afterErrors != null && budgetAtPassStart != null && afterErrors > budgetAtPassStart) {
               return { ok: false, reason: `analyze errors ${budgetAtPassStart} → ${afterErrors}` };
             }
-            if (baselineBuildBroken) return { ok: true };
-            const built = await buildOkFor(framework, projectRoot, opts.env, gateHook);
-            return built.ok !== false ? { ok: true } : { ok: false, reason: `build failed: ${built.error}` };
+            const afterTotal = a?.total ?? null;
+            if (afterTotal != null && groupTotalBudget != null && afterTotal > groupTotalBudget) {
+              return { ok: false, reason: `analyzer issues ${groupTotalBudget} → ${afterTotal} (the lift added lints)` };
+            }
+            if (!baselineBuildBroken) {
+              const built = await buildOkFor(framework, projectRoot, opts.env, gateHook);
+              if (built.ok === false) return { ok: false, reason: `build failed: ${built.error}` };
+            }
+            if (afterTotal != null) groupTotalBudget = afterTotal;
+            return { ok: true };
           },
         };
       },
@@ -725,6 +742,7 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
         else {
           // Pass is good: advance the error bar to this pass's error count.
           lastGoodErrors = afterErrors ?? lastGoodErrors;
+          lastGoodTotal = a?.total ?? lastGoodTotal;
         }
       }
     }
