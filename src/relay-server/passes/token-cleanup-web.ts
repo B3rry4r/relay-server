@@ -212,11 +212,18 @@ interface WebSizeSite { family: 'icon' | 'avatar' | 'tile' | 'button' | 'pill'; 
 
 /** Square style objects (`{ width: 24, height: 24 }`), control heights next to a text
  *  child, JSX `size={24}` on icon components, and stadium radii (≥ half the box). */
-export function scanWebSizeSites(src: string): WebSizeSite[] {
+export function scanWebSizeSites(src: string, resolve?: (expr: string) => number | null): WebSizeSite[] {
   const sites: WebSizeSite[] = [];
+  // `resolve` (planning only) also counts a position already holding a token
+  // (`width: AppTheme.size.iconMd`) as a use of its value, so a second run plans the
+  // same ladder as the first — 7f converges. Substitution never passes it.
+  const V = '(\\d+(?:\\.\\d+)?|[A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)+)';
+  const valueOf = (t: string): number | null => (/^\d/.test(t) ? parseFloat(t) : resolve ? resolve(t) : null);
   const num = (body: string, key: string, base: number): { value: number; start: number; end: number } | null => {
-    const m = new RegExp(`(?<![\\w$-])${key}\\s*:\\s*(\\d+(?:\\.\\d+)?)(?![\\w.])`).exec(body);
-    return m ? { value: parseFloat(m[1]), start: base + m.index + m[0].length - m[1].length, end: base + m.index + m[0].length } : null;
+    const m = new RegExp(`(?<![\\w$-])${key}\\s*:\\s*${V}(?![\\w.])`).exec(body);
+    if (!m) return null;
+    const value = valueOf(m[1]);
+    return value == null ? null : { value, start: base + m.index + m[0].length - m[1].length, end: base + m.index + m[0].length };
   };
   // innermost `{ … }` object literals (style objects are flat)
   for (const m of src.matchAll(/\{([^{}]*)\}/g)) {
@@ -238,18 +245,22 @@ export function scanWebSizeSites(src: string): WebSizeSite[] {
   // <img width={18} height={18}> / <Image width={40} height={40}>: a square JSX box
   for (const m of src.matchAll(/<([A-Za-z][\w.]*)\b([^<>]*?)\/?>/g)) {
     const attrs = m[2];
-    const w = /\bwidth=\{(\d+(?:\.\d+)?)\}/.exec(attrs); const h = /\bheight=\{(\d+(?:\.\d+)?)\}/.exec(attrs);
-    if (!w || !h || w[1] !== h[1]) continue;
-    const v = parseFloat(w[1]);
+    const w = new RegExp(`\\bwidth=\\{${V}\\}`).exec(attrs); const h = new RegExp(`\\bheight=\\{${V}\\}`).exec(attrs);
+    if (!w || !h) continue;
+    const wv = valueOf(w[1]); const hv = valueOf(h[1]);
+    if (wv == null || hv == null || wv !== hv) continue;
+    const v = wv;
     const fam = v < 28 ? 'icon' : /avatar/i.test(attrs) ? 'avatar' : v <= 120 ? 'tile' : null;
     if (!fam) continue;
     const base = m.index! + 1 + m[1].length;
     for (const a of [w, h]) { const at = base + a.index + a[0].length - 1 - a[1].length; sites.push({ family: fam, value: v, start: at, end: at + a[1].length, el: `j${base}` }); }
   }
   // <SomeIcon size={24} />
-  for (const m of src.matchAll(/<([A-Z]\w*)\b[^>]*?\bsize=\{(\d+(?:\.\d+)?)\}/g)) {
+  for (const m of src.matchAll(new RegExp(`<([A-Z]\\w*)\\b[^>]*?\\bsize=\\{${V}\\}`, 'g'))) {
+    const v = valueOf(m[2]);
+    if (v == null) continue;
     const at = m.index! + m[0].length - 1 - m[2].length;
-    if (parseFloat(m[2]) <= 48) sites.push({ family: 'icon', value: parseFloat(m[2]), start: at, end: at + m[2].length });
+    if (v <= 48) sites.push({ family: 'icon', value: v, start: at, end: at + m[2].length });
   }
   return sites;
 }
@@ -268,10 +279,13 @@ export function planWebVocabulary(theme: WebThemeModel, sites: WebSizeSite[]): {
   const sizes: Array<{ name: string; value: number }> = [];
   for (const [fam, ladder, md] of WEB_LADDERS) {
     const els = new Map<number, Set<string>>();
-    for (const s of sites) if (s.family === fam && Number.isInteger(s.value) && !have.some((z) => z.value === s.value && z.name.startsWith(fam === 'button' ? 'buttonHeight' : fam))) els.set(s.value, (els.get(s.value) ?? new Set()).add(s.el ?? String(s.start)));
+    const tokened = (v: number): boolean => have.some((z) => z.value === v && z.name.startsWith(fam === 'button' ? 'buttonHeight' : fam));
+    // token-held positions are counted too (see scanWebSizeSites `resolve`): the
+    // ladder stays the one the first run planned; tokened values are skipped.
+    for (const s of sites) if (s.family === fam && Number.isInteger(s.value)) els.set(s.value, (els.get(s.value) ?? new Set()).add(s.el ?? String(s.start)));
     const counts = new Map([...els].map(([v, set]) => [v, set.size]));
     for (const t of ladderNames(counts, ladder, md, 2)) {
-      if (taken.has(t.name)) continue;
+      if (tokened(t.value) || taken.has(t.name)) continue;
       taken.add(t.name); sizes.push({ name: t.name, value: t.value });
     }
   }
@@ -428,7 +442,14 @@ export async function deepenWebTokens(projectRoot: string, opts: WebTokenOptions
   // theme object (≥2 uses); the substitution below then uses it.
   {
     const allSites: WebSizeSite[] = [];
-    for (const [fi, f] of targets.entries()) { const src = await fs.readFile(f, 'utf-8').catch(() => ''); if (src) allSites.push(...scanWebSizeSites(src).map((x) => ({ ...x, el: `${fi}:${x.el ?? x.start}` }))); }
+    const sizeKey = theme.groupKeys.size ?? 'size';
+    const radiusKey = theme.groupKeys.radius ?? 'radius';
+    const tokenValues = new Map<string, number>([
+      ...(theme.sizes ?? []).map((z) => [`${theme.themeSymbol}.${sizeKey}.${z.name}`, z.value] as [string, number]),
+      ...theme.radius.map((z) => [`${theme.themeSymbol}.${radiusKey}.${z.name}`, z.value] as [string, number]),
+    ]);
+    const resolve = (expr: string): number | null => tokenValues.get(expr) ?? null;
+    for (const [fi, f] of targets.entries()) { const src = await fs.readFile(f, 'utf-8').catch(() => ''); if (src) allSites.push(...scanWebSizeSites(src, resolve).map((x) => ({ ...x, el: `${fi}:${x.el ?? x.start}` }))); }
     const plan = planWebVocabulary(theme, allSites);
     if (plan.sizes.length || plan.pill) {
       const cur = fsSync.readFileSync(theme.themeFile, 'utf-8');

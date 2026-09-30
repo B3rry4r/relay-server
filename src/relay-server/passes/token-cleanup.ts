@@ -401,7 +401,10 @@ async function runFlutter(projectRoot: string, opts: DeepenTokensOptions): Promi
     const isTarget = (f: string): boolean => f !== themeAbs && !/[\\/]_preview[\\/]/.test(f);
     const extras = parseVocabExtras(contents.get(themeAbs)!);
     const vt: VocabThemeModel = { className: theme.className, themeFileRel: theme.themeFileRel, colors: theme.colors, spacing: theme.spacing, radius: theme.radius, sizes: extras.sizes, corners: extras.corners };
-    const sites = [...contents].filter(([f]) => isTarget(f)).map(([, src]) => scanVocabSites(src));
+    // planning counts token-held positions too (`AppTheme.iconMd` = its value)
+    const tokenValues = new Map<string, number>([...vt.sizes, ...vt.spacing].map((z) => [`${theme.className}.${z.name}`, z.value]));
+    const resolve = (expr: string): number | null => tokenValues.get(expr.trim()) ?? null;
+    const sites = [...contents].filter(([f]) => isTarget(f)).map(([, src]) => scanVocabSites(src, resolve));
     const colorRefs = new Map<string, number>();
     for (const [f, src] of contents) if (isTarget(f)) for (const m of src.matchAll(new RegExp(`\\b${theme.className}\\.([A-Za-z_]\\w*)`, 'g'))) colorRefs.set(m[1], (colorRefs.get(m[1]) ?? 0) + 1);
     const plan = planVocabularyAmendment(vt, sites, colorRefs);

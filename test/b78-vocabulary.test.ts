@@ -279,3 +279,48 @@ describe('F4 web: counter-named colour keys get role names (react + next)', () =
 it('fixtures are untouched by these tests', () => {
   expect(fsSync.readFileSync(path.join(__dirname, 'fixtures', 'parity', 'react', 'src', 'theme', 'theme.ts'), 'utf8')).not.toMatch(/size:/);
 });
+
+describe('F5 convergence: a value outside the size ladder is never promoted on a later run', () => {
+  it('flutter: the ladder keeps its run-1 shape; values it left out are never promoted on run 2', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'b78-conv-'));
+    try {
+      await fs.writeFile(path.join(root, 'pubspec.yaml'), 'name: t\ndependencies:\n  flutter:\n    sdk: flutter\n');
+      await fs.mkdir(path.join(root, 'lib', 'theme'), { recursive: true });
+      await fs.mkdir(path.join(root, 'lib', 'screens'), { recursive: true });
+      await fs.writeFile(path.join(root, 'lib', 'theme', 'app_theme.dart'), THEME);
+      const uses: Array<[number, number]> = [[20, 6], [12, 3], [14, 3], [16, 3], [18, 3], [27, 2], [30, 2]];
+      const icons = uses.flatMap(([v, n]) => Array.from({ length: n }, () => `      Icon(Icons.add, size: ${v}),`));
+      for (const f of [0, 1]) {
+        const mine = icons.filter((_, i) => i % 2 === f).join('\n');
+        await fs.writeFile(path.join(root, 'lib', 'screens', `c${f}_screen.dart`), `import 'package:flutter/material.dart';\n\nclass C${f}Screen extends StatelessWidget {\n  const C${f}Screen({super.key});\n  @override\n  Widget build(BuildContext context) {\n    return Column(children: [\n${mine}\n    ]);\n  }\n}\n`);
+      }
+      const r1 = await deepenTokensAndCleanup('t', { projectRoot: root, noAi: true, skipAnalyze: true, noReport: true });
+      const added1 = (r1.report.vocabulary?.added ?? []).filter((a) => a.startsWith('icon'));
+      expect(added1).toEqual(['iconXs=16', 'iconSm=18', 'iconMd=20']);
+      const r2 = await deepenTokensAndCleanup('t', { projectRoot: root, noAi: true, skipAnalyze: true, noReport: true });
+      expect(r2.report.vocabulary).toBeUndefined();
+      expect(r2.report.changes).toEqual([]);
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+
+  for (const fw of ['react', 'next'] as const) {
+    it(`${fw}: the same on the web theme`, async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), `b78-convw-${fw}-`));
+      await fs.cp(path.join(__dirname, 'fixtures', 'parity', fw), root, { recursive: true });
+      try {
+        const probe = await deepenTokensAndCleanup('t', { projectRoot: root, noAi: true, skipAnalyze: true, noReport: true, dryRun: true });
+        const target = path.join(root, fw === 'react' ? 'src/screens/Home/HomeScreen.tsx' : 'app/(tabs)/10-2/page.tsx');
+        void probe;
+        const uses: Array<[number, number]> = [[20, 6], [12, 3], [14, 3], [16, 3], [18, 3], [23, 2], [26, 2]];
+        const imgs = uses.flatMap(([v, n]) => Array.from({ length: n }, () => `      <img src="" alt="" width={${v}} height={${v}} />`)).join('\n');
+        await fs.appendFile(target, `\nfunction IconRow() {\n  return (\n    <div>\n${imgs}\n    </div>\n  );\n}\nvoid IconRow;\n`);
+        const r1 = await deepenTokensAndCleanup('t', { projectRoot: root, noAi: true, skipAnalyze: true, noReport: true });
+        const added1 = (r1.report.vocabulary?.added ?? []).filter((a) => a.startsWith('icon'));
+        expect(added1.length).toBeGreaterThan(0);
+        const r2 = await deepenTokensAndCleanup('t', { projectRoot: root, noAi: true, skipAnalyze: true, noReport: true });
+        expect(r2.report.vocabulary?.added ?? []).toEqual([]);
+        expect(r2.report.substitutions.sizes ?? 0).toBe(0);
+      } finally { await fs.rm(root, { recursive: true, force: true }); }
+    });
+  }
+});

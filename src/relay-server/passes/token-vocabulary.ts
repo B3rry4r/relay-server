@@ -97,10 +97,17 @@ const NUM = /^-?\d+(?:\.\d+)?$/;
 export interface VocabSite { family: 'icon' | 'avatar' | 'tile' | 'button' | 'spacing' | 'radius' | 'corner' | 'pill'; value: number; start: number; end: number; /** the element the literal belongs to (a square's width + height are ONE use). */ el?: number }
 
 /** Find every literal in a recognisable role in one Dart source. */
-export function scanVocabSites(src: string): VocabSite[] {
+export function scanVocabSites(src: string, resolve?: (expr: string) => number | null): VocabSite[] {
   const sites: VocabSite[] = [];
-  const numAt = (a: { text: string; at: number } | undefined): { value: number; start: number; end: number } | null =>
-    a && NUM.test(a.text) ? { value: Number(a.text), start: a.at, end: a.at + a.text.length } : null;
+  // `resolve` (planning only) also counts a position already holding a token
+  // (`size: AppTheme.iconMd`) as a use of its value, so the ladder a second run
+  // plans is the same one the first run planned — 7f converges.
+  const numAt = (a: { text: string; at: number } | undefined): { value: number; start: number; end: number } | null => {
+    if (!a) return null;
+    if (NUM.test(a.text)) return { value: Number(a.text), start: a.at, end: a.at + a.text.length };
+    const v = resolve ? resolve(a.text) : null;
+    return v != null ? { value: v, start: a.at, end: a.at + a.text.length } : null;
+  };
   const pillSafe = new Set<number>();   // offsets of BorderRadius.circular( calls proven stadium
 
   const callRe = /\b(Icon|SvgPicture\.(?:asset|network|string|memory)|Image\.(?:asset|network|file|memory)|Container|AnimatedContainer|SizedBox|Ink|DecoratedBox|Row|Column|Wrap|EdgeInsets\.(?:all|symmetric|only|fromLTRB))\s*\(/g;
@@ -157,7 +164,7 @@ export function scanVocabSites(src: string): VocabSite[] {
       // a circle: BoxShape.circle, a clipped oval child, or a corner radius ≥ half the side
       const decText = args.get('decoration')?.text ?? '';
       const rr = /BorderRadius\.circular\(\s*(\d+(?:\.\d+)?)\s*\)/.exec(decText);
-      const circle = /BoxShape\.circle/.test(decText) || (!!rr && Number(rr[1]) * 2 >= w.value) || /^(?:const\s+)?(?:ClipOval|CircleAvatar)\b/.test(args.get('child')?.text ?? '');
+      const circle = /BoxShape\.circle|\bradiusPill\b/.test(decText) || (!!rr && Number(rr[1]) * 2 >= w.value) || /^(?:const\s+)?(?:ClipOval|CircleAvatar)\b/.test(args.get('child')?.text ?? '');
       const fam = circle ? 'avatar' : 'tile';
       sites.push({ family: fam, ...w, el: open }); sites.push({ family: fam, ...h, el: open });
     } else if (h && (!w || args.get('width')?.text === 'double.infinity') && h.value >= 36 && h.value <= 64 && hasChild && /\b(Text|TextField|TextFormField|ElevatedButton|TextButton|OutlinedButton)\s*\(/.test(argText)) {
@@ -226,9 +233,11 @@ export function planVocabularyAmendment(theme: VocabThemeModel, sitesByFile: Voc
   const fams: Array<[VocabSite['family'], string[], number]> = [['icon', ICON_LADDER, 2], ['avatar', AVATAR_LADDER, 1], ['tile', TILE_LADDER, 2], ['button', BUTTON_LADDER, 1]];
   for (const [fam, ladder, md] of fams) {
     const famPrefix = fam === 'button' ? 'buttonheight' : fam;
+    // Values already tokened in this family stay on the ladder (their positions were
+    // counted through `resolve`) and are skipped here, so the ladder is stable.
     const counts = count(fam);
-    for (const v of [...counts.keys()]) if (existingSize(famPrefix, v)) counts.delete(v);
     for (const t of ladderNames(counts, ladder, md, 2)) {
+      if (existingSize(famPrefix, t.value)) continue;
       if (taken.has(t.name) || !Number.isInteger(t.value)) continue;
       taken.add(t.name);
       sizes.push({ name: t.name, value: t.value });
