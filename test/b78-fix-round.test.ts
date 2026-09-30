@@ -173,3 +173,44 @@ describe('readability metric ships in dist/src (release tarballs hold dist/src o
     expect(req('../scripts/readability-report.cjs')).toBe(req('../src/relay-server/readability-report.cjs'));
   });
 });
+
+describe('F2 parameter quality: a positional asset argument is `String asset`, not `dynamic value`', () => {
+  it('Image.asset(AppAssets.x) in two copies lifts with a typed, named parameter; the reuse block shows types', async () => {
+    const { extractComponents } = await import('../src/relay-server/passes/component-extraction');
+    const { scanBuiltComponents } = await import('../src/relay-server/component-contract');
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'b78fx-f2-'));
+    try {
+      await fs.writeFile(path.join(root, 'pubspec.yaml'), 'name: t\nenvironment:\n  sdk: ">=3.0.0 <4.0.0"\ndependencies:\n  flutter:\n    sdk: flutter\n');
+      for (const d of ['theme', 'screens', 'resources']) await fs.mkdir(path.join(root, 'lib', d), { recursive: true });
+      await fs.writeFile(path.join(root, 'lib', 'theme', 'app_theme.dart'), "import 'package:flutter/material.dart';\n\nclass AppTheme {\n  static const Color brand = Color(0xFF12AE89);\n  static const Color ink = Color(0xFF000000);\n}\n");
+      await fs.writeFile(path.join(root, 'lib', 'resources', 'app_assets.dart'), "class AppAssets {\n  AppAssets._();\n  static const String homeIcon = 'assets/icons/home.png';\n  static const String scanIcon = 'assets/icons/scan.png';\n}\n");
+      const screen = (n: string, asset: string, color: string) => `import 'package:flutter/material.dart';\nimport '../theme/app_theme.dart';\nimport '../resources/app_assets.dart';\n\nclass ${n}Screen extends StatelessWidget {\n  const ${n}Screen({super.key});\n  @override\n  Widget build(BuildContext context) => const _NavItem();\n}\n\nclass _NavItem extends StatelessWidget {\n  const _NavItem();\n  @override\n  Widget build(BuildContext context) {\n    return Column(children: [\n      Image.asset(${asset}, width: 24, height: 24),\n      Container(width: 8, height: 8, color: ${color}),\n    ]);\n  }\n}\n`;
+      await fs.writeFile(path.join(root, 'lib', 'screens', 'a_screen.dart'), screen('A', 'AppAssets.homeIcon', 'AppTheme.brand'));
+      await fs.writeFile(path.join(root, 'lib', 'screens', 'b_screen.dart'), screen('B', 'AppAssets.scanIcon', 'AppTheme.ink'));
+      const r = await extractComponents('t', { projectRoot: root, noAiConfirm: true });
+      expect(r.extracted.map((e) => e.name)).toEqual(['NavItem']);
+      const nav = await fs.readFile(path.join(root, r.extracted[0].componentPath), 'utf8');
+      expect(nav).toMatch(/final String asset;/);
+      expect(nav).not.toMatch(/\bdynamic\b|\bvalue\b/);
+      expect(nav).toMatch(/Image\.asset\(\s*asset,/);
+      expect(await fs.readFile(path.join(root, 'lib', 'screens', 'a_screen.dart'), 'utf8')).toMatch(/NavItem\([^)]*asset: AppAssets\.homeIcon/);
+      const built = scanBuiltComponents(root, 'flutter');
+      const sig = built.find((b) => b.className === 'NavItem')!.signature;
+      expect(sig).toMatch(/^NavItem\(\{required String asset, required Color color\}\)$/);
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+
+  it('reuse signatures render cleanly: no `(this.x, )`, no `({ required`', async () => {
+    const { scanBuiltComponents } = await import('../src/relay-server/component-contract');
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'b78fx-sig-'));
+    try {
+      await fs.writeFile(path.join(root, 'pubspec.yaml'), 'name: t\n');
+      await fs.mkdir(path.join(root, 'lib', 'components'), { recursive: true });
+      await fs.writeFile(path.join(root, 'lib', 'components', 'disc.dart'), "import 'package:flutter/material.dart';\n\nclass Disc extends StatelessWidget {\n  const Disc(this.color, {super.key});\n  final Color color;\n  @override\n  Widget build(BuildContext context) => Container(color: color);\n}\n");
+      await fs.writeFile(path.join(root, 'lib', 'components', 'pill.dart'), "import 'package:flutter/material.dart';\n\nclass Pill extends StatelessWidget {\n  const Pill({\n    super.key,\n    required this.label,\n    this.onTap,\n  });\n  final String label;\n  final VoidCallback? onTap;\n  @override\n  Widget build(BuildContext context) => Text(label);\n}\n");
+      const sigs = Object.fromEntries(scanBuiltComponents(root, 'flutter').map((b) => [b.className, b.signature]));
+      expect(sigs.Disc).toBe('Disc(Color color)');
+      expect(sigs.Pill).toBe('Pill({required String label, VoidCallback? onTap})');
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+});

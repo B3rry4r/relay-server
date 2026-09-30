@@ -971,7 +971,7 @@ function planParameterization(projectRoot: string, group: WidgetUnit[]): ParamPl
     // CONTRACTS §5: the parameter is named after the named argument it feeds
     // (`color:` → `color`), never `p0`. Collisions get a numeric suffix.
     const taken = new Set([...existingParamNames, ...spanParams.map((x) => x.name)]);
-    const stem = paramNameFor(base, lo, ptype);
+    const stem = paramNameFor(base, lo, ptype, [...perFile.values()]);
     let pname = stem;
     for (let k = 2; taken.has(pname) || DART_RESERVED.has(pname); k++) pname = `${stem}${k}`;
     pidx++;
@@ -1083,16 +1083,31 @@ const DART_RESERVED = new Set(['key', 'default', 'class', 'const', 'final', 'new
  *  through enclosing brackets until a `key:` at that level (`color: Color(p)` →
  *  `color`, `style: TextStyle(fontSize: p)` → `fontSize`). No named key anywhere
  *  (a positional `Text('…')`) → the callee (`text`) or the type (`value`). */
-function paramNameFor(toks: Tok[], lo: number, ptype: string): string {
+/** What a POSITIONAL argument of these calls is (`Image.asset(p)` → `asset`). */
+const POSITIONAL_ARG_NAMES: Record<string, string> = {
+  'Image.asset': 'asset', 'SvgPicture.asset': 'asset', AssetImage: 'asset', 'Image.file': 'file',
+  'Image.network': 'imageUrl', 'SvgPicture.network': 'imageUrl', NetworkImage: 'imageUrl',
+  Icon: 'icon', Text: 'text', 'Text.rich': 'text', SelectableText: 'text', Tooltip: 'message',
+};
+
+function paramNameFor(toks: Tok[], lo: number, ptype: string, values: string[] = []): string {
   let depth = 0;
   let positional = false;
   let firstCallee: string | null = null;
+  // An asset path from the generated resources class (`AppAssets.netflixIcon`) is an
+  // asset whatever call it feeds.
+  if (values.length && values.every((v) => /^(?:const\s+)?AppAssets\.[A-Za-z_]\w*$/.test(v.trim()))) return 'asset';
   for (let j = lo - 1; j >= 0; j--) {
     const t = toks[j].text;
     if (t === ')' || t === ']' || t === '}') { depth++; continue; }
     if (t === '(' || t === '[' || t === '{') {
       if (depth > 0) { depth--; continue; }
-      if (t === '(' && toks[j - 1]?.kind === 'id' && !firstCallee) firstCallee = toks[j - 1].text;
+      if (t === '(' && toks[j - 1]?.kind === 'id' && !firstCallee) {
+        firstCallee = toks[j - 1].text;
+        if (toks[j - 2]?.text === '.' && toks[j - 3]?.kind === 'id') firstCallee = `${toks[j - 3].text}.${firstCallee}`;
+        // the span is this call's own positional argument
+        if (!positional && POSITIONAL_ARG_NAMES[firstCallee]) return POSITIONAL_ARG_NAMES[firstCallee];
+      }
       positional = false;   // leaving this level; look for the key one level up
       continue;
     }
@@ -1105,7 +1120,7 @@ function paramNameFor(toks: Tok[], lo: number, ptype: string): string {
     }
     if (t === ';' || t === '=>') break;
   }
-  if (firstCallee && /^[A-Z]/.test(firstCallee)) return firstCallee.charAt(0).toLowerCase() + firstCallee.slice(1);
+  if (firstCallee && /^[A-Z]\w*$/.test(firstCallee)) return firstCallee.charAt(0).toLowerCase() + firstCallee.slice(1);
   if (ptype !== 'dynamic') return ptype.charAt(0).toLowerCase() + ptype.slice(1).replace(/Geometry$/, '');
   return 'value';
 }
@@ -1125,15 +1140,24 @@ function mergeRanges(ranges: Array<[number, number]>): Array<[number, number]> {
  *  (`static const Color brand` → Color, `static TextStyle button18(...)` → TextStyle). */
 function themeMemberTypes(projectRoot: string): Map<string, string> {
   const out = new Map<string, string>();
-  let src = '';
-  try { src = fsSync.readFileSync(path.join(projectRoot, 'lib', 'theme', 'app_theme.dart'), 'utf8'); } catch { return out; }
+  // the theme class, and the generated resources classes (`AppAssets.x` is a String path)
+  const files = [path.join(projectRoot, 'lib', 'theme', 'app_theme.dart')];
+  try { for (const f of fsSync.readdirSync(path.join(projectRoot, 'lib', 'resources'))) if (f.endsWith('.dart')) files.push(path.join(projectRoot, 'lib', 'resources', f)); } catch { /* none */ }
+  for (const f of files) {
+    let src = '';
+    try { src = fsSync.readFileSync(f, 'utf8'); } catch { continue; }
+    collectStaticMemberTypes(src, out);
+  }
+  return out;
+}
+
+function collectStaticMemberTypes(src: string, out: Map<string, string>): void {
   const cls = /class\s+([A-Za-z_]\w*)\s*\{/.exec(src)?.[1] ?? 'AppTheme';
   for (const m of src.matchAll(/static\s+(?:const\s+|final\s+)?([A-Z][A-Za-z0-9_<>?]*)\s+(?:get\s+)?([A-Za-z_]\w*)\s*(?=[=(;,])/g)) out.set(`${cls}.${m[2]}`, m[1]);
   // multi-assign `static const double s4 = 4, s8 = 8;`
   for (const m of src.matchAll(/static\s+const\s+(double|int)\s+((?:[A-Za-z_]\w*\s*=\s*[^,;]+,?\s*)+);/g)) {
     for (const pm of m[2].matchAll(/([A-Za-z_]\w*)\s*=/g)) out.set(`${cls}.${pm[1]}`, m[1]);
   }
-  return out;
 }
 
 /** The named argument a span feeds (`style: <span>` → 'style'), or null. */
