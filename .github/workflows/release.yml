@@ -76,7 +76,8 @@ jobs:
             echo "::error::package.json has no pack:release script (CONTRACTS §3: npm run pack:release → release.tgz + manifest.json)."
             exit 1
           fi
-          npm run pack:release
+          # --out .: the default is .release/; everything below reads the repo root.
+          npm run pack:release -- --out .
           test -s release.tgz || { echo "::error::pack:release did not produce release.tgz"; exit 1; }
           # The host reads manifest.json from INSIDE the tarball; keep a copy beside it.
           if ! tar -tzf release.tgz | grep -qxE '(\./)?manifest\.json'; then

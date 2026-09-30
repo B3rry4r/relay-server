@@ -154,7 +154,7 @@ On Fly, relay-server is not an app of its own. It is a **release** that the rela
 (relay-pty repo, Fly app `relay-host`) installs on its volume and hot-swaps.
 Terminals live in the host and survive every relay-server deploy.
 
-- `npm run pack:release` → `release.tgz` + `manifest.json`: the release contract
+- `npm run pack:release` → `.release/release.tgz` + `manifest.json` (`-- --out <dir>` to write elsewhere; CI uses `--out .`): the release contract
   (relay-pty README, "Release contract").
 - CI: `.github/workflows/release.yml` runs `tsc`, vitest (with the parity
   ratchet), `npm run build`, `pack:release` and uploads the artifact on every push/PR. On `main`

@@ -16,3 +16,6 @@ acli
 !.claude/skills/
 !.claude/skills/**
 .release/
+/release.tgz
+/release.sha256
+/manifest.json
