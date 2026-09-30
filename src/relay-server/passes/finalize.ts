@@ -898,7 +898,7 @@ async function buildOkFor(
 export interface BuildOutcome { ok: boolean | null; error?: string; reason?: string; tool?: string }
 
 type TypecheckOutcome =
-  | { ok: true; errors: number; lines: string[]; tool: string }
+  | { ok: true; errors: number; lines: string[]; tool: string; /** stale .next/types route files removed first */ pruned?: string[] }
   | { ok: false; reason: string };
 
 /** The project's OWN TypeScript compiler, or null. Never `npx tsc`: in a project
@@ -966,11 +966,21 @@ export async function webTypecheck(projectRoot: string, framework: 'react' | 'ne
     };
   }
   // Next 15.5+/16 declares route types (LayoutProps, PageProps) in generated
-  // .next/types; without them a pristine app fails tsc. Generate them first
-  // (best-effort: older Next has no `typegen`, and then there is nothing to generate).
+  // .next/types; without them a pristine app fails tsc. Generate them first.
+  // Older Next has no `typegen` (its CLI would read the word as a project dir), so
+  // the route type files the last `next build` wrote are never regenerated: a
+  // route deleted or renamed since then (7b deletes dead modal routes) leaves a
+  // .next/types file importing a page that is gone. `next build` put
+  // `.next/types/**/*.ts` in tsconfig's include, so the gate counted those TS2307s
+  // — errors in build output no source edit can fix, which parked the run and
+  // reverted every pass that ran after the deletion (B56 fix round, PG-36).
+  let pruned: string[] = [];
   if (framework === 'next') {
     const nextBin = path.join(projectRoot, 'node_modules', 'next', 'dist', 'bin', 'next');
-    if (fsSync.existsSync(nextBin)) await runCmdStatus(process.execPath, [nextBin, 'typegen'], projectRoot, env, 120_000).catch(() => null);
+    if (fsSync.existsSync(nextBin) && nextHasTypegen(projectRoot)) {
+      await runCmdStatus(process.execPath, [nextBin, 'typegen'], projectRoot, env, 120_000).catch(() => null);
+    }
+    pruned = pruneStaleNextRouteTypes(projectRoot);
   }
   let errors = 0;
   const all: string[] = [];
@@ -987,7 +997,52 @@ export async function webTypecheck(projectRoot: string, framework: 'react' | 'ne
     errors += parsed.errors;
     all.push(...parsed.lines);
   }
-  return { ok: true, errors, lines: all, tool: `typescript@${ts.version} (node_modules)` };
+  return { ok: true, errors, lines: all, tool: `typescript@${ts.version} (node_modules)`, ...(pruned.length ? { pruned } : {}) };
+}
+
+/** True when the project's installed Next has `next typegen` (added in 15.5). */
+export function nextHasTypegen(projectRoot: string): boolean {
+  try {
+    const v = String((JSON.parse(fsSync.readFileSync(path.join(projectRoot, 'node_modules', 'next', 'package.json'), 'utf8')) as { version?: string }).version ?? '');
+    const [maj, min] = v.split('.').map((x) => parseInt(x, 10));
+    return maj > 15 || (maj === 15 && min >= 5);
+  } catch { return false; }
+}
+
+/** Remove the route type files under `.next/types` whose route module no longer
+ *  exists (a page/layout/route deleted or renamed since the last `next build`).
+ *  Each one is `// File: <abs source>` + `import * as entry from '<rel>/page.js'`;
+ *  when neither the import nor the recorded file resolves, the type file checks a
+ *  module that is gone and can only ever produce TS2307. `.next` is build output
+ *  and `next build` regenerates it. Files that import nothing relative
+ *  (package.json, link.d.ts, cache-life.d.ts) are left alone. Returns the removed
+ *  project-relative paths. */
+export function pruneStaleNextRouteTypes(projectRoot: string): string[] {
+  const typesDir = path.join(projectRoot, '.next', 'types');
+  const removed: string[] = [];
+  const walk = (dir: string): string[] => {
+    let entries: fsSync.Dirent[] = [];
+    try { entries = fsSync.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
+    return entries.flatMap((e) => (e.isDirectory() ? walk(path.join(dir, e.name)) : /\.tsx?$/.test(e.name) && !/\.d\.ts$/.test(e.name) ? [path.join(dir, e.name)] : []));
+  };
+  const exists = (base: string): boolean => {
+    const noJs = base.replace(/\.(?:js|jsx|mjs)$/, '');
+    return [base, noJs, `${noJs}.tsx`, `${noJs}.ts`, `${noJs}.jsx`, `${noJs}.js`, `${noJs}.mdx`].some((c) => {
+      try { return fsSync.statSync(c).isFile(); } catch { return false; }
+    });
+  };
+  for (const f of walk(typesDir)) {
+    let src = '';
+    try { src = fsSync.readFileSync(f, 'utf8'); } catch { continue; }
+    const rel = /import\s+\*\s+as\s+entry\s+from\s+['"](\.[^'"]+)['"]/.exec(src)?.[1]
+      ?? /typeof\s+import\(\s*['"](\.[^'"]+)['"]\s*\)/.exec(src)?.[1] ?? null;
+    if (!rel) continue;
+    if (exists(path.resolve(path.dirname(f), rel))) continue;
+    const recorded = /^\/\/\s*File:\s*(.+)$/m.exec(src)?.[1]?.trim();
+    if (recorded && path.isAbsolute(recorded) && exists(recorded)) continue;
+    try { fsSync.rmSync(f, { force: true }); removed.push(path.relative(projectRoot, f).split(path.sep).join('/')); } catch { /* best-effort */ }
+  }
+  return removed;
 }
 
 /** The project's real build. `npm run build` when the script exists — the only

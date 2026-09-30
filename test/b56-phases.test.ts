@@ -179,6 +179,62 @@ describe('analyze gate is framework-aware (PG-36)', () => {
     expect(g.unmeasured).toMatch(/could not re-measure.*pre-repair count was 3/);
   });
 
+  it('Next < 15.5 (no `next typegen`): stale .next/types for a deleted route are pruned, never counted; a real error still is (B56 fix round)', async () => {
+    // `next build` adds `.next/types/**/*.ts` to tsconfig's include and writes one
+    // route type file per page. Next 14 has no typegen, so after 7b deletes a route
+    // the gate counted TS2307 in .next/types/app/<gone>/page.ts — errors no source edit
+    // can fix — parked the run, and reverted every later pass on the Next 14 fixture.
+    const tsDir = path.resolve(__dirname, '..', 'node_modules', 'typescript');
+    await fs.mkdir(path.join(root, 'node_modules'), { recursive: true });
+    await fs.symlink(tsDir, path.join(root, 'node_modules', 'typescript'), 'dir');
+    await write('node_modules/next/package.json', JSON.stringify({ name: 'next', version: '14.2.5' }));
+    await write('package.json', JSON.stringify({ dependencies: { next: '14.2.5', react: '18' } }));
+    await write('tsconfig.json', JSON.stringify({
+      compilerOptions: { strict: true, noEmit: true, module: 'esnext', moduleResolution: 'bundler', target: 'ES2020', skipLibCheck: true },
+      include: ['**/*.ts', '.next/types/**/*.ts'], exclude: ['node_modules'],
+    }));
+    await write('app/live/page.ts', 'export default function Page() { return null; }\n');
+    const typeFile = (route: string) => [
+      `// File: ${path.join(root, 'app', route, 'page.tsx')}`,
+      `import * as entry from '../../../../app/${route}/page.js'`,
+      `type TEntry = typeof import('../../../../app/${route}/page.js')`,
+      'export const check: TEntry = entry',
+      '',
+    ].join('\n');
+    await write('.next/types/app/live/page.ts', typeFile('live'));
+    await write('.next/types/app/gone/page.ts', typeFile('gone'));        // route deleted since the build
+    await write('.next/types/package.json', '{"type":"module"}');
+
+    const { webTypecheck, pruneStaleNextRouteTypes, nextHasTypegen } = await import('../src/relay-server/passes/finalize');
+    expect(nextHasTypegen(root)).toBe(false);
+    const t = await webTypecheck(root, 'next');
+    expect(t).toMatchObject({ ok: true, errors: 0, pruned: ['.next/types/app/gone/page.ts'] });
+    expect(fsSync.existsSync(path.join(root, '.next/types/app/live/page.ts'))).toBe(true);
+    expect(fsSync.existsSync(path.join(root, '.next/types/package.json'))).toBe(true);
+    expect(pruneStaleNextRouteTypes(root)).toEqual([]);                 // idempotent
+
+    // The gate end to end: nothing to repair, no model call, not parked.
+    await write('.next/types/app/gone/page.ts', typeFile('gone'));
+    let called = 0;
+    const g = await runAnalyzeGate({ projectRoot: root, framework: 'next', model: 'claude' as never, runModel: async () => { called++; return { text: '' }; } });
+    expect(g).toMatchObject({ errors: 0, ok: true, repairAttempted: false });
+    expect(called).toBe(0);
+
+    // A real error in a route that exists is still counted.
+    await write('app/live/page.ts', "const n: number = 'x';\nexport default function Page() { return n; }\n");
+    const bad = await webTypecheck(root, 'next');
+    expect(bad).toMatchObject({ ok: true, errors: 1 });
+    expect((bad as { lines: string[] }).lines[0]).toMatch(/^app\/live\/page\.ts\(1,7\): error TS2322/);
+  });
+
+  it('nextHasTypegen: only Next >= 15.5', async () => {
+    const { nextHasTypegen } = await import('../src/relay-server/passes/finalize');
+    for (const [v, want] of [['14.2.5', false], ['15.4.9', false], ['15.5.0', true], ['16.3.7', true]] as const) {
+      await write('node_modules/next/package.json', JSON.stringify({ name: 'next', version: v }));
+      expect([v, nextHasTypegen(root)]).toEqual([v, want]);
+    }
+  });
+
   it('a web project with no installed typescript reports WHY it could not measure', async () => {
     await write('package.json', JSON.stringify({ dependencies: { react: '19' } }));
     await write('tsconfig.json', '{}');
