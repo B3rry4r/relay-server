@@ -151,7 +151,9 @@ describe('F6 provenance strip: JSX-aware, no litter, no false provenance', () =>
   it('a size that is a sentence predicate or a small grid count stays; a measured size goes', () => {
     expect(stripProvenanceText('Grid is 3×3 so the QR code fits')).toBe('Grid is 3×3 so the QR code fits');
     expect(stripProvenanceText('The avatar is 40×40 so it lines up with the row')).toBe('The avatar is 40×40 so it lines up with the row');
-    expect(stripProvenanceText('Dots are 27×27 each.')).toBe('');
+    expect(stripProvenanceText('Dots are 27×27 each.')).toBe('Dots are 27×27 each.');   // a predicate: the size IS the statement
+    expect(stripProvenanceText('Back chevron in a 24×24 tap target.')).toBe('Back chevron in a tap target.');
+    expect(stripProvenanceText('The icon is 24×24px so it aligns')).toBe('The icon is 24×24px so it aligns');
     expect(stripProvenanceText('Chevron, 24×24px, right aligned.')).toBe('Chevron, right aligned.');
   });
 });
