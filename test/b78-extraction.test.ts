@@ -180,3 +180,16 @@ describe('F2 flutter extraction on a real run', () => {
     } finally { await fs.rm(root, { recursive: true, force: true }); }
   });
 });
+
+describe('F2 web: a hoisted component takes its own leading comment along', () => {
+  it('the comment moves into the component file and no orphan is left in the screens', async () => {
+    const { leadingLineComments } = await import('../src/relay-server/passes/component-extraction-web');
+    const src = "// canonicalId: c_1\nimport x from 'y';\n\n// Avatar row — shows the signed-in user.\n// Second line.\nfunction UserChip() {\n  return <div />;\n}\n";
+    const at = src.indexOf('function UserChip');
+    expect(leadingLineComments(src, at)).toBe('// Avatar row — shows the signed-in user.\n// Second line.\n');
+    const hdr = "// canonicalId: c_1\nfunction A() {}\n";
+    expect(leadingLineComments(hdr, hdr.indexOf('function A'))).toBe('');
+    const blank = "// unrelated\n\nfunction B() {}\n";
+    expect(leadingLineComments(blank, blank.indexOf('function B'))).toBe('');
+  });
+});
