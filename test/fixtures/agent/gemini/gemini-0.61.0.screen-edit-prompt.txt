@@ -1,0 +1,33 @@
+bash-5.2# gemini
+
+ ▝▜▄     Gemini CLI v0.61.0
+   ▝▜▄
+  ▗▟▀    Authenticated with gemini-api-key /auth
+ ▝▀    
+
+
+Tips for getting started:
+1. Create GEMINI.md files to customize your interactions
+2. /help for more information
+3. Ask coding questions, edit code or run commands
+4. Be specific for the best results
+                                                                                                    
+ > edit hello.txt                                                                                   
+                                                                                                    
+✦ I'll make the edit.
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ? Edit  hello.txt: hello world => hello relay                                                    │
+│ ╭──────────────────────────────────────────────────────────────────────────────────────────────╮ │
+│ │ 1 - hello world                                                                              │ │
+│ │ 1 + hello relay                                                                              │ │
+│ ╰──────────────────────────────────────────────────────────────────────────────────────────────╯ │
+│ Apply this change?                                                                               │
+│                                                                                                  │
+│ ● 1. Allow once                                                                                  │
+│   2. Allow for this session                                                                      │
+│   3. Modify with external editor                                                                 │
+│   4. No, suggest changes (esc)                                                                   │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+

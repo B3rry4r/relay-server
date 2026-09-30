@@ -22,7 +22,8 @@
  */
 import { parseDisplayBlocks } from './blocks';
 import type { RawAgentEvent } from './adapters/common';
-import { permissionOptions } from './keys';
+import { editPermissionOptions, permissionOptions } from './keys';
+import { toolKind } from './adapters/common';
 import type {
   AgentCli, AgentEvent, AgentEventBody, AgentSessionSummary, AgentSource, AgentState, Attribution,
   PermissionRequestEvent, SessionCandidate,
@@ -362,7 +363,7 @@ export class TerminalTimeline {
         s.lastWasTurnEnd = false;
         const ev = this.push(s, id, meta.source, at, {
           kind: 'permission.request', requestId, ...(toolUseId ? { toolUseId } : {}), tool: String(raw.tool ?? ''),
-          title, ...(detail ? { detail } : {}), options: permissionOptions(s.cli), answerable,
+          title, ...(detail ? { detail } : {}), options: isEditRequest(raw.tool, input) ? editPermissionOptions(s.cli) : permissionOptions(s.cli), answerable,
         }) as PermissionRequestEvent;
         s.pending = { event: ev, input, answering: false, source: meta.source };
         out.push(ev);
@@ -557,4 +558,17 @@ export function truncateInput(input: unknown): unknown {
     if (size(clipped) <= MAX_INPUT_BYTES) return clipped;
   }
   return { truncated: true, preview: truncateBytes(JSON.stringify(input), MAX_INPUT_BYTES - 64) };
+}
+
+/**
+ * Is this permission request a file edit? An edit tool (Edit, Write, replace,
+ * apply_patch …), or Codex's `apply_patch` sent through its shell tool, which the
+ * Codex TUI turns into an edit prompt ("Would you like to make the following edits?").
+ */
+export function isEditRequest(tool: unknown, input: unknown): boolean {
+  if (toolKind(tool) === 'edit') return true;
+  if (toolKind(tool) !== 'shell' || !input || typeof input !== 'object') return false;
+  const rec = input as Record<string, unknown>;
+  const cmd = Array.isArray(rec.command) ? rec.command.map(String).join(' ') : String(rec.cmd ?? rec.command ?? '');
+  return /(^|\s|-lc\s+)apply_patch\b/.test(cmd.trim());
 }

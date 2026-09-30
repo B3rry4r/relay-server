@@ -18,6 +18,37 @@ export const PERMISSION_KEYS: Readonly<Record<AgentCli, Readonly<Record<Permissi
   opencode: Object.freeze({ allow_once: ['\r'], allow_always: [KEY_RIGHT, '\r', '\r'], deny: ['\x1b'] }),
 });
 
+/**
+ * Edit / patch prompt keystrokes — VERIFIED against the real TUIs (claude 2.1.284,
+ * codex 0.159.0, gemini 0.61.0) driven by a scripted mock model: every key below
+ * was pressed at the recorded edit prompt and the file on disk was checked
+ * (test/fixtures/agent/<cli>/*.screen-edit-*.txt, README "Edit prompts").
+ *   claude  1 → edited · 2 → edited + "accept edits on" for the session · Esc → unchanged
+ *   codex   y → edited · a → edited, no more asking for these files · Esc → unchanged
+ *   gemini  1 → edited · 2 → edited + "auto-accept edits" for the session · Esc → unchanged
+ * Deny is Esc, as for commands. opencode has no edit prompt (it asks one
+ * "Permission required" for every tool), so it has no entry.
+ */
+export const EDIT_KEYS: Readonly<Partial<Record<AgentCli, Readonly<Record<PermissionChoice, readonly string[]>>>>> = Object.freeze({
+  claude: Object.freeze({ allow_once: ['1'], allow_always: ['2'], deny: ['\x1b'] }),
+  codex: Object.freeze({ allow_once: ['y'], allow_always: ['a'], deny: ['\x1b'] }),
+  gemini: Object.freeze({ allow_once: ['1'], allow_always: ['2'], deny: ['\x1b'] }),
+});
+
+/** Card options for an edit prompt: "Always" means something different per CLI. */
+export function editPermissionOptions(cli: AgentCli): PermissionOption[] {
+  if (!EDIT_KEYS[cli]) return permissionOptions(cli);
+  const always: PermissionOption = { id: 'allow_always', label: 'Always', confirm: true };
+  if (cli === 'claude') always.detail = 'Claude switches to accept-edits mode: file edits run without asking for the rest of this session.';
+  if (cli === 'codex') always.detail = "Codex won't ask again before editing these files.";
+  if (cli === 'gemini') always.detail = 'Gemini switches to auto-accept edits for the rest of this session.';
+  return [
+    { id: 'allow_once', label: 'Allow' },
+    always,
+    { id: 'deny', label: 'Deny' },
+  ];
+}
+
 /** Gap between keys of a multi-key sequence (§8.1: 250 ms, then assert through the ScreenGuard). */
 export const KEY_GAP_MS = 250;
 /** Retry the final key once if the prompt is unchanged this long after it (§8.1). */

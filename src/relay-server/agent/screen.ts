@@ -17,7 +17,11 @@ const { Terminal } = require('@xterm/headless') as typeof import('@xterm/headles
 export interface ScreenSignature {
   /** Every pattern must match the visible screen. */
   permission: RegExp[];
-  /** Edit / patch prompts — UNVERIFIED (§8.1): never answerable from a card, only detected. */
+  /**
+   * Edit / patch prompts. VERIFIED against the real TUIs (claude 2.1.284, codex
+   * 0.159.0, gemini 0.61.0; test/fixtures/agent/<cli>/*.screen-edit-*.txt):
+   * answerable from a card with EDIT_KEYS (keys.ts). opencode has none.
+   */
   edit?: RegExp[];
   /** The CLI's own "interrupt" hint, shown while a turn runs (UNVERIFIED as an Esc-interrupt, §7.2). */
   interruptHint: RegExp;
@@ -25,9 +29,9 @@ export interface ScreenSignature {
 
 /** §8.1 signature table (verified against the real TUIs; see test/fixtures/agent/<cli>/*.screen-*.txt). */
 export const SCREEN_SIGNATURES: Readonly<Record<AgentCli, ScreenSignature>> = Object.freeze({
-  claude: { permission: [/Do you want to proceed\?/, /❯\s*1\. Yes/], edit: [/Do you want to make this edit/], interruptHint: /esc to interrupt/i },
-  codex: { permission: [/Would you like to run the following command\?/], edit: [/Would you like to make the following edits\?/], interruptHint: /esc to interrupt/i },
-  gemini: { permission: [/Allow execution of \[/], edit: [/Apply this change\?/], interruptHint: /esc to cancel/i },
+  claude: { permission: [/Do you want to proceed\?/, /❯\s*1\. Yes/], edit: [/Do you want to make this edit to /, /❯\s*1\. Yes/], interruptHint: /esc to interrupt/i },
+  codex: { permission: [/Would you like to run the following command\?/], edit: [/Would you like to make the following edits\?/, /1\. Yes, proceed \(y\)/], interruptHint: /esc to interrupt/i },
+  gemini: { permission: [/Allow execution of \[/], edit: [/Apply this change\?/, /1\. Allow once/], interruptHint: /esc to cancel/i },
   opencode: { permission: [/Permission required/], interruptHint: /esc (to )?interrupt/i },
 });
 
@@ -36,6 +40,27 @@ export const CODEX_HOOK_REVIEW = /Hooks need review/;
 
 export function matchesPermission(cli: AgentCli, screen: string): boolean {
   return SCREEN_SIGNATURES[cli].permission.every((re) => re.test(screen));
+}
+
+export function matchesEdit(cli: AgentCli, screen: string): boolean {
+  const edit = SCREEN_SIGNATURES[cli].edit;
+  return Boolean(edit && edit.every((re) => re.test(screen)));
+}
+
+/** Which of the CLI's prompts is on screen right now: a command, an edit, or none. */
+export type PromptKind = 'command' | 'edit';
+export function promptOnScreen(cli: AgentCli, screen: string): PromptKind | null {
+  if (matchesPermission(cli, screen)) return 'command';
+  if (matchesEdit(cli, screen)) return 'edit';
+  return null;
+}
+
+/** Title for a screen-sourced edit request ("Edit hello.txt"). */
+export function editUnderSignature(cli: AgentCli, screen: string): string {
+  const m = cli === 'claude' ? /Do you want to make this edit to (.+?)\?/.exec(screen)
+    : cli === 'codex' ? /Edited (\S+) \(\+\d+ -\d+\)/.exec(screen)
+      : cli === 'gemini' ? /\?\s+Edit\s+(\S+?):/.exec(screen) : null;
+  return m ? `Edit ${m[1].trim().slice(0, 150)}` : 'Edit requested in the terminal';
 }
 
 /** The command line shown under a permission signature (title for screen-sourced requests). */

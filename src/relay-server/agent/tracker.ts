@@ -17,15 +17,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { claudeLine, claudeTitle } from './adapters/claude';
 import { codexLine } from './adapters/codex';
-import type { Json, RawAgentEvent } from './adapters/common';
+import { toolKind, type Json, type RawAgentEvent } from './adapters/common';
 import { geminiLineKind, geminiMessageKeyed } from './adapters/gemini';
 import { opencodeUserText, spoolRecord, spoolSessionId, type SpoolRecord } from './adapters/spool';
 import { findTranscripts } from './discover';
-import { INTERRUPT_KEYS, KEY_GAP_MS, KEY_RETRY_AFTER_MS, PERMISSION_KEYS, resolveKey } from './keys';
+import { EDIT_KEYS, INTERRUPT_KEYS, KEY_GAP_MS, KEY_RETRY_AFTER_MS, PERMISSION_KEYS, resolveKey } from './keys';
 import { agentPidFromRecord, attributeRecord, ProcessInspector } from './process';
 import { getBridgeWriter, getEmbeddedPtyAccess, ptyHub } from './pty-hub';
-import { isAnswerable, TerminalTimeline, type SessionState } from './reducer';
-import { CODEX_HOOK_REVIEW, commandUnderSignature, matchesPermission, SCREEN_SIGNATURES, ScreenGuard } from './screen';
+import { isAnswerable, isEditRequest, TerminalTimeline, type SessionState } from './reducer';
+import { CODEX_HOOK_REVIEW, commandUnderSignature, editUnderSignature, promptOnScreen, SCREEN_SIGNATURES, ScreenGuard, type PromptKind } from './screen';
 import type { PtyServiceLink } from './service-link';
 import { SpoolWatcher, spoolFileName, type SpoolLine } from './spool';
 import { JsonlTailer, readCompleteLines } from './tail';
@@ -513,12 +513,15 @@ export class AgentTracker extends EventEmitter {
     }
     // §8.2 screen-only permission detection for sessions without trusted hooks
     if (s.attribution === 'process' || s.attribution === 'ambiguous') {
-      const onScreen = matchesPermission(s.cli, screen);
+      const prompt = promptOnScreen(s.cli, screen);
+      const onScreen = prompt !== null;
       if (onScreen && !s.pending) {
         t.screenCounter += 1;
+        const request = prompt === 'edit'
+          ? { tool: 'Edit', title: editUnderSignature(s.cli, screen), input: {} }
+          : { tool: s.cli === 'opencode' ? 'bash' : 'Bash', title: commandUnderSignature(s.cli, screen), input: { command: commandUnderSignature(s.cli, screen) } };
         events.push(...t.timeline.ingest([{
-          kind: 'permission.request', at: new Date(this.now()).toISOString(), tool: s.cli === 'opencode' ? 'bash' : 'Bash',
-          title: commandUnderSignature(s.cli, screen), input: { command: commandUnderSignature(s.cli, screen) },
+          kind: 'permission.request', at: new Date(this.now()).toISOString(), ...request,
         }], { idBase: `${t.info.id}:screen:${this.epoch}:${t.screenCounter}`, source: 'screen', cli: s.cli, sessionId: s.sessionId }));
       } else if (!onScreen && s.pending && t.timeline.pendingSource(s) === 'screen') {
         events.push(...t.timeline.resolvePending(s, 'unknown', `${t.info.id}:screen:${this.epoch}:${t.screenCounter}:resolved`, 'screen'));
@@ -755,14 +758,18 @@ export class AgentTracker extends EventEmitter {
     const pending = s?.pending;
     // 1. the request the user saw is still the one on screen
     if (!s || !pending || pending.event.requestId !== requestId || pending.answering) return { ok: false, reason: 'stale' };
-    const keys = PERMISSION_KEYS[s.cli]?.[choice];
-    if (!keys) return { ok: false, reason: 'invalid-choice' };
+    if (!PERMISSION_KEYS[s.cli]?.[choice]) return { ok: false, reason: 'invalid-choice' };
     // 2. attribution must allow keys (never for detached / ambiguous sessions)
     if (!isAnswerable(s.attribution)) return { ok: false, reason: 'not-answerable' };
-    // 3. the CLI's prompt must be on THIS terminal's screen right now
+    // 3. the CLI's prompt must be on THIS terminal's screen right now, and it must be
+    //    the KIND of prompt the card showed: the keys differ (Codex: `p` vs `a`), and
+    //    an edit card must never answer a command prompt (or the reverse)
     if (!t.guard) return { ok: false, reason: 'guard-mismatch' };
     const screen = await t.guard.screen();
-    if (!matchesPermission(s.cli, screen)) return { ok: false, reason: 'guard-mismatch' };
+    const kind = promptOnScreen(s.cli, screen);
+    if (!kind || !promptFitsRequest(kind, pending.event.tool, pending.input)) return { ok: false, reason: 'guard-mismatch' };
+    const keys = (kind === 'edit' ? EDIT_KEYS[s.cli] : PERMISSION_KEYS[s.cli])?.[choice];
+    if (!keys) return { ok: false, reason: 'guard-mismatch' };
     if (s.pending !== pending || t.writing) return { ok: false, reason: 'stale' };
     // 4. write, then wait for evidence (never resolve optimistically)
     t.writing = true;
@@ -786,7 +793,7 @@ export class AgentTracker extends EventEmitter {
           void (async () => {
             if (!t.guard || s.pending !== pending) return;
             const now = await t.guard.screen();
-            if (now === beforeLast && matchesPermission(s.cli, now)) await this.write(t, last, viaSocketId);
+            if (now === beforeLast && promptOnScreen(s.cli, now) === kind) await this.write(t, last, viaSocketId);
           })();
         }, retryAfter).unref?.();
       }
@@ -854,4 +861,16 @@ function realOrSelf(p: string): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => { const t = setTimeout(resolve, ms); t.unref?.(); });
+}
+
+/**
+ * Does the prompt on screen fit the request the card showed? An edit request
+ * never answers a command prompt, and a command request answers an edit prompt
+ * only when it IS an edit (Codex sends `apply_patch` through its shell tool).
+ * A request of unknown kind (screen-sourced, `other`) answers whatever is shown.
+ */
+export function promptFitsRequest(kind: PromptKind, tool: string, input: unknown): boolean {
+  const edit = isEditRequest(tool, input);
+  if (kind === 'command') return !edit;
+  return edit || toolKind(tool) !== 'shell';
 }
