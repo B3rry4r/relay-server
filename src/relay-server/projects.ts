@@ -3,6 +3,7 @@ import path from 'node:path';
 import { execFile as execFileCallback } from 'node:child_process';
 import { promisify } from 'node:util';
 import { ensureGitRepo, runGit, getGitStatus } from './git';
+import { childProcessEnv } from './auth/secrets';
 import {
   RECENT_PROJECT_LIMIT,
   type TreeNode,
@@ -192,6 +193,14 @@ export async function duplicateItem(
 export async function listListeningPorts(): Promise<number[]> {
   const excludedPorts: number[] = [22, 80, 443, 8080, 8443];
 
+  // Under the host, the front door, the PTY service and the release ports are
+  // listening on this machine too: they are never user dev servers (preview
+  // "port cards"). The host passes them in RELAY_HOST_PORTS.
+  for (const raw of (process.env.RELAY_HOST_PORTS || '').split(',')) {
+    const p = Number.parseInt(raw.trim(), 10);
+    if (Number.isInteger(p) && p > 0) excludedPorts.push(p);
+  }
+
   function isNotExcluded(p: number): boolean {
     return p > 0 && !excludedPorts.includes(p);
   }
@@ -200,7 +209,7 @@ export async function listListeningPorts(): Promise<number[]> {
     try {
       const { stdout } = await execFile('sh', ['-c', 'ss -ltnH 2>/dev/null || netstat -ltn 2>/dev/null'], {
         cwd: process.cwd(),
-        env: process.env,
+        env: childProcessEnv(),
       });
 
       const ports = stdout

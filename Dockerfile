@@ -1,8 +1,10 @@
 FROM ubuntu:24.04 AS builder
 
+# No AUTH_TOKEN default: the owner secret (AUTH_TOKEN_HASH preferred, or
+# AUTH_TOKEN) MUST come from the deployment's secrets. relay refuses to boot
+# without one (src/index.ts).
 ENV DEBIAN_FRONTEND=noninteractive \
     WORKSPACE=/workspace \
-    AUTH_TOKEN=change_this_to_a_strong_random_string \
     PORT=3000
 
 RUN apt-get update && apt-get install -y \
@@ -41,9 +43,11 @@ RUN gcc -O2 -Wall -Wextra -o /app/native/pty-bridge native/pty-bridge.c -lutil
 
 FROM ubuntu:24.04
 
+# No AUTH_TOKEN default: the owner secret (AUTH_TOKEN_HASH preferred, or
+# AUTH_TOKEN) MUST come from the deployment's secrets. relay refuses to boot
+# without one (src/index.ts).
 ENV DEBIAN_FRONTEND=noninteractive \
     WORKSPACE=/workspace \
-    AUTH_TOKEN=change_this_to_a_strong_random_string \
     PORT=3000
 
 RUN apt-get update && apt-get install -y \
@@ -99,6 +103,10 @@ RUN npm ci --omit=dev --ignore-scripts
 RUN node -e "require.resolve('socket.io-client')" \
   || (echo "FATAL: socket.io-client missing from prod deps — remote PTY would crash-loop at boot" && exit 1)
 COPY setup-workspace.sh .
+# relay-auth CLI (installed into $RELAY_HOME/bin by setup-workspace.sh) and the
+# MCP server both read the box-local token; ship them in the runtime image.
+COPY scripts/relay-auth ./scripts/relay-auth
+COPY mcp-server.mjs .
 
 # Non-root user. Claude Code and Flutter refuse to run as root, and the root
 # check is only skipped when Claude itself runs as a non-root user. Setting

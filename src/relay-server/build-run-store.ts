@@ -239,10 +239,32 @@ export interface BuildRun {
   // Runs UI can show "AI: N ok / M failed" + a loud error state without parsing the
   // raw log. Best-effort; never required for correctness.
   ai?: { ok: number; failed: number };
+  // ── Host (CONTRACTS §3): run lease ────────────────────────────────────────────
+  // The relay-server process currently orchestrating this run. Under the host two
+  // releases can briefly overlap (drain-first makes it rare, a crash-restarted
+  // supervisor or a kill -9 makes it possible), and every in-process guard
+  // (isRunActive) is per process. resumeInterruptedRuns and the rate-limit sweep
+  // skip a run whose lease is FRESH (heartbeat within RUN_LEASE_STALE_MS) and held
+  // by ANOTHER live pid. Released (cleared) when orchestration ends and on a
+  // graceful shutdown.
+  lease?: RunLease;
   screens: RunScreen[];
   status: RunStatus;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface RunLease {
+  releaseId: string;
+  pid: number;
+  heartbeatAt: number; // epoch ms
+  // Identity of the holder beyond its pid (Linux; absent elsewhere / older leases).
+  // A pid alone is not an identity: after a machine restart pid namespaces start
+  // small and deterministic, so a dead holder's pid is often reused by some other
+  // live process. bootId = /proc/sys/kernel/random/boot_id of the holder's boot,
+  // startTime = field 22 of /proc/<pid>/stat (clock ticks since boot).
+  bootId?: string;
+  startTime?: string;
 }
 
 // P2: hard ceiling on concurrent screen workers, regardless of what the caller
@@ -398,10 +420,48 @@ export async function getRun(projectId: string, id: string): Promise<BuildRun | 
 // re-reading inside the chain — so writes compose instead of clobbering. Mirrors the
 // existing `aiTallyChain` pattern, generalized.
 const runWriteChain = new Map<string, Promise<unknown>>();
+// Every in-flight run-file write (mutateRun chains AND saveRun), so a graceful
+// shutdown can await them all (drainRunWrites) before the process exits.
+const pendingRunWrites = new Set<Promise<unknown>>();
+function trackRunWrite<T>(promise: Promise<T>): Promise<T> {
+  pendingRunWrites.add(promise);
+  const done = () => { pendingRunWrites.delete(promise); };
+  promise.then(done, done);
+  return promise;
+}
+// Graceful shutdown (lifecycle.ts): once frozen, NO run file is written by this
+// process any more. Killing the agents makes the orchestrator's error paths fire
+// (screen failed, asset pass "AI did not fire" → park at a gate, …); those writes
+// would turn an interrupted-but-resumable run into a failed/parked one. Frozen
+// writes resolve with the run as it is on disk (or null) and change nothing.
+let runWritesFrozen = false;
+export function freezeRunWrites(): void { runWritesFrozen = true; }
+export function areRunWritesFrozen(): boolean { return runWritesFrozen; }
+/** Test helper. */
+export function unfreezeRunWritesForTests(): void { runWritesFrozen = false; }
+/** Resolve once every run-file write started so far has settled. */
+export async function drainRunWrites(): Promise<void> {
+  while (pendingRunWrites.size > 0) {
+    await Promise.allSettled(Array.from(pendingRunWrites));
+  }
+}
+async function writeRunFileAtomic(root: string, runId: string, run: BuildRun): Promise<void> {
+  // tmp + rename: a reader (or a process killed mid-write) never sees a torn file.
+  const dest = runFile(root, runId);
+  const tmp = `${dest}.${process.pid}.${crypto.randomBytes(3).toString('hex')}.tmp`;
+  try {
+    await fs.writeFile(tmp, JSON.stringify(run, null, 2), 'utf-8');
+    await fs.rename(tmp, dest);
+  } catch (e) {
+    await fs.rm(tmp, { force: true }).catch(() => { /* best-effort */ });
+    throw e;
+  }
+}
 export async function mutateRun(
   projectId: string, runId: string,
   mutate: (run: BuildRun) => void | Promise<void>,
 ): Promise<BuildRun | null> {
+  if (runWritesFrozen) return getRun(projectId, runId);
   const key = `${projectId}:${runId}`;
   // Chain on the prior write for this run (swallow its rejection so one failure
   // doesn't poison the chain); each step re-reads inside the chain so writes compose.
@@ -411,11 +471,14 @@ export async function mutateRun(
     if (!root) return null;
     const run = await getRun(projectId, runId);
     if (!run) return null;
+    // A step queued before the freeze but running after it must not write either.
+    if (runWritesFrozen) return run;
     await mutate(run);
     run.updatedAt = new Date().toISOString();
-    await fs.writeFile(runFile(root, runId), JSON.stringify(run, null, 2), 'utf-8');
+    await writeRunFileAtomic(root, runId, run);
     return run;
   });
+  trackRunWrite(next);
   runWriteChain.set(key, next);
   try { return await next; }
   finally { if (runWriteChain.get(key) === next) runWriteChain.delete(key); }
@@ -461,6 +524,10 @@ export async function updateRunScreen(
 
 /** Low-level: persist a mutated run object (route handlers mutate then save). */
 export async function saveRun(projectId: string, run: BuildRun): Promise<void> {
+  if (runWritesFrozen) return;
+  await trackRunWrite(saveRunNow(projectId, run));
+}
+async function saveRunNow(projectId: string, run: BuildRun): Promise<void> {
   const root = rootFor(projectId);
   if (!root) return;
   run.updatedAt = new Date().toISOString();
@@ -750,6 +817,10 @@ export async function putAsset(projectId: string, logicalKey: string, bytes: Buf
 
 // ── Durable, replayable run log ────────────────────────────────────────────────
 export async function appendRunLog(projectId: string, runId: string, line: string): Promise<void> {
+  // Graceful shutdown: after the freeze, lines come only from the error paths of
+  // the agents we just killed ("status=error", "retrying") — noise that would read
+  // as a failure in a run that is merely interrupted and resumable.
+  if (runWritesFrozen) return;
   // T18: PUSH the line live the instant it's written so prep/canon/assets (which
   // have no per-CLI job, so never streamed over ai:progress) stream in real time.
   // Best-effort + before the file write so a slow/failing disk write can't delay
@@ -780,3 +851,160 @@ const active = new Set<string>();
 export function isRunActive(runId: string): boolean { return active.has(runId); }
 export function markRunActive(runId: string): void { active.add(runId); }
 export function clearRunActive(runId: string): void { active.delete(runId); }
+/** Keys currently orchestrating in this process (run ids and `<runId>:<frameId>` retries). */
+export function listActiveRunKeys(): string[] { return Array.from(active); }
+
+// ── Host (CONTRACTS §3): run leases ───────────────────────────────────────────
+// A lease says "process <pid> of release <releaseId> is orchestrating this run".
+// Held from the moment prep / the build loop starts until it ends; heartbeated
+// every RUN_LEASE_HEARTBEAT_MS. Another process must not resume a run whose lease
+// is fresh AND whose pid is alive (see isForeignLeaseLive).
+export const RUN_LEASE_HEARTBEAT_MS = Number(process.env.RELAY_RUN_LEASE_HEARTBEAT_MS) || 15_000;
+export const RUN_LEASE_STALE_MS = Number(process.env.RELAY_RUN_LEASE_STALE_MS) || 60_000;
+
+export function currentReleaseId(): string {
+  return (process.env.RELAY_RELEASE_ID || '').trim() || 'dev';
+}
+
+/** What a liveness probe knows about a pid. startTime null = unknown (no /proc). */
+export type ProcessProbeResult = { alive: boolean; startTime: string | null };
+export type ProcessProbe = (pid: number) => boolean | ProcessProbeResult;
+
+/** Field 22 of /proc/<pid>/stat (start time, clock ticks since boot) and whether it is a zombie. */
+function readProcStat(pid: number): { startTime: string; zombie: boolean } | null {
+  try {
+    const stat = fsSync.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    // comm (field 2) may contain spaces/parens: split after the LAST ')'.
+    const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+    // rest[0] is field 3 (state) → field 22 is rest[19].
+    const startTime = rest[19];
+    if (!startTime) return null;
+    return { startTime, zombie: rest[0] === 'Z' || rest[0] === 'X' };
+  } catch {
+    return null;
+  }
+}
+
+/** Default probe: signal 0, refined by /proc when available (zombies are dead). */
+export function probeProcess(pid: number): ProcessProbeResult {
+  if (!Number.isInteger(pid) || pid <= 0) return { alive: false, startTime: null };
+  let alive: boolean;
+  try { process.kill(pid, 0); alive = true; } catch (e) {
+    alive = (e as NodeJS.ErrnoException)?.code === 'EPERM';
+  }
+  if (!alive) return { alive: false, startTime: null };
+  const stat = readProcStat(pid);
+  if (stat?.zombie) return { alive: false, startTime: stat.startTime };
+  return { alive: true, startTime: stat?.startTime ?? null };
+}
+
+let cachedBootId: string | null | undefined;
+/** This machine's boot id (Linux), or null where there is none. */
+export function currentBootId(): string | null {
+  if (cachedBootId === undefined) {
+    try { cachedBootId = fsSync.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() || null; } catch { cachedBootId = null; }
+  }
+  return cachedBootId;
+}
+
+let ownStartTime: string | null | undefined;
+function selfStartTime(): string | null {
+  if (ownStartTime === undefined) ownStartTime = readProcStat(process.pid)?.startTime ?? null;
+  return ownStartTime;
+}
+
+/**
+ * Is the process that wrote `lease` still the one running under its pid?
+ * False when the lease is from another boot, the pid is dead (or a zombie), or
+ * the pid now belongs to a process that started at a different time (reused).
+ */
+export function leaseHolderAlive(
+  lease: Pick<RunLease, 'pid' | 'bootId' | 'startTime'>,
+  probe: ProcessProbe = probeProcess,
+  bootId: string | null = currentBootId(),
+): boolean {
+  if (lease.bootId && bootId && lease.bootId !== bootId) return false;
+  const r = probe(lease.pid);
+  const res: ProcessProbeResult = typeof r === 'boolean' ? { alive: r, startTime: null } : r;
+  if (!res.alive) return false;
+  if (lease.startTime && res.startTime && lease.startTime !== res.startTime) return false;
+  return true;
+}
+
+/**
+ * True when `run` is leased by ANOTHER process that is still alive and has
+ * heart-beaten recently — i.e. resuming it here would double-run it. A lease held
+ * by this very process, a stale heartbeat, a dead pid, a lease from a previous
+ * boot, or a pid now reused by a different process is never "foreign live".
+ */
+export function isForeignLeaseLive(
+  run: Pick<BuildRun, 'lease'>,
+  now: number = Date.now(),
+  probe: ProcessProbe = probeProcess,
+  bootId: string | null = currentBootId(),
+): boolean {
+  const lease = run.lease;
+  if (!lease || typeof lease.pid !== 'number' || typeof lease.heartbeatAt !== 'number') return false;
+  if (lease.pid === process.pid && lease.releaseId === currentReleaseId()) return false;
+  if (now - lease.heartbeatAt > RUN_LEASE_STALE_MS) return false;
+  return leaseHolderAlive(lease, probe, bootId);
+}
+
+type HeldLease = { projectId: string; runId: string; holders: number; timer: ReturnType<typeof setInterval> };
+const heldLeases = new Map<string, HeldLease>();
+
+async function writeLease(projectId: string, runId: string): Promise<void> {
+  await mutateRun(projectId, runId, (run) => {
+    const bootId = currentBootId();
+    const startTime = selfStartTime();
+    run.lease = {
+      releaseId: currentReleaseId(), pid: process.pid, heartbeatAt: Date.now(),
+      ...(bootId ? { bootId } : {}), ...(startTime ? { startTime } : {}),
+    };
+  });
+}
+
+/**
+ * Take (or re-enter) this process's lease on a run and start heart-beating it.
+ * Reentrant: prepAndRun holds it and hands off to runAppLoop, which holds it too;
+ * the lease is released only when the last holder lets go.
+ */
+export async function acquireRunLease(projectId: string, runId: string): Promise<void> {
+  const held = heldLeases.get(runId);
+  if (held) { held.holders += 1; await writeLease(projectId, runId).catch(() => undefined); return; }
+  const timer = setInterval(() => { void writeLease(projectId, runId).catch(() => undefined); }, RUN_LEASE_HEARTBEAT_MS);
+  if (typeof timer.unref === 'function') timer.unref();
+  heldLeases.set(runId, { projectId, runId, holders: 1, timer });
+  await writeLease(projectId, runId).catch(() => undefined);
+}
+
+/** Drop one hold; the last one stops the heartbeat and clears the lease (if still ours). */
+export async function releaseRunLease(projectId: string, runId: string): Promise<void> {
+  const held = heldLeases.get(runId);
+  if (!held) return;
+  held.holders -= 1;
+  if (held.holders > 0) return;
+  clearInterval(held.timer);
+  heldLeases.delete(runId);
+  await mutateRun(projectId, runId, (run) => {
+    if (run.lease && run.lease.pid === process.pid) run.lease = undefined;
+  }).catch(() => undefined);
+}
+
+/** Runs this process holds a lease on (i.e. is orchestrating: prep or build loop). */
+export function listLeasedRuns(): Array<{ projectId: string; runId: string }> {
+  return Array.from(heldLeases.values()).map(({ projectId, runId }) => ({ projectId, runId }));
+}
+
+/** Graceful shutdown: stop every heartbeat (the caller clears the leases on disk). */
+export function stopLeaseHeartbeats(): void {
+  for (const held of heldLeases.values()) clearInterval(held.timer);
+}
+
+/** Test helper. */
+export function resetRunLeasesForTests(): void {
+  for (const held of heldLeases.values()) clearInterval(held.timer);
+  heldLeases.clear();
+  active.clear();
+  cancelled.clear();
+}

@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { execFile as execFileCallback } from 'node:child_process';
+import { childProcessEnv } from './relay-server/auth/secrets';
 
 export type ExecFileFn = (
   file: string,
@@ -36,10 +37,7 @@ export async function runWorkspaceBootstrap(
   try {
     const { stdout, stderr } = await execFile(scriptPath, [], {
       cwd: process.cwd(),
-      env: {
-        ...process.env,
-        WORKSPACE: workspace,
-      },
+      env: childProcessEnv({ WORKSPACE: workspace }),
     });
 
     if (stdout.trim().length > 0) {

@@ -5,96 +5,19 @@ const ROOT_RELATIVE_STRING_PATTERN = /([\"'`])\/(?!\/|[a-zA-Z][a-zA-Z0-9+.-]*:)(
 const ROOT_RELATIVE_CSS_URL_PATTERN = /url\((["']?)\/(?!\/|[a-zA-Z][a-zA-Z0-9+.-]*:)([^"')]+)\1\)/g;
 const PREVIEW_BRIDGE_MARKER = 'data-relay-preview-bridge';
 
-function withPreviewAuth(url: string, authQuery = ''): string {
-  if (!authQuery) return url;
-  const hashIndex = url.indexOf('#');
-  const withoutHash = hashIndex >= 0 ? url.slice(0, hashIndex) : url;
-  const hash = hashIndex >= 0 ? url.slice(hashIndex) : '';
-  return `${withoutHash}${withoutHash.includes('?') ? '&' : '?'}${authQuery}${hash}`;
+function toPreviewUrl(baseHref: string, value: string): string {
+  return value.startsWith(baseHref) ? value : `${baseHref}${value.replace(/^\/+/, '')}`;
 }
 
-function toPreviewUrl(baseHref: string, value: string, authQuery = ''): string {
-  const path = value.startsWith(baseHref) ? value : `${baseHref}${value.replace(/^\/+/, '')}`;
-  return withPreviewAuth(path, authQuery);
-}
-
-function createPreviewBridgeScript(baseHref: string, authQuery = ''): string {
+// The preview bridge only REPORTS (console / errors / network) to the parent
+// frame. It used to also rewrite src/href/action to append `?token=` — that
+// query-string auth is gone: /flutter-preview is served under a path capability
+// carried by <base href> (auth/preview-cap.ts), so no URL needs rewriting.
+function createPreviewBridgeScript(): string {
   return `<script ${PREVIEW_BRIDGE_MARKER}>
 (() => {
   if (window.__relayPreviewBridgeInstalled) return;
   window.__relayPreviewBridgeInstalled = true;
-  const relayPreviewBaseHref = ${JSON.stringify(baseHref)};
-  const relayPreviewAuthQuery = ${JSON.stringify(authQuery)};
-
-  const withRelayPreviewAuth = (value) => {
-    if (!relayPreviewAuthQuery || !value) return value;
-    try {
-      const url = new URL(value, window.location.href);
-      const baseUrl = new URL(relayPreviewBaseHref, window.location.origin);
-      if (url.origin !== window.location.origin || !url.pathname.startsWith(baseUrl.pathname)) return value;
-      const key = relayPreviewAuthQuery.split('=')[0];
-      if (url.searchParams.has(key)) return value;
-      const raw = url.pathname + url.search + url.hash;
-      const hashIndex = raw.indexOf('#');
-      const withoutHash = hashIndex >= 0 ? raw.slice(0, hashIndex) : raw;
-      const hash = hashIndex >= 0 ? raw.slice(hashIndex) : '';
-      return withoutHash + (withoutHash.includes('?') ? '&' : '?') + relayPreviewAuthQuery + hash;
-    } catch {
-      return value;
-    }
-  };
-
-  // Flutter DDC (Dart Dev Compiler) loads scripts by setting script.src and then
-  // tracks completion via load events keyed on the exact src value it set.
-  // If we rewrite script[src] to append ?token=..., DDC's internal map no longer
-  // matches the load event URL and the script pool stalls permanently (visible as
-  // dart_sdk.js staying "Pending" in DevTools). We must never rewrite src on
-  // <script> elements — the HTML shell rewrite already adds the token to all
-  // statically declared <script src="..."> tags, and dynamic script insertion
-  // by DDC must pass through unchanged.
-  const isScriptElement = (el) => el && el.tagName && el.tagName.toUpperCase() === 'SCRIPT';
-
-  const normalizePreviewElement = (element) => {
-    if (!element || typeof element.getAttribute !== 'function') return element;
-    if (isScriptElement(element)) return element; // Never rewrite script[src] — breaks DDC pool
-    for (const attr of ['src', 'href', 'action']) {
-      const value = element.getAttribute(attr);
-      if (value) element.setAttribute(attr, withRelayPreviewAuth(value));
-    }
-    return element;
-  };
-
-  const originalSetAttribute = Element.prototype.setAttribute;
-  Element.prototype.setAttribute = function relaySetAttribute(name, value) {
-    // Never rewrite src on script elements — DDC pool tracks scripts by exact src value
-    if (String(name) === 'src' && isScriptElement(this)) {
-      return originalSetAttribute.call(this, name, value);
-    }
-    const normalized = ['src', 'href', 'action'].includes(String(name))
-      ? withRelayPreviewAuth(String(value))
-      : value;
-    return originalSetAttribute.call(this, name, normalized);
-  };
-
-  const originalAppendChild = Node.prototype.appendChild;
-  Node.prototype.appendChild = function relayAppendChild(child) {
-    return originalAppendChild.call(this, normalizePreviewElement(child));
-  };
-
-  const originalAppend = Element.prototype.append;
-  Element.prototype.append = function relayAppend(...nodes) {
-    return originalAppend.apply(this, nodes.map(normalizePreviewElement));
-  };
-
-  const originalPrepend = Element.prototype.prepend;
-  Element.prototype.prepend = function relayPrepend(...nodes) {
-    return originalPrepend.apply(this, nodes.map(normalizePreviewElement));
-  };
-
-  const originalInsertBefore = Node.prototype.insertBefore;
-  Node.prototype.insertBefore = function relayInsertBefore(child, reference) {
-    return originalInsertBefore.call(this, normalizePreviewElement(child), reference);
-  };
 
   const serialize = (value) => {
     if (value instanceof Error) return { name: value.name, message: value.message, stack: value.stack };
@@ -255,17 +178,13 @@ function createPreviewBridgeScript(baseHref: string, authQuery = ''): string {
 }
 
 export function rewritePreviewHtml(html: string, baseHref: string): string {
-  return rewritePreviewHtmlWithAuth(html, baseHref, '');
-}
-
-export function rewritePreviewHtmlWithAuth(html: string, baseHref: string, authQuery = ''): string {
   const rewritten = html
     .replace(ROOT_RELATIVE_ATTRIBUTE_PATTERN, (_match, attr: string, quote: string, value: string) =>
-      `${attr}=${quote}${toPreviewUrl(baseHref, value, authQuery)}${quote}`)
+      `${attr}=${quote}${toPreviewUrl(baseHref, value)}${quote}`)
     .replace(RELATIVE_ATTRIBUTE_PATTERN, (_match, attr: string, quote: string, value: string) =>
-      `${attr}=${quote}${toPreviewUrl(baseHref, value, authQuery)}${quote}`)
+      `${attr}=${quote}${toPreviewUrl(baseHref, value)}${quote}`)
     .replace(ROOT_RELATIVE_IMPORT_PATTERN, (_match, prefix: string, quote: string, value: string) =>
-      `${prefix}${quote}${toPreviewUrl(baseHref, value, authQuery)}${quote}`);
+      `${prefix}${quote}${toPreviewUrl(baseHref, value)}${quote}`);
 
   const withBase = /<base\s+href=/i.test(rewritten)
     ? rewritten.replace(/<base\s+href=(["'])[^"']*\1\s*\/?>/i, `<base href="${baseHref}">`)
@@ -276,20 +195,16 @@ export function rewritePreviewHtmlWithAuth(html: string, baseHref: string, authQ
   }
 
   if (/<\/head>/i.test(withBase)) {
-    return withBase.replace(/<\/head>/i, `${createPreviewBridgeScript(baseHref, authQuery)}</head>`);
+    return withBase.replace(/<\/head>/i, `${createPreviewBridgeScript()}</head>`);
   }
 
-  return `${createPreviewBridgeScript(baseHref, authQuery)}${withBase}`;
+  return `${createPreviewBridgeScript()}${withBase}`;
 }
 
 export function rewritePreviewText(text: string, baseHref: string): string {
-  return rewritePreviewTextWithAuth(text, baseHref, '');
-}
-
-export function rewritePreviewTextWithAuth(text: string, baseHref: string, authQuery = ''): string {
   return text
     .replace(ROOT_RELATIVE_STRING_PATTERN, (_match, quote: string, value: string) =>
-      `${quote}${toPreviewUrl(baseHref, value, authQuery)}${quote}`)
+      `${quote}${toPreviewUrl(baseHref, value)}${quote}`)
     .replace(ROOT_RELATIVE_CSS_URL_PATTERN, (_match, quote: string, value: string) =>
-      `url(${quote}${toPreviewUrl(baseHref, value, authQuery)}${quote})`);
+      `url(${quote}${toPreviewUrl(baseHref, value)}${quote})`);
 }

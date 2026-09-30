@@ -96,7 +96,9 @@ describe('Relay server', () => {
       service: 'terminal-backend',
       status: 'ok',
       transport: {
-        httpAuthHeader: 'x-auth-token',
+        login: '/api/auth/login',
+        httpAuthHeader: 'authorization',
+        httpAuth: ['Authorization: Bearer <session token>', 'x-auth-token: <session token>'],
         socketAuthField: 'auth.token',
         socketPath: '/socket.io',
       },
@@ -122,6 +124,9 @@ describe('Relay server', () => {
     expect(invalidTokenResponse.body.error).toBe('unauthorized');
   });
 
+  // The raw AUTH_TOKEN is still accepted during the legacy migration window
+  // (first boot + 14 days; a fresh temp WORKSPACE opens it) and is reported as
+  // via:'legacy'. Sessions / local token / window closing: test/auth-sessions.test.ts.
   it('accepts the auth token from the x-auth-token header', async () => {
     process.env.PORT = '0';
     process.env.AUTH_TOKEN = 'test-token';
@@ -135,7 +140,7 @@ describe('Relay server', () => {
       .set('x-auth-token', 'test-token');
 
     expect(response.status).toBe(200);
-    expect(response.body).toEqual({ authenticated: true });
+    expect(response.body).toEqual({ authenticated: true, via: 'legacy' });
   });
 
   it('accepts the auth token from the bearer authorization header', async () => {
@@ -151,7 +156,7 @@ describe('Relay server', () => {
       .set('authorization', 'Bearer test-token');
 
     expect(response.status).toBe(200);
-    expect(response.body).toEqual({ authenticated: true });
+    expect(response.body).toEqual({ authenticated: true, via: 'legacy' });
   });
 
   it('returns bootstrap status from the workspace', async () => {

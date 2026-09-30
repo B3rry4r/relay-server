@@ -5,7 +5,6 @@ import {
   createTerminalEnv,
   exists,
   getRelayTerminalSessionsPath,
-  isValidToken,
   readJsonFile,
   resolveProjectRoot,
   resolveShell,
@@ -152,6 +151,18 @@ async function restorePersistedTerminalSessions(ptyFactory: PtyFactory): Promise
   await restorePromise;
 }
 
+/**
+ * Mouse reporting sequences xterm.js emits via onData when a TUI (opencode, vim,
+ * htop …) enabled mouse mode. They are NOT keyboard input — forwarding them
+ * clogs the PTY's write buffer and makes the terminal unresponsive.
+ *   SGR:        ESC [ < … M/m
+ *   X10/normal: ESC [ M Cb X Y (6 bytes)
+ */
+export function isMouseReport(data: string): boolean {
+  if (data.startsWith('\x1b[<') && (data.endsWith('M') || data.endsWith('m'))) return true;
+  return data.startsWith('\x1b[M') && data.length === 6;
+}
+
 export function getActiveTerminals(): TerminalSession[] {
   return Array.from(terminalSessions.values());
 }
@@ -172,7 +183,9 @@ export function createTerminalSession(
       command: resolveShell(),
       cols: DEFAULT_COLS,
       cwd,
-      env: createTerminalEnv(workspaceRoot),
+      // RELAY_TERMINAL_ID (CONTRACTS §3): lets a program in the shell (an agent
+      // CLI's hooks, relay tools) say which terminal it runs in.
+      env: { ...createTerminalEnv(workspaceRoot, { profile: 'shell' }), RELAY_TERMINAL_ID: terminalId },
       rows: DEFAULT_ROWS,
     });
   } catch {
@@ -264,16 +277,9 @@ export function registerSocketHandlers(
     }
   });
 
-  io.use((socket, next) => {
-    const authToken = typeof socket.handshake.auth.token === 'string'
-      ? socket.handshake.auth.token
-      : '';
-    if (!isValidToken(authToken)) {
-      next(new Error('Unauthorized'));
-      return;
-    }
-    next();
-  });
+  // Handshake authentication is installed by createRelayServer (auth/index.ts
+  // installSocketAuth) BEFORE these handlers: every socket that reaches
+  // 'connection' carries socket.data.auth.
 
   io.on('connection', (socket) => {
     const workspaceRoot = resolveWorkspace();
@@ -299,6 +305,18 @@ export function registerSocketHandlers(
         () => socket.emit('git:changed', { projectId }),
       );
     });
+
+    // Option B (CONTRACTS §3): a browser that talks to the PTY service directly
+    // (/pty/socket.io via the host front door) opens THIS socket with
+    // auth.noTerminals:true for the app plumbing only. It gets no terminals —
+    // no per-client upstream bridge in remote mode, no shell in embedded mode.
+    if ((socket.handshake.auth as { noTerminals?: unknown } | undefined)?.noTerminals === true) {
+      socket.on('disconnect', () => {
+        projectWatcher?.stop();
+        projectWatcher = null;
+      });
+      return;
+    }
 
     // REMOTE PTY MODE (RELAY_PTY_MODE=remote): terminal sessions are owned by
     // the standalone relay-pty service so they survive relay-server redeploys.
@@ -601,19 +619,28 @@ export function registerSocketHandlers(
 
     socket.on('input', (data: string) => {
       if (typeof data !== 'string' || data.length === 0) return;
-      // Drop mouse reporting sequences that xterm.js emits via onData when a
-      // TUI app (opencode, vim, htop …) has enabled mouse mode.  These are NOT
-      // keyboard input — forwarding them to the PTY clogs its write buffer and
-      // makes the terminal completely unresponsive.
-      // SGR mouse: ESC [ < … M/m
-      if (data.startsWith('\x1b[<') && (data.endsWith('M') || data.endsWith('m'))) return;
-      // X10/normal mouse: ESC [ M Cb X Y (6 bytes)
-      if (data.startsWith('\x1b[M') && data.length === 6) return;
+      if (isMouseReport(data)) return;
       const shell = getShell();
       if (shell) {
         handleTerminalInput(socket, transcript, data);
         shell.write(data);
       }
+    });
+
+    // CONTRACTS §3: write to ONE terminal by id, whatever is selected (split
+    // panes, agent views answering a prompt in a background terminal). Same
+    // mouse-report filter as 'input'.
+    socket.on('terminal:input', (payload: { id?: unknown; data?: unknown } = {}, ack?: unknown) => {
+      const id = typeof payload?.id === 'string' ? payload.id : '';
+      const data = typeof payload?.data === 'string' ? payload.data : '';
+      const reply = (result: { ok: boolean; error?: string }) => { if (typeof ack === 'function') ack(result); };
+      if (!id || !data) { reply({ ok: false, error: 'invalid_payload' }); return; }
+      if (isMouseReport(data)) { reply({ ok: true }); return; }
+      const shell = activeShells.get(id);
+      if (!shell) { reply({ ok: false, error: 'unknown_terminal' }); return; }
+      if (id === selectedTerminalId) handleTerminalInput(socket, transcript, data);
+      shell.write(data);
+      reply({ ok: true });
     });
 
     // Debounce resize to avoid sending SIGWINCH on every rapid layout reflow.

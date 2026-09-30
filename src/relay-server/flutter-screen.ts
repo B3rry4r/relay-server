@@ -16,6 +16,7 @@ import { spawn, execFile as execFileCb, type ChildProcess } from 'node:child_pro
 import { promisify } from 'node:util';
 import { createServer } from 'node:net';
 import { exists, resolveWorkspace, getFlutterRoot, createTerminalEnv } from './runtime';
+import { childProcessEnv } from './auth/secrets';
 
 const execFile = promisify(execFileCb);
 
@@ -86,7 +87,7 @@ async function ensureTool(name: string): Promise<void> {
   } catch {
     // Try apt-get
     await execFile('apt-get', ['install', '-y', '--no-install-recommends', name], {
-      env: { ...process.env, DEBIAN_FRONTEND: 'noninteractive' },
+      env: childProcessEnv({ DEBIAN_FRONTEND: 'noninteractive' }),
     });
   }
 }
@@ -305,6 +306,13 @@ export async function stopScreenSession(projectId: string): Promise<void> {
 
   // Clean up X lock file if Xvfb left it
   await fs.unlink(`/tmp/.X${session.display}-lock`).catch(() => undefined);
+}
+
+/** Stop every Flutter screen session (graceful shutdown). */
+export async function stopAllScreenSessions(): Promise<number> {
+  const ids = [...sessions.keys()];
+  await Promise.all(ids.map((id) => stopScreenSession(id).catch(() => undefined)));
+  return ids.length;
 }
 
 export function getScreenSession(projectId: string): ScreenSession | null {

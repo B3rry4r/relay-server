@@ -4,6 +4,8 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { execFile as execFileCallback } from 'node:child_process';
 import { promisify } from 'node:util';
 import { exists, resolveWorkspace } from './runtime';
+import { childProcessEnv } from './auth/secrets';
+import { ProtectedPortError, protectedPortReason } from './protected-ports';
 
 const execFile = promisify(execFileCallback);
 
@@ -38,7 +40,7 @@ function spawnTunnel(bin: string, port: number): Promise<TunnelEntry> {
   return new Promise((resolve, reject) => {
     const child = spawn(bin, [
       'tunnel', '--url', `http://localhost:${port}`, '--no-autoupdate',
-    ], { stdio: 'pipe' }) as ChildProcessWithoutNullStreams;
+    ], { stdio: 'pipe', env: childProcessEnv() }) as ChildProcessWithoutNullStreams;
 
     let output = '';
     let settled = false;
@@ -106,6 +108,9 @@ async function waitForTunnelReady(url: string, timeoutMs = 20_000): Promise<void
  * Creates a tunnel if none exists, reuses if already running.
  */
 export async function getTunnelUrl(port: number): Promise<string> {
+  // Never publish relay's own API / host / internal helper ports (see protected-ports.ts).
+  const protectedReason = protectedPortReason(port);
+  if (protectedReason) throw new ProtectedPortError(port, protectedReason);
   const existing = tunnels.get(port);
   if (existing && existing.process.exitCode === null) {
     return existing.url;
@@ -139,6 +144,16 @@ export function closeTunnel(port: number): void {
     tunnels.delete(port);
   }
   inFlight.delete(port);
+}
+
+/** Stop every tunnel (graceful shutdown). cloudflared is not in our process
+ *  group's lifetime: without this it outlives the release, pointing at a dead
+ *  port, and the next release starts a second tunnel for the same port. */
+export function closeAllTunnels(): number {
+  const ports = [...tunnels.keys()];
+  for (const port of ports) closeTunnel(port);
+  inFlight.clear();
+  return ports.length;
 }
 
 /** Returns all currently active tunnel entries (for status/debug). */

@@ -4,13 +4,20 @@ set -euo pipefail
 
 WORKSPACE="${WORKSPACE:-/workspace}"
 
-# The Railway volume mounts root-owned on first attach, but the container now
-# runs as the non-root 'dev' user (see Dockerfile: USER dev). Before writing
-# anything into the volume, take ownership of it. 'dev' has passwordless sudo
-# for exactly this. Guarded by an ownership check so reboots stay fast.
-if [ "$(stat -c '%U' "$WORKSPACE" 2>/dev/null || echo unknown)" != "dev" ]; then
-  sudo chown -R dev:dev "$WORKSPACE"
-fi
+# Volume ownership is NOT fixed here any more: a recursive `sudo chown -R` of a
+# volume holding Flutter + node_modules takes minutes (the platform health check
+# fails first) and needs sudo + a 'dev' user. The image entrypoints own it:
+# relay-pty's host-entrypoint.sh (runs as root, chowns once per volume via a
+# marker, then drops to dev) and relay-server's legacy entrypoint.sh.
+#
+# This script is IDEMPOTENT and is run by the host once per machine boot and once
+# per deploy (the release's copy, with a timeout): every download is non-fatal
+# (recorded in .bootstrap-status, never `exit 1`), and files are rewritten only
+# when their content changes.
+#
+# RELAY_SETUP_SYSTEM_IDENTITY=0 skips the OS-level identity writes
+# (/etc/machine-id, dbus machine-id, `hostname`) — for tests and dev boxes.
+RELAY_SETUP_SYSTEM_IDENTITY="${RELAY_SETUP_SYSTEM_IDENTITY:-1}"
 
 BOOTSTRAP_FLAG="$WORKSPACE/.bootstrapped"
 BOOTSTRAP_STATUS_PATH="$WORKSPACE/.bootstrap-status"
@@ -82,6 +89,22 @@ record_status() {
   printf '%s=%s\n' "$key" "$value" >> "$BOOTSTRAP_STATUS_PATH"
 }
 
+# write_if_changed <path> [mode]: stdin → <path>, but only when the content
+# differs (keeps mtimes stable and makes repeated runs no-ops). Atomic rename.
+write_if_changed() {
+  local dest="$1"
+  local mode="${2:-}"
+  local tmp
+  tmp="$(mktemp "${dest}.XXXXXX")"
+  cat > "$tmp"
+  if [[ -f "$dest" ]] && cmp -s "$tmp" "$dest"; then
+    rm -f "$tmp"
+  else
+    mv -f "$tmp" "$dest"
+  fi
+  if [[ -n "$mode" ]]; then chmod "$mode" "$dest"; fi
+}
+
 mkdir -p "$WORKSPACE" "$PROJECTS_DIR" "$NPM_GLOBAL_DIR/bin" "$PYTHON_USERBASE/bin"
 mkdir -p "$RELAY_ROOT" "$RELAY_TOOLS_DIR" "$RELAY_CACHE_DIR" "$RELAY_BIN_DIR" "$RELAY_STATE_DIR" \
   "$PUB_CACHE_DIR" "$PIP_CACHE_DIR" "$CARGO_HOME_DIR/bin" "$GO_HOME_DIR/bin" "$GRADLE_HOME_DIR" \
@@ -121,10 +144,19 @@ ensure_relay_identity() {
   # app runs as the non-root 'dev' user, so write them via passwordless sudo.
   # The relay's own identity is already persisted on the volume above, so these
   # OS-level writes are best-effort — never let them crash bootstrap.
-  printf '%s\n' "$RELAY_MACHINE_ID" | sudo tee /etc/machine-id >/dev/null 2>&1 || true
-  sudo mkdir -p /var/lib/dbus 2>/dev/null || true
-  printf '%s\n' "$RELAY_MACHINE_ID" | sudo tee /var/lib/dbus/machine-id >/dev/null 2>&1 || true
-  hostname "$RELAY_HOSTNAME" >/dev/null 2>&1 || true
+  # Idempotent: only written when they differ from the persisted identity.
+  if [[ "$RELAY_SETUP_SYSTEM_IDENTITY" != "0" ]]; then
+    if [[ "$(tr -d '\n\r' < /etc/machine-id 2>/dev/null || true)" != "$RELAY_MACHINE_ID" ]]; then
+      printf '%s\n' "$RELAY_MACHINE_ID" | sudo tee /etc/machine-id >/dev/null 2>&1 || true
+    fi
+    if [[ "$(tr -d '\n\r' < /var/lib/dbus/machine-id 2>/dev/null || true)" != "$RELAY_MACHINE_ID" ]]; then
+      sudo mkdir -p /var/lib/dbus 2>/dev/null || true
+      printf '%s\n' "$RELAY_MACHINE_ID" | sudo tee /var/lib/dbus/machine-id >/dev/null 2>&1 || true
+    fi
+    if [[ "$(hostname 2>/dev/null || true)" != "$RELAY_HOSTNAME" ]]; then
+      hostname "$RELAY_HOSTNAME" >/dev/null 2>&1 || true
+    fi
+  fi
 
   export RELAY_MACHINE_ID
   export RELAY_HOSTNAME
@@ -136,12 +168,20 @@ ensure_relay_identity() {
 
 ensure_relay_identity
 
-if ! has_command mise; then
-  curl https://mise.run | MISE_INSTALL_PATH="$MISE_BIN_DIR/mise" sh
+# mise lives on the volume ($MISE_BIN_DIR is never on this script's PATH, so
+# `has_command mise` alone re-downloaded it on EVERY boot). A failed download is
+# recorded and retried on the next run — it never fails the boot.
+if [[ -x "$MISE_BIN_DIR/mise" ]] || has_command mise; then
+  record_status mise "ready"
+elif download_to_stdout https://mise.run | MISE_INSTALL_PATH="$MISE_BIN_DIR/mise" sh; then
+  record_status mise "installed"
+else
+  echo "[bootstrap] mise download failed (non-fatal; retried on the next run)" >&2
+  record_status mise "failed"
+  BOOTSTRAP_COMPLETE=0
 fi
-record_status mise "installed"
 
-cat > "$RELAY_BIN_DIR/relay-browser" <<EOF
+write_if_changed "$RELAY_BIN_DIR/relay-browser" 0755 <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 URL="\${1:-}"
@@ -155,17 +195,29 @@ elif command -v open >/dev/null 2>&1; then
   open "\$URL" >/dev/null 2>&1 || true
 fi
 EOF
-chmod +x "$RELAY_BIN_DIR/relay-browser"
 record_status relay_browser "ready"
 
-cat > "$RELAY_BIN_DIR/relay-chrome" <<EOF
+write_if_changed "$RELAY_BIN_DIR/relay-chrome" 0755 <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 CHROME_BIN="\${RELAY_CHROME_BIN:-/usr/bin/google-chrome}"
 exec "\$CHROME_BIN" --headless=new --no-sandbox --disable-dev-shm-usage --disable-gpu "\$@"
 EOF
-chmod +x "$RELAY_BIN_DIR/relay-chrome"
 record_status relay_chrome "ready"
+
+# relay-auth: box-local session management (login-link break-glass, sessions,
+# revoke, mint, local-token). Copied from this checkout; idempotent (only
+# rewritten when the content changed).
+RELAY_AUTH_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/relay-auth"
+if [[ -f "$RELAY_AUTH_SRC" ]]; then
+  if ! cmp -s "$RELAY_AUTH_SRC" "$RELAY_BIN_DIR/relay-auth"; then
+    install -m 0755 "$RELAY_AUTH_SRC" "$RELAY_BIN_DIR/relay-auth"
+  fi
+  record_status relay_auth "ready"
+else
+  echo "[bootstrap] relay-auth source not found at $RELAY_AUTH_SRC" >&2
+  record_status relay_auth "missing"
+fi
 
 if [[ ! -f "$WORKSPACE/.gemini/settings.json" ]]; then
   cat > "$WORKSPACE/.gemini/settings.json" <<EOF
@@ -192,7 +244,7 @@ EOF
 fi
 record_status gemini_auth "ready"
 
-cat > "$RELAY_ENV_PATH" <<EOF
+write_if_changed "$RELAY_ENV_PATH" <<EOF
 export RELAY_HOME="$RELAY_ROOT"
 export RELAY_TOOLS="$RELAY_TOOLS_DIR"
 export RELAY_CACHE="$RELAY_CACHE_DIR"
@@ -218,18 +270,19 @@ export CHROME_EXECUTABLE="$RELAY_BIN_DIR/relay-chrome"
 export CHROME_EXECUTABLE_PATH="\${CHROME_EXECUTABLE_PATH:-\$CHROME_EXECUTABLE}"
 export BROWSER="$RELAY_BIN_DIR/relay-browser"
 export RELAY_BROWSER_STATE_PATH="$RELAY_STATE_DIR/browser-url.txt"
+export RELAY_LOCAL_TOKEN_FILE="$RELAY_STATE_DIR/local-token"
 export TERM="xterm-256color"
 export COLORTERM="truecolor"
 export PATH="$MISE_BIN_DIR:$RELAY_BIN_DIR:$GO_HOME_DIR/bin:$CARGO_HOME_DIR/bin:$NPM_GLOBAL_DIR/bin:$PYTHON_USERBASE/bin:$FLUTTER_HOME_DIR/bin:\$PATH"
 [ -s "\$NVM_DIR/nvm.sh" ] && source "\$NVM_DIR/nvm.sh"
 EOF
 
-cat > "$BASHRC_PATH" <<EOF
+write_if_changed "$BASHRC_PATH" <<EOF
 export HOME="$WORKSPACE"
 [ -f "$RELAY_ENV_PATH" ] && source "$RELAY_ENV_PATH"
 EOF
 
-cat > "$BASH_PROFILE_PATH" <<EOF
+write_if_changed "$BASH_PROFILE_PATH" <<EOF
 if [ -f "$BASHRC_PATH" ]; then
   source "$BASHRC_PATH"
 fi

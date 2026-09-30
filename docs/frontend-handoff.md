@@ -31,21 +31,39 @@ The frontend connects to the backend over HTTP and Socket.IO.
 
 ## What Must Be Built
 
-## 1. Auth Entry
+## 1. Auth Entry (sessions)
 
-Frontend-only token entry screen.
+The owner password is exchanged for a revocable **session token**; the password is
+never stored.
 
-Behavior:
-
-- User enters backend URL
-- User enters backend token
-- Frontend calls `GET /api/auth/validate`
-- On success, frontend stores:
-  - backend base URL
-  - auth token
-- On failure, frontend shows clear error
-
-This is not account auth. It is only backend token entry.
+- Sign-in form: backend URL, "Owner password", optional device name.
+- `POST /api/auth/login {secret, label?}` → `{token, session}` (401 wrong password,
+  429 + `Retry-After` while backing off, 503 no owner secret configured).
+- Store `{baseUrl, token}` in localStorage key `relay.session.v2`. Never store the
+  password. Delete any legacy `token` field from the old storage key once a session
+  is obtained (the raw token still works during the 14-day legacy window, so a
+  stored legacy token can be exchanged via `POST /api/auth/login {secret: legacyToken}`).
+- Send `Authorization: Bearer <token>` on every API call (or `x-auth-token`), and
+  `auth: {token}` in the Socket.IO handshake. No `?token=`, no cookies.
+- Boot: `GET /api/auth/session` → `{authenticated, via, session?}`. **Only a 401
+  clears the stored session**; network errors / 5xx keep it and retry.
+- Socket: a `connect_error` with message `Unauthorized`, or an `auth:revoked`
+  event `{reason: 'session_revoked' | 'session_expired' | 'logged_out' |
+  'legacy_window_closed'}` followed by a server disconnect → back to sign-in
+  (terminals survive server-side).
+- Logout: `POST /api/auth/logout`, then clear local state.
+- Sessions UI: `GET /api/auth/sessions`, `DELETE /api/auth/sessions/:id`,
+  `POST /api/auth/sessions/revoke-all {keepCurrent:true}`, `POST /api/auth/session/rotate`.
+- **Login link (break-glass).** `relay-auth login-link` on the box prints
+  `<relay-web>/#relay-login-link=<code>&relay-server=<urlencoded relay URL>`. On load,
+  if the fragment has `relay-login-link`: `POST <relay-server>/api/auth/login-link/exchange
+  {code, label?}` → `{token, session}` (401 if invalid/expired/used; one use, 5 min;
+  never 429 — it is not rate-limited, so offer it when password login returns 429),
+  store it as above, then `history.replaceState` to drop the fragment.
+- Header-less URLs: fetch with the header and use a blob URL (`review-image`,
+  downloads). The Flutter preview iframe uses the server-supplied `previewIndexUrl`
+  (`/flutter-preview/<id>/c/<cap>/index.html`, a 12 h capability bound to the
+  session). UIX is reached only through `${baseUrl}/api/uix/*` with the same Bearer.
 
 ## 2. Workspace Shell UI
 
@@ -195,7 +213,9 @@ Response:
   "service": "terminal-backend",
   "status": "ok",
   "transport": {
-    "httpAuthHeader": "x-auth-token",
+    "login": "/api/auth/login",
+    "httpAuthHeader": "authorization",
+    "httpAuth": ["Authorization: Bearer <session token>", "x-auth-token: <session token>"],
     "socketAuthField": "auth.token",
     "socketPath": "/socket.io"
   }
@@ -212,27 +232,33 @@ Response:
 }
 ```
 
-## `GET /api/auth/validate`
+## `GET /api/auth/session` (deprecated alias: `GET /api/auth/validate`)
 
-Auth options:
+Auth options (every API route):
 
-- `x-auth-token: <token>`
-- `Authorization: Bearer <token>`
+- `Authorization: Bearer <session token>`
+- `x-auth-token: <session token>`
 
 Success:
 
 ```json
 {
-  "authenticated": true
+  "authenticated": true,
+  "via": "session",
+  "session": { "id": "…", "kind": "browser", "label": "Chrome on macOS", "createdAt": "…",
+               "lastUsedAt": "…", "expiresAt": "…", "idleExpiresAt": "…", "current": true }
 }
 ```
+
+`via` is `session`, `local` (box-local token) or `legacy` (raw `AUTH_TOKEN` during the
+migration window).
 
 Failure:
 
 ```json
 {
   "error": "unauthorized",
-  "message": "A valid auth token is required."
+  "message": "A valid session token is required."
 }
 ```
 
@@ -243,7 +269,7 @@ Connect with:
 ```ts
 io(baseUrl, {
   auth: {
-    token: authToken
+    token: sessionToken
   }
 })
 ```
@@ -267,7 +293,7 @@ These APIs now exist on the backend and are the current contract.
 
 Auth:
 
-- `x-auth-token: <token>` or `Authorization: Bearer <token>`
+- `Authorization: Bearer <session token>` (or `x-auth-token`)
 
 Response:
 

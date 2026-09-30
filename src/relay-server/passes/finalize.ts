@@ -38,6 +38,7 @@ import * as fs from 'fs/promises';
 import * as fsSync from 'fs';
 import * as path from 'path';
 import { spawn } from 'child_process';
+import { sanitizeChildEnv } from '../auth/secrets';
 import type { AIModel } from '../ai-adapters';
 import { getFlutterRoot } from '../runtime';
 import { runModelObserved } from '../ai-observability';
@@ -795,7 +796,7 @@ function flutterBin(): string | null {
  */
 function runCmd(cmd: string, args: string[], cwd: string, env?: NodeJS.ProcessEnv, rejectOnNonZero = false): Promise<string> {
   return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { cwd, env: env ?? process.env });
+    const p = spawn(cmd, args, { cwd, env: sanitizeChildEnv(env ?? process.env) });
     let out = '';
     p.stdout.on('data', (d) => (out += d.toString()));
     p.stderr.on('data', (d) => (out += d.toString()));

@@ -3,10 +3,7 @@ import fsSync from 'node:fs';
 import path from 'node:path';
 import type { NextFunction, Request, Response } from 'express';
 import { PROJECT_NAME_PATTERN } from './types';
-
-export function resolveAuthToken(): string {
-  return process.env.AUTH_TOKEN || '';
-}
+import { sanitizeChildEnv, type ChildEnvProfile } from './auth/secrets';
 
 export function resolveWorkspace(): string {
   return process.env.WORKSPACE || '/workspace';
@@ -183,7 +180,27 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-export function createTerminalEnv(workspace: string): NodeJS.ProcessEnv {
+// Loopback URL of the running API (set by RelayServer.start()) so tools in a
+// shell/agent can reach relay without inheriting PORT (see RELAY_API_URL below).
+let relayApiUrl = '';
+export function setRelayApiUrl(url: string): void {
+  relayApiUrl = url;
+}
+export function getRelayApiUrl(): string {
+  return relayApiUrl;
+}
+
+/**
+ * Environment for every PTY shell and every relay-spawned agent/tool.
+ *
+ * Starts from process.env but strips the CONTRACTS §3 list (AUTH_TOKEN,
+ * AUTH_TOKEN_HASH, RELAY_PTY_TOKEN, RELAY_DEPLOY_TOKEN, UIX_SERVICE_TOKEN,
+ * RELAY_TOKEN, PORT, RELAY_RELEASE_ID, RELAY_START_MODE, RELAY_SKIP_BOOTSTRAP,
+ * RELAY_HOST_PORTS, FLY_*). `profile: 'agent'` (default) keeps RELAY_RELEASE_ID
+ * so the host can sweep a dead release's children; PTY shells use 'shell'.
+ * Tools that need the relay API get RELAY_API_URL + RELAY_LOCAL_TOKEN_FILE.
+ */
+export function createTerminalEnv(workspace: string, options: { profile?: ChildEnvProfile } = {}): NodeJS.ProcessEnv {
   const relayRoot = getRelayRoot(workspace);
   const relayTools = getRelayToolsRoot(workspace);
   const relayCache = getRelayCacheRoot(workspace);
@@ -198,7 +215,7 @@ export function createTerminalEnv(workspace: string): NodeJS.ProcessEnv {
     : '';
 
   const env: NodeJS.ProcessEnv = {
-    ...process.env,
+    ...sanitizeChildEnv(process.env, options.profile ?? 'agent'),
     HOME: workspace,
     RELAY_HOME: relayRoot,
     RELAY_TOOLS: relayTools,
@@ -225,6 +242,8 @@ export function createTerminalEnv(workspace: string): NodeJS.ProcessEnv {
     BROWSER: getRelayBrowserPath(workspace),
     RELAY_BROWSER: '1',
     RELAY_BROWSER_STATE_PATH: path.join(getRelayStateRoot(workspace), 'browser-url.txt'),
+    RELAY_LOCAL_TOKEN_FILE: path.join(getRelayStateRoot(workspace), 'local-token'),
+    ...(relayApiUrl ? { RELAY_API_URL: relayApiUrl } : {}),
     // Never let git block the terminal on an interactive credential/askpass
     // prompt. The relay credential helper supplies auth non-interactively; if
     // it has nothing, git must FAIL FAST instead of hanging on a prompt that
@@ -279,51 +298,25 @@ export function escapeHtml(value: string): string {
     .replace(/'/g, '&#39;');
 }
 
-export function extractRequestToken(req: Request): string {
-  const tokenFromQuery = typeof req.query.token === 'string' ? req.query.token : '';
-  const headerValue = req.header('x-auth-token');
-  const authorization = req.header('authorization');
-  const bearerToken = authorization?.startsWith('Bearer ')
-    ? authorization.slice('Bearer '.length)
-    : '';
-  const cookieToken = (req.header('cookie') || '')
-    .split(';')
-    .map((part) => part.trim())
-    .find((part) => part.startsWith('relay_auth_token='))
-    ?.slice('relay_auth_token='.length) || '';
-
-  return tokenFromQuery || headerValue || bearerToken || decodeURIComponent(cookieToken);
-}
-
-export function isValidToken(token: string): boolean {
-  const expected = resolveAuthToken();
-  return expected.length > 0 && token === expected;
-}
-
 export function readStringParam(value: string | string[] | undefined): string {
   return typeof value === 'string' ? value : '';
 }
 
+/**
+ * Route-level guard. Authentication itself is the DEFAULT-DENY middleware that
+ * createRelayServer installs before every route (src/relay-server/auth); this
+ * only asserts it ran and succeeded, as belt and braces. A preview capability is
+ * never enough for an API route.
+ */
 export function requireAuth(req: Request, res: Response, next: NextFunction): void {
-  const token = extractRequestToken(req);
-  if (!isValidToken(token)) {
+  const via = req.auth?.via;
+  if (!via || via === 'preview-cap') {
     res.status(401).json({
       error: 'unauthorized',
-      message: 'A valid auth token is required.',
+      message: 'A valid session token is required.',
     });
     return;
   }
-
-  if (typeof req.query.token === 'string') {
-    const isSecureRequest = req.secure || req.header('x-forwarded-proto') === 'https';
-    res.cookie('relay_auth_token', token, {
-      httpOnly: true,
-      sameSite: isSecureRequest ? 'none' : 'lax',
-      secure: isSecureRequest,
-      path: '/',
-    });
-  }
-
   next();
 }
 

@@ -4,6 +4,7 @@ import { promisify } from 'node:util';
 import path from 'node:path';
 import { type GitFileEntry } from './types';
 import { getRelayGitAuthPath, getRelayBinRoot, resolveWorkspace, readJsonFile, writeJsonFile } from './runtime';
+import { childProcessEnv } from './auth/secrets';
 
 const execFile = promisify(execFileCallback);
 
@@ -14,7 +15,7 @@ export async function runGit(
 ): Promise<{ stdout: string; stderr: string }> {
   return execFile('git', args, {
     cwd: projectRoot,
-    env: { ...process.env, ...extraEnv },
+    env: childProcessEnv(extraEnv),
   });
 }
 

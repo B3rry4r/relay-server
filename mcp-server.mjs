@@ -1,25 +1,58 @@
 #!/usr/bin/env node
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { io } from 'socket.io-client';
 import { McpServer, StdioServerTransport } from '@modelcontextprotocol/server';
 import * as z from 'zod/v4';
 
-const authToken = process.env.AUTH_TOKEN || '';
+// ── Relay credential (CONTRACTS §2) ─────────────────────────────────────────
+// 1. RELAY_TOKEN   — an api session (`relay-auth mint --label mcp`); works remotely.
+// 2. the box-local token file — works only against a loopback relay URL.
+// 3. AUTH_TOKEN    — the raw owner secret; accepted only during the legacy window.
+const stateDir = process.env.RELAY_HOME
+  ? join(process.env.RELAY_HOME, 'state')
+  : join(process.env.WORKSPACE || '/workspace', '.relay', 'state');
+
+function readTrimmed(file) {
+  try { return readFileSync(file, 'utf8').trim(); } catch { return ''; }
+}
+
+function resolveRelayToken() {
+  const explicit = (process.env.RELAY_TOKEN || '').trim();
+  if (explicit) return { token: explicit, source: 'RELAY_TOKEN' };
+  const localFile = process.env.RELAY_LOCAL_TOKEN_FILE || join(stateDir, 'local-token');
+  const local = readTrimmed(localFile);
+  if (local) return { token: local, source: `local-token (${localFile})` };
+  const legacy = (process.env.AUTH_TOKEN || '').trim();
+  if (legacy) {
+    console.error('[relay-mcp] WARNING: authenticating with the raw AUTH_TOKEN. This only works during the '
+      + 'legacy window. Mint an api session (`relay-auth mint --label mcp`) and set RELAY_TOKEN instead.');
+    return { token: legacy, source: 'AUTH_TOKEN (deprecated)' };
+  }
+  return { token: '', source: 'none' };
+}
+
+const { token: authToken, source: authSource } = resolveRelayToken();
 const backendUrl = new URL(
   process.env.RELAY_BACKEND_URL
     || process.env.BACKEND_URL
+    || process.env.RELAY_API_URL
+    || readTrimmed(join(stateDir, 'api-url'))
     || `http://127.0.0.1:${process.env.PORT || '8080'}`,
 );
 
 if (!authToken) {
-  console.error('[relay-mcp] AUTH_TOKEN is required.');
+  console.error('[relay-mcp] No relay credential: set RELAY_TOKEN (an api session from `relay-auth mint --label mcp`), '
+    + 'or run on the relay box where the local-token file is readable.');
   process.exit(1);
 }
+console.error(`[relay-mcp] using ${authSource}`);
 
 function backendHeaders() {
   return {
-    'x-auth-token': authToken,
+    authorization: `Bearer ${authToken}`,
     'content-type': 'application/json',
   };
 }
@@ -386,15 +419,16 @@ server.registerTool(
   'relay_preview_serve_port',
   {
     title: 'Serve Port',
-    description: 'Start a simple preview server on a port if nothing is already listening.',
+    description: 'Start a simple static preview server on a port if nothing is already listening. Serves the given project directory, or the projects root by default (never the workspace root).',
     inputSchema: z.object({
       port: z.number().int().min(1).max(65535),
+      projectId: z.string().optional(),
     }),
   },
-  async ({ port }) => {
+  async ({ port, projectId }) => {
     const data = await backendJson(`/api/previews/${port}/serve`, {
       method: 'POST',
-      body: '{}',
+      body: JSON.stringify(projectId ? { projectId } : {}),
     });
     return textResult(`Preview port ${port} started or already active.`, data);
   },
@@ -519,10 +553,20 @@ server.registerTool(
 );
 
 // ── UIX design-inspection tools (debug loop: IR + rendered image) ────────────
-const uixUrl = new URL(process.env.UIX_URL || 'https://uix-production.up.railway.app');
+// UIX is reached THROUGH relay (`/api/uix/*`), which authenticates this client
+// with the relay credential above and adds the UIX service token server-side —
+// the MCP process never holds UIX_SERVICE_TOKEN.
+function uixViaRelay(pathOrUrl) {
+  let path = pathOrUrl;
+  if (/^https?:\/\//i.test(pathOrUrl)) {
+    const u = new URL(pathOrUrl);
+    path = `${u.pathname}${u.search}`;
+  }
+  return new URL(`/api/uix${path.startsWith('/') ? '' : '/'}${path}`, backendUrl);
+}
 
 async function uixJson(path, init = {}) {
-  const r = await fetch(new URL(path, uixUrl), { ...init, headers: { 'content-type': 'application/json', ...(init.headers || {}) } });
+  const r = await fetch(uixViaRelay(path), { ...init, headers: { ...backendHeaders(), ...(init.headers || {}) } });
   const t = await r.text();
   if (!r.ok) throw new Error(t || `UIX ${r.status}`);
   return t ? JSON.parse(t) : null;
@@ -577,7 +621,7 @@ server.registerTool(
     try {
       const render = await uixJson('/api/v1/figma/render', { method: 'POST', body: JSON.stringify({ figStorageKey, nodeId, format: 'png', scale }) });
       if (render?.url) {
-        const png = await fetch(render.url);
+        const png = await fetch(uixViaRelay(render.url), { headers: { authorization: `Bearer ${authToken}` } });
         if (png.ok) {
           const buf = Buffer.from(await png.arrayBuffer());
           image = { type: 'image', data: buf.toString('base64'), mimeType: 'image/png' };
