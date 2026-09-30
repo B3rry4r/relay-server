@@ -19,6 +19,7 @@ import { createReadStream } from 'node:fs';
 import * as path from 'node:path';
 import { rewritePreviewHtml } from './preview-html';
 import { closeTunnel } from './tunnel-manager';
+import { resolveRouteDocument } from './static-route-doc';
 
 interface FlutterPreviewEntry {
   port:      number;
@@ -81,9 +82,25 @@ function makeStaticHandler(buildDir: string) {
         return;
       }
 
+      // A Next static export writes one document PER ROUTE (`settings.html`), and a
+      // route with nested routes ALSO gets a directory (`10-3.html` + `10-3/`). The
+      // route document is resolved on "is there a regular FILE here" — a directory
+      // at the path must never win over `<path>.html` (it was answered 403 "Directory
+      // listing disabled"), and on an export a route with no document is a 404,
+      // never the root page (PG-33). Same rule as the verify server (serveDir).
+      const route = resolveRouteDocument(root, urlPath);
+      if (route.kind === 'not-found') {
+        const body = route.file ? rewritePreviewHtml(await fs.readFile(route.file, 'utf-8'), '/') : 'Not found';
+        res.writeHead(404, { 'Content-Type': route.file ? 'text/html; charset=utf-8' : 'text/plain; charset=utf-8' });
+        res.end(body);
+        return;
+      }
+      if (route.kind === 'doc') filePath = route.file;
+
       let stat;
       try { stat = await fs.stat(filePath); }
-      catch {
+      catch { /* no such file → the SPA fallback below */ }
+      if (!stat) {
         // SPA fallback: serve index.html so client-side routing works
         const indexPath = path.join(root, 'index.html');
         if (await pathExists(indexPath)) {

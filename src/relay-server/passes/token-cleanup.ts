@@ -54,7 +54,7 @@ import * as path from 'path';
 import { spawn } from 'child_process';
 import { childProcessEnv } from '../auth/secrets';
 import type { AIModel } from '../ai-adapters';
-import { detectFramework, type Framework } from './component-extraction';
+import { detectFramework, type Framework } from './framework';
 import { deepenWebTokens } from './token-cleanup-web';
 
 export { detectFramework };
@@ -129,6 +129,10 @@ export interface TokenCleanupReport {
   /** Substitutions considered but REJECTED (and why) — the adversarial trail. */
   rejected: Array<{ file: string; kind: string; literal: string; reason: string }>;
   analyze: { before: number | null; after: number | null; skipped: boolean };
+  /** Source files the strategy read. 0 = examined nothing. */
+  filesScanned?: number;
+  /** Set when the pass had no input / no support — finalize records `skipped` with it. */
+  skippedReason?: string;
 }
 
 export interface TokenCleanupResult {
@@ -199,6 +203,8 @@ export async function deepenTokensAndCleanup(
     changes: [],
     rejected: [],
     analyze: { before: null, after: null, skipped: true },
+    filesScanned: 0,
+    skippedReason: `no token-cleanup strategy for framework '${framework}'`,
   };
 
   if (!strategy) {
@@ -226,7 +232,9 @@ function getStrategy(fw: Framework): DeepenStrategy | null {
 }
 
 async function maybeWriteReport(projectRoot: string, report: TokenCleanupReport, opts: DeepenTokensOptions): Promise<string | null> {
-  if (opts.noReport) return null;
+  // A dry run describes a build that was never applied: it must not leave a
+  // report next to the real ones (PG-38).
+  if (opts.noReport || opts.dryRun) return null;
   const abs = opts.reportPath ?? path.join(projectRoot, '.uix', 'token-cleanup-report.json');
   try {
     await fs.mkdir(path.dirname(abs), { recursive: true });
@@ -483,6 +491,8 @@ async function runFlutter(projectRoot: string, opts: DeepenTokensOptions): Promi
       changes,
       rejected,
       analyze: { before: analyzeBefore, after: analyzeAfter, skipped: !!opts.skipAnalyze },
+      filesScanned: dartFiles.length,
+      ...(dartFiles.length === 0 ? { skippedReason: 'no .dart files under lib/ to scan' } : {}),
     },
   };
 }
@@ -1110,6 +1120,8 @@ const webStrategy = (framework: Framework): DeepenStrategy => ({
         // The finalize orchestrator owns the typecheck gate for web; this pass does
         // not shell out a second time.
         analyze: { before: null, after: null, skipped: true },
+        filesScanned: r.filesScanned,
+        ...(r.skippedReason ? { skippedReason: r.skippedReason } : {}),
       },
     };
   },

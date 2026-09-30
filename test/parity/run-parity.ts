@@ -59,7 +59,7 @@ export interface FileDiff {
 export interface Cell {
   pass: string;
   framework: Fw;
-  reported: { status: string; counts: Record<string, number>; warnings: string[]; error?: string } | null;
+  reported: { status: string; reason?: string; counts: Record<string, number>; warnings: string[]; error?: string } | null;
   files: FileDiff[];
   checks: Check[];
   cell_status: CellStatus;
@@ -205,7 +205,9 @@ function chk(id: string, ok: boolean, cls: FailClass, what: string, evidence: st
 
 function classify(reported: Cell['reported'], checks: Check[]): CellStatus {
   if (reported?.status === 'reverted') return 'ERROR';
-  if (reported?.status === 'skipped' && checks.every((c) => c.ok || c.cls === 'stub')) return 'SKIPPED_WITH_REASON';
+  // `skipped` only earns SKIPPED_WITH_REASON when it carries the reason (PG-01) and
+  // nothing it left behind is a lie.
+  if (reported?.status === 'skipped' && !!reported.reason?.trim() && checks.every((c) => c.ok || c.cls === 'stub')) return 'SKIPPED_WITH_REASON';
   const failed = checks.filter((c) => !c.ok);
   if (!failed.length) return 'IMPLEMENTED';
   if (failed.some((c) => c.cls === 'error')) return 'ERROR';
@@ -219,6 +221,12 @@ const SCREEN = {
   react: { login: 'src/screens/Login/LoginScreen.tsx', home: 'src/screens/Home/HomeScreen.tsx', settings: 'src/screens/IPhone1415Pro57Screen.tsx', profile: 'src/screens/Frame123Screen.tsx' },
   next: { login: 'app/10-1/page.tsx', home: 'app/(tabs)/10-2/page.tsx', settings: 'app/10-3/page.tsx', profile: 'app/(tabs)/10-4/page.tsx' },
 } as const;
+
+/** Where each framework's localized design assets live (CONTRACTS §5: a web server
+ *  serves only public/, so web assets are public/assets/…, served at /assets/…). */
+const ASSET_DIR: Record<Fw, string> = { flutter: 'assets', react: 'public/assets', next: 'public/assets' };
+/** The generated resources module (next: beside the app dir's parent, CONTRACTS §5). */
+const RES_FILE: Record<Fw, string> = { flutter: 'lib/resources/app_assets.dart', react: 'src/resources/assets.ts', next: 'lib/resources/assets.ts' };
 
 /** All source files a framework's app is made of (for "anywhere in source" checks). */
 async function appSources(root: string, fw: Fw): Promise<string[]> {
@@ -268,12 +276,25 @@ async function runOnePass(fw: Fw, pass: PassName, mutate?: (root: string) => Pro
   const p = report.passes.find((x) => x.name === pass) ?? null;
   return {
     root, projectId, logs, mutate,
-    reported: p ? { status: p.status, counts: p.counts, warnings: p.warnings, ...(p.error ? { error: p.error } : {}) } : null,
+    reported: p ? { status: p.status, ...(p.reason ? { reason: p.reason } : {}), counts: p.counts, warnings: p.warnings, ...(p.error ? { error: p.error } : {}) } : null,
     files: diffSnaps(before, after),
   };
 }
 
 type CheckFn = (fw: Fw, r: PassRun) => Promise<Check[]>;
+
+/** A pass whose input (the fixture's screens) EXISTS may skip only by naming what it
+ *  does not support — never by claiming the input is absent ("no local component
+ *  declarations found", "0 files matched"): an operator reading that concludes the
+ *  app has nothing to extract/audit (B1 verify #2). Vacuous unless the pass skipped. */
+export function honestSkipReason(reason: string): boolean {
+  return /not implemented|not supported|unsupported|were not read|was not read|not audited|PG-\d+/i.test(reason);
+}
+function honestSkip(id: string, r: PassRun, inputFact: string): Check {
+  const reason = r.reported?.status === 'skipped' ? r.reported.reason ?? '' : null;
+  return chk(id, reason === null || honestSkipReason(reason), 'lie', `a skip names the unsupported layout/scope instead of claiming absent input (${inputFact})`,
+    reason === null ? 'not skipped' : `reason: ${reason}`);
+}
 
 const flowReport = (root: string): { findings: Array<{ from: string; to: string; status: string; detail: string; autoFixed?: boolean }> } | null => {
   try { return JSON.parse(read(root, '.uix/flow-wiring-report.json')); } catch { return null; }
@@ -317,7 +338,13 @@ const CHECKS: Record<PassName, CheckFn> = {
         ? chk('x.near-dup-param', !pillMerged || pillValuesKept, 'lie', 'near-duplicate PillButton merged only with each call site keeping its own colour', pillMerged ? `merged; call-site colours kept: ${pillValuesKept}` : 'not merged')
         : chk('x.near-dup-kept', !pillMerged, 'lie', 'near-duplicate PillButton (differing colour literal) is NOT merged blind', pillMerged ? 'a PillButton component was extracted' : 'PillButton left in place'),
       chk('x.syntax', syn.length === 0, 'lie', 'every file the pass wrote parses', syn.length ? syn.join(' | ') : 'all written TS/TSX files parse'),
+      ...(fw === 'flutter' ? [(() => {
+        // CONTRACTS §5: a parameterized field is named after the named argument it feeds, never `p0`.
+        const machine = added.filter((f) => f.endsWith('.dart')).flatMap((f) => [...read(r.root, f).matchAll(/\bthis\.(p\d+)\b/g)].map((m) => `${f}: ${m[1]}`));
+        return chk('x.param-names', machine.length === 0, 'lie', 'a lifted parameter is named after its named-argument key (color, fontSize), never p0', machine.join(' | ') || 'no pN parameters');
+      })()] : []),
       chk('x.deps-carried', depsMissing.length === 0, 'lie', 'a hoisted component carries the imports its body uses (SearchGlyph uses `assets`)', depsMissing.join(' | ') || 'every hoisted component imports what it uses'),
+      honestSkip('x.skip-reason-honest', r, 'SectionHeading is declared locally in two screens'),
     ];
   },
 
@@ -378,6 +405,12 @@ const CHECKS: Record<PassName, CheckFn> = {
     const syn = fw === 'flutter' ? [] : syntaxErrorsIn(r.root, r.files);
     const warn = (r.reported?.warnings ?? []).join('\n');
     const artReported = fw === 'flutter' ? true : /inline <svg> artwork/.test(warn);
+    // The fixture's screens were built under the pre-B56 packet (`/${assets.x}`, values
+    // were paths). The resources values are served URLs now (`/assets/…`), so a prefix
+    // left behind requests `//assets/…` — a protocol-relative URL to host "assets".
+    // Every spelling the old packet produced, not only the whole template: the home
+    // screen also carries `url(/${assets.mapDark})` and `'/' + assets.userAvatar`.
+    const prefixLeft = fw === 'flutter' ? [] : await grepSources(r.root, fw, /(?<!\/)\/\$\{\s*assets\b|['"`]\/['"`]\s*\+\s*assets\b/);
     return [
       chk('a.old-path', oldPathGone && oldToSym, 'stub', "the IR's OPAQUE pre-rename path 'assets/icons/vector_10_20.svg' (asset-map oldPath) is re-pointed to the searchIcon symbol",
         oldPathGone ? `home now: ${home.split('\n').find((l) => /searchIcon/.test(l))?.trim() ?? '?'}` : `still a raw literal in ${s.home}: ${home.split('\n').find((l) => /vector_10_20/.test(l))?.trim()}`),
@@ -387,6 +420,7 @@ const CHECKS: Record<PassName, CheckFn> = {
       chk('a.import', importOk, 'lie', 'a file that now uses the symbol imports the resources module', importOk ? 'import present' : `${s.login} uses ${sym}.userAvatar with no import`),
       chk('a.art-reported', artReported, 'stub', 'the art-sized hand-drawn <svg> (DeliveryMapCard) is reported against the real image assets', artReported ? 'reported' : `no inline-svg finding in warnings (${(r.reported?.warnings ?? []).length} warning(s))`),
       chk('a.syntax', syn.length === 0, 'lie', 'every file the pass wrote parses', syn.join(' | ') || 'ok'),
+      ...(fw === 'flutter' ? [] : [chk('a.served-url', prefixLeft.length === 0, 'lie', 'no `/`-prefixed served URL is left (`/${assets.x}`, `url(/${assets.x})`, `\'/\' + assets.x`) now that every symbol value is a served URL (it would request //assets/…)', prefixLeft.slice(0, 4).join(' | ') || 'none left')]),
     ];
   },
 
@@ -418,7 +452,18 @@ const CHECKS: Record<PassName, CheckFn> = {
   // ── 7e ────────────────────────────────────────────────────────────────────
   async renameSemantic(fw, r) {
     const machineClass = await grepSources(r.root, fw, /IPhone1415Pro57(Screen|Page)|Frame123(Screen|Page)/);
-    const machineFiles = (await appSources(r.root, fw)).filter((f) => /screen_10_[34]\.dart|IPhone1415Pro57|Frame123|(^|\/)10-3(\/|$)/.test(f));
+    // Verify-harness previews are addressed by FRAME id by contract (`/_preview/<frame>`,
+    // lib/_preview/screen_<frame>_…): their paths are not the app's names and must
+    // not be renamed — but they must keep compiling (r.preview-intact).
+    const isPreviewPath = (f: string) => /(^|\/)(_preview|%5Fpreview)\//i.test(f);
+    const machineFiles = (await appSources(r.root, fw)).filter((f) => !isPreviewPath(f) && /screen_10_[34]\.dart|IPhone1415Pro57|Frame123|(^|\/)10-3(\/|$)/.test(f));
+    const brokenPreviewImports: string[] = [];
+    for (const f of (await appSources(r.root, fw)).filter(isPreviewPath)) {
+      for (const m of read(r.root, f).matchAll(/(?:from\s*|import\s+)['"](\.[^'"]+)['"]/g)) {
+        const base = path.resolve(r.root, path.dirname(f), m[1]);
+        if (![base, `${base}.tsx`, `${base}.ts`, `${base}.dart`].some((c) => fsSync.existsSync(c) && fsSync.statSync(c).isFile())) brokenPreviewImports.push(`${f} → ${m[1]}`);
+      }
+    }
     const frameCode = await grepSources(r.root, fw, /283[_:-]?1967|2831967/);
     let routeTable = '';
     let settingsRoute: string | null = null;
@@ -449,6 +494,7 @@ const CHECKS: Record<PassName, CheckFn> = {
       chk('r.route-path', !!settingsRoute, 'stub', "settings' machine route /10-3 becomes a semantic path (/settings)", settingsRoute ? `served at ${settingsRoute}` : `no /settings route (reported renamed=${renamed}); warnings: ${(r.reported?.warnings ?? []).slice(0, 3).join(' | ')}`),
       chk('r.class', machineClass.length === 0, 'stub', 'machine component/class names (IPhone1415Pro57*, Frame123*) are renamed', machineClass.length ? machineClass.slice(0, 6).join(' | ') : 'none left'),
       chk('r.file', machineFiles.length === 0, 'stub', 'machine file/dir names (screen_10_3.dart / IPhone1415Pro57Screen.tsx / app/10-3/) are renamed', machineFiles.length ? machineFiles.join(', ') : 'none left'),
+      chk('r.preview-intact', brokenPreviewImports.length === 0, 'lie', 'verify-harness previews still import the (renamed) screens they mount', brokenPreviewImports.join(' | ') || 'every preview import resolves'),
       chk('r.frame-code', frameCode.length === 0, 'lie', 'the raw frame-code name "283:1967" never becomes an identifier', frameCode.slice(0, 4).join(' | ') || 'none'),
       chk('r.headers-consistent', stale.length === 0, 'lie', 'every `// canonicalId: … route:` header names the route the app actually serves (later passes resolve by it)', stale.slice(0, 6).join(' | ') || 'all headers match'),
       chk('r.syntax', syn.length === 0, 'lie', 'every file the pass wrote parses', syn.join(' | ') || 'ok'),
@@ -472,6 +518,10 @@ const CHECKS: Record<PassName, CheckFn> = {
       chk('t.radius', radiusOk, 'stub', 'borderRadius 12 → the r12 radius token', radiusOk ? 'ok' : line(/[Rr]adius/)),
       chk('t.import', !colorOk || importOk, 'lie', 'a file that now uses the theme imports it', importOk ? 'import present' : 'token used without import'),
       chk('t.syntax', syn.length === 0, 'lie', 'every file the pass wrote parses', syn.join(' | ') || 'ok'),
+      // The fixture HAS a theme module (flutter lib/theme/app_theme.dart, react
+      // src/theme/theme.ts, next <root>/lib/theme/theme.ts per CONTRACTS §5): a 7f skip
+      // claiming "no web theme module" is the B12 lie (the Next theme was never read).
+      honestSkip('t.skip-reason-honest', r, 'the fixture ships a theme module with an exported token object'),
     ];
   },
 
@@ -499,6 +549,7 @@ const CHECKS: Record<PassName, CheckFn> = {
     }
     const inPreview = fs_.filter((x) => /preview/i.test(x.file));
     out.push(chk('i.no-preview', inPreview.length === 0, 'lie', 'verify-harness preview files are never audited as shipped UI', inPreview.map((x) => x.file).join(', ') || 'none'));
+    out.push(honestSkip('i.skip-reason-honest', r, 'the screens hold planted dead controls'));
     return out;
   },
 
@@ -519,7 +570,7 @@ const CHECKS: Record<PassName, CheckFn> = {
       checks.push(chk('h.preview', previewPages.length === 0, 'stub', 'app/_preview preview pages removed', previewPages.join(', ') || 'removed'));
       checks.push(chk('h.placeholder', placeholderPages.length === 0, 'stub', 'pages that only mount PlaceholderScreen removed', placeholderPages.join(', ') || 'removed'));
     }
-    const kept = exists(r.root, 'assets/images/promo_banner.png');
+    const kept = exists(r.root, `${ASSET_DIR[fw]}/images/promo_banner.png`);
     checks.push(chk('h.computed-asset-kept', kept, 'lie', 'asset reached only via a computed key (promoBanner) is NOT deleted', kept ? 'kept' : 'DELETED'));
     const warn = (r.reported?.warnings ?? []).join('\n');
     checks.push(chk('h.computed-asset-reported', /computed key|assets\[/.test(warn), 'stub', 'unreferenced-looking asset symbols are REPORTED, flagging the computed-key access', warn.slice(0, 300) || 'no warning'));
@@ -575,7 +626,7 @@ async function phaseResolver(): Promise<Cell[]> {
     const res = await resolveAll(root);
     const miss = res.filter((x) => !x.hit).map((x) => x.id);
     checks.push(chk('rs.headers', miss.length === 0, 'stub', 'every stamped screen resolves by its `// canonicalId:` header', miss.length ? `unresolved: ${miss.join(', ')} (srcDir=${res[0].ix?.srcDir})` : res.map((x) => `${x.id}→${x.hit!.file.replace(root + '/', '')}`).join(', ')));
-    // Without headers (nothing in the web pipeline stamps them — restampCanonicalHeaders is lib/screens/*.dart only).
+    // Without headers (an agent that rewrote a screen may drop the header before the pre-finalize re-stamp).
     const bare = await copyFixture(fw, 'resolver-noheader');
     for (const f of await appSources(bare.root, fw)) {
       const p = path.join(bare.root, f);
@@ -611,13 +662,31 @@ async function phaseHeaderRestamp(): Promise<Cell[]> {
     const canonical = JSON.parse(read(root, '.uix/canonical.json'));
     const before = await snapshot(root);
     const r = await restampCanonicalHeaders(root, canonical);
-    const diff = diffSnaps(before, await snapshot(root));
+    const after = await snapshot(root);
+    const diff = diffSnaps(before, after);
     const stamped = diff.filter((d) => d.change === 'modified').map((d) => d.file);
     const ok = fw === 'flutter' ? stamped.length >= 2 : stamped.length >= 3;
+    const checks: Check[] = [chk('hdr.restamp', ok, 'stub', 'header re-stamp (run before finalize) restores `// canonicalId:` on built screens', `stamped=${JSON.stringify(r.stamped)} missingFiles=${JSON.stringify(r.missingFiles)}`)];
+    if (fw !== 'flutter' && ok) {
+      // The stamp must be the one the resolver reads (layer 1), and on Next it must
+      // sit ABOVE 'use client' without displacing the directive.
+      const web = await import('../../src/relay-server/passes/web-app');
+      const bad: string[] = [];
+      for (const f of stamped) {
+        const src = read(root, f);
+        const h = web.readHeader(src);
+        const firstCode = src.split('\n').find((l) => l.trim() && !l.trim().startsWith('//'));
+        if (!h || !h.route) bad.push(`${f}: no header`);
+        else if (fw === 'next' && /^['"]use client['"]/m.test(src) && !/^['"]use client['"]/.test(firstCode?.trim() ?? '')) bad.push(`${f}: 'use client' is no longer the first statement`);
+      }
+      checks.push(chk('hdr.web-header', bad.length === 0, 'lie', "the stamped header is `// canonicalId: <id> route: <route>` (above 'use client' on Next)", bad.join(' | ') || `${stamped.length} header(s) ok`));
+    }
+    await restampCanonicalHeaders(root, canonical);
+    const d2 = diffSnaps(after, await snapshot(root));
+    checks.push(chk('hdr.idempotent', d2.length === 0, 'lie', 'a second re-stamp changes nothing', d2.map((d) => `${d.change}:${d.file}`).join(', ') || 'no change'));
     cells.push({
       pass: 'restampCanonicalHeaders', framework: fw, reported: null, files: diff,
-      checks: [chk('hdr.restamp', ok, 'stub', 'header re-stamp (run before finalize) restores `// canonicalId:` on built screens', `stamped=${JSON.stringify(r.stamped)} missingFiles=${JSON.stringify(r.missingFiles)}`)],
-      cell_status: ok ? 'IMPLEMENTED' : 'STUB', notes: fw === 'flutter' ? ['flutter resolves only semantic/legacy lib/screens names; machine files like screen_10_3.dart resolve via the legacy slug'] : [],
+      checks, cell_status: classify(null, checks), notes: fw === 'flutter' ? ['flutter resolves only semantic/legacy lib/screens names; machine files like screen_10_3.dart resolve via the legacy slug'] : [],
     });
   }
   return cells;
@@ -638,6 +707,28 @@ async function phaseDesignSystem(): Promise<Cell[]> {
       chk('ds.theme-file', g.wrote && diff.some((d) => d.change === 'added'), 'stub', 'an importable theme/token file is generated before screen 1', `wrote=${g.wrote} themeFile=${g.themeFile} added=${diff.map((d) => d.file).join(', ') || 'none'}`),
       chk('ds.api-idiom', fw === 'flutter' || !apiMentionsDart, 'lie', "the design-system API injected into the agent's prompt is in this framework's idiom", `api excerpt: ${g.api.split('\n').slice(0, 1).join(' ')} … mentions Dart types: ${apiMentionsDart}; themeFile=${g.themeFile}`),
     ];
+    if (fw !== 'flutter' && g.wrote) {
+      // PG-31: the web theme is a typed token module + CSS custom properties at the
+      // CONTRACTS §5 location, found by the SAME resolver the passes use, and its
+      // `AppTheme = { color, spacing, radius }` parses with token-cleanup-web's parser.
+      const web = await import('../../src/relay-server/passes/web-app');
+      const tcw = await import('../../src/relay-server/passes/token-cleanup-web');
+      const want = fw === 'react' ? 'src/theme/theme.ts' : 'lib/theme/theme.ts';
+      const ix = await web.loadWebApp(root);
+      const ts = exists(root, want) ? read(root, want) : '';
+      const css = g.tokens.cssFile && exists(root, g.tokens.cssFile) ? read(root, g.tokens.cssFile) : '';
+      const model = ts ? tcw.parseWebThemeSource(ts, path.join(root, want)) : null;
+      const brand = model?.colors.find((c) => c.value.toLowerCase() === '#12ae89');
+      const syn = tsSyntaxErrors({ [want]: ts });
+      const problems = [
+        ...(g.themeFile !== want ? [`themeFile=${g.themeFile}, want ${want}`] : []),
+        ...(ix?.themeFile !== path.join(root, want) ? [`resolver themeFile=${ix?.themeFile ? path.relative(root, ix.themeFile) : 'null'}`] : []),
+        ...(!model || model.themeSymbol !== 'AppTheme' || !brand || !model.spacing.length || !model.radius.length ? [`token object not parseable (symbol=${model?.themeSymbol}, colors=${model?.colors.length ?? 0}, spacing=${model?.spacing.length ?? 0}, radius=${model?.radius.length ?? 0})`] : []),
+        ...(brand && !new RegExp(`--color-${brand.name}:\\s*#12ae89`, 'i').test(css) ? [`${g.tokens.cssFile ?? 'css'} lacks --color-${brand.name}`] : []),
+        ...syn,
+      ];
+      checks.push(chk('ds.web-theme', problems.length === 0, 'lie', 'the web theme is a typed AppTheme {color, spacing, radius} module + matching CSS variables, at the resolver-found CONTRACTS §5 path', problems.join(' | ') || `${want}: AppTheme.color.${brand?.name}=#12ae89, ${model?.spacing.length} spacing, ${model?.radius.length} radius; ${g.tokens.cssFile} declares --color-${brand?.name}`));
+    }
     const v = await ensureScreenPreviewEntry(root, fw, '10:3', { canonicalId: 'c_10_3', variant: { kind: 'modal', id: 'm_10_8', frameId: '10:8' } });
     checks.push(chk('ds.preview-variant', !!v, 'stub', 'a modal variant preview entry is produced (file on flutter, route on web)', `entry=${v ?? 'undefined'}${fw === 'flutter' && v ? `; presenter call present: ${/showModal_10_8\(context\)/.test(read(root, v))}` : ''}`));
     if (fw === 'next') {
@@ -667,15 +758,54 @@ async function phaseSkeletonAndRestart(): Promise<Cell[]> {
     const diff = diffSnaps(before, await snapshot(root));
     const removedScreens = diff.filter((d) => d.change === 'removed').length;
     const ok = removedScreens > 0;
+    const rstChecks = [chk('rst.clean-slate', ok, 'stub', 'restart removes the previously generated surface so the rebuild does not mix old+new files', `removed ${removedScreens} file(s); skipped=${(r as { skipped?: string }).skipped ?? 'no'}`)];
+    if (fw !== 'flutter') {
+      // Web has no single generated dir to drop: the clean slate is by marker. The
+      // stamped screens must go; an unmarked hand-written module must stay.
+      const s = SCREEN[fw];
+      const stampedLeft = [s.login, s.home, s.settings, s.profile].filter((f) => exists(root, f));
+      const hand = fw === 'react' ? 'src/modal/modalController.ts' : 'components/modalController.ts';
+      rstChecks.push(chk('rst.stamped-removed', stampedLeft.length === 0, 'stub', 'every header-stamped generated screen is removed', stampedLeft.join(', ') || 'all removed'));
+      rstChecks.push(chk('rst.hand-kept', exists(root, hand), 'lie', 'an unmarked (hand-authored) module is never deleted', exists(root, hand) ? `${hand} kept` : `${hand} DELETED`));
+      if (fw === 'next') rstChecks.push(chk('rst.previews', !exists(root, 'app/_preview') && !exists(root, 'app/%5Fpreview'), 'stub', 'verify preview routes are removed', exists(root, 'app/_preview') ? 'app/_preview left' : 'removed'));
+    }
+    // A restart after a FINALIZED build: the shared components 7a itself wrote carry
+    // no canonical header, but they are pipeline output and import generated modules
+    // the nuke removes (B56 fix round: components/SearchGlyph.tsx survived, importing
+    // the removed '@/…/assets', and tsc broke with no warning). Real 7a output, then
+    // a hand-written importer of it (Next through the `@/` alias), then the nuke.
+    {
+      const x = await runOnePass(fw, 'extractComponents');
+      const extracted = x.files.filter((d) => d.change === 'added' && /\.(tsx?|dart)$/.test(d.file)).map((d) => d.file);
+      const comp = extracted.find((f) => fw === 'flutter' || /^(src\/)?components\//.test(f));
+      let importer: string | null = null;
+      if (comp && fw !== 'flutter') {
+        const name = path.basename(comp).replace(/\.tsx?$/, '');
+        const exported = /export\s+(?:function|const)\s+([A-Za-z0-9_]+)/.exec(read(x.root, comp))?.[1] ?? name;
+        importer = fw === 'next' ? 'components/HandToolbar.tsx' : 'src/extra/HandToolbar.tsx';
+        const spec = fw === 'next' ? `@/${comp.replace(/\.tsx?$/, '')}` : path.posix.relative('src/extra', comp.replace(/\.tsx?$/, ''));
+        await fs.mkdir(path.dirname(path.join(x.root, importer)), { recursive: true });
+        await fs.writeFile(path.join(x.root, importer), `import { ${exported} } from '${spec}';\nexport const HandToolbar = ${exported};\n`);
+      }
+      const n = await nukeGeneratedAppSurface(x.root, fw);
+      const survivors = extracted.filter((f) => exists(x.root, f));
+      rstChecks.push(chk('rst.extracted-removed', !!comp && survivors.length === 0, 'stub', "a restart after finalize removes the shared components 7a wrote (pipeline output with no canonical header)",
+        !comp ? `7a extracted nothing on the fixture (added: ${extracted.join(', ') || 'none'}) — nothing to grade` : survivors.length ? `kept: ${survivors.join(', ')}` : `removed ${extracted.join(', ')}`));
+      if (importer) {
+        const warned = (n.warnings ?? []).some((w) => w.startsWith(importer!) && w.includes(comp!));
+        rstChecks.push(chk('rst.kept-importer-warned', exists(x.root, importer) && warned, 'lie', 'a hand-written file importing a removed module (through the `@/` alias on Next) is kept AND named in the restart warnings',
+          `${importer} ${exists(x.root, importer) ? 'kept' : 'DELETED'}; warnings: ${(n.warnings ?? []).join(' | ').slice(0, 300) || 'none'}`));
+      }
+    }
     cells.push({
       pass: 'restart clean-slate (nukeGeneratedAppSurface)', framework: fw, reported: null, files: diff.slice(0, 40),
-      checks: [chk('rst.clean-slate', ok, 'stub', 'restart removes the previously generated surface so the rebuild does not mix old+new files', `removed ${removedScreens} file(s); skipped=${(r as { skipped?: string }).skipped ?? 'no'}`)],
-      cell_status: ok ? 'IMPLEMENTED' : 'STUB', notes: [],
+      checks: rstChecks, cell_status: classify(null, rstChecks), notes: [],
     });
     // Run the skeleton generator for this framework on an EMPTY project + the fixture
     // canonical, then grade what it wrote: one header-stamped stub per canonical screen
-    // and a route registry the passes can parse. Web contract (for the fix): canonicalize
-    // exports `generateWebSkeleton(projectRoot, canonical, framework)`.
+    // and a route registry the passes can parse. Web contract (PG-02): canonicalize
+    // exports `generateWebSkeleton(projectRoot, canonical, framework)`; its output is
+    // graded through the SAME resolver the passes use (web-app.ts), never its report.
     const canon = await import('../../src/relay-server/canonicalize');
     const skRoot = path.join(WS, 'projects', `skeleton-${fw}-${++copySeq}`);
     await fs.mkdir(path.join(skRoot, '.uix'), { recursive: true });
@@ -688,7 +818,8 @@ async function phaseSkeletonAndRestart(): Promise<Cell[]> {
       skChecks = [chk('sk.generator', false, 'stub', 'a skeleton generator exists for this framework',
         'canonicalize.ts exports no generateWebSkeleton; ai-screen-loop.ts only calls generateFlutterSkeleton and logs "[canon] skeleton SKIPPED — <fw> not yet supported by this phase; flutter-only"')];
     } else {
-      await (fw === 'flutter' ? (gen as (c: unknown) => Promise<unknown>)(canonical) : (gen as (r: string, c: unknown, f: string) => Promise<unknown>)(skRoot, canonical, fw));
+      const runGen = () => (fw === 'flutter' ? (gen as (c: unknown) => Promise<unknown>)(canonical) : (gen as (r: string, c: unknown, f: string) => Promise<unknown>)(skRoot, canonical, fw));
+      await runGen();
       const files = await listFiles(skRoot, '', /\.(dart|tsx?|jsx?)$/);
       const stamped = new Set<string>();
       for (const f of files) { const h = /^\/\/\s*canonicalId:\s*(\S+)\s+route:/m.exec(read(skRoot, f)); if (h) stamped.add(h[1]); }
@@ -697,38 +828,101 @@ async function phaseSkeletonAndRestart(): Promise<Cell[]> {
         chk('sk.generator', true, 'stub', 'a skeleton generator exists for this framework', `${files.length} file(s) written`),
         chk('sk.stamped-stubs', missing.length === 0, 'stub', 'one `// canonicalId: <id> route: <route>` stamped stub per canonical screen', missing.length ? `missing: ${missing.join(', ')}` : 'all stamped'),
       ];
+      if (fw !== 'flutter') skChecks.push(...await gradeWebSkeleton(skRoot, fw, canonical, files));
+      // Additive + idempotent: a second run over its own output changes nothing.
+      const snap1 = await snapshot(skRoot);
+      await runGen();
+      const d2 = diffSnaps(snap1, await snapshot(skRoot));
+      skChecks.push(chk('sk.idempotent', d2.length === 0, 'lie', 'a second skeleton run over its own output changes nothing', d2.length ? d2.map((d) => `${d.change}:${d.file}`).join(', ') : 'no change'));
     }
     cells.push({ pass: 'Skeleton (GEN_PHASE 3)', framework: fw, reported: null, files: [], checks: skChecks, cell_status: classify(null, skChecks), notes: [] });
   }
   return cells;
 }
 
+/** The web skeleton's contract, graded from the files through the passes' own
+ *  resolver: a parseable route table + router (react) / file-system routes (next)
+ *  for every canonical screen, a `/_preview/<frame>` route for every verified frame
+ *  (lead, state, modal) — on Next at the routable `%5Fpreview` escape — every stub
+ *  indexed as a PLACEHOLDER (so 7d grades an edge to it `missing`), and sources that
+ *  parse. */
+async function gradeWebSkeleton(root: string, fw: 'react' | 'next', canonical: {
+  screens: Array<{ canonicalId: string; route: string; frameIds: string[]; states: Array<{ id: string; frameId: string }>; modals: Array<{ id: string; frameId: string }> }>;
+}, files: string[]): Promise<Check[]> {
+  const web = await import('../../src/relay-server/passes/web-app');
+  const { webPreviewRoute } = await import('../../src/relay-server/agent-packet');
+  const checks: Check[] = [];
+  const routesRel = fw === 'react' ? 'src/router/routes.ts' : 'lib/routes.ts';
+  const table = exists(root, routesRel) ? web.parseRouteTable(read(root, routesRel)) : null;
+  const noConst = canonical.screens.filter((c) => !table?.routeToConst.has(c.route)).map((c) => `${c.canonicalId}(${c.route})`);
+  checks.push(chk('sk.route-table', !!table && noConst.length === 0, 'stub', `${routesRel} declares a ROUTES constant for every canonical route`, table ? (noConst.length ? `no constant for ${noConst.join(', ')}` : `${table.constToRoute.size} route constant(s)`) : `${routesRel} missing`));
+
+  const ix = await web.loadWebApp(root);
+  const unrouted: string[] = [];
+  const notPlaceholder: string[] = [];
+  for (const c of canonical.screens) {
+    const hit = ix ? web.resolveScreen(ix, c.canonicalId, c.frameIds) : null;
+    const served = !!hit && (fw === 'react'
+      ? [...web.parseRouteElements(read(root, 'src/App.tsx')).entries()].some(([k, comp]) => k === `ROUTES.${hit.routeConst}` && comp === hit.componentName)
+      : !!ix?.appDir && web.nextAppRoute(ix.appDir, hit.file) === c.route);
+    if (!served) unrouted.push(`${c.canonicalId}${hit ? ` (${path.relative(root, hit.file)})` : ' (unresolved)'}`);
+    if (!hit?.placeholder) notPlaceholder.push(c.canonicalId);
+  }
+  checks.push(chk('sk.router', !!ix && unrouted.length === 0, 'stub', fw === 'react' ? 'src/App.tsx <Routes> mounts each canonical screen at its ROUTES constant' : 'each canonical screen is an app-dir page served at its canonical route', unrouted.length ? `not routed: ${unrouted.join(', ')}` : `${canonical.screens.length} screen(s) routed`));
+  checks.push(chk('sk.placeholders', !!ix && notPlaceholder.length === 0, 'lie', 'every unbuilt stub is indexed as a placeholder by the shared resolver (never as a built screen)', notPlaceholder.length ? `indexed as built: ${notPlaceholder.join(', ')}` : 'all stubs are placeholders'));
+
+  const frames = canonical.screens.flatMap((c) => [c.states[0]?.frameId ?? c.frameIds[0], ...c.states.slice(1).map((s) => s.frameId), ...c.modals.map((m) => m.frameId)]).filter(Boolean) as string[];
+  const noPreview: string[] = [];
+  for (const f of frames) {
+    const route = webPreviewRoute(f);
+    if (fw === 'react') {
+      if (!new RegExp(`<Route\\s+path=["']${route}["']`).test(read(root, 'src/App.tsx'))) noPreview.push(route);
+    } else {
+      const page = path.join(root, 'app', '%5Fpreview', route.split('/').pop()!, 'page.tsx');
+      if (!fsSync.existsSync(page) || !ix?.appDir || web.nextAppRoute(ix.appDir, page) !== route) noPreview.push(route);
+    }
+  }
+  checks.push(chk('sk.previews', noPreview.length === 0, 'stub', `a /_preview/<frame> verify route for every lead/state/modal frame${fw === 'next' ? ' (app/%5Fpreview/<frame>/page.tsx — `_preview` is a private folder)' : ''}`, noPreview.length ? `missing: ${noPreview.join(', ')}` : `${frames.length} preview route(s)`));
+
+  const src: Record<string, string> = {};
+  for (const f of files) if (/\.(tsx?|jsx?)$/.test(f)) src[f] = read(root, f);
+  const syn = tsSyntaxErrors(src);
+  checks.push(chk('sk.syntax', syn.length === 0, 'lie', 'every generated source parses', syn.join(' | ') || `${Object.keys(src).length} file(s) ok`));
+  return checks;
+}
+
+/** Put a fixture copy back into the RESOLVE-path state: opaque on-disk names under
+ *  `into`, no asset-map, no resources module (the legacy re-export stub included). */
+async function unApplyAssets(root: string, fw: Fw, into: string): Promise<void> {
+  await fs.rm(path.join(root, '.uix', 'asset-map.json'), { force: true });
+  await fs.rm(path.join(root, RES_FILE[fw]), { force: true });
+  if (fw !== 'flutter') await fs.rm(path.join(root, 'src', 'resources', 'assets.ts'), { force: true });
+  const from = ASSET_DIR[fw];
+  const moves: Array<[string, string]> = [
+    [`${from}/icons/search_icon.svg`, `${into}/icons/vector_10_20.svg`],
+    [`${from}/images/map_dark.png`, `${into}/images/image_10_40.png`],
+    [`${from}/images/promo_banner.png`, `${into}/images/image_10_41.png`],
+    [`${from}/images/user_avatar.png`, `${into}/images/user_avatar_10_31.png`],
+  ];
+  for (const [a, b] of moves) {
+    await fs.mkdir(path.dirname(path.join(root, b)), { recursive: true });
+    await fs.rename(path.join(root, a), path.join(root, b));
+  }
+  if (into !== from) await fs.rm(path.join(root, from), { recursive: true, force: true });
+}
+
 async function phaseAssetPhase(): Promise<Cell[]> {
   const { runAssetPhaseOnBuild } = await import('../../src/relay-server/passes/asset-phase');
   const { gatherExistingAssets } = await import('../../src/relay-server/reference-render');
   const cells: Cell[] = [];
-  /** Put the fixture back into the RESOLVE-path state: opaque on-disk names, no map, no resources file. */
-  const unApply = async (root: string, fw: Fw, into = 'assets') => {
-    await fs.rm(path.join(root, '.uix', 'asset-map.json'), { force: true });
-    await fs.rm(path.join(root, fw === 'flutter' ? 'lib/resources/app_assets.dart' : 'src/resources/assets.ts'), { force: true });
-    const moves: Array<[string, string]> = [
-      ['assets/icons/search_icon.svg', `${into}/icons/vector_10_20.svg`],
-      ['assets/images/map_dark.png', `${into}/images/image_10_40.png`],
-      ['assets/images/promo_banner.png', `${into}/images/image_10_41.png`],
-      ['assets/images/user_avatar.png', `${into}/images/user_avatar_10_31.png`],
-    ];
-    for (const [a, b] of moves) {
-      await fs.mkdir(path.dirname(path.join(root, b)), { recursive: true });
-      await fs.rename(path.join(root, a), path.join(root, b));
-    }
-    if (into !== 'assets') await fs.rm(path.join(root, 'assets'), { recursive: true, force: true });
-  };
   for (const fw of FRAMEWORKS) {
+    // Web: root `assets/` is where EVERY framework localized before B56 (a web server
+    // never serves it) — the phase must migrate it; public/assets is the contract.
     const variants: Array<{ label: string; into: string }> = [{ label: 'assets/ (where localize writes)', into: 'assets' }];
     if (fw !== 'flutter') variants.push({ label: 'public/assets (where the web server serves)', into: 'public/assets' });
     for (const v of variants) {
       const { projectId, root } = await copyFixture(fw, 'assetphase');
-      await unApply(root, fw, v.into);
+      await unApplyAssets(root, fw, v.into);
       const gathered = await gatherExistingAssets(root, fw);
       const before = await snapshot(root);
       const r1 = await runAssetPhaseOnBuild(projectId, { projectRoot: root, skipBuildCheck: true });
@@ -737,17 +931,18 @@ async function phaseAssetPhase(): Promise<Cell[]> {
       const after = await snapshot(root);
       const d1 = diffSnaps(before, mid);
       const d2 = diffSnaps(mid, after);
-      const resFile = fw === 'flutter' ? 'lib/resources/app_assets.dart' : 'src/resources/assets.ts';
+      const resFile = RES_FILE[fw];
       const res = read(root, resFile);
       // After run 1, every asset path literal left in app code must still point at a
       // file that exists (the pass RENAMED the files; anything it did not re-point is
-      // now a broken image).
+      // now a broken image). A web literal resolves the way the server serves it.
       const dangling: string[] = [];
       for (const f of await appSources(root, fw)) {
         if (f === resFile) continue;
         for (const m of read(root, f).matchAll(/['"]\/?((?:public\/)?assets\/[^'"$]+)['"]/g)) {
           const p = m[1];
-          if (!exists(root, p) && !exists(root, path.join('public', p))) dangling.push(`${f}: '${p}'`);
+          const ok = fw === 'flutter' ? exists(root, p) : exists(root, path.join('public', p.replace(/^public\//, '')));
+          if (!ok) dangling.push(`${f}: '${p}'`);
         }
       }
       const checks: Check[] = [
@@ -757,10 +952,16 @@ async function phaseAssetPhase(): Promise<Cell[]> {
         chk('ap.idempotent', d2.length === 0, 'lie', 'run 2 is a no-op (already applied)', `run2 status=${r2.status}${r2.reason ? ` (${r2.reason})` : ''}; run2 changed ${d2.length} file(s): ${d2.map((d) => `${d.change}:${d.file}`).slice(0, 8).join(', ')}`),
       ];
       if (fw !== 'flutter' && res) {
-        const served = !/'public\//.test(res);
-        checks.push(chk('ap.web-urls', served, 'lie', 'emitted symbol values are URLs the web server serves (no `public/` prefix)', res.split('\n').filter((l) => /:\s*'/.test(l)).slice(0, 3).join(' | ')));
+        const values = [...res.matchAll(/:\s*'([^']+)'/g)].map((m) => m[1]);
+        const served = values.length > 0 && values.every((x) => /^\/assets\//.test(x));
+        checks.push(chk('ap.web-urls', served, 'lie', 'emitted symbol values are URLs the web server serves (`/assets/…`, no `public/` prefix)', res.split('\n').filter((l) => /:\s*'/.test(l)).slice(0, 3).join(' | ')));
+        // Every served URL is backed by a file the server will actually serve.
+        const unbacked = values.filter((x) => !exists(root, path.join('public', x)));
+        checks.push(chk('ap.served-files', values.length > 0 && unbacked.length === 0, 'lie', 'every emitted URL is a file under public/ (so it is in the build output)', unbacked.join(', ') || `${values.length} URL(s) backed by public/`));
+        const rootLeft = await listFiles(root, 'assets', /\.(svg|png)$/);
+        checks.push(chk('ap.no-root-assets', rootLeft.length === 0, 'stub', 'no design asset is left in the unserved root assets/', rootLeft.join(', ') || 'none'));
       }
-      cells.push({ pass: `asset-phase [${v.label}]`, framework: fw, reported: { status: r1.status, counts: { gathered: r1.gathered, renamed: r1.renamed, repointed: r1.repointed }, warnings: r1.warnings, ...(r1.error ? { error: r1.error } : {}) }, files: d1.slice(0, 30), checks, cell_status: classify(null, checks), notes: [] });
+      cells.push({ pass: `asset-phase [${v.label}]`, framework: fw, reported: { status: r1.status, ...(r1.reason ? { reason: r1.reason } : {}), counts: { gathered: r1.gathered, renamed: r1.renamed, repointed: r1.repointed }, warnings: r1.warnings, ...(r1.error ? { error: r1.error } : {}) }, files: d1.slice(0, 30), checks, cell_status: classify(null, checks), notes: fw !== 'flutter' && v.into === 'assets' ? ['web: root assets/ is the pre-B56 localize location; the phase migrates it into public/assets'] : [] });
     }
   }
   return cells;
@@ -774,11 +975,27 @@ async function phaseResolveCanonical(): Promise<Cell[]> {
     const beforeScreens = JSON.parse(read(root, '.uix/canonical.json')).screens.length;
     const c = await resolveCanonicalFromCode(projectId, { projectRoot: root, noAi: true });
     const afterScreens = JSON.parse(read(root, '.uix/canonical.json')).screens?.length ?? 0;
+    // The design has exactly c_10_1..c_10_5; a verify preview or a redirect-only root
+    // page derived as a "screen" would put a harness page into the app's canonical.
+    const want = new Set(['c_10_1', 'c_10_2', 'c_10_3', 'c_10_4', 'c_10_5']);
+    const foreign = c.screens.map((x) => x.canonicalId).filter((id) => !want.has(id));
+    const m9 = c.modals.find((m) => m.canonicalId === 'm_10_9');
+    // An app with NO screens left (every source root gone): the empty derivation must
+    // not be written over the real canonical.json.
+    const bare = await copyFixture(fw, 'resolve-empty');
+    for (const d of fw === 'flutter' ? ['lib/screens'] : ['src', 'app', 'components']) await fs.rm(path.join(bare.root, d), { recursive: true, force: true });
+    const canonBefore = read(bare.root, '.uix/canonical.json');
+    const ce = await resolveCanonicalFromCode(bare.projectId, { projectRoot: bare.root, noAi: true }) as typeof c & { persisted?: boolean; skippedReason?: string };
+    const canonAfter = read(bare.root, '.uix/canonical.json');
     const checks = [
       chk('rc.screens', c.screens.length >= 4, 'stub', 'screens derived from the emitted code (≥4 built screens)', `derived ${c.screens.length} screen(s): ${c.screens.map((s) => s.canonicalId).join(', ')}; warnings: ${c.warnings.join(' | ')}`),
       chk('rc.edges', c.flow.edges.length > 0, 'stub', 'flow edges derived from navigation calls', `${c.flow.edges.length} edge(s)`),
       chk('rc.no-clobber', afterScreens >= Math.min(beforeScreens, c.screens.length) && !(c.screens.length === 0 && beforeScreens > 0 && afterScreens === 0), 'lie', 'an unimplemented strategy never overwrites a real canonical.json with an empty one',
         `canonical.json screens before=${beforeScreens} after=${afterScreens}; backup=${exists(root, '.uix/canonical.frames.json.bak')}`),
+      chk('rc.only-design-screens', foreign.length === 0, 'lie', 'no verify preview / redirect-only root page is derived as a screen of the app', foreign.join(', ') || 'only c_10_1..c_10_5'),
+      chk('rc.modal-bound', m9?.baseCanonicalId === 'c_10_2', 'stub', 'the modal home presents (m_10_9) is derived with its base screen c_10_2', m9 ? `m_10_9 base=${m9.baseCanonicalId || '(none)'}` : `no m_10_9 (modals: ${c.modals.map((m) => m.canonicalId).join(', ') || 'none'})`),
+      chk('rc.empty-not-persisted', ce.screens.length > 0 || (canonAfter === canonBefore && ce.persisted === false && !!ce.skippedReason), 'lie', 'an app with no screens left derives an empty canonical that is NOT written over canonical.json (skipped + reason)',
+        `derived ${ce.screens.length} screen(s); canonical.json ${canonAfter === canonBefore ? 'unchanged' : 'OVERWRITTEN'}; persisted=${ce.persisted}; reason=${ce.skippedReason ?? '(none)'}`),
     ];
     cells.push({ pass: 'resolve-canonical', framework: fw, reported: null, files: [], checks, cell_status: classify(null, checks), notes: [] });
   }
@@ -822,9 +1039,31 @@ async function phaseAnalyzeGate(): Promise<Cell[]> {
     });
     const prompt = prompts[0] ?? '';
     const wrongIdiom = fw !== 'flutter' && /flutter analyze|Flutter project/.test(prompt);
+    let live: Check | null = null;
+    if (fw !== 'flutter') {
+      // A minimal real TS project (relay-server's own typescript linked in as the
+      // project's compiler) with 2 planted type errors; the "repair" fixes the file.
+      // The gate must measure 2 with tsc, then RE-MEASURE 0 after the repair.
+      const tp = await fs.mkdtemp(path.join(os.tmpdir(), `parity-gate-${fw}-`));
+      await fs.mkdir(path.join(tp, 'node_modules'), { recursive: true });
+      await fs.symlink(path.dirname(require.resolve('typescript/package.json')), path.join(tp, 'node_modules', 'typescript'));
+      await fs.writeFile(path.join(tp, 'package.json'), JSON.stringify({ name: 'gate', private: true, dependencies: fw === 'next' ? { next: '16', react: '19' } : { react: '19' } }));
+      await fs.writeFile(path.join(tp, 'tsconfig.json'), JSON.stringify({ compilerOptions: { strict: true, noEmit: true, lib: ['es2020'], types: [] }, include: ['src/**/*.ts'] }));
+      await fs.mkdir(path.join(tp, 'src'), { recursive: true });
+      await fs.writeFile(path.join(tp, 'src', 'a.ts'), "export const n: number = 'x';\nexport const s: string = 1;\n");
+      const lp: string[] = [];
+      const lg = await runAnalyzeGate({
+        projectRoot: tp, model: 'claude' as never,
+        runModel: async (_m, p) => { lp.push(p); await fs.writeFile(path.join(tp, 'src', 'a.ts'), "export const n: number = 1;\nexport const s: string = 'x';\n"); return { text: 'fixed' }; },
+      });
+      live = chk('g.tsc-live', lg.initialErrors === 2 && lg.errors === 0 && lg.ok && lg.repairAttempted && /TS2322/.test(lp[0] ?? ''), 'lie', "the gate measures with the project's own tsc (2 planted errors, listed in the prompt) and re-measures 0 after the repair",
+        `initial=${lg.initialErrors} after=${lg.errors} ok=${lg.ok} tool=${lg.tool ?? '?'} prompt lists TS2322: ${/TS2322/.test(lp[0] ?? '')}`);
+      await fs.rm(tp, { recursive: true, force: true });
+    }
     const checks = [
       chk('g.measures', fw === 'flutter' || g.errors !== 2 || !g.repairAttempted, 'lie', 'after a repair the gate RE-MEASURES with this framework\'s checker (tsc for web) instead of keeping the stale count', `errors=${g.errors} initial=${g.initialErrors} repairAttempted=${g.repairAttempted} ok=${g.ok}`),
       chk('g.prompt-idiom', !wrongIdiom, 'lie', "the repair prompt names this framework's checker", prompt.split('\n')[0]?.slice(0, 160) ?? '(no prompt)'),
+      ...(live ? [live] : []),
     ];
     cells.push({ pass: 'analyze-gate (P3 completion gate)', framework: fw, reported: null, files: [], checks, cell_status: classify(null, checks), notes: fw === 'flutter' ? ['flutter SDK absent here: live analyze → null, fallback path exercised'] : [] });
   }
@@ -840,47 +1079,81 @@ async function phaseVerifyServing(): Promise<Cell[]> {
   await fs.mkdir(path.join(out, '_preview'), { recursive: true });
   await fs.writeFile(path.join(out, 'index.html'), '<html><body>ROOT PAGE</body></html>');
   await fs.writeFile(path.join(out, '_preview', '10-3.html'), '<html><body>SETTINGS PREVIEW</body></html>');
+  // trailingSlash: true writes out/_preview/10-4/index.html; a real export also has
+  // _next/ + 404.html — a route with no document must never render the ROOT page.
+  await fs.mkdir(path.join(out, '_preview', '10-4'), { recursive: true });
+  await fs.writeFile(path.join(out, '_preview', '10-4', 'index.html'), '<html><body>PROFILE PREVIEW</body></html>');
+  await fs.mkdir(path.join(out, '_next'), { recursive: true });
+  await fs.writeFile(path.join(out, '404.html'), '<html><body>NOT FOUND</body></html>');
   const srv = await serveDir(out);
-  let body = '';
+  let body = ''; let body4 = ''; let bodyMissing = ''; let missingStatus = 0; let doc = '';
   try {
-    const res = await fetch(`${srv.url.replace(/\/index\.html$/, '').replace(/\/$/, '')}/_preview/10-3`);
-    body = await res.text();
+    const base = srv.url.replace(/\/index\.html$/, '').replace(/\/$/, '');
+    body = await (await fetch(`${base}/_preview/10-3`)).text();
+    body4 = await (await fetch(`${base}/_preview/10-4`)).text();
+    const m = await fetch(`${base}/_preview/10-9`);
+    missingStatus = m.status; bodyMissing = await m.text();
+    doc = srv.servedDocument('/_preview/10-9') ?? '(none)';
   } finally { srv.close(); }
-  const ok = /SETTINGS PREVIEW/.test(body);
+  const strip = (b: string) => b.replace(/<[^>]+>/g, '').trim();
+  const vChecks = [
+    chk('v.next-export-route', /SETTINGS PREVIEW/.test(body), 'lie', 'GET /_preview/10-3 on a Next `output:"export"` build serves out/_preview/10-3.html (the screen under test)', `served: ${strip(body)}`),
+    chk('v.next-trailing-slash', /PROFILE PREVIEW/.test(body4), 'lie', 'GET /_preview/10-4 serves out/_preview/10-4/index.html (trailingSlash export)', `served: ${strip(body4)}`),
+    chk('v.next-missing-route', missingStatus === 404 && !/ROOT PAGE/.test(bodyMissing) && doc === '404', 'lie', 'a preview route with no exported document is a 404 (identity: servedDocument=404), never the ROOT page', `HTTP ${missingStatus} served: ${strip(bodyMissing)}; servedDocument=${doc}`),
+  ];
   return [{
     pass: 'verify serving (/_preview/<id> on a static export)', framework: 'next', reported: null, files: [],
-    checks: [chk('v.next-export-route', ok, 'lie', 'GET /_preview/10-3 on a Next `output:"export"` build serves out/_preview/10-3.html (the screen under test)', `served: ${body.replace(/<[^>]+>/g, '').trim()}`)],
-    cell_status: ok ? 'IMPLEMENTED' : 'LIES',
+    checks: vChecks,
+    cell_status: classify(null, vChecks),
     notes: ['the identity assertion compares location.pathname only; the URL stays /_preview/10-3 while the ROOT page renders, so the wrong screen is scored silently'],
   }];
 }
 
-/** Do the design's assets reach the served web build? Asset localization writes
- *  <projectRoot>/assets/{icons,images} for EVERY framework (reference-render.ts), the
- *  packet tells the web agent to reference them as `/${assets.x}` at runtime, and the
- *  verify harness serves the production build. Vite copies only public/ into dist/, so
- *  a runtime `/assets/icons/x.svg` 404s. Probed with the real vite binary. */
+/** Do the design's assets reach the served web build? The asset phase runs for real
+ *  on a react copy in the RESOLVE state with the assets where every build localized
+ *  them before B56 (root `assets/`); then a real `vite build` bundles a page that
+ *  renders every `assets.<symbol>` exactly as the packet tells the agent
+ *  (`<img src={assets.x}>`), and each URL is fetched from the served build. */
 async function phaseWebAssetServing(): Promise<Cell[]> {
   let viteBin = '';
   try { viteBin = path.join(path.dirname(require.resolve('vite/package.json')), 'bin', 'vite.js'); } catch { /* absent */ }
-  const { root } = await copyFixture('react', 'vite-assets');
   if (!viteBin || !fsSync.existsSync(viteBin)) {
     return [{ pass: 'web asset serving (vite build)', framework: 'react', reported: null, files: [], checks: [chk('va.vite', false, 'stub', 'vite available to probe', 'vite not resolvable')], cell_status: 'SKIPPED_WITH_REASON', notes: ['vite absent'] }];
   }
-  const probe = path.join(root, '_vite_probe');
-  await fs.mkdir(probe, { recursive: true });
-  await fs.cp(path.join(root, 'assets'), path.join(probe, 'assets'), { recursive: true });
-  await fs.writeFile(path.join(probe, 'index.html'), '<!doctype html><html><body><div id="root"></div><script type="module" src="/main.js"></script></body></html>');
-  // Exactly the shape renderAssetInventory tells the web agent to emit.
-  await fs.writeFile(path.join(probe, 'main.js'), "const assets = { searchIcon: 'assets/icons/search_icon.svg' };\ndocument.getElementById('root').innerHTML = `<img src=\"/${assets.searchIcon}\">`;\n");
-  const r = spawnSync(process.execPath, [viteBin, 'build', '--logLevel', 'error'], { cwd: probe, encoding: 'utf8', timeout: 120000 });
-  const shipped = fsSync.existsSync(path.join(probe, 'dist', 'assets', 'icons', 'search_icon.svg'));
-  const distFiles = await listFiles(probe, 'dist');
+  const { runAssetPhaseOnBuild } = await import('../../src/relay-server/passes/asset-phase');
+  const { serveDir } = await import('../../src/relay-server/visual-routes');
+  const { projectId, root } = await copyFixture('react', 'vite-assets');
+  await unApplyAssets(root, 'react', 'assets');
+  const ap = await runAssetPhaseOnBuild(projectId, { projectRoot: root, skipBuildCheck: true });
+  const res = read(root, RES_FILE.react);
+  const symbols = [...res.matchAll(/^\s*([A-Za-z0-9_$]+):\s*'([^']+)'/gm)].map((m) => ({ sym: m[1], url: m[2] }));
+  // The app's own vite config needs @vitejs/plugin-react (not installed here): build
+  // the probe page with an empty config — the public/ → dist/ copy is vite's own.
+  await fs.writeFile(path.join(root, 'probe.config.mjs'), 'export default {};\n');
+  await fs.writeFile(path.join(root, 'index.html'), '<!doctype html><html><body><div id="root"></div><script type="module" src="/probe-main.ts"></script></body></html>');
+  await fs.writeFile(path.join(root, 'probe-main.ts'), `import { assets } from './src/resources/assets';\ndocument.getElementById('root')!.innerHTML = Object.values(assets).map((u) => \`<img src="\${u}">\`).join('');\n`);
+  const r = spawnSync(process.execPath, [viteBin, 'build', '--config', 'probe.config.mjs', '--logLevel', 'error'], { cwd: root, encoding: 'utf8', timeout: 120000 });
+  const bundled = (await listFiles(root, 'dist/assets', /\.js$/)).map((f) => read(root, f)).join('\n');
+  const results: string[] = [];
+  let ok200 = 0;
+  const srv = await serveDir(path.join(root, 'dist'));
+  try {
+    const base = srv.url.replace(/\/index\.html$/, '');
+    for (const { sym, url } of symbols) {
+      const resp = await fetch(`${base}${url}`);
+      const body = Buffer.from(await resp.arrayBuffer());
+      const want = fsSync.existsSync(path.join(root, 'public', url)) ? fsSync.readFileSync(path.join(root, 'public', url)) : null;
+      const same = !!want && Buffer.compare(body, want) === 0;
+      if (resp.status === 200 && same && bundled.includes(url)) ok200++;
+      results.push(`${sym} ${url} → HTTP ${resp.status}${same ? '' : ' (bytes differ)'}${bundled.includes(url) ? '' : ' (not in bundle)'}`);
+    }
+  } finally { srv.close(); }
+  const shipped = ap.status === 'applied' && symbols.length === 4 && ok200 === symbols.length;
   return [{
     pass: 'web asset serving (vite build)', framework: 'react', reported: null, files: [],
-    checks: [chk('va.shipped', shipped, 'lie', 'an asset localized to <root>/assets/ and referenced as `/${assets.x}` is present in the served build', `vite exit=${r.status}; dist: ${distFiles.join(', ')}`)],
+    checks: [chk('va.shipped', shipped, 'lie', 'after the asset phase, every `assets.<symbol>` URL the bundle renders is served by the real vite build (HTTP 200, the design bytes)', `asset phase ${ap.status}; vite exit=${r.status}${r.stderr ? ` ${r.stderr.slice(0, 200)}` : ''}; ${results.join(' | ') || 'no symbols emitted'}`)],
     cell_status: shipped ? 'IMPLEMENTED' : 'LIES',
-    notes: ['next: `next build` likewise serves static files only from public/ — same mechanism, not probed (no next binary)'],
+    notes: ['next: `next build` serves public/ the same way — proven with the real next binary in scratchpad/web-real/B56 (not required by this harness)'],
   }];
 }
 
@@ -937,6 +1210,16 @@ async function phaseFinalizeDryRun(): Promise<Cell[]> {
   return cells;
 }
 
+/** Passes that claim `applied` without having examined anything: recorded `applied`
+ *  with every count zero, or `guarded` — the pass returned an all-zero `applied` and
+ *  only finalize's safety net recorded it `skipped`. Exported so the check itself is
+ *  tested (it must be able to fail). */
+export function zeroAppliedViolations(passes: Array<{ name: string; status: string; counts: Record<string, number>; guarded?: boolean }>): string[] {
+  return passes
+    .filter((p) => (p.status === 'applied' && Object.values(p.counts).every((v) => !v)) || (p.status === 'skipped' && p.guarded))
+    .map((p) => (p.guarded ? `${p.name} (all-zero applied, skipped only by the safety net)` : p.name));
+}
+
 /** Full finalize twice (standalone, no agent): run 2 must change nothing, and the
  *  report must not claim `applied` for passes that are stubs. */
 async function phaseFinalizeTwice(): Promise<Cell[]> {
@@ -948,6 +1231,7 @@ async function phaseFinalizeTwice(): Promise<Cell[]> {
     const r1 = await finalizeApp(projectId, { projectRoot: root, skipBuildCheck: true });
     const s1 = await snapshot(root);
     const flow1 = flowReport(root);
+    const audit1 = (() => { try { return JSON.parse(read(root, '.uix/interaction-audit-report.json')) as { findings: Array<{ file: string; line: number }> }; } catch { return null; } })();
     const r2 = await finalizeApp(projectId, { projectRoot: root, skipBuildCheck: true });
     const s2 = await snapshot(root);
     const flow2 = flowReport(root);
@@ -959,17 +1243,165 @@ async function phaseFinalizeTwice(): Promise<Cell[]> {
       const g = flow2?.findings.find((x) => x.from === f.from && x.to === f.to);
       if (g && g.status !== f.status) flowDelta.push(`${f.from}→${f.to}: ${f.status} → ${g.status} (${g.detail.slice(0, 120)})`);
     }
-    const zeroApplied = r1.passes.filter((p) => p.status === 'applied' && Object.values(p.counts).every((v) => !v)).map((p) => p.name);
+    const zeroApplied = zeroAppliedViolations(r1.passes);
+    // `applied` must be grounded in the pass's OUTPUT, not its counts (a padded count —
+    // filesScanned=1 on src/resources/assets.ts — passes any count-based check): an
+    // applied interaction audit must have found the dead 'Resolve' control planted in
+    // the settings screen (B1 verify #3).
+    const auditApplied = r1.passes.find((p) => p.name === 'auditInteractions')?.status === 'applied';
+    // 7e renames the settings screen's file (screen_10_3.dart → settings_screen.dart,
+    // app/10-3/ → app/settings/) BEFORE 7g runs, so the planted control is located in
+    // whichever file carries the settings screen's canonical header after run 1 — the
+    // same identity every pass resolves by — falling back to the fixture path.
+    const settingsFile = (await appSources(root, fw)).find((f) => /^\/\/\s*canonicalId:\s*c_10_3\b/m.test(read(root, f))) ?? SCREEN[fw].settings;
+    const plantedLine = read(root, settingsFile).split('\n').findIndex((l) => (fw === 'flutter' ? /onPressed:\s*\(\)\s*\{\}.*Resolve/ : /onClick=\{\(\) => \{\}\}.*Resolve/).test(l)) + 1;
+    const auditHit = plantedLine > 0 && (audit1?.findings.some((f) => f.file === settingsFile && f.line === plantedLine) ?? false);
+    const reasonless = r1.passes.filter((p) => p.status === 'skipped' && !p.reason?.trim()).map((p) => p.name);
+    const skippedWithReason = r1.passes.filter((p) => p.status === 'skipped' && p.reason).map((p) => `${p.name}: ${p.reason}`);
     const checks = [
       chk('fz.idempotent-files', d2.length === 0, 'lie', 'finalize run 2 changes no source file', d2.map((d) => `${d.change}:${d.file}`).slice(0, 10).join(', ') || 'no changes'),
       chk('fz.idempotent-verdicts', flowDelta.length === 0, 'lie', 'finalize run 2 grades every flow edge the same as run 1', flowDelta.join(' | ') || 'identical'),
-      chk('fz.no-zero-applied', zeroApplied.length === 0, 'lie', "no pass is recorded `applied` with all-zero counts (a stub or a no-input run must say `skipped` + reason)", zeroApplied.join(', ') || 'none'),
+      chk('fz.no-zero-applied', zeroApplied.length === 0, 'lie', "no pass is recorded `applied` with all-zero counts, and no pass leaves it to finalize's safety net to turn its all-zero `applied` into a skip (a stub or a no-input run must say `skipped` + its own reason)", zeroApplied.join(', ') || 'none'),
+      chk('fz.applied-grounded', !auditApplied || auditHit, 'lie', "an `applied` interaction audit's report contains the dead 'Resolve' control planted in the settings screen (applied means it read the screens)", auditApplied ? (auditHit ? `found at ${settingsFile}:${plantedLine}` : `applied, but .uix/interaction-audit-report.json has no finding at ${settingsFile}:${plantedLine} (${audit1?.findings.length ?? 'no'} finding(s))`) : 'auditInteractions not applied'),
+      // In a FULL finalize 7b runs before 7d: the bound modal m_10_9 it converts/credits
+      // must still grade `wired` (its trigger now calls the overlay presenter, not the
+      // removed route) — the single-pass 7d cell never sees 7b's output.
+      chk('fz.modal-after-7b', flow1?.findings.find((x) => x.from === 'c_10_2' && x.to === 'm_10_9')?.status === 'wired', 'lie', 'after 7b converts the bound modal, 7d still grades home→m_10_9 wired', (() => { const e = flow1?.findings.find((x) => x.from === 'c_10_2' && x.to === 'm_10_9'); return e ? `${e.status} — ${e.detail}` : 'no finding'; })()),
+      chk('fz.skip-reasons', reasonless.length === 0, 'lie', 'every `skipped` pass carries its reason', reasonless.join(', ') || skippedWithReason.join(' | ') || 'no pass skipped'),
     ];
     const summary = (r: typeof r1) => r.passes.map((p) => `${p.name}:${p.status}`).join(', ');
     cells.push({
       pass: 'finalize (standalone ×2)', framework: fw,
       reported: { status: summary(r1), counts: {}, warnings: [`run2: ${summary(r2)}`] },
       files: d1.slice(0, 60), checks, cell_status: classify(null, checks), notes: [],
+    });
+  }
+  return cells;
+}
+
+// ── readability (lane B78) ──────────────────────────────────────────────────
+
+/** Where each framework keeps shared components (CONTRACTS §5). */
+const COMPONENTS_DIR: Record<Fw, string> = { flutter: 'lib/components', react: 'src/components', next: 'components' };
+
+/** 7h readability hygiene (F1 + F6): a skeleton stub component nothing imports is
+ *  deleted, one something imports is kept; Figma/IR provenance leaves every comment
+ *  while the behaviour text, the canonicalId header and string literals stay. */
+async function phaseReadabilityHygiene(): Promise<Cell[]> {
+  const { finalizeApp } = await import('../../src/relay-server/passes/finalize');
+  const cells: Cell[] = [];
+  const LEAK = /IR "Rectangle 24"|frame 61|Frame 83|m_313_9543|added by \/login|27×27/;
+  for (const fw of FRAMEWORKS) {
+    const { projectId, root } = await copyFixture(fw, 'readability-hygiene');
+    const s = SCREEN[fw];
+    const dir = COMPONENTS_DIR[fw];
+    const login = read(root, s.login);
+    const header = login.split('\n')[0];
+    const provenance = [
+      '// Login form (IR "Rectangle 24", frame 61) — submits the credentials.',
+      '// Frame 83 shows the biometric shortcut.',
+      '// Loading sheet (modal m_313_9543) that resolves into the dashboard',
+      '// (added by /login). Dots are 27×27 each.',
+    ].join('\n');
+    const literal = fw === 'flutter' ? `\nconst kProvenanceLiteral = 'frame 61 (IR "Rectangle 24")';\n` : `\nexport const PROVENANCE_LITERAL = 'frame 61 (IR "Rectangle 24")';\n`;
+    const lines = login.split('\n');
+    // after the header (and after 'use client' on next, which must stay first-statement)
+    const at = lines.findIndex((l, i) => i > 0 && !/^\/\/|^'use client'/.test(l));
+    lines.splice(at, 0, provenance);
+    await fs.writeFile(path.join(root, s.login), lines.join('\n') + (fw === 'next' ? '' : literal));
+    if (fw === 'next') await fs.appendFile(path.join(root, 'components/FilterSheet.tsx'), literal);
+    const literalFile = fw === 'next' ? 'components/FilterSheet.tsx' : s.login;
+    let unused: string; let used: string;
+    if (fw === 'flutter') {
+      unused = `${dir}/cmp_other_17.dart`; used = `${dir}/cmp_used_3.dart`;
+      const stub = (c: string) => `// GENERATED SKELETON — shared component stub (write-locked API surface).\nimport 'package:flutter/material.dart';\n\nclass ${c} extends StatelessWidget {\n  const ${c}({super.key});\n  @override\n  Widget build(BuildContext context) => const SizedBox.shrink();\n}\n`;
+      await fs.mkdir(path.join(root, dir), { recursive: true });
+      await fs.writeFile(path.join(root, unused), stub('OtherWidget'));
+      await fs.writeFile(path.join(root, used), stub('UsedWidget'));
+      const home = read(root, s.home);
+      await fs.writeFile(path.join(root, s.home), home.replace(/^(import 'package:flutter\/material\.dart';)$/m, "$1\nimport '../components/cmp_used_3.dart';"));
+    } else {
+      unused = `${dir}/Other.tsx`; used = `${dir}/UsedStub.tsx`;
+      const stub = (c: string) => `// GENERATED SKELETON — shared component stub (write-locked API surface).\nexport function ${c}() {\n  return null;\n}\n`;
+      await fs.mkdir(path.join(root, dir), { recursive: true });
+      await fs.writeFile(path.join(root, unused), stub('Other'));
+      await fs.writeFile(path.join(root, used), stub('UsedStub'));
+      const homeRel = s.home;
+      const spec = fw === 'react' ? '../../components/UsedStub' : '@/components/UsedStub';
+      const home = read(root, homeRel);
+      const lines2 = home.split('\n');
+      const lastImport = lines2.reduce((acc, l, i) => (/^import\s/.test(l) ? i : acc), 0);
+      lines2.splice(lastImport + 1, 0, `import { UsedStub } from '${spec}';`, 'void UsedStub;');
+      await fs.writeFile(path.join(root, homeRel), lines2.join('\n'));
+    }
+    const before = await snapshot(root);
+    const r1 = await finalizeApp(projectId, { projectRoot: root, onlyPasses: ['productionHygiene'], skipBuildCheck: true, noReport: true });
+    const mid = await snapshot(root);
+    const r2 = await finalizeApp(projectId, { projectRoot: root, onlyPasses: ['productionHygiene'], skipBuildCheck: true, noReport: true });
+    const after = await snapshot(root);
+    const files = diffSnaps(before, mid);
+    const p = r1.passes.find((x) => x.name === 'productionHygiene');
+    const leftLogin = read(root, s.login);
+    const commentLeaks = (await appSources(root, fw)).flatMap((f) => read(root, f).split('\n').map((l, i) => ({ f, i, l })))
+      .filter(({ l }) => /^\s*\/\//.test(l) && LEAK.test(l)).map(({ f, i, l }) => `${f}:${i + 1}: ${l.trim()}`);
+    const syn = fw === 'flutter' ? [] : syntaxErrorsIn(root, files);
+    const d2 = diffSnaps(mid, after);
+    const checks = [
+      chk('rh.stub-removed', !exists(root, unused), 'stub', `the stub component nothing imports (${unused}) is deleted`, exists(root, unused) ? 'still present' : 'deleted'),
+      chk('rh.stub-kept', exists(root, used), 'lie', `a stub something still imports (${used}) is kept (deleting it would break the build)`, exists(root, used) ? 'kept' : 'DELETED'),
+      chk('rh.leak-stripped', commentLeaks.length === 0, 'stub', 'no comment carries Figma/IR provenance (frame numbers, IR layer names, node/modal ids, "added by /route", design pixel sizes)', commentLeaks.join(' | ') || 'none'),
+      chk('rh.behaviour-kept', /Login form/.test(leftLogin) && /submits the credentials/.test(leftLogin) && /Loading sheet/.test(leftLogin) && /resolves into the dashboard/.test(leftLogin), 'lie', 'the behavioural text of a stripped comment survives', leftLogin.split('\n').filter((l) => /Login form|Loading sheet|resolves into|Dots are/.test(l)).join(' | ') || 'behaviour text gone'),
+      chk('rh.header', leftLogin.split('\n')[0] === header, 'lie', 'the `// canonicalId:` header line is untouched', leftLogin.split('\n')[0]),
+      chk('rh.string-untouched', read(root, literalFile).includes(`'frame 61 (IR "Rectangle 24")'`), 'lie', 'a string literal that happens to contain provenance words is never edited (comments only)', read(root, literalFile).split('\n').find((l) => /frame 61/.test(l)) ?? 'literal gone'),
+      chk('rh.counts', (p?.counts?.stubComponentsRemoved ?? -1) === 1 && (p?.counts?.commentsStripped ?? 0) >= 1, 'lie', 'the report counts exactly the one removed stub and the stripped comment(s)', JSON.stringify(p?.counts ?? {})),
+      chk('rh.syntax', syn.length === 0, 'lie', 'every file the pass rewrote parses', syn.join(' | ') || 'ok'),
+      chk('rh.idempotent', d2.length === 0, 'lie', 'a second run changes nothing', d2.map((d) => `${d.change}:${d.file}`).join(', ') || 'no changes'),
+    ];
+    cells.push({
+      pass: 'readability hygiene: stub components + provenance comments (F1/F6)', framework: fw,
+      reported: p ? { status: p.status, ...(p.reason ? { reason: p.reason } : {}), counts: p.counts, warnings: p.warnings } : null,
+      files, checks, cell_status: classify(p ? { status: p.status, reason: p.reason, counts: p.counts, warnings: p.warnings } : null, checks),
+      notes: [`run 2: ${r2.passes.find((x) => x.name === 'productionHygiene')?.status}`],
+    });
+  }
+  return cells;
+}
+
+/** F9 + F7: finalize-report.json carries a before/after readability block and the
+ *  warn-only screen gate, and a mutating pass that changed nothing on run 2 says
+ *  `skipped: no-op` instead of `applied` (the Ping finalize: "5 applied", empty diff). */
+async function phaseReadabilityReport(): Promise<Cell[]> {
+  const { finalizeApp } = await import('../../src/relay-server/passes/finalize');
+  const cells: Cell[] = [];
+  const MUTATING = ['extractComponents', 'applyModalOverlays', 'repointAssetUsage', 'renameSemantic', 'deepenTokensAndCleanup', 'productionHygiene'];
+  for (const fw of FRAMEWORKS) {
+    const { projectId, root } = await copyFixture(fw, 'readability-report');
+    const r1 = await finalizeApp(projectId, { projectRoot: root, skipBuildCheck: true });
+    const s1 = await snapshot(root);
+    const r2 = await finalizeApp(projectId, { projectRoot: root, skipBuildCheck: true });
+    const s2 = await snapshot(root);
+    const d2 = diffSnaps(s1, s2, /^\.uix\//);
+    let persisted: { readability?: { before?: unknown; after?: unknown; gate?: { status?: string } } } | null = null;
+    try { persisted = JSON.parse(read(root, '.uix/finalize-report.json')); } catch { /* none */ }
+    const rd1 = r1.readability;
+    const rd2 = r2.readability;
+    const fakeApplied = r2.passes.filter((p) => MUTATING.includes(p.name) && p.status === 'applied');
+    const noops = r2.passes.filter((p) => p.noop);
+    const badNoop = noops.filter((p) => p.status !== 'skipped' || !/^no-op/.test(p.reason ?? ''));
+    const checks = [
+      chk('rr.measured', !!rd1?.before && !!rd1?.after && !rd1?.unmeasured, 'stub', 'finalize measures readability before and after the passes', rd1 ? (rd1.unmeasured ?? `before.loc=${rd1.before?.loc} after.loc=${rd1.after?.loc}`) : 'no readability block'),
+      chk('rr.delta', !!rd1 && !rd1.unchanged && Object.keys(rd1.delta).length > 0, 'lie', 'run 1 changed the app, and the delta says what moved', rd1 ? JSON.stringify(rd1.delta) : 'n/a'),
+      chk('rr.unchanged-visible', !!rd2 && rd2.unchanged === true && Object.keys(rd2.delta).length === 0, 'lie', 'run 2 changed nothing, and the report says readability is UNCHANGED', rd2 ? JSON.stringify({ unchanged: rd2.unchanged, delta: rd2.delta }) : 'n/a'),
+      chk('rr.run2-no-files', d2.length === 0, 'lie', 'run 2 changes no source file', d2.map((d) => `${d.change}:${d.file}`).join(', ') || 'none'),
+      chk('rr.no-op-honest', fakeApplied.length === 0, 'lie', 'no mutating pass is recorded `applied` on a run that changed nothing', fakeApplied.map((p) => `${p.name} ${JSON.stringify(p.counts)}`).join(' | ') || `none; no-op: ${noops.map((p) => p.name).join(', ')}`),
+      chk('rr.no-op-reason', noops.length > 0 && badNoop.length === 0, 'lie', 'each no-op is `skipped` with a "no-op: … examined …" reason', noops.map((p) => `${p.name}: ${p.reason}`).join(' | ') || 'no no-op recorded'),
+      chk('rr.gate', rd1?.gate?.status === 'ran', 'stub', 'the warn-only readability gate ran over the screens and is recorded', JSON.stringify(rd1?.gate ?? null).slice(0, 400)),
+      chk('rr.persisted', !!persisted?.readability?.before && persisted?.readability?.gate?.status === 'ran', 'lie', '.uix/finalize-report.json carries the readability block', persisted?.readability ? 'present' : 'absent'),
+    ];
+    cells.push({
+      pass: 'finalize readability delta + honest no-op (F7/F9)', framework: fw,
+      reported: { status: r2.passes.map((p) => `${p.name}:${p.status}${p.noop ? '(no-op)' : ''}`).join(', '), counts: {}, warnings: [] },
+      files: [], checks, cell_status: classify(null, checks), notes: [],
     });
   }
   return cells;
@@ -999,16 +1431,17 @@ function probeTools(): Record<string, string> {
 
 // ── entry ───────────────────────────────────────────────────────────────────
 
-export async function runParity(opts: { log?: (m: string) => void } = {}): Promise<ParityResult> {
+export async function runParity(opts: { log?: (m: string) => void; /** debug: run only the passes/phases whose name contains this */ only?: string } = {}): Promise<ParityResult> {
   const log = opts.log ?? (() => { /* quiet */ });
   await initWorkspace();
   const toolchain = probeTools();
   const cells: Cell[] = [];
   const flowRuns = new Map<Fw, PassRun>();
 
-  // The Next fixture carries src/resources/assets.ts because the asset pass emits it
-  // there for `next` (resources-emit EMITTERS.next). A second Next column without src/
-  // isolates what breaks BECAUSE of that file from what is broken regardless.
+  // The Next fixture's resources module lives at lib/resources/assets.ts (CONTRACTS
+  // §5); its src/ holds only the legacy re-export the asset pass leaves at the pre-B56
+  // location. A second Next column without src/ proves nothing depends on src/ and
+  // that src/ never hides app/ from the resolver.
   const NO_SRC = ' [next variant: app/ only, no src/]';
   const runs: Array<{ fw: Fw; suffix: string; mutate?: (root: string) => Promise<void> }> = [
     ...FRAMEWORKS.map((fw) => ({ fw, suffix: '' })),
@@ -1017,6 +1450,7 @@ export async function runParity(opts: { log?: (m: string) => void } = {}): Promi
   for (const { fw, suffix, mutate } of runs) {
     for (const passName of PASS_NAMES) {
       const pass = passName;
+      if (opts.only && !pass.includes(opts.only)) continue;
       log(`[parity] ${fw}${suffix} × ${pass}`);
       let r: PassRun;
       try {
@@ -1052,8 +1486,11 @@ export async function runParity(opts: { log?: (m: string) => void } = {}): Promi
     ['standalone-finalize', phaseStandaloneFinalize],
     ['finalize×2', phaseFinalizeTwice],
     ['finalize-dryrun', phaseFinalizeDryRun],
+    ['readability-hygiene', phaseReadabilityHygiene],
+    ['readability-report', phaseReadabilityReport],
   ];
   for (const [name, fn] of phases) {
+    if (opts.only && !name.includes(opts.only)) continue;
     log(`[parity] phase ${name}`);
     try { cells.push(...await fn()); } catch (e) {
       cells.push({ pass: name, framework: 'flutter', reported: null, files: [], checks: [chk('run', false, 'error', `${name} ran`, String((e as Error).stack ?? e))], cell_status: 'ERROR', notes: ['phase harness threw'] });

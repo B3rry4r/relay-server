@@ -11,8 +11,8 @@
 // usages to the correct exported resource.
 //
 // FRAMEWORK-AGNOSTIC. detectFramework() (same contract as 7a/7b) dispatches to a
-// per-framework `AssetUsageStrategy`. Flutter ships a full implementation; react
-// is a stubbed seam so the contract is visible.
+// per-framework `AssetUsageStrategy`: flutter here, react + next in
+// asset-usage-web.ts (the same old+new path index, every source root).
 //
 // DETERMINISTIC where possible: rewriting a raw path literal that appears
 // verbatim in the asset-map → its resources symbol, and inserting the import,
@@ -36,10 +36,14 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import type { AIModel } from '../ai-adapters';
 import { repointWeb, findWebResourcesFile, parseDeclaredWebSymbols, WEB_RESOURCES_SYMBOL } from './asset-usage-web';
+import { loadWebApp } from './web-app';
+import { detectFramework, type Framework } from './framework';
 
 // ── Public contract ──────────────────────────────────────────────────────────
 
-export type Framework = 'flutter' | 'react' | 'next' | 'unknown';
+/** One shared detector (./framework) — never a local copy that can drift. */
+export { detectFramework };
+export type { Framework };
 
 export interface RepointOptions {
   /** Resolved absolute project root. */
@@ -101,6 +105,10 @@ export interface RepointResult {
   warnings: string[];
   resourcesPath: string | null;
   dryRun: boolean;
+  /** Source files the strategy actually read. 0 means it examined nothing. */
+  filesScanned: number;
+  /** Set when the pass had no input / no support — finalize records `skipped` with it. */
+  skippedReason?: string;
 }
 
 // ── asset-map model ──────────────────────────────────────────────────────────
@@ -128,24 +136,6 @@ async function readAssetMap(root: string): Promise<AssetMap | null> {
   }
 }
 
-// ── Framework detection (same contract as 7a/7b) ─────────────────────────────
-
-export async function detectFramework(projectRoot: string): Promise<Framework> {
-  const has = async (p: string) => {
-    try { await fs.access(path.join(projectRoot, p)); return true; } catch { return false; }
-  };
-  if (await has('pubspec.yaml')) return 'flutter';
-  if (await has('package.json')) {
-    try {
-      const pkg = JSON.parse(await fs.readFile(path.join(projectRoot, 'package.json'), 'utf8'));
-      const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
-      if (deps.next) return 'next';
-      if (deps.react) return 'react';
-    } catch { /* fall through */ }
-  }
-  return 'unknown';
-}
-
 // ── Per-framework strategy seam ──────────────────────────────────────────────
 
 export interface AssetUsageStrategy {
@@ -160,7 +150,7 @@ export interface AssetUsageStrategy {
     projectRoot: string,
     index: AssetIndex,
     opts: RepointOptions,
-  ): Promise<{ repointed: Repoint[]; skipped: RepointSkip[]; warnings: string[] }>;
+  ): Promise<{ repointed: Repoint[]; skipped: RepointSkip[]; warnings: string[]; filesScanned: number; skippedReason?: string }>;
 }
 
 // ── Orchestrator ─────────────────────────────────────────────────────────────
@@ -176,6 +166,7 @@ export async function repointAssetUsage(projectId: string, opts: RepointOptions)
       framework, repointed: [], skipped: [],
       warnings: ['no .uix/asset-map.json (or empty) — nothing to re-point. Run the Phase-2 asset pass (runAssetPass) first.'],
       resourcesPath: map?.resourcesPath ?? null, dryRun: !!opts.dryRun,
+      filesScanned: 0, skippedReason: 'no .uix/asset-map.json (or it is empty) — nothing to re-point',
     };
   }
   if (!strategy) {
@@ -183,6 +174,7 @@ export async function repointAssetUsage(projectId: string, opts: RepointOptions)
       framework, repointed: [], skipped: [],
       warnings: [`no strategy for framework '${framework}'`],
       resourcesPath: map.resourcesPath ?? null, dryRun: !!opts.dryRun,
+      filesScanned: 0, skippedReason: `no asset re-point strategy for framework '${framework}'`,
     };
   }
 
@@ -195,6 +187,8 @@ export async function repointAssetUsage(projectId: string, opts: RepointOptions)
     warnings: out.warnings,
     resourcesPath: map.resourcesPath ?? null,
     dryRun: !!opts.dryRun,
+    filesScanned: out.filesScanned,
+    ...(out.skippedReason ? { skippedReason: out.skippedReason } : {}),
   };
 }
 
@@ -325,7 +319,7 @@ async function repointFlutter(
   projectRoot: string,
   index: AssetIndex,
   opts: RepointOptions,
-): Promise<{ repointed: Repoint[]; skipped: RepointSkip[]; warnings: string[] }> {
+): Promise<{ repointed: Repoint[]; skipped: RepointSkip[]; warnings: string[]; filesScanned: number; skippedReason?: string }> {
   const repointed: Repoint[] = [];
   const skipped: RepointSkip[] = [];
   const warnings: string[] = [];
@@ -341,8 +335,9 @@ async function repointFlutter(
   const resourcesAbs = path.join(projectRoot, FLUTTER_RESOURCES_REL);
   const resourcesSrc = await readFileOrNull(resourcesAbs);
   if (!resourcesSrc) {
-    warnings.push(`resources file ${FLUTTER_RESOURCES_REL} not found — cannot reference ${FLUTTER_RESOURCES_CLASS} symbols. Run the asset pass first.`);
-    return { repointed, skipped, warnings };
+    const reason = `resources file ${FLUTTER_RESOURCES_REL} not found — cannot reference ${FLUTTER_RESOURCES_CLASS} symbols. Run the asset pass first.`;
+    warnings.push(reason);
+    return { repointed, skipped, warnings, filesScanned: 0, skippedReason: reason };
   }
   const declaredSymbols = parseDeclaredSymbols(resourcesSrc);
 
@@ -435,7 +430,10 @@ async function repointFlutter(
     }
   }
 
-  return { repointed, skipped, warnings };
+  return {
+    repointed, skipped, warnings, filesScanned: files.length,
+    ...(files.length === 0 ? { skippedReason: 'no .dart source files under lib/ to scan' } : {}),
+  };
 }
 
 // ── pubspec / resources introspection ────────────────────────────────────────
@@ -851,18 +849,22 @@ async function readFileOrNull(abs: string): Promise<string | null> {
 }
 
 // =============================================================================
-// React strategy (seam only — Phase 7c ships flutter; react contract is stubbed)
+// Web strategy (react + next) — asset-usage-web.ts
 // =============================================================================
 
 const webStrategy = (framework: Framework): AssetUsageStrategy => ({
   framework,
   async repoint(projectRoot, index, opts) {
+    // The same old+new path index flutter re-points through (PG-15): the IR the
+    // agent built from carries the OPAQUE pre-rename paths.
+    const byPath = new Map<string, string>();
+    for (const [p, a] of index.byPath) byPath.set(p, a.symbolKey);
     const r = await repointWeb(
       projectRoot,
       index.assets.map((a) => ({
         symbolKey: a.symbolKey, name: a.name, newPath: a.newPath, format: a.format, kind: a.kind,
       })),
-      { dryRun: opts.dryRun, onlyFiles: opts.onlyFiles },
+      { dryRun: opts.dryRun, onlyFiles: opts.onlyFiles, byPath },
     );
     return {
       repointed: r.repointed.map((x) => ({
@@ -872,6 +874,8 @@ const webStrategy = (framework: Framework): AssetUsageStrategy => ({
       })),
       skipped: r.skipped,
       warnings: r.warnings,
+      filesScanned: r.filesScanned,
+      ...(r.skippedReason ? { skippedReason: r.skippedReason } : {}),
     };
   },
 });
@@ -930,7 +934,9 @@ export async function buildAssetInventory(projectRoot: string): Promise<AssetInv
   // asset block at all — which is why it hand-drew photos and avatars that shipped in
   // the .fig. Same contract, web symbols.
   if (framework === 'react' || framework === 'next') {
-    const resourcesFile = findWebResourcesFile(projectRoot);
+    const ix = await loadWebApp(projectRoot);
+    const viaIx = ix?.resourcesFile ? parseDeclaredWebSymbols((await readFileOrNull(ix.resourcesFile)) ?? '').size > 0 : false;
+    const resourcesFile = viaIx ? ix!.resourcesFile : findWebResourcesFile(projectRoot);
     if (!resourcesFile) return null;
     const resourcesSrc = await readFileOrNull(resourcesFile);
     if (!resourcesSrc) return null;
@@ -970,7 +976,7 @@ export function renderAssetInventory(inv: AssetInventory, cap = 120): string {
   if (inv.framework === 'flutter') {
     lines.push(`Import it with a relative path to ${inv.resourcesRel}. SVG symbols → \`SvgPicture.asset(${inv.className}.x, width:.., height:.., colorFilter: ColorFilter.mode(color, BlendMode.srcIn))\` (needs \`flutter_svg\`); raster symbols → \`Image.asset(${inv.className}.x)\`.`);
   } else {
-    lines.push(`Import it: \`import { ${inv.className} } from '<relative path to ${inv.resourcesRel}>'\`. Raster symbols → \`<img src={\`/\${${inv.className}.x}\`} alt="" />\`. Monochrome icon symbols → the project's \`<Icon name="x" />\` component when one exists, else \`<img src={\`/\${${inv.className}.x}\`} />\`. A photo, avatar, map or illustration in the design is a REAL exported image — do NOT draw it with inline <svg>.`);
+    lines.push(`Import it: \`import { ${inv.className} } from '<relative path (or the project's @/ alias) to ${inv.resourcesRel}>'\`. Each value is the URL the asset is SERVED at (the files live in public/assets/, served at /assets/…), so use it as-is: raster symbols → \`<img src={${inv.className}.x} alt="" />\`; monochrome icon symbols → the project's \`<Icon name="x" />\` component when one exists, else \`<img src={${inv.className}.x} alt="" />\`. Never prefix it (\`/\${${inv.className}.x}\` yields //assets/… — a broken protocol-relative URL). A photo, avatar, map or illustration in the design is a REAL exported image — do NOT draw it with inline <svg>.`);
   }
   if (icons.length) lines.push(`Icons: ${shown.filter(a => a.kind === 'icon').map(fmt).join('; ')}`);
   if (images.length) lines.push(`Images: ${shown.filter(a => a.kind === 'image').map(fmt).join('; ')}`);

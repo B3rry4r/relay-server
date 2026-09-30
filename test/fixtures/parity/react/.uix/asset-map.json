@@ -2,9 +2,9 @@
   "framework": "react",
   "resourcesPath": "src/resources/assets.ts",
   "assets": [
-    { "nodeId": "10:20", "name": "search_icon", "oldPath": "assets/icons/vector_10_20.svg", "newPath": "assets/icons/search_icon.svg", "format": "svg", "kind": "icon" },
-    { "nodeId": "10:40", "name": "map_dark", "oldPath": "assets/images/image_10_40.png", "newPath": "assets/images/map_dark.png", "format": "png", "kind": "image" },
-    { "nodeId": "10:41", "name": "promo_banner", "oldPath": "assets/images/image_10_41.png", "newPath": "assets/images/promo_banner.png", "format": "png", "kind": "image" },
-    { "nodeId": "10:31", "name": "user_avatar", "oldPath": "assets/images/user_avatar_10_31.png", "newPath": "assets/images/user_avatar.png", "format": "png", "kind": "image" }
+    { "nodeId": "10:20", "name": "search_icon", "oldPath": "public/assets/icons/vector_10_20.svg", "newPath": "public/assets/icons/search_icon.svg", "format": "svg", "kind": "icon" },
+    { "nodeId": "10:40", "name": "map_dark", "oldPath": "public/assets/images/image_10_40.png", "newPath": "public/assets/images/map_dark.png", "format": "png", "kind": "image" },
+    { "nodeId": "10:41", "name": "promo_banner", "oldPath": "public/assets/images/image_10_41.png", "newPath": "public/assets/images/promo_banner.png", "format": "png", "kind": "image" },
+    { "nodeId": "10:31", "name": "user_avatar", "oldPath": "public/assets/images/user_avatar_10_31.png", "newPath": "public/assets/images/user_avatar.png", "format": "png", "kind": "image" }
   ]
 }

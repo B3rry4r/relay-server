@@ -49,6 +49,10 @@ export interface FlowGraph {
 export const screenDirName = (frameId: string): string => frameId.replace(/[^a-zA-Z0-9._-]+/g, '_');
 export const webPreviewRoute = (frameId: string): string => `/_preview/${frameId.replace(/[^0-9a-zA-Z]+/g, '-')}`;
 export const screenManifestPath = (frameId: string): string => `.uix/screens/${screenDirName(frameId)}/last-gen.json`;
+/** The Next App Router directory (under the app dir) that serves webPreviewRoute(frameId):
+ *  `%5Fpreview/<frame>` — `%5F` is the escape for a literal `_`; a bare `_preview`
+ *  folder is private and never routed. */
+export const webPreviewDir = (frameId: string): string => `%5Fpreview/${webPreviewRoute(frameId).split('/').pop()}`;
 
 export interface AgentPacketInput {
   frame: { id: string; name: string; width: number; height: number };
@@ -141,10 +145,18 @@ function bootstrapSteps(framework: string, fwLabel: string, flow: FlowGraph, ass
       + `a navigation stack for push/replace/modal routes. Create a central route table / router and register screens by name.`,
   ] : [];
   const assetStep = assetCount > 0 ? [
-    `${hasNav ? 5 : 4}. The design's real assets (${assetCount} files) are already in assets/icons/ (SVG) and assets/images/ (raster). Reference these actual files for icons/images — the IR tree's "assets/..." paths point at them; do NOT invent placeholder icons.`,
+    isWeb
+      // Web (CONTRACTS §5): assets live in public/assets/ and are SERVED at /assets/….
+      ? `${hasNav ? 5 : 4}. The design's real assets (${assetCount} files) are already in public/assets/icons/ (SVG) and public/assets/images/ (raster), served at /assets/icons/… and /assets/images/…. Reference them through the generated resources module (\`assets.<symbol>\` — its values are those served URLs; \`<img src={assets.x} />\`) — the IR tree's "assets/..." paths name the same files; do NOT invent placeholder icons or redraw images.`
+      : `${hasNav ? 5 : 4}. The design's real assets (${assetCount} files) are already in assets/icons/ (SVG) and assets/images/ (raster). Reference these actual files for icons/images — the IR tree's "assets/..." paths point at them; do NOT invent placeholder icons. SVGs render with \`SvgPicture.asset\` (flutter_svg is already in pubspec.yaml); NEVER hand-draw an icon or illustration that exists in assets/ with a CustomPainter or stacked shapes.`,
   ] : [];
   return [
-    `1. Inspect the project. If it is empty or a bare scaffold, set it up idiomatically for ${fwLabel} (initialise, add dependencies, entry point).`,
+    isWeb
+      // The web skeleton (GEN_PHASE 3) writes the app's contract files before screen
+      // 1; a create-vite / create-next-app run over them would clobber the router,
+      // route table, theme and screen slots every finalize pass depends on.
+      ? `1. Inspect the project. The pipeline has usually already written the app SKELETON (files marked "GENERATED SKELETON": package.json, the ${framework === 'next' ? 'app/ pages + lib/routes.ts' : 'src/App.tsx router + src/router/routes.ts'}, the theme, one stub per screen). If it is there, do NOT re-scaffold over it (no create-vite / create-next-app) — run \`npm install\` and build on it. Only if the project is empty or a bare scaffold, set it up idiomatically for ${fwLabel} (initialise, add dependencies, entry point).`
+      : `1. Inspect the project. If it is empty or a bare scaffold, set it up idiomatically for ${fwLabel} (initialise, add dependencies, entry point).`,
     ...webHostStep,
     `2. Establish a real DESIGN SYSTEM you'll reuse for every later screen: derive the colour palette, typography scale (families/sizes/weights) and spacing from this screen's IR and centralise them as theme tokens; factor recurring UI (buttons, inputs, cards, nav/app bars) into shared components. Later screens MUST reuse these, not re-style inline.`,
     `3. Create .uix/context.md — a durable hand-off for future build sessions: record where the design-system tokens & shared components live, the routing/navigation structure, and a screens index (screen name → source file). You will read and extend this on every later screen.`,
@@ -186,7 +198,7 @@ export function buildAgentPacket(input: AgentPacketInput): string {
     ``,
     ...(refImagePath ? [
       `Reference render (pixel-accurate image of the target screen): ${refImagePath}`,
-      `OPEN this image first with your file-reading tool and treat it as the visual ground truth — match its layout, proportions, spacing and colours. Use the IR tree below for exact values (hex colours, text, sizes).`,
+      `OPEN this image first with your file-reading tool and treat it as the visual ground truth — match its layout, proportions, spacing and colours. Use the IR tree below for exact values (hex colours, text, sizes) — expressed through the generated theme tokens: a value that equals (or is within 1px / a few RGB steps of) a token IS that token. The IR's layer names, node ids and frame numbers are for YOU to read — never copy them into identifiers or comments.`,
       ``,
     ] : []),
     // DEMO DATA rule — sits next to the exact-values instruction on purpose: "use
@@ -214,7 +226,9 @@ export function buildAgentPacket(input: AgentPacketInput): string {
           // path. It is not a suggestion and must not be renamed — a missing route
           // makes the app's catch-all render a DIFFERENT screen and the build fails
           // loudly with "preview route ... is not registered".
-          `- Register a PREVIEW ROUTE at EXACTLY this path: \`${webPreviewRoute(frame.id)}\` — it must mount ONLY this screen, inside the app's real theme/providers/router. The verify harness screenshots this exact route; do NOT rename it, and keep it registered on every revision. If it is missing, the app's catch-all route will render a different screen and the build will fail.`,
+          `- PREVIEW ROUTE (pipeline-owned) at EXACTLY this path: \`${webPreviewRoute(frame.id)}\` — it must mount ONLY this screen, inside the app's real theme/providers/router. The web skeleton already registers it (${framework === 'next'
+            ? `\`app/${webPreviewDir(frame.id)}/page.tsx\`); if it is missing, create it THERE — the folder is \`%5Fpreview\`, not \`_preview\`: in the Next App Router a folder whose name starts with "_" is a PRIVATE folder that is never routed, so app/_preview/… would 404 and the verify harness would screenshot the wrong page`
+            : `a \`<Route path="${webPreviewRoute(frame.id)}" …/>\` line in src/App.tsx); if it is missing, add it`}. The verify harness screenshots this exact route; do NOT rename it, and keep it registered on every revision. If it is missing, the app's catch-all route will render a different screen and the build will fail.`,
         ]),
     `- Update .uix/context.md: add this screen to its index (screen name → source file) and note any new shared components/tokens/decisions, so the next session can resume with full context.`,
     // Per-screen manifest: parallel workers must never share one mutable file.

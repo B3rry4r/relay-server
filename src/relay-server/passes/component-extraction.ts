@@ -31,12 +31,17 @@
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import * as fsSync from 'fs';
 import type { AIModel } from '../ai-adapters';
-import { collectWebWidgets, extractWebGroup } from './component-extraction-web';
+import { collectWebWidgets, extractWebGroup, webComponentsDir, webScreenFiles } from './component-extraction-web';
+import { detectFramework, type Framework } from './framework';
+import { loadWebApp } from './web-app';
 
 // ── Public contract ──────────────────────────────────────────────────────────
 
-export type Framework = 'flutter' | 'react' | 'next' | 'unknown';
+/** One shared detector (./framework) — never a local copy that can drift. */
+export { detectFramework };
+export type { Framework };
 
 export interface ExtractOptions {
   /** Resolved absolute project root. */
@@ -115,6 +120,10 @@ export interface ExtractResult {
   rejected: Array<{ names: string[]; reason: string }>;
   componentsDir: string;
   dryRun: boolean;
+  /** Local component/widget declarations collected and compared. 0 = examined nothing. */
+  scanned: number;
+  /** Set when the pass had no input / no support — finalize records `skipped` with it. */
+  skippedReason?: string;
 }
 
 // ── Per-framework strategy seam ──────────────────────────────────────────────
@@ -146,7 +155,9 @@ export interface ExtractorStrategy {
     chosenName: string,
     kind: string,
     dryRun: boolean,
-  ): Promise<ExtractedComponent | null>;
+  ): Promise<ExtractedComponent | null | { bail: string }>;
+  /** Absolute components dir when it depends on the app layout (web: the resolver's). */
+  componentsDirFor?(projectRoot: string): Promise<string>;
 }
 
 // ── Canonical naming guide ───────────────────────────────────────────────────
@@ -163,22 +174,17 @@ async function readCanonicalComponents(projectRoot: string): Promise<CanonicalCo
   }
 }
 
-// ── Framework detection ──────────────────────────────────────────────────────
-
-export async function detectFramework(projectRoot: string): Promise<Framework> {
-  const has = async (p: string) => {
-    try { await fs.access(path.join(projectRoot, p)); return true; } catch { return false; }
-  };
-  if (await has('pubspec.yaml')) return 'flutter';
-  if (await has('package.json')) {
-    try {
-      const pkg = JSON.parse(await fs.readFile(path.join(projectRoot, 'package.json'), 'utf8'));
-      const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
-      if (deps.next) return 'next';
-      if (deps.react) return 'react';
-    } catch { /* fall through */ }
+/** Why a strategy collected nothing — worded from what is on disk, so a layout the
+ *  strategy cannot read is never reported as an app with nothing to extract (B1
+ *  verify #2: a Next app with locally-declared components under app/ was reported
+ *  "no local component declarations found"). */
+async function emptyCollectionReason(projectRoot: string, framework: string): Promise<string> {
+  if (framework === 'react' || framework === 'next') {
+    const files = await webScreenFiles(projectRoot);
+    if (!files.length) return 'the resolver indexed no built screen file (no header-stamped screen, route table entry or page) — nothing was read';
+    return `no JSX component declarations found in the ${files.length} screen file(s) the resolver indexed — nothing to compare`;
   }
-  return 'unknown';
+  return `no local widget declarations found to compare (the ${framework} strategy collected 0 candidates)`;
 }
 
 // ── Orchestrator ─────────────────────────────────────────────────────────────
@@ -189,10 +195,20 @@ export async function extractComponents(projectId: string, opts: ExtractOptions)
   const framework = await detectFramework(projectRoot);
   const strategy = getStrategy(framework);
   if (!strategy) {
-    return { framework, extracted: [], rejected: [], componentsDir: '', dryRun: !!opts.dryRun };
+    return {
+      framework, extracted: [], rejected: [], componentsDir: '', dryRun: !!opts.dryRun,
+      scanned: 0, skippedReason: `no component-extraction strategy for framework '${framework}'`,
+    };
   }
 
   const units = await strategy.collectWidgets(projectRoot, opts.onlyFiles);
+  if (units.length === 0) {
+    return {
+      framework, extracted: [], rejected: [], componentsDir: path.join(projectRoot, strategy.componentsDirName),
+      dryRun: !!opts.dryRun, scanned: 0,
+      skippedReason: await emptyCollectionReason(projectRoot, framework),
+    };
+  }
 
   // Group by exact normalized structural signature. Cross-file, name-agnostic.
   const bySig = new Map<string, WidgetUnit[]>();
@@ -248,10 +264,10 @@ export async function extractComponents(projectId: string, opts: ExtractOptions)
         continue;
       }
       const result = await strategy.extractGroup(projectRoot, group, chosen, kind, false);
-      if (!result) {
+      if (!result || 'bail' in result) {
         // Strategy bailed without writing; nothing to roll back, but restore to be safe.
         await guard.restore(token).catch(() => { /* best-effort */ });
-        rejected.push({ names: group.map((g) => g.localName), reason: 'strategy bailed (unsafe to merge)' });
+        rejected.push({ names: group.map((g) => g.localName), reason: result && 'bail' in result ? result.bail : 'strategy bailed (unsafe to merge)' });
         continue;
       }
       const built = await guard.buildOk();
@@ -265,16 +281,17 @@ export async function extractComponents(projectId: string, opts: ExtractOptions)
     }
 
     const result = await strategy.extractGroup(projectRoot, group, chosen, kind, !!opts.dryRun);
-    if (result) extracted.push(result);
-    else rejected.push({ names: group.map((g) => g.localName), reason: 'strategy bailed (unsafe to merge)' });
+    if (result && !('bail' in result)) extracted.push(result);
+    else rejected.push({ names: group.map((g) => g.localName), reason: result && 'bail' in result ? result.bail : 'strategy bailed (unsafe to merge)' });
   }
 
   return {
     framework,
     extracted,
     rejected,
-    componentsDir: path.join(projectRoot, strategy.componentsDirName),
+    componentsDir: strategy.componentsDirFor ? await strategy.componentsDirFor(projectRoot) : path.join(projectRoot, strategy.componentsDirName),
     dryRun: !!opts.dryRun,
+    scanned: units.length,
   };
 }
 
@@ -744,7 +761,7 @@ function planParameterization(projectRoot: string, group: WidgetUnit[]): ParamPl
 
   // 2) expand each diff token to its enclosing argument-expression span (token
   //    index range), then merge overlapping ranges.
-  let ranges: Array<[number, number]> = diffIdx.map((i) => enclosingArgRange(base, i));
+  let ranges: Array<[number, number]> = diffIdx.map((i) => widenToValueWrapper(base, enclosingArgRange(base, i)));
   ranges = mergeRanges(ranges);
 
   // 3) Skip ranges that are exactly an existing ctor param reference (already a
@@ -766,7 +783,14 @@ function planParameterization(projectRoot: string, group: WidgetUnit[]): ParamPl
       perFile.set(unitKey(group[gi]), txt);
     }
     const ptype = dartTypeForSpan([...perFile.values()]);
-    spanParams.push({ name: `p${pidx++}`, type: ptype, baseSpan: [base[lo].start, base[hi].end], perFile });
+    // CONTRACTS §5: the parameter is named after the named argument it feeds
+    // (`color:` → `color`), never `p0`. Collisions get a numeric suffix.
+    const taken = new Set([...existingParamNames, ...spanParams.map((x) => x.name)]);
+    const stem = paramNameFor(base, lo, ptype);
+    let pname = stem;
+    for (let k = 2; taken.has(pname) || DART_RESERVED.has(pname); k++) pname = `${stem}${k}`;
+    pidx++;
+    spanParams.push({ name: pname, type: ptype, baseSpan: [base[lo].start, base[hi].end], perFile });
   }
 
   return makePlan(group, base, bodies[0], ctors[0], spanParams);
@@ -830,6 +854,65 @@ function enclosingArgRange(toks: Tok[], i: number): [number, number] {
   return [lo, hi];
 }
 
+/** A differing value that is the sole argument of a value wrapper
+ *  (`const Color(0xFF12AE89)`, `BorderRadius.circular(12)`, `EdgeInsets.all(16)`,
+ *  `Radius.circular(8)`) is parameterized as the WHOLE wrapper expression, so the
+ *  parameter is a typed `Color` / `BorderRadius` / `EdgeInsets` rather than an `int`
+ *  the body re-wraps. Identical token shape across the group guarantees every
+ *  occurrence has the same wrapper. */
+const VALUE_WRAPPERS = new Set(['Color', 'Color.fromARGB', 'BorderRadius.circular', 'Radius.circular', 'EdgeInsets.all', 'EdgeInsets.symmetric', 'EdgeInsets.only', 'EdgeInsets.fromLTRB']);
+function widenToValueWrapper(toks: Tok[], [lo, hi]: [number, number]): [number, number] {
+  if (toks[lo - 1]?.text !== '(') return [lo, hi];
+  // the matching close must sit right after the span
+  let depth = 0;
+  let close = -1;
+  for (let j = lo - 1; j < toks.length; j++) {
+    const t = toks[j].text;
+    if (t === '(') depth++;
+    else if (t === ')') { depth--; if (depth === 0) { close = j; break; } }
+  }
+  if (close !== hi + 1) return [lo, hi];
+  let start = lo - 2;
+  let callee = toks[start]?.text ?? '';
+  if (toks[start - 1]?.text === '.' && toks[start - 2]?.kind === 'id') { callee = `${toks[start - 2].text}.${callee}`; start -= 2; }
+  if (!VALUE_WRAPPERS.has(callee)) return [lo, hi];
+  if (toks[start - 1]?.text === 'const') start--;
+  return [start, close];
+}
+
+const DART_RESERVED = new Set(['key', 'default', 'class', 'const', 'final', 'new', 'this', 'super', 'switch', 'case', 'if', 'else', 'for', 'in', 'is', 'return', 'var', 'void', 'null', 'true', 'false', 'with', 'extends', 'build', 'context']);
+
+/** Name a parameter after the named argument its span feeds: walk out from the span
+ *  through enclosing brackets until a `key:` at that level (`color: Color(p)` →
+ *  `color`, `style: TextStyle(fontSize: p)` → `fontSize`). No named key anywhere
+ *  (a positional `Text('…')`) → the callee (`text`) or the type (`value`). */
+function paramNameFor(toks: Tok[], lo: number, ptype: string): string {
+  let depth = 0;
+  let positional = false;
+  let firstCallee: string | null = null;
+  for (let j = lo - 1; j >= 0; j--) {
+    const t = toks[j].text;
+    if (t === ')' || t === ']' || t === '}') { depth++; continue; }
+    if (t === '(' || t === '[' || t === '{') {
+      if (depth > 0) { depth--; continue; }
+      if (t === '(' && toks[j - 1]?.kind === 'id' && !firstCallee) firstCallee = toks[j - 1].text;
+      positional = false;   // leaving this level; look for the key one level up
+      continue;
+    }
+    if (depth !== 0) continue;
+    if (t === ',') { positional = true; continue; }
+    if (t === ':' && !positional && toks[j - 1]?.kind === 'id' && toks[j - 2]?.text !== '?') {
+      const key = toks[j - 1].text;
+      if (key !== 'child' && key !== 'children') return key;
+      break;
+    }
+    if (t === ';' || t === '=>') break;
+  }
+  if (firstCallee && /^[A-Z]/.test(firstCallee)) return firstCallee.charAt(0).toLowerCase() + firstCallee.slice(1);
+  if (ptype !== 'dynamic') return ptype.charAt(0).toLowerCase() + ptype.slice(1).replace(/Geometry$/, '');
+  return 'value';
+}
+
 function mergeRanges(ranges: Array<[number, number]>): Array<[number, number]> {
   const sorted = [...ranges].sort((a, b) => a[0] - b[0]);
   const out: Array<[number, number]> = [];
@@ -842,7 +925,7 @@ function mergeRanges(ranges: Array<[number, number]>): Array<[number, number]> {
 }
 
 function dartTypeForSpan(values: string[]): string {
-  const v0 = values.map((v) => v.trim());
+  const v0 = values.map((v) => v.trim().replace(/^const\s+/, ''));
   if (v0.every((v) => /^['"]/.test(v))) return 'String';
   // Bare hex literal (e.g. `0xFFf5f5f5` inside an outer `Color(...)`): the call
   // site supplies the int and the body wraps it (`Color(p0)`).
@@ -859,6 +942,8 @@ function dartTypeForSpan(values: string[]): string {
   if (v0.every((v) => /^Icons\./.test(v))) return 'IconData';
   if (/^Color\(/.test(v0[0]) || v0.every((v) => /\.(brand|ink\d?|surface|hint|muted|neutral\d?|helper|success|error|warning)\b/.test(v)) || /Fill\b|fill\b/.test(joined)) return 'Color';
   if (v0.every((v) => /^EdgeInsets/.test(v))) return 'EdgeInsetsGeometry';
+  if (v0.every((v) => /^BorderRadius\./.test(v))) return 'BorderRadius';
+  if (v0.every((v) => /^Radius\./.test(v))) return 'Radius';
   return 'dynamic';
 }
 
@@ -1265,16 +1350,17 @@ function snake(s: string): string { return (s ?? '').replace(/([a-z0-9])([A-Z])/
 function escapeRe(s: string): string { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
 // =============================================================================
-// React strategy (seam only — Phase 7a ships flutter; react contract is stubbed)
+// Web strategy (react + next) — component-extraction-web.ts
 // =============================================================================
 
 const webStrategy = (framework: Framework): ExtractorStrategy => ({
   framework,
   componentsDirName: path.join('src', 'components'),
   collectWidgets: (projectRoot, onlyFiles) => collectWebWidgets(projectRoot, onlyFiles),
+  componentsDirFor: (projectRoot) => webComponentsDir(projectRoot),
   extractGroup: async (projectRoot, group, chosenName, kind, dryRun) => {
     const r = await extractWebGroup(projectRoot, group, chosenName, kind, dryRun);
-    if (!r) return null;
+    if ('bail' in r) return r;
     return {
       name: r.name,
       kind: r.kind,

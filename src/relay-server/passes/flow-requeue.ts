@@ -15,8 +15,12 @@
 // RULES (the idempotency contract — documented, load-bearing):
 //   • Only HIGH-class findings requeue: status 'tab-as-push',
 //     'missing-step-presenter', or 'unmapped' whose detail marks a REAL gap
-//     (the pass's own "(REAL gap, not folded)" phrasing). `duplicate`, `wired`,
-//     and every other benign/med status NEVER requeue.
+//     (the pass's own "(REAL gap, not folded)" phrasing), or 'missing' whose
+//     detail the pass marked `HIGH:` — an edge landing on a placeholder route /
+//     an unbuilt skeleton stub / a screen nothing serves (PG-35: the headline
+//     defect of FRAMEWORK-PARITY.md used to finalize green on all three
+//     frameworks). `duplicate`, `wired`, a plain `missing` (no nav call — never
+//     auto-invented) and every other benign/med status NEVER requeue.
 //   • The finding maps to its FROM screen's LEAD frame: finding.from is a
 //     canonical screen id (or a modal id, when the edge originates inside a
 //     sheet — that resolves to the modal's base screen). Unresolvable → skipped.
@@ -69,10 +73,15 @@ export interface FlowRequeueDecision {
 const HIGH_STATUSES = new Set(['tab-as-push', 'missing-step-presenter']);
 /** An `unmapped` finding requeues only when the pass marked it a REAL gap. */
 const REAL_GAP_RE = /REAL gap/i;
+/** A `missing` finding requeues only when the pass graded it HIGH: the edge lands
+ *  on a placeholder / skeleton stub / a screen no route serves (flutter 7d and
+ *  web 7d use the same `HIGH:` prefix for exactly these verdicts). */
+const HIGH_DETAIL_RE = /^HIGH:/;
 
-function isHighClass(f: FlowFindingLike): boolean {
+export function isHighClass(f: FlowFindingLike): boolean {
   if (HIGH_STATUSES.has(f.status)) return true;
   if (f.status === 'unmapped' && REAL_GAP_RE.test(f.detail ?? '')) return true;
+  if (f.status === 'missing' && HIGH_DETAIL_RE.test((f.detail ?? '').trim())) return true;
   return false;
 }
 

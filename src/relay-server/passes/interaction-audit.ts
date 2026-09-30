@@ -11,17 +11,19 @@
  * offending screens to needs-review (see planInteractionRequeue), exactly like a
  * flow-wiring REAL gap.
  *
- * Framework-agnostic: flutter (`onPressed: () {}` / `: null`) and react/next
- * (`onClick={() => {}}` / `={undefined}`).
+ * Framework-agnostic: flutter (`onPressed: () {}` / `: null`, every .dart file under
+ * lib/) and react/next (`onClick={() => {}}` / `={undefined}`, every resolver source
+ * root — src/, app/, components/, lib/, pages/). Verify-harness previews are never
+ * audited.
  */
 
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import path from 'node:path';
 
-import { detectFramework, type Framework } from './component-extraction';
+import { detectFramework, type Framework } from './framework';
 import {
-  loadWebApp, listSourceFiles, findDeadHandlers, enclosingMentions, readHeader, idCore,
+  loadWebApp, listWebSources, findDeadHandlers, readHeader, idCore,
 } from './web-app';
 
 export interface InteractionFinding {
@@ -43,7 +45,7 @@ export interface InteractionAuditReport {
   projectId: string;
   framework: Framework;
   generatedAt: string;
-  summary: { total: number; high: number; med: number; screensAffected: number };
+  summary: { total: number; high: number; med: number; screensAffected: number; filesScanned: number };
   findings: InteractionFinding[];
 }
 
@@ -58,57 +60,176 @@ export interface InteractionAuditOptions {
 export interface InteractionAuditResult {
   report: InteractionAuditReport;
   reportPath: string | null;
+  /** Set when the audit read no source at all — finalize records `skipped` with it. */
+  skippedReason?: string;
 }
 
-// The visible-label extractor: the text a user reads on the control. `>Resolve<`,
-// `label="Filter"`, `aria-label="Close"`, or a nearby JSX text node.
-function labelNear(src: string, pos: number): string | null {
-  const win = src.slice(Math.max(0, pos - 200), Math.min(src.length, pos + 200));
-  const attr = /(?:aria-label|label|title|placeholder)\s*=\s*["'{`]([^"'}`]+)/.exec(win);
-  if (attr) return attr[1].trim();
-  // `>Resolve Dispute<` after the handler.
-  const after = src.slice(pos, Math.min(src.length, pos + 240));
-  const text = />\s*([A-Z][A-Za-z0-9 &./-]{1,40}?)\s*</.exec(after);
-  return text ? text[1].trim() : null;
+interface AuditScan { findings: InteractionFinding[]; filesScanned: number; skippedReason?: string }
+
+// ── Labels ───────────────────────────────────────────────────────────────────
+//
+// The label names the control a user will tap and see nothing happen — it is the
+// requeue reason the build agent reads. It must be the text of the element that
+// OWNS the dead handler, never a neighbour's prop: a ±200-char window read a
+// sibling `<Badge label="beta">` as the name of the dead 'Resolve' button (PG-23).
+
+const collapse = (s: string): string => s.replace(/\s+/g, ' ').trim();
+
+/** Index of the `<Tag` that opens the JSX element whose attribute list contains
+ *  `pos`, or -1. Walks backwards skipping balanced `{…}` expressions, so the `=>`
+ *  inside `onClick={() => {}}` is never read as the end of a tag. */
+function jsxOpenerBefore(src: string, pos: number): number {
+  let depth = 0;
+  for (let i = pos - 1; i >= 0; i--) {
+    const c = src[i];
+    if (c === '}') depth++;
+    else if (c === '{') { if (depth > 0) depth--; else return -1; }
+    else if (depth === 0) {
+      if (c === '<' && /[A-Za-z]/.test(src[i + 1] ?? '')) return i;
+      if (c === '>') return -1;   // we left the attribute list: pos is in children text
+    }
+  }
+  return -1;
+}
+
+/** End of an opening tag starting at `open` (index just past its `>`), skipping
+ *  `{…}` expressions and quoted attribute values. `selfClosing` for `/>`. */
+function jsxOpenerEnd(src: string, open: number): { end: number; selfClosing: boolean } | null {
+  let depth = 0;
+  let quote: string | null = null;
+  for (let i = open + 1; i < src.length; i++) {
+    const c = src[i];
+    if (quote) { if (c === quote) quote = null; continue; }
+    if (depth === 0 && (c === '"' || c === "'")) { quote = c; continue; }
+    if (c === '{') depth++;
+    else if (c === '}') depth--;
+    else if (depth === 0 && c === '>') return { end: i + 1, selfClosing: src[i - 1] === '/' };
+  }
+  return null;
+}
+
+/** The label of the JSX element owning the handler at `pos`: its own
+ *  aria-label/title, else its visible text children (nested tags and `{…}`
+ *  expressions stripped), else a nested element's aria-label/alt/title. */
+export function jsxOwnerLabel(src: string, pos: number): string | null {
+  const open = jsxOpenerBefore(src, pos);
+  if (open < 0) return null;
+  const tag = /^<([A-Za-z][A-Za-z0-9_.$]*)/.exec(src.slice(open))?.[1];
+  const head = jsxOpenerEnd(src, open);
+  if (!tag || !head) return null;
+  const attrs = src.slice(open, head.end);
+  const own = /\b(?:aria-label|title)\s*=\s*(?:"([^"]+)"|'([^']+)'|\{\s*['"`]([^'"`]+)['"`]\s*\})/.exec(attrs);
+  if (own) return collapse(own[1] ?? own[2] ?? own[3]);
+  if (head.selfClosing) {
+    const lab = /\blabel\s*=\s*(?:"([^"]+)"|'([^']+)')/.exec(attrs);   // <IconButton label="Close" onClick…/>
+    return lab ? collapse(lab[1] ?? lab[2]) : null;
+  }
+  // Matching close tag, counting nested elements of the same name.
+  const esc = tag.replace(/[.$]/g, '\\$&');
+  const re = new RegExp(`<${esc}(?=[\\s>/])|</${esc}\\s*>`, 'g');
+  re.lastIndex = head.end;
+  let nest = 1;
+  let close = -1;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(src)) !== null) {
+    if (m[0].startsWith('</')) { if (--nest === 0) { close = m.index; break; } }
+    else {
+      const inner = jsxOpenerEnd(src, m.index);
+      if (inner && !inner.selfClosing) nest++;
+    }
+  }
+  if (close < 0) return null;
+  const body = src.slice(head.end, close);
+  const text = collapse(body.replace(/\{[^{}]*\}/g, ' ').replace(/<[^>]*>/g, ' '));
+  if (text) return text.slice(0, 60);
+  const nested = /\b(?:aria-label|alt|title)\s*=\s*(?:"([^"]+)"|'([^']+)')/.exec(body);
+  return nested ? collapse(nested[1] ?? nested[2]) : null;
+}
+
+/** Index of the `(` opening the Dart call whose argument list contains `pos`. */
+function dartCallOpenBefore(src: string, pos: number): number {
+  let depth = 0;
+  for (let i = pos - 1; i >= 0; i--) {
+    const c = src[i];
+    if (c === ')' || c === ']' || c === '}') depth++;
+    else if (c === '(' || c === '[' || c === '{') {
+      if (depth > 0) { depth--; continue; }
+      return c === '(' ? i : -1;
+    }
+  }
+  return -1;
+}
+
+function matchingClose(src: string, open: number): number {
+  let depth = 0;
+  let quote: string | null = null;
+  for (let i = open; i < src.length; i++) {
+    const c = src[i];
+    if (quote) { if (c === '\\') i++; else if (c === quote) quote = null; continue; }
+    if (c === '"' || c === "'") { quote = c; continue; }
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') { if (--depth === 0) return i; }
+  }
+  return -1;
+}
+
+/** The label of the Dart widget whose argument list holds the dead handler:
+ *  `tooltip:` / `semanticLabel:` / `label: Text('…')` / `child: Text('…')` — the
+ *  widget's OWN arguments, never a sibling's. */
+export function dartOwnerLabel(src: string, pos: number): string | null {
+  const open = dartCallOpenBefore(src, pos);
+  if (open < 0) return null;
+  const close = matchingClose(src, open);
+  if (close < 0) return null;
+  const args = src.slice(open + 1, close);
+  const str = `(?:'([^'\\n]+)'|"([^"\\n]+)")`;
+  const pick = (m: RegExpExecArray | null): string | null => (m ? collapse(m[1] ?? m[2]) : null);
+  return pick(new RegExp(`\\b(?:tooltip|semanticLabel|semanticsLabel)\\s*:\\s*${str}`).exec(args))
+    ?? pick(new RegExp(`\\b(?:label|child|title|text)\\s*:\\s*(?:const\\s+)?Text\\s*\\(\\s*${str}`).exec(args))
+    ?? pick(new RegExp(`\\bText\\s*\\(\\s*${str}`).exec(args));
 }
 
 const lineOf = (src: string, pos: number): number => src.slice(0, pos).split('\n').length;
 
 // ── Web ──────────────────────────────────────────────────────────────────────
 
-async function auditWeb(projectRoot: string, opts: InteractionAuditOptions): Promise<InteractionFinding[]> {
+async function auditWeb(projectRoot: string, opts: InteractionAuditOptions): Promise<AuditScan> {
   const ix = await loadWebApp(projectRoot);
-  const srcDir = path.join(projectRoot, 'src');
-  if (!fsSync.existsSync(srcDir)) return [];
+  if (!ix) return { findings: [], filesScanned: 0, skippedReason: 'no package.json with react/next — not a web app this audit can read' };
 
-  // folder of each screen's *Screen file → its canonicalId, so a dead handler in a
-  // sibling panel (DisputeDetailPanel.tsx) maps to the Disputes screen.
+  // folder of each screen's file → its canonicalId, so a dead handler in a sibling
+  // panel (DisputeDetailPanel.tsx) maps to the Disputes screen. Deepest folder wins
+  // (a Next page at app/page.tsx must not swallow every page beneath it).
   const screenFolders: { dir: string; canonicalId: string }[] = [];
-  if (ix) {
-    for (const [, s] of ix.byId) {
-      if (s.canonicalId && !s.placeholder) screenFolders.push({ dir: path.dirname(s.file), canonicalId: s.canonicalId });
-    }
+  for (const [, s] of ix.byId) {
+    if (s.canonicalId && !s.placeholder) screenFolders.push({ dir: path.dirname(s.file), canonicalId: s.canonicalId });
   }
-  const resolveScreenId = (file: string): string | null => {
-    // header on the file itself wins
-    const own = fsSync.existsSync(file) ? readHeader(fsSync.readFileSync(file, 'utf-8')) : null;
+  screenFolders.sort((a, b) => b.dir.length - a.dir.length);
+  const resolveScreenId = (file: string, src: string): string | null => {
+    const own = readHeader(src);
     if (own) return own.canonicalId;
     const dir = path.dirname(file);
     const hit = screenFolders.find((f) => dir === f.dir || dir.startsWith(f.dir + path.sep));
     return hit ? hit.canonicalId : null;
   };
 
-  const files = (await listSourceFiles(srcDir)).filter((f) => !/Preview\.(tsx|jsx)$/.test(f));
+  // Every source root the resolver knows (src/, app/, components/, lib/, pages/) —
+  // never one hardcoded directory (PG-24). listSourceFiles already drops the verify
+  // harness dirs (`_preview`, `%5Fpreview`); `*Preview` modules are dropped here.
+  const files = (await listWebSources(ix)).filter((f) => !/Preview\.(tsx|jsx|ts|js)$/.test(f));
   const targets = opts.onlyFiles?.length ? files.filter((f) => opts.onlyFiles!.includes(path.basename(f))) : files;
+  if (targets.length === 0) {
+    return { findings: [], filesScanned: 0, skippedReason: `no source files under ${ix.sourceRoots.map((r) => rel(projectRoot, r) || '.').join(', ')} to audit` };
+  }
 
   const findings: InteractionFinding[] = [];
   for (const file of targets) {
     const src = await fs.readFile(file, 'utf-8').catch(() => '');
     if (!src) continue;
     const isShared = /[/\\]components[/\\]/.test(file);
-    const screenId = resolveScreenId(file);
+    const screenId = resolveScreenId(file, src);
     for (const dead of findDeadHandlers(src)) {
-      const label = labelNear(src, dead.start);
+      const label = jsxOwnerLabel(src, dead.start);
       findings.push({
         file: rel(projectRoot, file),
         screenCanonicalId: screenId,
@@ -122,53 +243,70 @@ async function auditWeb(projectRoot: string, opts: InteractionAuditOptions): Pro
       });
     }
   }
-  return findings;
+  return { findings, filesScanned: targets.length };
 }
 
 // ── Flutter ──────────────────────────────────────────────────────────────────
 
-const DART_DEAD = /\b(onTap|onPressed|onChanged|onSubmitted)\s*:\s*(null|\(\s*\)\s*(?:=>\s*null|\{\s*(?:\/\/[^\n]*\s*)*\}))/g;
+const DART_DEAD = /\b(onTap|onPressed|onLongPress|onChanged|onSubmitted)\s*:\s*(null\b|\(\s*\)\s*(?:=>\s*null\b|\{\s*(?:\/\/[^\n]*\s*|\/\*[\s\S]*?\*\/\s*)*\}))/g;
 
-async function auditFlutter(projectRoot: string, opts: InteractionAuditOptions): Promise<InteractionFinding[]> {
-  const screensDir = path.join(projectRoot, 'lib', 'screens');
-  if (!fsSync.existsSync(screensDir)) return [];
-  const files = (await listSourceFiles(screensDir)).filter((f) => f.endsWith('.dart') && !/_preview\.dart$/.test(f));
+/** Every shipped .dart file under lib/: the verify harness (lib/_preview,
+ *  *_preview.dart) and generated code (*.g.dart, *.freezed.dart) excluded. */
+async function listDartFiles(dir: string, out: string[] = []): Promise<string[]> {
+  let entries: fsSync.Dirent[];
+  try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return out; }
+  for (const e of entries) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) { if (e.name !== '_preview' && !e.name.startsWith('.')) await listDartFiles(p, out); }
+    else if (e.name.endsWith('.dart') && !/(_preview|\.g|\.freezed)\.dart$/.test(e.name)) out.push(p);
+  }
+  return out;
+}
+
+async function auditFlutter(projectRoot: string, opts: InteractionAuditOptions): Promise<AuditScan> {
+  const libDir = path.join(projectRoot, 'lib');
+  if (!fsSync.existsSync(libDir)) return { findings: [], filesScanned: 0, skippedReason: 'no lib/ directory — nothing to audit' };
+  const files = await listDartFiles(libDir);
   const targets = opts.onlyFiles?.length ? files.filter((f) => opts.onlyFiles!.includes(path.basename(f))) : files;
+  if (targets.length === 0) return { findings: [], filesScanned: 0, skippedReason: 'no .dart files under lib/ to audit' };
 
   const findings: InteractionFinding[] = [];
   for (const file of targets) {
     const src = await fs.readFile(file, 'utf-8').catch(() => '');
     if (!src) continue;
     const header = readHeader(src);
+    const isShared = /[/\\](components|widgets)[/\\]/.test(file);
     let m: RegExpExecArray | null;
     DART_DEAD.lastIndex = 0;
     while ((m = DART_DEAD.exec(src)) !== null) {
-      const label = labelNear(src, m.index);
-      const kind: InteractionFinding['kind'] = /null/.test(m[2]) && !m[2].includes('{') ? 'null-handler'
-        : /\/\//.test(m[2]) ? 'todo-body' : 'empty-block';
+      const label = dartOwnerLabel(src, m.index);
+      const body = m[2];
+      const kind: InteractionFinding['kind'] = /^null\b/.test(body) || /=>\s*null/.test(body) ? 'null-handler'
+        : /\/\/|\/\*/.test(body) ? 'todo-body' : 'empty-block';
       findings.push({
         file: rel(projectRoot, file),
         screenCanonicalId: header?.canonicalId ?? null,
         element: label,
         handler: m[1],
         kind,
-        severity: label ? 'high' : 'med',
+        severity: label && !isShared ? 'high' : 'med',
         line: lineOf(src, m.index),
       });
     }
   }
-  return findings;
+  return { findings, filesScanned: targets.length };
 }
 
 // ── Orchestrator ─────────────────────────────────────────────────────────────
 
 export async function auditInteractions(projectId: string, opts: InteractionAuditOptions): Promise<InteractionAuditResult> {
   const framework = await detectFramework(opts.projectRoot);
-  const findings = framework === 'flutter'
+  const scan: AuditScan = framework === 'flutter'
     ? await auditFlutter(opts.projectRoot, opts)
     : (framework === 'react' || framework === 'next')
       ? await auditWeb(opts.projectRoot, opts)
-      : [];
+      : { findings: [], filesScanned: 0, skippedReason: `no interaction-audit strategy for framework '${framework}'` };
+  const findings = scan.findings;
 
   const high = findings.filter((f) => f.severity === 'high').length;
   const report: InteractionAuditReport = {
@@ -181,6 +319,7 @@ export async function auditInteractions(projectId: string, opts: InteractionAudi
       high,
       med: findings.length - high,
       screensAffected: new Set(findings.map((f) => f.screenCanonicalId).filter(Boolean)).size,
+      filesScanned: scan.filesScanned,
     },
     findings,
   };
@@ -194,7 +333,7 @@ export async function auditInteractions(projectId: string, opts: InteractionAudi
       reportPath = abs;
     } catch { /* best-effort */ }
   }
-  return { report, reportPath };
+  return { report, reportPath, ...(scan.skippedReason ? { skippedReason: scan.skippedReason } : {}) };
 }
 
 const rel = (root: string, p: string): string => path.relative(root, p).split(path.sep).join('/');
@@ -237,4 +376,4 @@ export function planInteractionRequeue(
   return decisions;
 }
 
-export const __test = { labelNear, auditWeb, auditFlutter };
+export const __test = { jsxOwnerLabel, dartOwnerLabel, auditWeb, auditFlutter };

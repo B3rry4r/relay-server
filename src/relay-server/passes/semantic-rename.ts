@@ -33,8 +33,7 @@
 // identifier when a canonical name is ambiguous, multi-word, or collides.
 //
 // FRAMEWORK-AGNOSTIC. detectFramework() (same contract as 7a–7d) dispatches to a
-// per-framework `RenameStrategy`. Flutter ships a full implementation; react is a
-// stubbed seam so the contract is visible.
+// per-framework `RenameStrategy`: flutter here, react + next in semantic-rename-web.ts.
 //
 // IDEMPOTENT: a second run finds every screen already semantic (its file/class/
 // route no longer match the machine shape) and applies 0 renames.
@@ -45,10 +44,13 @@ import * as path from 'path';
 import type { AIModel } from '../ai-adapters';
 import { deriveSemanticIdentifiers } from '../semantic-names';
 import { renameWeb } from './semantic-rename-web';
+import { detectFramework, type Framework } from './framework';
 
 // ── Public contract ──────────────────────────────────────────────────────────
 
-export type Framework = 'flutter' | 'react' | 'next' | 'unknown';
+/** One shared detector (./framework) — never a local copy that can drift. */
+export { detectFramework };
+export type { Framework };
 
 export interface RenameSemanticOptions {
   /** Resolved absolute project root. */
@@ -133,6 +135,8 @@ export interface RenameSemanticResult {
   report: RenameSemanticReport;
   reportPath: string | null;
   dryRun: boolean;
+  /** Set when the pass had no input / no support — finalize records `skipped` with it. */
+  skippedReason?: string;
 }
 
 // ── Canonical model (subset we read) ─────────────────────────────────────────
@@ -153,24 +157,6 @@ async function readCanonical(root: string): Promise<CanonModel | null> {
   }
 }
 
-// ── Framework detection (same contract as 7a–7d) ─────────────────────────────
-
-export async function detectFramework(projectRoot: string): Promise<Framework> {
-  const has = async (p: string) => {
-    try { await fs.access(path.join(projectRoot, p)); return true; } catch { return false; }
-  };
-  if (await has('pubspec.yaml')) return 'flutter';
-  if (await has('package.json')) {
-    try {
-      const pkg = JSON.parse(await fs.readFile(path.join(projectRoot, 'package.json'), 'utf8'));
-      const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
-      if (deps.next) return 'next';
-      if (deps.react) return 'react';
-    } catch { /* fall through */ }
-  }
-  return 'unknown';
-}
-
 // ── Per-framework strategy seam ──────────────────────────────────────────────
 
 export interface RenameStrategy {
@@ -179,7 +165,7 @@ export interface RenameStrategy {
     projectRoot: string,
     screens: CanonScreen[],
     opts: RenameSemanticOptions,
-  ): Promise<{ renames: ScreenRename[]; skipped: SkippedScreen[]; builtScreens: number; filesTouched: number }>;
+  ): Promise<{ renames: ScreenRename[]; skipped: SkippedScreen[]; builtScreens: number; filesTouched: number; unsupported?: string }>;
 }
 
 // ── Orchestrator ─────────────────────────────────────────────────────────────
@@ -213,7 +199,7 @@ export async function renameSemantic(projectId: string, opts: RenameSemanticOpti
   if (!canonical || !Array.isArray(canonical.screens)) {
     const report = mkReport([], [], 0, 0, 0);
     const reportPath = await maybeWriteReport(projectRoot, report, opts);
-    return { report, reportPath, dryRun: !!opts.dryRun };
+    return { report, reportPath, dryRun: !!opts.dryRun, skippedReason: 'no .uix/canonical.json screens to rename' };
   }
 
   if (!strategy) {
@@ -221,19 +207,22 @@ export async function renameSemantic(projectId: string, opts: RenameSemanticOpti
       canonicalId: s.canonicalId, reason: `no rename strategy for framework '${framework}'`,
     })), 0, 0, 0);
     const reportPath = await maybeWriteReport(projectRoot, report, opts);
-    return { report, reportPath, dryRun: !!opts.dryRun };
+    return { report, reportPath, dryRun: !!opts.dryRun, skippedReason: `no rename strategy for framework '${framework}'` };
   }
 
   let screens = canonical.screens;
   if (opts.only?.length) screens = screens.filter((s) => opts.only!.includes(s.canonicalId));
 
-  const { renames, skipped, builtScreens, filesTouched } = await strategy.rename(projectRoot, screens, opts);
+  const { renames, skipped, builtScreens, filesTouched, unsupported } = await strategy.rename(projectRoot, screens, opts);
   // mappable = renames + skips-that-mapped-but-were-not-renamed-for-non-unmapped-reasons.
   const mappable = renames.length + skipped.filter((s) => !/no built|unmapped/i.test(s.reason)).length;
 
   const report = mkReport(renames, skipped, builtScreens, filesTouched, mappable);
   const reportPath = await maybeWriteReport(projectRoot, report, opts);
-  return { report, reportPath, dryRun: !!opts.dryRun };
+  return {
+    report, reportPath, dryRun: !!opts.dryRun,
+    ...(unsupported ? { skippedReason: unsupported } : screens.length === 0 ? { skippedReason: 'no canonical screens selected to rename' } : {}),
+  };
 }
 
 function getStrategy(fw: Framework): RenameStrategy | null {
@@ -243,7 +232,9 @@ function getStrategy(fw: Framework): RenameStrategy | null {
 }
 
 async function maybeWriteReport(projectRoot: string, report: RenameSemanticReport, opts: RenameSemanticOptions): Promise<string | null> {
-  if (opts.noReport) return null;
+  // A dry run describes a build that was never applied: it must not leave a
+  // report next to the real ones (PG-38).
+  if (opts.noReport || opts.dryRun) return null;
   const abs = opts.reportPath ?? path.join(projectRoot, '.uix', 'semantic-rename-report.json');
   try {
     await fs.mkdir(path.dirname(abs), { recursive: true });
@@ -482,6 +473,14 @@ async function renameFlutter(
       if (next !== src) contents.set(file, next);
     }
 
+    // 3) PG-21: the screen's `// canonicalId: … route: …` header names the route the
+    // app now serves — rewritten in the same transaction (stamped when absent). A
+    // stale header made the next finalize re-rename the screen (settings_2_screen)
+    // and flip 7d verdicts, because every pass resolves a screen by it.
+    const own = contents.get(oldAbs);
+    const headerRoute = r.newRoutePath ?? r.oldRoutePath ?? null;
+    if (own != null) contents.set(oldAbs, syncDartHeader(own, r.canonicalId, headerRoute));
+
     moves.push({ from: oldAbs, to: newAbs });
   }
 
@@ -508,6 +507,16 @@ async function renameFlutter(
   void dirty;
 
   return { renames, skipped, builtScreens: builtById.size, filesTouched };
+}
+
+/** Rewrite (or stamp) a Dart screen's canonical header route, keeping its spacing. */
+export function syncDartHeader(src: string, canonicalId: string, route: string | null): string {
+  const re = /^(\/\/\s*canonicalId:\s*\S+)(?:(\s+route:\s*)(\S+))?/m;
+  const m = re.exec(src);
+  if (!m) return `// canonicalId: ${canonicalId}${route ? `  route: ${route}` : ''}\n${src}`;
+  if (!route) return src;
+  const line = `${m[1]}${m[2] ?? '  route: '}${route}`;
+  return m[0] === line ? src : src.slice(0, m.index) + line + src.slice(m.index + m[0].length);
 }
 
 // ── route table parsing ──────────────────────────────────────────────────────
@@ -694,7 +703,7 @@ async function listDartFiles(dir: string): Promise<string[]> {
 function rel(root: string, abs: string): string { return path.relative(root, abs); }
 
 // =============================================================================
-// React strategy (seam only — Phase 7e ships flutter; react contract is stubbed)
+// Web strategy (react + next) — semantic-rename-web.ts
 // =============================================================================
 
 const webStrategy = (framework: Framework): RenameStrategy => ({
@@ -710,17 +719,18 @@ const webStrategy = (framework: Framework): RenameStrategy => ({
         canonicalId: x.canonicalId,
         canonicalName: x.canonicalName,
         oldFile: x.file,
-        newFile: x.file,
-        oldClass: '',
-        newClass: '',
-        ...(x.routeConst ? { oldRouteConst: x.routeConst, newRouteConst: x.routeConst } : {}),
-        oldRoutePath: x.oldRoutePath,
-        newRoutePath: x.newRoutePath,
+        newFile: x.newFile,
+        oldClass: x.oldComponent,
+        newClass: x.newComponent,
+        ...(x.routeConst ? { oldRouteConst: x.routeConst, newRouteConst: x.newRouteConst ?? x.routeConst } : {}),
+        ...(x.oldRoutePath ? { oldRoutePath: x.oldRoutePath } : {}),
+        ...(x.newRoutePath ? { newRoutePath: x.newRoutePath } : {}),
         identifierHow: 'deterministic' as const,
       })),
       skipped: r.skipped,
       builtScreens: r.builtScreens,
       filesTouched: r.filesTouched,
+      ...(r.unsupported ? { unsupported: r.unsupported } : {}),
     };
   },
 });

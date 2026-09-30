@@ -47,7 +47,7 @@ import {
 import { notify } from './notify';
 import { getProjectsRoot } from './runtime';
 import {
-  canonicalizeRun, writeCanonical, readCanonical, generateFlutterSkeleton,
+  canonicalizeRun, writeCanonical, readCanonical, generateFlutterSkeleton, generateWebSkeleton,
   restampCanonicalHeaders, cleanOrphanScreens, syncLiveCanonical,
   nukeGeneratedAppSurface, planSemanticScreens, computeTabCluster,
   type Canonical, type CanonicalScreen,
@@ -59,15 +59,18 @@ import type { ReduceFlow } from './canonicalize-ai/reduce';
 import { AiStepError, runModelObserved, _emptyStreakConfig } from './ai-observability';
 import { generateDesignSystem, seedContextWithThemeApi, ensureMainWired, consolidateDesignTokens, ensureScreenPreviewEntry, modalPresenterName, type ThemeTokens } from './design-system';
 import { prepScreen, ensureIrComplete, getIrData, runAssetPass, type PrepConfig, type LocalizedAsset } from './reference-render';
-import { screenDirName, screenManifestPath, webPreviewRoute } from './agent-packet';
+import { screenDirName, screenManifestPath, webPreviewRoute, webPreviewDir } from './agent-packet';
+import { webScreenSlot, webModalSlots } from './web-skeleton';
 import type { FigFrame, FlowGraph } from './agent-packet';
 import { computePreflight } from './preflight';
 import { reconcileScreen, reconcileSummary, type ReconcileResult } from './reconcile';
+import { componentContract, componentReuseBlock } from './component-contract';
 import { finalizeApp, runAnalyzeGate, analyzeGateEnabled } from './passes/finalize';
 import { planFlowRequeue } from './passes/flow-requeue';
 import { planInteractionRequeue } from './passes/interaction-audit';
 import { repointAssetUsage, buildAssetInventory, renderAssetInventory } from './passes/asset-usage';
 import { ensureProjectGit, commitCheckpoint, snapshotBeforeMutation, rollbackTo } from './version-control';
+import { screenReadabilityFindings, readabilityFixBlock, type ReadabilityFinding } from './readability';
 
 const execFile = promisify(execFileCb);
 
@@ -270,7 +273,8 @@ async function clearScreenArtifacts(screenDir: string): Promise<void> {
  */
 export async function findBrokenAssets(projectRoot: string): Promise<string[]> {
   const broken: string[] = [];
-  for (const rel of ['assets/icons', 'assets/images']) {
+  // flutter bundles assets/; react/next serve public/assets/ (CONTRACTS §5).
+  for (const rel of ['assets/icons', 'assets/images', 'public/assets/icons', 'public/assets/images']) {
     const dir = path.join(projectRoot, rel);
     let names: string[];
     try { names = await fs.readdir(dir); } catch { continue; }
@@ -600,12 +604,15 @@ export function buildAppPlan(run: import('./build-run-store').BuildRun, canonica
   // P4: design-system summary + shared-component inventory (from compact digests).
   const digest = buildDesignDigest(run);
   if (digest.colors.length || digest.fonts.length) {
-    out.push(`DESIGN SYSTEM — a real theme file (lib/theme/app_theme.dart, class \`AppTheme\`) is GENERATED before screens build. IMPORT \`AppTheme.<token>\` for colors/spacing/radius/typeface; a raw Color(0x..)/fontSize/EdgeInsets literal that duplicates a token is a DEFECT the review flags. The exact symbol list is in .uix/context.md ("Design system (importable)").`);
+    const fwPlan = (run.framework || 'flutter').toLowerCase();
+    out.push(fwPlan === 'react' || fwPlan === 'next'
+      ? `DESIGN SYSTEM — a real typed theme module (\`AppTheme\`, plus the same tokens as CSS custom properties) is GENERATED before screens build. IMPORT \`AppTheme.<group>.<token>\` (or use \`var(--…)\` in CSS) for colours/spacing/sizes/radius/typeface; a raw hex / px literal that duplicates a token is a DEFECT the review flags. The exact symbol list is in .uix/context.md ("Design system (importable)").`
+      : `DESIGN SYSTEM — a real theme file (lib/theme/app_theme.dart, class \`AppTheme\`) is GENERATED before screens build. IMPORT \`AppTheme.<token>\` for colors/spacing/sizes/radius/typeface; a raw Color(0x..)/fontSize/EdgeInsets literal that duplicates a token is a DEFECT the review flags. The exact symbol list is in .uix/context.md ("Design system (importable)").`);
     if (digest.colors.length) out.push(`- Palette behind the tokens (most-used): ${digest.colors.join(', ')}`);
     if (digest.fonts.length) out.push(`- Typeface(s): ${digest.fonts.join(', ')}`);
   }
   if (digest.components.length) {
-    out.push(`SHARED COMPONENT INVENTORY (these recur across multiple screens — build each ONCE as a reusable widget and reuse it; do NOT re-implement per screen):`);
+    out.push(`SHARED COMPONENT INVENTORY (these recur across multiple screens — build each ONCE as a public component at the path the SHARED COMPONENTS block names, and reuse it; do NOT re-implement per screen):`);
     for (const c of digest.components) out.push(`- ${c.name} (used in ${c.screens} screens)`);
   }
   if (run.flow?.entryFrameId) {
@@ -698,29 +705,64 @@ async function readContextSlice(projectRoot: string): Promise<string> {
  * + the screens index from context.md. Kept as its own block so each screen builds
  * against a SHARED contract instead of re-inventing names per session.
  */
-function buildComponentApiSurface(run: import('./build-run-store').BuildRun, canonical?: Canonical): string {
+function buildComponentApiSurface(run: import('./build-run-store').BuildRun, canonical?: Canonical, projectRoot?: string): string {
   const out: string[] = [
     `CANONICAL API SURFACE — the shared route/screen names every screen MUST build against (do NOT invent variants of these names; reuse them verbatim so cross-screen navigation resolves):`,
   ];
   // ONE route scheme — canonical routes when canonicalized (audit A.3), else legacy.
   if (canonical) {
     for (const cs of canonical.screens) out.push(`- route ${cs.route}  ⟶  screen "${cs.name}" (canonicalId ${cs.canonicalId})`);
-    if (canonical.components.length) {
-      for (const c of canonical.components) out.push(`- component ${c.name} (import from lib/components/)`);
-    }
   } else {
     for (const s of run.screens) out.push(`- route ${routeNameFor(s.frameName)}  ⟶  screen "${s.frameName}"`);
   }
-  // Component OWNERSHIP (option 3, Fix #1): recurring UI (from the digest) must be
-  // extracted ONCE into lib/components/ and imported — not re-implemented per screen.
-  // We can't author the widget bodies deterministically (that's the per-screen
-  // agent's job), so we assign ownership + name them, and the review flags re-impl.
+  // Component OWNERSHIP (readability F1): ONE authoritative location + class name per
+  // shared component (component-contract.ts) — the same block the canonical context
+  // points at — plus what earlier screens ALREADY BUILT on disk (packet-level reuse:
+  // a later screen imports the real widget instead of re-implementing it privately).
+  // Canonical components when canonicalized; else the recurring names from the digest.
   const digest = buildDesignDigest(run);
-  if (digest.components.length) {
-    out.push(`SHARED WIDGETS — these recur across multiple screens; the FIRST screen that renders one CREATES it as a public widget in lib/components/<name>.dart and EXPORTS it, and every other screen IMPORTS it. Re-implementing one of these inline (a private _Foo widget duplicated across screens) is a DEFECT the review flags:`);
-    for (const c of digest.components) out.push(`- ${c.name} (seen in ${c.screens} screens → lib/components/${c.name.replace(/[^A-Za-z0-9]/g, '')}.dart)`);
-  }
+  const comps = canonical?.components.length
+    ? canonical
+    : { components: digest.components.map(c => ({ id: `cmp_${c.name}`, frameId: '', name: c.name })) };
+  const reuse = componentReuseBlock(projectRoot, run.framework || 'flutter', comps);
+  if (reuse) out.push(reuse);
   return out.join('\n');
+}
+
+/**
+ * THEME TOKENS (readability F4) — the reconciliation gate flags inline colour /
+ * type literals, so the agent is told, in its framework's idiom, to use the
+ * generated tokens. The old block was Dart-only for every framework and said
+ * "NEVER inline, request a token instead" — agents obeyed by minting one
+ * screen-named, single-use token per literal (Ping: 47 colours, 19 used once, 54
+ * near-duplicate pairs). A new token now needs a ROLE name and ≥2 real uses; a
+ * one-off value stays a local, named value in the one file that uses it.
+ */
+export function themeTokenRules(framework: string): string {
+  const fw = (framework || 'flutter').toLowerCase();
+  const web = fw === 'react' || fw === 'next';
+  return [
+    `THEME TOKENS — MANDATORY (the reconciliation gate flags inline type/colour literals):`,
+    web
+      ? `- Use the generated theme for ALL colour, type, spacing, size and radius values: \`AppTheme.color.<role>\`, \`AppTheme.spacing.s<n>\`, \`AppTheme.size.<role>\`, \`AppTheme.radius.<role>\` in style props, or the matching CSS variables (\`var(--color-<role>)\`, \`var(--space-<n>)\`, \`var(--size-<role>)\`, \`var(--radius-<role>)\`) in CSS. Never a raw hex, and never a Tailwind arbitrary value (\`bg-[#12ae89]\`, \`text-[16px]\`, \`rounded-[50px]\`) for a value the theme has.`
+      : `- Use the generated AppTheme for ALL text, colour, spacing, size and radius values: AppTheme text-style helpers for every Text, \`AppTheme.<role>\` colours, \`AppTheme.s<n>\` spacing, the size tokens (icon/avatar/button heights) and radius tokens (incl. \`AppTheme.radiusPill\` / StadiumBorder for pills). Import lib/theme/app_theme.dart. Never inline a TextStyle(...), GoogleFonts.*(), Color(0x........) or Colors.* literal in a screen.`,
+    `- The token names are in the established project contract above (.uix/context.md). Tokens are named by ROLE (textPrimary, textMuted, surfaceMuted, buttonHeight, radiusPill) — never by screen ("settingsBg", "cardListInk") and never with a counter ("neutral3", "ink2").`,
+    `- A value the theme lacks: if it recurs (≥2 uses across the app), add ONE role-named token (and reuse it); if it is a genuine one-off, keep it as a named local constant in the single file that uses it. Never mint a single-use token, and never add a near-duplicate of an existing colour (within a few RGB steps) — use the existing token.`,
+  ].join('\n');
+}
+
+/** Readability F6 (provenance-free comments) + F8 (real assets, never hand-drawn
+ *  copies) — rules every framework's agent gets. */
+export function codeHygieneRules(framework: string): string {
+  const fw = (framework || 'flutter').toLowerCase();
+  const web = fw === 'react' || fw === 'next';
+  return [
+    `SOURCE HYGIENE — the code is handed to a product team; it must read like hand-written code:`,
+    `- Comments describe BEHAVIOUR (what a widget does, why a choice was made). NEVER provenance: no frame numbers ("frame 61"), no IR/Figma layer names ("IR \"Ellipse 2797\"", "Rectangle 24"), no node or modal ids (283:1967, m_313_9543), no design pixel sizes ("27×27"), no "added by /route" notes, no "matches the reference". Keep the \`// canonicalId:\` header line exactly as the skeleton wrote it.`,
+    web
+      ? `- Icons and illustrations: use the exported asset through the resources module (\`<img src={assets.x} />\`). NEVER hand-draw an icon/illustration that exists in public/assets as inline <svg> path code or CSS shapes.`
+      : `- Icons and illustrations: use the exported asset (\`SvgPicture.asset(AppAssets.x)\` — flutter_svg is a project dependency — or \`Image.asset\`). NEVER hand-draw an icon/illustration that exists in assets/ with a CustomPainter or stacked shapes.`,
+  ].join('\n');
 }
 
 /**
@@ -731,11 +773,11 @@ function buildComponentApiSurface(run: import('./build-run-store').BuildRun, can
  * body is identical so serial-shared-session and fresh-session builds converge on
  * the same design language.
  */
-function buildWrittenContract(
+export function buildWrittenContract(
   run: import('./build-run-store').BuildRun, appPlan: string, contextSlice: string, freshSession: boolean,
-  canonical?: Canonical,
+  canonical?: Canonical, projectRoot?: string,
 ): string {
-  const parts: string[] = [appPlan, buildComponentApiSurface(run, canonical)];
+  const parts: string[] = [appPlan, buildComponentApiSurface(run, canonical, projectRoot)];
   if (contextSlice) {
     parts.push(
       [
@@ -753,12 +795,10 @@ function buildWrittenContract(
   // screens into needs-review. Tell the agent, authoritatively, to use AppTheme tokens.
   // (The exact token names live in .uix/context.md / lib/theme/app_theme.dart, already
   // injected above via the established contract.)
-  parts.push([
-    `THEME TOKENS — MANDATORY (the reconciliation gate REJECTS inline type/colour literals):`,
-    `- Use the generated AppTheme for ALL text and colour: AppTheme text-style helpers for every Text, AppTheme colour tokens for every colour. Import lib/theme/app_theme.dart.`,
-    `- NEVER inline a TextStyle(...), GoogleFonts.*(), Color(0x........), or Colors.* literal in a screen — these are flagged and the screen is sent back for review.`,
-    `- The available token names are in the established project contract above (.uix/context.md). If a token you genuinely need is missing, request it via the amendment protocol below rather than inlining a literal.`,
-  ].join('\n'));
+  parts.push(themeTokenRules(run.framework || 'flutter'));
+  // Readability F6 + F8: comments describe behaviour, never provenance; real assets,
+  // never hand-drawn copies of them. Both are framework-agnostic.
+  parts.push(codeHygieneRules(run.framework || 'flutter'));
   // P5 (RFC §4.8): AMENDMENT PROTOCOL. The plan is append-only + namespace-locked,
   // NOT frozen — but the agent must not silently invent routes/components. When a
   // route/component it genuinely needs is missing from the plan above, it REQUESTS
@@ -812,12 +852,21 @@ const MODALISH_NAME = /modal|sheet|dialog|dialogue|popup|pop-?over|drawer|overla
  */
 export function modalPresentationHint(
   tree: string | undefined, frameW?: number, frameH?: number, baseW?: number, baseH?: number,
+  framework = 'flutter',
 ): { kind: ModalPresentationKind; hint: string } {
-  const hints: Record<ModalPresentationKind, string> = {
-    bottomSheet: `BOTTOM SHEET — present via showModalBottomSheet over the reused base (content anchored to the bottom edge, scrim above).`,
-    dialog: `centered DIALOG — present via showDialog over the reused base (small centered card, dimmed scrim around it).`,
-    fullOverlay: `FULL-SCREEN SCRIM OVERLAY — dim the (reused) base behind a scrim and center this content over it. Do NOT use a Material spinner dialog and do NOT rebuild the base as a new page.`,
-  };
+  const hints: Record<ModalPresentationKind, string> = isWebFramework(framework)
+    // Web: the ModalHost (web skeleton) supplies the scrim layer; the content
+    // positions itself inside it. Never name Flutter APIs to a web agent.
+    ? {
+      bottomSheet: `BOTTOM SHEET — the content anchors to the bottom edge of the ModalHost layer (position: absolute; bottom: 0), over the reused base with the host's scrim above it.`,
+      dialog: `centered DIALOG — a small card centered in the ModalHost layer over the reused base, the host's scrim around it.`,
+      fullOverlay: `FULL-SCREEN SCRIM OVERLAY — center this content over the dimmed (reused) base inside the ModalHost layer. Do NOT use a spinner dialog and do NOT rebuild the base as a new page.`,
+    }
+    : {
+      bottomSheet: `BOTTOM SHEET — present via showModalBottomSheet over the reused base (content anchored to the bottom edge, scrim above).`,
+      dialog: `centered DIALOG — present via showDialog over the reused base (small centered card, dimmed scrim around it).`,
+      fullOverlay: `FULL-SCREEN SCRIM OVERLAY — dim the (reused) base behind a scrim and center this content over it. Do NOT use a Material spinner dialog and do NOT rebuild the base as a new page.`,
+    };
   const lines = (tree ?? '').split('\n');
   // Root dims from the first node line when the caller has no frame dims.
   const rootM = lines.length ? NODE_DIMS_RE.exec(lines[0]) : null;
@@ -857,10 +906,19 @@ export function modalPresentationHint(
  * + presentation hint + presenter contract — the payload the agent needs to build
  * the variant for real instead of inventing a placeholder.
  */
-export function buildCanonicalContext(canonical: Canonical, cs: CanonicalScreen, runScreens?: RunScreen[], framework = 'flutter'): string {
+export function buildCanonicalContext(canonical: Canonical, cs: CanonicalScreen, runScreens?: RunScreen[], framework = 'flutter', projectRoot?: string): string {
   const web = isWebFramework(framework);
+  const next = framework === 'next';
+  // Web: the slot the web skeleton generated for this screen (PG-02) — the agent
+  // fills THAT file; it never invents a router, a route table or a preview route.
+  const slot = web ? webScreenSlot(canonical, cs.canonicalId, framework) : null;
+  const modalSlots = web ? webModalSlots(canonical, framework, Object.fromEntries((runScreens ?? []).map(s => [s.frameId, s.frameName]))) : null;
   const out: string[] = [
-    `CANONICAL SCREEN — this is ONE screen (canonicalId ${cs.canonicalId}, route ${cs.route}); build a SINGLE widget, not one page per variant. Its write-locked route slot already exists in lib/app_router.dart; fill the widget body, keep the route.`,
+    slot
+      ? (next
+        ? `CANONICAL SCREEN — this is ONE screen (canonicalId ${cs.canonicalId}, route ${cs.route}); build a SINGLE page, not one page per variant. Its write-locked route slot already exists: \`${slot.file}\` (under the app's source root) — a stub whose header \`// canonicalId: ${cs.canonicalId} route: ${cs.route}\` sits ABOVE 'use client'. REPLACE the body of its default export ${slot.className} with the real UI; keep the header, the file location and the default export. Navigate with the constants in lib/routes.ts (router.push(ROUTES.x) / <Link href={ROUTES.x}>); never add or rename routes.`
+        : `CANONICAL SCREEN — this is ONE screen (canonicalId ${cs.canonicalId}, route ${cs.route}); build a SINGLE component, not one page per variant. Its write-locked route slot already exists: src/App.tsx mounts <${slot.className} /> from \`${slot.file}\` at ROUTES.${slot.routeConst}. REPLACE the body of that stub with the real UI; keep its \`// canonicalId: ${cs.canonicalId} route: ${cs.route}\` header, file and export name. Navigate with the constants in src/router/routes.ts (navigate(ROUTES.x) / <Link to={ROUTES.x}>); never edit src/App.tsx or the route table.`)
+      : `CANONICAL SCREEN — this is ONE screen (canonicalId ${cs.canonicalId}, route ${cs.route}); build a SINGLE widget, not one page per variant. Its write-locked route slot already exists in lib/app_router.dart; fill the widget body, keep the route.`,
   ];
   const specOf = (frameId: string): ScreenSpec | undefined =>
     runScreens?.find(s => s.frameId === frameId)?.spec;
@@ -872,8 +930,9 @@ export function buildCanonicalContext(canonical: Canonical, cs: CanonicalScreen,
   // navbar + pushNamed's its siblings (Ping audit).
   const tabCluster = computeTabCluster(canonical);
   if (tabCluster?.memberIds.includes(cs.canonicalId)) {
-    out.push(
-      `APP SHELL — this screen is a TAB destination hosted inside AppShell (lib/screens/app_shell.dart, an IndexedStack over the tab cluster). Do NOT render your own bottom navigation bar — the shell owns it (one shared bottom nav for all tabs). Never Navigator.push a tab route from inside a tab screen; tab switching is the shell's job (it only changes the IndexedStack index). Build this screen's body WITHOUT any bottom nav.`,
+    out.push(web
+      ? `APP SHELL — this screen is a TAB destination hosted inside AppShell (${next ? 'components/AppShell.tsx, rendered by app/(tabs)/layout.tsx' : 'src/shell/AppShell.tsx, the <Route element={<AppShell />}> parent'}) — one shared tab bar for the whole tab cluster. Do NOT render your own bottom navigation bar and never ${next ? 'router.push()' : 'navigate()'} to a sibling tab from inside a tab screen; tab switching is the shell's job. Build this screen's body WITHOUT any bottom nav.`
+      : `APP SHELL — this screen is a TAB destination hosted inside AppShell (lib/screens/app_shell.dart, an IndexedStack over the tab cluster). Do NOT render your own bottom navigation bar — the shell owns it (one shared bottom nav for all tabs). Never Navigator.push a tab route from inside a tab screen; tab switching is the shell's job (it only changes the IndexedStack index). Build this screen's body WITHOUT any bottom nav.`,
     );
   }
   let foldedPayloads = 0;
@@ -884,9 +943,11 @@ export function buildCanonicalContext(canonical: Canonical, cs: CanonicalScreen,
       if (!spec?.referenceImagePath) { out.push(`- state "${s.id}" (frame ${s.frameId})${s.frameId === leadFrameId ? ' — the base/default state this packet builds' : ''}`); continue; }
       foldedPayloads++;
       out.push([
-        `- FOLDED STATE "${s.id}" (frame ${s.frameId}) — rendered by THIS widget as ${className}(state: '${s.id}'); NOT a separate route/file.`,
+        web
+          ? `- FOLDED STATE "${s.id}" (frame ${s.frameId}) — rendered by THIS ${next ? 'page' : 'component'} ${next ? `when useScreenState() returns '${s.id}'` : `as <${className} state="${s.id}" />`}; NOT a separate route/file.`
+          : `- FOLDED STATE "${s.id}" (frame ${s.frameId}) — rendered by THIS widget as ${className}(state: '${s.id}'); NOT a separate route/file.`,
         `  REFERENCE IMAGE (ground truth): ${spec.referenceImagePath} — OPEN this image with your file-reading tool and match it EXACTLY (layout, text, colours).`,
-        ...(web ? [`  PREVIEW ROUTE CONTRACT: register a route at EXACTLY \`${webPreviewRoute(s.frameId)}\` that mounts THIS screen in state '${s.id}'. The verify harness screenshots that exact route to check this state against the reference above; do NOT rename it. This is a verify-only entrypoint, not a user-facing page.`] : []),
+        ...(web ? [`  PREVIEW ROUTE CONTRACT: \`${webPreviewRoute(s.frameId)}\` mounts THIS screen in state '${s.id}' — the skeleton already registered it (${next ? `app/${webPreviewDir(s.frameId)}/page.tsx wraps the page in <ScreenStateProvider state="${s.id}">` : `src/App.tsx: <${className} state="${s.id}" />`}); if it is missing, create it exactly so. The verify harness screenshots that exact route to check this state against the reference above; do NOT rename it. This is a verify-only entrypoint, not a user-facing page.`] : []),
         `  IR TREE of this state's frame:`,
         boundFoldedIR(spec.tree),
       ].join('\n'));
@@ -898,17 +959,21 @@ export function buildCanonicalContext(canonical: Canonical, cs: CanonicalScreen,
       const spec = specOf(m.frameId);
       if (!spec?.referenceImagePath) { out.push(`- modal "${m.id}" (frame ${m.frameId})`); continue; }
       foldedPayloads++;
-      const p = modalPresentationHint(spec.tree, spec.width, spec.height, leadSpec?.width, leadSpec?.height);
+      const p = modalPresentationHint(spec.tree, spec.width, spec.height, leadSpec?.width, leadSpec?.height, framework);
       out.push([
         `- FOLDED MODAL "${m.id}" (frame ${m.frameId}) — part of THIS screen.`,
         `  REFERENCE IMAGE (ground truth): ${spec.referenceImagePath} — OPEN this image with your file-reading tool and match it EXACTLY (layout, text, colours).`,
         `  PRESENTATION (derived from the frame's geometry): ${p.hint}`,
         web
-          // Web has no presenter to call — the harness screenshots a ROUTE. Give the
-          // agent the exact route so producer and consumer cannot disagree, and say
-          // plainly that the BASE route renders closed (an earlier build force-opened
-          // modals on the base route to match a reference that was itself wrong).
-          ? `  PREVIEW ROUTE CONTRACT: register a route at EXACTLY \`${webPreviewRoute(m.frameId)}\` that mounts THIS base screen with this modal ALREADY OPEN. The verify harness screenshots that exact route to check the modal against the reference above; do NOT rename it. The base screen's own route \`${webPreviewRoute(leadFrameId)}\` MUST render with NO modal open — never force a modal open on the base route.`
+          // The harness screenshots a ROUTE that calls the presenter. The skeleton
+          // generated both (the presenter slot and the preview route), so producer and
+          // consumer cannot disagree; say plainly that the BASE route renders closed
+          // (an earlier build force-opened modals on the base route to match a
+          // reference that was itself wrong).
+          ? [
+            `  PRESENTER CONTRACT: the skeleton created the presenter slot \`${modalSlots?.get(m.id)?.file ?? `${modalPresenterName(m.id)}()`}\` — REPLACE the body of ${modalSlots?.get(m.id)?.component ?? 'its content component'} with the real modal UI and keep \`export function ${modalPresenterName(m.id)}()\` (it calls modalController.open('${m.id}', …); the root ModalHost renders it above a scrim). The name is FIXED. Call ${modalPresenterName(m.id)}() from the trigger in THIS screen that opens the modal — a modal only the preview presents is unreachable in the shipped app.`,
+            `  PREVIEW ROUTE CONTRACT: \`${webPreviewRoute(m.frameId)}\` mounts THIS base screen and calls ${modalPresenterName(m.id)}() on mount — the skeleton already registered it${next ? ` (app/${webPreviewDir(m.frameId)}/page.tsx)` : ' (src/App.tsx)'}; if it is missing, create it exactly so. The verify harness screenshots that exact route to check the modal against the reference above; do NOT rename it. The base screen's own route \`${webPreviewRoute(leadFrameId)}\` MUST render with NO modal open — never force a modal open on the base route.`,
+          ].join('\n')
           : `  PRESENTER CONTRACT: declare a top-level function \`Future<void> ${modalPresenterName(m.id)}(BuildContext context)\` in this screen's file that presents this modal. The name is FIXED — the automated preview harness calls it verbatim to screenshot the modal for verification.`,
         `  IR TREE of the modal frame:`,
         boundFoldedIR(spec.tree),
@@ -925,7 +990,11 @@ export function buildCanonicalContext(canonical: Canonical, cs: CanonicalScreen,
     out.push(`This screen shares template "${cs.templateRef}" with ${sibs.length} sibling screen(s) — extract the shared layout into a reusable widget + thin per-screen config.`);
   }
   if (canonical.components.length) {
-    out.push(`Shared components available (import from lib/components/ — reuse, don't re-invent): ${canonical.components.map(c => c.name).join(', ')}.`);
+    // Same slots as the SHARED COMPONENTS block of the written contract (one
+    // authoritative path + class per component, component-contract.ts) — the two
+    // blocks used to name different paths, and this one offered write-locked stubs.
+    const slots = componentContract(canonical, framework, projectRoot);
+    out.push(`Shared components (ONE location each — import it when an earlier screen already built it, otherwise create it there; never a private per-screen copy; see SHARED COMPONENTS below): ${slots.map(sl => `${sl.className} (${sl.file})`).join(', ')}.`);
   }
   return out.join('\n');
 }
@@ -1050,6 +1119,33 @@ async function readLastGen(projectRoot: string, frameId?: string): Promise<LastG
   return {};
 }
 
+/**
+ * Readability F7: the source files that make up ONE built screen — the manifest's
+ * entry + files, minus pipeline scaffolding (preview entries, the theme, generated
+ * route tables). Framework-agnostic (dart / ts / tsx / js / jsx).
+ */
+export function readabilityScreenFiles(projectRoot: string, lastGen: LastGen): string[] {
+  const out = new Set<string>();
+  for (const f of [lastGen.entry, ...(lastGen.files ?? [])]) {
+    if (!f || typeof f !== 'string' || f.startsWith('/') || f.includes('..')) continue;
+    const rel = f.replace(/^\.\//, '');
+    if (!/\.(dart|tsx?|jsx?)$/.test(rel)) continue;
+    if (/(^|\/)(_preview|%5Fpreview|\.uix|node_modules|test|theme)(\/|$)/.test(rel)) continue;
+    if (/(^|\/)(main\.dart|app_router\.dart|app_routes\.dart|app_theme\.dart|layout\.tsx?|App\.tsx?|main\.tsx?|router\.tsx?|routes\.tsx?)$/.test(rel)) continue;
+    if (fsSync.existsSync(path.join(projectRoot, rel))) out.add(rel);
+  }
+  return [...out];
+}
+
+/** F7: measure the screen's files (warn-only — the result is advisory, never a block). */
+async function screenReadability(projectRoot: string, framework: string, frameId: string): Promise<{ files: string[]; findings: ReadabilityFinding[] } | { skipped: string }> {
+  const files = readabilityScreenFiles(projectRoot, await readLastGen(projectRoot, frameId));
+  if (!files.length) return { skipped: 'the screen manifest names no source file on disk' };
+  const r = screenReadabilityFindings(projectRoot, framework, files);
+  if (!r.ok) return { skipped: r.reason };
+  return { files: r.files, findings: r.findings };
+}
+
 // ── prompt builders ───────────────────────────────────────────────────────────
 
 function verifyPrompt(refPath: string, candPath: string, frameName: string, prevScore: number | null, userNotes?: string): string {
@@ -1096,7 +1192,7 @@ function tiledVerifyPrompt(refPath: string, candTilePaths: string[], frameName: 
   ].filter(Boolean).join('\n');
 }
 
-function fixPrompt(frameId: string, frameName: string, refPath: string, candPath: string, v: Verdict, userNotes?: string): string {
+export function fixPrompt(frameId: string, frameName: string, refPath: string, candPath: string, v: Verdict, userNotes?: string, readability?: string): string {
   const items = v.discrepancies.map((d, i) => `  ${i + 1}. [${d.severity ?? 'med'}] ${d.area ? d.area + ': ' : ''}${d.issue}`).join('\n');
   const notes = (userNotes ?? '').trim();
   return [
@@ -1107,6 +1203,8 @@ function fixPrompt(frameId: string, frameName: string, refPath: string, candPath
     `Open BOTH images, then revise the EXISTING screen file(s) to fix these specific discrepancies — but skip any that contradict the user rules above:`,
     items || '  (general fidelity — bring it closer to the reference)',
     `Reuse the project's existing design system / theme / shared components — do not restyle inline.`,
+    // F7: the warn-only readability findings for THIS screen's files (empty when clean).
+    readability ?? '',
     `Keep the preview entrypoint working and keep ${screenManifestPath(frameId)} accurate (this screen's OWN manifest — never a shared one). Output a one-line summary.`,
   ].filter(Boolean).join('\n');
 }
@@ -1262,6 +1360,15 @@ async function renderPreview(
       // the fix loop rewrite CORRECT code until it gives up. Fail loud instead, with a
       // message the fix agent can act on.
       if (route && !out.error) {
+        // A multi-page static export (Next `output: 'export'`) serves one document
+        // per route; the URL — and so the beacon — stays on the requested route even
+        // when no document exists for it. Assert on the DOCUMENT served (PG-33).
+        const doc = srv.servedDocument(route);
+        if (doc === '404' || (doc === 'index.html' && fsSync.existsSync(path.join(outDir, '_next')))) {
+          return {
+            error: `preview route ${route} is not in the static export — ${doc === '404' ? 'no document' : 'only the ROOT page'} was served for it, so the screenshot would be of the WRONG screen. On Next the preview page lives at app/%5Fpreview/<id>/page.tsx (a folder named _preview is private and never routed).`,
+          };
+        }
         const seen = srv.observedPath();
         if (seen && seen !== route) {
           return {
@@ -1731,7 +1838,12 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
 
     // FIX (resume the implementation session so the agent keeps full context).
     appendJobLog(jobId, `[loop] fix ${iter}: applying ${verdict.discrepancies.length} change(s)`);
-    const fix = await observedBuildCall('fix', fixPrompt(frameId, frameName, referenceImagePath, candRel ?? '(build failed — no screenshot)', verdict, req.userNotes), { sessionId: session });
+    // F7: the fix prompt also carries this screen's readability findings (warn-only),
+    // so a fix pass stops growing magic numbers / provenance comments (Ping 04→06).
+    const rdFix = await screenReadability(projectRoot, screenFramework, frameId).catch(() => null);
+    const rdBlock = rdFix && 'findings' in rdFix ? readabilityFixBlock({ ok: true, findings: rdFix.findings, files: rdFix.files }) : '';
+    if (rdBlock) appendJobLog(jobId, `[loop] fix ${iter}: + ${(rdFix as { findings: ReadabilityFinding[] }).findings.length} readability finding(s) (advisory)`);
+    const fix = await observedBuildCall('fix', fixPrompt(frameId, frameName, referenceImagePath, candRel ?? '(build failed — no screenshot)', verdict, req.userNotes, rdBlock), { sessionId: session });
     // T29: a rate-limited (incl. empty-streak soft-limit) fix → pause resumably rather
     // than burning the remaining iterations on empty calls + ending in needs-review.
     if (fix.rateLimited && req.runId) { await pauseRunRateLimited(req.projectId, req.runId, frameId, session, fix.stalled ? stallPauseReason : undefined, fix.resetHint); return session; }
@@ -1758,6 +1870,23 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     if (recon.flags.length) appendJobLog(jobId, `[loop] ${reconcileSummary(recon)}`);
   } catch { /* recon is best-effort — never block on a grep error */ }
   const reconBlocked = !!recon && !recon.ok;
+  // F7: WARN-ONLY readability gate on the finished screen. Recorded on the run +
+  // result.json; it NEVER demotes the screen (CONTRACTS §5 — only do-nothing handlers
+  // requeue, and that is 7g's job).
+  let readability: RunScreen['readability'];
+  try {
+    const rd = await screenReadability(projectRoot, screenFramework, frameId);
+    if ('skipped' in rd) readability = { skipped: rd.skipped };
+    else {
+      const byCode: Record<string, number> = {};
+      for (const f of rd.findings) byCode[f.code] = (byCode[f.code] ?? 0) + 1;
+      readability = { warnings: rd.findings.length, byCode, files: rd.files, sample: rd.findings.slice(0, 8).map((f) => `${f.file}: ${f.message}`) };
+      if (rd.findings.length) {
+        appendJobLog(jobId, `[loop] readability (warn-only): ${rd.findings.length} finding(s) — ${Object.entries(byCode).map(([k, n]) => `${k}×${n}`).join(', ')}`);
+        if (req.runId) { try { await appendRunLog(req.projectId, req.runId, `[screen ${frameName}] readability (warn-only): ${Object.entries(byCode).map(([k, n]) => `${k}×${n}`).join(', ')}`); } catch { /* non-fatal */ } }
+      }
+    }
+  } catch (e) { readability = { skipped: `readability gate threw: ${(e as Error).message}` }; }
   if (reconBlocked && matched) {
     matched = false;
     stopReason = `reconciliation failed (${recon!.flags.filter(f => f.severity === 'high').map(f => f.code).join(', ')})`;
@@ -1844,7 +1973,10 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
       vPrev = score;
       if (iter === maxIterations) break;
       appendJobLog(jobId, `[loop] variant ${vLabel} fix ${iter}: applying ${verdict.discrepancies.length} change(s)`);
-      const fix = await observedBuildCall('fix', fixPrompt(v.frameId, vFrameName, v.referenceImagePath!, vCand ?? '(build failed — no screenshot)', verdict, req.userNotes), { sessionId: session });
+      // F7: same advisory readability block as the lead's fix (the variant lives in the lead's files).
+      const vRd = await screenReadability(projectRoot, screenFramework, frameId).catch(() => null);
+      const vRdBlock = vRd && 'findings' in vRd ? readabilityFixBlock({ ok: true, findings: vRd.findings, files: vRd.files }) : '';
+      const fix = await observedBuildCall('fix', fixPrompt(v.frameId, vFrameName, v.referenceImagePath!, vCand ?? '(build failed — no screenshot)', verdict, req.userNotes, vRdBlock), { sessionId: session });
       if (fix.rateLimited) { await pauseRunRateLimited(req.projectId, req.runId!, frameId, session, fix.stalled ? stallPauseReason : undefined, fix.resetHint); return 'paused'; }
       if (fix.sessionId) session = fix.sessionId;
       variantFixesApplied++;
@@ -1945,6 +2077,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
     iterations: iterationsRun, maxIterations,
     finalVerdict, sessionId: session,
     reconciliation: recon ? { ok: recon.ok, flags: recon.flags } : undefined,
+    readability,
     referenceImage: referenceImagePath,
     candidateImage: lastCandRel ?? undefined,
     ir: req.tree ? path.join(relScreenDir, 'ir.txt') : undefined,
@@ -1958,7 +2091,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
   if (req.runId) {
     try {
       if (matched) {
-        await updateRunScreen(req.projectId, req.runId, frameId, { status: 'done', matched: true, sessionId: session, review: undefined });
+        await updateRunScreen(req.projectId, req.runId, frameId, { status: 'done', matched: true, sessionId: session, review: undefined, readability });
         // T9 (RFC v2 §8.2): explicit terminal outcome line — at a glance "ACCEPTED",
         // not just "loop done", so the human doesn't have to parse the log to know it
         // passed. Score (when the verify agent gave one) rides along.
@@ -1968,7 +2101,7 @@ async function runScreenLoop(req: BuildScreenReq, projectRoot: string, jobId: st
         // Surface recon flags alongside the visual discrepancies in the review queue.
         const reconDiscs = (recon?.flags ?? []).map(f => ({ area: `recon:${f.code}`, issue: f.message, severity: f.severity }));
         await updateRunScreen(req.projectId, req.runId, frameId, {
-          status: 'needs-review', matched: false, sessionId: session,
+          status: 'needs-review', matched: false, sessionId: session, readability,
           review: {
             candidateImagePath: lastCandRel ?? undefined,
             referenceImagePath,
@@ -2030,7 +2163,7 @@ async function buildRunScreen(
   // Read the written contract FRESH per screen — earlier screens append to
   // .uix/context.md, so each screen sees the latest established tokens/components.
   const contextSlice = await readContextSlice(projectRoot);
-  let contract = buildWrittenContract(run, appPlan, contextSlice, fresh, canonical);
+  let contract = buildWrittenContract(run, appPlan, contextSlice, fresh, canonical, projectRoot);
   // T12 (RFC v2 §3 Phase 5/6): inject the AppAssets symbol inventory so the agent
   // references real exported assets via `AppAssets.<x>` from the START — never the
   // raw 'assets/...' literals in the IR (those point at pre-rename/deduped files
@@ -2041,7 +2174,7 @@ async function buildRunScreen(
   // route-slot context so the agent builds ONE widget instead of per-variant pages.
   // P1-core: run.screens rides along so each folded state/modal block carries its
   // OWN reference image path + bounded IR + presentation hint (not just a name).
-  if (canonicalCtx) contract = `${buildCanonicalContext(canonicalCtx.canonical, canonicalCtx.screen, run.screens, run.framework)}\n\n— — —\n${contract}`;
+  if (canonicalCtx) contract = `${buildCanonicalContext(canonicalCtx.canonical, canonicalCtx.screen, run.screens, run.framework, projectRoot)}\n\n— — —\n${contract}`;
   // P4: strip [preview:…] + RLE repeated siblings from the agent-facing IR.
   const cleanPacket = hygieneIR(screen.spec.packet) ?? screen.spec.packet;
   const sreq: BuildScreenReq = {
@@ -2216,14 +2349,15 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
             // modals into base screens, rebuilds frameMap, maps states/templates/flow).
             canonical = aiModelToCanonical(result.canonical);
           }
-          // Generate the deterministic skeleton (Flutter only for now; other
-          // frameworks still get canonical.json + the manifest, no router file).
+          // Generate the deterministic skeleton for EVERY framework: flutter →
+          // generateFlutterSkeleton; react / next → generateWebSkeleton (PG-02).
           // (Skeleton writes are additive — a built screen file is never clobbered.)
-          // generateFlutterSkeleton derives SEMANTIC file/class/route-const/route-PATH
-          // names and REWRITES canonical.screens[].route to the semantic path, so the
-          // canonical must be PERSISTED AFTER the skeleton runs (below) — otherwise the
-          // sidecar carries machine routes the router no longer uses.
-          if ((run.framework || 'flutter').toLowerCase() === 'flutter') {
+          // Both derive SEMANTIC file/class/route-const/route-PATH names and REWRITE
+          // canonical.screens[].route to the semantic path, so the canonical must be
+          // PERSISTED AFTER the skeleton runs (below) — otherwise the sidecar carries
+          // machine routes the router no longer uses.
+          const skFw = (run.framework || 'flutter').toLowerCase();
+          if (skFw === 'flutter') {
             try {
               setGenPhase(projectId, runId, 'Skeleton');
               // T35: reap stale screen files from a prior (different/smaller) build so
@@ -2235,11 +2369,20 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
             } catch (e: any) {
               await appendRunLog(projectId, runId, `[canon] skeleton generation failed (continuing): ${e?.message || 'unknown'}`);
             }
+          } else if (skFw === 'react' || skFw === 'next') {
+            try {
+              setGenPhase(projectId, runId, 'Skeleton');
+              const frameNames = Object.fromEntries(run.screens.map(s => [s.frameId, s.frameName]));
+              const sk = await generateWebSkeleton(projectRoot, canonical, skFw, { frameNames });
+              await appendRunLog(projectId, runId, `[canon] skeleton (${skFw}): ${sk.files.length} file(s), ${sk.routes.length} route(s), ${sk.previews.length} /_preview route(s), ${sk.modals.length} modal presenter slot(s)${sk.kept.length ? `; kept hand-written ${sk.kept.join(', ')}` : ''}`);
+              for (const w of sk.warnings) await appendRunLog(projectId, runId, `[canon] skeleton WARNING: ${w}`);
+            } catch (e: any) {
+              await appendRunLog(projectId, runId, `[canon] skeleton generation failed (continuing): ${e?.message || 'unknown'}`);
+            }
           } else {
-            // T15 (RFC §0.1 — no silent degrade): the write-locked router/theme/component
-            // skeleton is flutter-only. A react/web run gets NO skeleton — say so LOUDLY
-            // (canonical.json + the manifest are still written above) instead of a silent no-op.
-            await appendRunLog(projectId, runId, `[canon] skeleton SKIPPED — ${(run.framework || 'flutter')} not yet supported by this phase; flutter-only (no router/theme/component stubs were generated)`);
+            // T15 (RFC §0.1 — no silent degrade): no skeleton exists for this framework.
+            // Say so LOUDLY (canonical.json + the manifest are still written above).
+            await appendRunLog(projectId, runId, `[canon] skeleton SKIPPED — no skeleton generator for framework '${skFw}' (flutter, react and next have one)`);
           }
           // Persist AFTER the skeleton has rewritten canonical.screens[].route to the
           // SEMANTIC path — so the per-run sidecar + the live `.uix/canonical.json`
@@ -2306,15 +2449,19 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
     // the app run it, so the whole app was dead code behind a counter-demo main.dart.
     // Both are idempotent (skip when already done / never clobber a real main.dart).
     let themeTokens: ThemeTokens | undefined;
-    // T15 (RFC §0.1 — no silent degrade): the EXTRACT-FIRST theme file + main.dart
-    // router wiring + AppAssets repoint below are flutter-only. A react/web run gets
-    // a degraded design-system (description only, no importable token file) and NO
-    // main wiring — make that gap LOUD up-front so the user knows, rather than the
-    // theme/app-wiring phases quietly no-op'ing on a non-flutter build.
-    const isFlutterRun = (run.framework || 'flutter').toLowerCase() === 'flutter';
-    if (!isFlutterRun) {
-      await appendRunLog(projectId, runId, `[design-system] DEGRADED — ${(run.framework || 'flutter')} not yet supported by this phase; flutter-only. No importable AppTheme token file is generated (the agent gets a theme DESCRIPTION only).`);
-      await appendRunLog(projectId, runId, `[app-wiring] SKIPPED — ${(run.framework || 'flutter')} not yet supported by this phase; flutter-only. main.dart router wiring is a no-op (the entrypoint is NOT auto-wired).`);
+    // T15 (RFC §0.1 — no silent degrade): the EXTRACT-FIRST theme file is generated
+    // for flutter (lib/theme/app_theme.dart) and react/next (a typed AppTheme module +
+    // CSS custom properties at the CONTRACTS §5 location, PG-31). main.dart wiring is
+    // flutter's; the web entry is wired by the web skeleton. Any other framework gets
+    // neither — say so LOUDLY instead of the phases quietly no-op'ing.
+    const runFw = (run.framework || 'flutter').toLowerCase();
+    if (runFw === 'react' || runFw === 'next') {
+      // The web entry (react: src/main.tsx → App; next: app/layout.tsx) is wired by
+      // the web skeleton itself; ensureMainWired is the Flutter main.dart analogue.
+      await appendRunLog(projectId, runId, `[app-wiring] ${runFw}: the entrypoint is wired by the web skeleton (${runFw === 'react' ? 'src/main.tsx → App router + theme.css' : 'app/layout.tsx → theme.css + ModalHost'}) — main.dart wiring does not apply`);
+    } else if (runFw !== 'flutter') {
+      await appendRunLog(projectId, runId, `[design-system] DEGRADED — no design-system renderer for framework '${runFw}' (flutter, react and next have one). No importable token file is generated.`);
+      await appendRunLog(projectId, runId, `[app-wiring] SKIPPED — no entrypoint wiring for framework '${runFw}'.`);
     }
     setGenPhase(projectId, runId, 'Pre-flight', 'design system + token extract');
     try {
@@ -2586,7 +2733,7 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
         try {
           const canonForStamp = await readCanonical(projectRoot, runId);
           if (canonForStamp) {
-            const r = await restampCanonicalHeaders(projectRoot, canonForStamp);
+            const r = await restampCanonicalHeaders(projectRoot, canonForStamp, run.framework || 'flutter');
             if (r.stamped.length || r.missingFiles.length) {
               await appendRunLog(projectId, runId,
                 `[finalize] header re-stamp — restored canonicalId header on ${r.stamped.length} screen file(s)`
@@ -2623,7 +2770,12 @@ async function runAppLoop(projectId: string, runId: string): Promise<void> {
           reportFinalErrors = report.finalErrors;
           const applied = report.passes.filter(p => p.status === 'applied').length;
           const reverted = report.passes.filter(p => p.status === 'reverted').length;
-          await appendRunLog(projectId, runId, `[finalize] complete — ${applied} applied, ${reverted} reverted (analyze ${report.baselineAnalyze ?? 'n/a'} → ${report.finalAnalyze ?? 'n/a'})`);
+          const skippedPasses = report.passes.filter(p => p.status === 'skipped');
+          await appendRunLog(projectId, runId, `[finalize] complete — ${applied} applied, ${skippedPasses.length} skipped, ${reverted} reverted (analyze ${report.baselineAnalyze ?? 'n/a'} → ${report.finalAnalyze ?? 'n/a'})`);
+          for (const p of skippedPasses) await appendRunLog(projectId, runId, `[finalize]   ${p.name}: skipped — ${p.reason ?? 'no reason given'}`);
+          if (report.gate.typecheck.status === 'skipped' || report.gate.build.status === 'skipped') {
+            await appendRunLog(projectId, runId, `[finalize] WARNING: build gate incomplete — typecheck ${report.gate.typecheck.status}${report.gate.typecheck.reason ? ` (${report.gate.typecheck.reason})` : ''}; build ${report.gate.build.status}${report.gate.build.reason ? ` (${report.gate.build.reason})` : ''}`);
+          }
           // RFC §9.2 — checkpoint after finalize (the production passes are already
           // per-pass committed inside finalizeApp; this captures any net residue).
           await runCheckpoint(projectId, runId, projectRoot, 'phase finalize', `${applied} applied, ${reverted} reverted`);
@@ -2807,10 +2959,10 @@ async function retryScreenLoop(projectId: string, runId: string, frameId: string
     const contextSlice = await readContextSlice(projectRoot);
     // T12: a corrected-retry must also see the AppAssets inventory (so a re-build
     // emits symbols, not raw paths).
-    let contract = `${await assetInventoryBlock(projectRoot)}${buildWrittenContract(run, appPlan, contextSlice, run.freshSessions === true, canonical)}`;
+    let contract = `${await assetInventoryBlock(projectRoot)}${buildWrittenContract(run, appPlan, contextSlice, run.freshSessions === true, canonical, projectRoot)}`;
     // P1-core: a canonical lead's retry also carries its states/modals payload
     // (reference paths + IR + presentation hints) — same contract as the build.
-    if (canonical && canonScreen) contract = `${buildCanonicalContext(canonical, canonScreen, run.screens, run.framework)}\n\n— — —\n${contract}`;
+    if (canonical && canonScreen) contract = `${buildCanonicalContext(canonical, canonScreen, run.screens, run.framework, projectRoot)}\n\n— — —\n${contract}`;
     // The human correction is authoritative and injected up-front so the fresh pass
     // acts on it (the previous automated discrepancies didn't converge).
     const correction = `HUMAN CORRECTION (authoritative — the automated loop did NOT converge; apply this specific guidance):\n${note}`;
@@ -3287,16 +3439,19 @@ export function isAutoResumeSweepRunning(): boolean {
  * P5 (RFC §4.8): regenerate the write-locked skeleton after an approved amendment
  * bumps the plan version. Reuses the persisted canonical.json (the skeleton
  * generator is additive — it never clobbers a built screen file, only fills in the
- * router/route-table + missing stubs), so downstream screens see plan v+1. Flutter
- * only for now (matches generateFlutterSkeleton's scope). Best-effort + logged.
+ * router/route-table + missing stubs), so downstream screens see plan v+1. Every
+ * framework with a skeleton (flutter, react, next). Best-effort + logged.
  */
 async function regenSkeletonForRun(projectId: string, run: BuildRun): Promise<void> {
-  if (!run.canonical || (run.framework || 'flutter').toLowerCase() !== 'flutter') return;
+  const fw = (run.framework || 'flutter').toLowerCase();
+  if (!run.canonical || !['flutter', 'react', 'next'].includes(fw)) return;
   const projectRoot = resolveProjectRoot(projectId);
   if (!projectRoot || !fsSync.existsSync(projectRoot)) return;
   try {
     const canonical = (await readCanonical(projectRoot, run.id)) ?? canonicalizeRun(run.screens, run.flow);
-    const sk = await generateFlutterSkeleton(projectRoot, canonical);
+    const sk = fw === 'flutter'
+      ? await generateFlutterSkeleton(projectRoot, canonical)
+      : await generateWebSkeleton(projectRoot, canonical, fw, { frameNames: Object.fromEntries(run.screens.map(s => [s.frameId, s.frameName])) });
     await appendRunLog(projectId, run.id, `[amend] skeleton regenerated for plan v${run.planVersion ?? 1}: ${sk.files.length} file(s), ${sk.routes.length} route(s)`);
   } catch (e: any) {
     await appendRunLog(projectId, run.id, `[amend] skeleton regen failed (continuing): ${e?.message || 'unknown'}`);
@@ -3558,6 +3713,7 @@ export function registerScreenLoopRoutes(app: Express): void {
                 `[run] restart — clean slate: snapshot ${snapshotSha ? snapshotSha.slice(0, 8) : '(clean tree, HEAD recoverable)'}, ` +
                 `removed ${removedCount} generated file(s); regenerating from scratch`);
             }
+            for (const w of nuked.warnings ?? []) await appendRunLog(projectId, runId, `[run] restart — clean slate WARNING: ${w}`);
           } catch (e) {
             // Nuke is best-effort + never throws, but belt+braces: never break the handler.
             await appendRunLog(projectId, runId, `[run] restart — clean-slate nuke error (non-fatal): ${(e as Error).message}`);
@@ -3711,6 +3867,12 @@ export function registerScreenLoopRoutes(app: Express): void {
       const skippedPasses = report.passes.filter(p => p.status === 'skipped').length;
       await appendRunLog(projectId, runId,
         `[finalize] complete — ${applied} applied, ${skippedPasses} skipped, ${reverted} reverted (analyze ${report.baselineAnalyze ?? 'n/a'} → ${report.finalAnalyze ?? 'n/a'})`);
+      for (const p of report.passes.filter(x => x.status === 'skipped')) {
+        await appendRunLog(projectId, runId, `[finalize]   ${p.name}: skipped — ${p.reason ?? 'no reason given'}`);
+      }
+      if (!dryRun && (report.gate.typecheck.status === 'skipped' || report.gate.build.status === 'skipped')) {
+        await appendRunLog(projectId, runId, `[finalize] WARNING: build gate incomplete — typecheck ${report.gate.typecheck.status}${report.gate.typecheck.reason ? ` (${report.gate.typecheck.reason})` : ''}; build ${report.gate.build.status}${report.gate.build.reason ? ` (${report.gate.build.reason})` : ''}`);
+      }
 
       if (!dryRun) {
         await runCheckpoint(projectId, runId, projectRoot, 'phase finalize (standalone)', `${applied} applied, ${reverted} reverted`);

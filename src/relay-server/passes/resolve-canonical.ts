@@ -38,8 +38,9 @@
 //     is the embedded backdrop screen class resolved back to its canonicalId.
 //
 // FRAMEWORK-AGNOSTIC: detectFramework() (the 7a–7f contract) dispatches to a
-// per-framework ResolveStrategy. Flutter ships a full implementation; react is a
-// stubbed seam so the contract is visible (mirrors the six passes).
+// per-framework ResolveStrategy: flutter reads lib/; react and next derive through
+// the shared web resolver (web-app.ts) — see the web strategy at the end. An empty
+// derivation is never persisted over an existing canonical.
 //
 // IDEMPOTENT: identical lib/ → identical canonical (stable ordering + the same
 // structure-only contentHash hashCanonical()-style derivation reduce.ts uses).
@@ -54,7 +55,7 @@ import * as fsSync from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import type { AIModel } from '../ai-adapters';
-import { detectFramework, type Framework } from './component-extraction';
+import { detectFramework, type Framework } from './framework';
 import {
   canonicalIdFor,
   modalIdFor,
@@ -123,10 +124,16 @@ export interface DerivedCanonical {
  * drifted, frame-derived — canonical to .uix/canonical.frames.json.bak first),
  * unless opts.dryRun. Returns the CanonicalModel.
  */
+/** The resolved model plus whether it was written. An EMPTY derivation is never
+ *  persisted over .uix/canonical.json (PG-27): an unimplemented or failing strategy
+ *  used to replace a real 5-screen canonical with nothing, after which resolve-app
+ *  finalized against nothing and reported it applied. */
+export type ResolvedCanonical = CanonicalModel & { framework: Framework; persisted: boolean; skippedReason?: string };
+
 export async function resolveCanonicalFromCode(
   projectId: string,
   opts: ResolveCanonicalOptions,
-): Promise<CanonicalModel> {
+): Promise<ResolvedCanonical> {
   const { projectRoot } = opts;
   const framework = await detectFramework(projectRoot);
   const strategy = getStrategy(framework);
@@ -134,26 +141,24 @@ export async function resolveCanonicalFromCode(
   const figStorageKey = await readFigStorageKey(projectRoot);
 
   // No strategy (unknown framework) → an honest empty canonical + a warning, no crash.
-  if (!strategy) {
-    const empty = assemble(projectId, figStorageKey, {
-      screens: [], modals: [], templates: [], components: [],
-      entryCanonicalId: null, edges: [],
-      warnings: [`no resolve strategy for framework '${framework}' — empty canonical`],
-      mappingRate: { mapped: 0, total: 0 },
-    });
-    if (!opts.dryRun) await persist(projectRoot, empty);
-    return empty;
-  }
-
-  const derived = await strategy.derive(projectId, opts);
+  const derived: DerivedCanonical = strategy ? await strategy.derive(projectId, opts) : {
+    screens: [], modals: [], templates: [], components: [],
+    entryCanonicalId: null, edges: [],
+    warnings: [`no resolve strategy for framework '${framework}' — empty canonical`],
+    mappingRate: { mapped: 0, total: 0 },
+  };
   const canonical = assemble(projectId, figStorageKey, derived);
+  if (canonical.screens.length === 0) {
+    const skippedReason = `resolved 0 screens from the ${framework} code (${derived.warnings.join('; ') || 'no reason given'}) — .uix/canonical.json left untouched`;
+    return { ...canonical, framework, persisted: false, skippedReason };
+  }
   if (!opts.dryRun) await persist(projectRoot, canonical);
-  return canonical;
+  return { ...canonical, framework, persisted: !opts.dryRun };
 }
 
 function getStrategy(fw: Framework): ResolveStrategy | null {
   if (fw === 'flutter') return flutterStrategy;
-  if (fw === 'react') return reactStrategy;
+  if (fw === 'react' || fw === 'next') return webStrategy(fw);
   return null;
 }
 
@@ -960,23 +965,182 @@ function matchBrace(s: string, open: number): number {
 function escapeRe(s: string): string { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
 // =============================================================================
-// React strategy (seam only — flutter ships; react contract is stubbed)
+// Web strategy (react + next) — derive the canonical from the app through the
+// SHARED resolver (web-app.ts), never a bespoke filename regex (PG-27).
 // =============================================================================
+//
+//   • screens — every route the app serves (react: the ROUTES table + the <Routes>
+//     element map; next: the App/Pages Router directories), keyed by the stamped
+//     `// canonicalId:` header, else the frame route core (`/10-3` → c_10_3), else
+//     the component. A route mounting <PlaceholderScreen> is still a canonical
+//     screen (an unbuilt slot the flow points at); a verify preview never is.
+//   • modals — every folded-modal presenter the app declares
+//     (`export function showModal_<core>()`); its base is the screen whose code
+//     CALLS the presenter (a preview presenting it does not count — PG-11). A
+//     frame route whose core is a modal's is the modal's dead route, not a screen.
+//   • flow edges — collectNavTargets over each screen (+ the local components it
+//     imports), mapped route → canonical id; presenter call sites → overlay edges.
+//   • entry — ENTRY_ROUTE in the route table, else the `/` / `*` redirect (react)
+//     or the root page's redirect (next).
+// An EMPTY derivation is never persisted (see resolveCanonicalFromCode).
 
-const reactStrategy: ResolveStrategy = {
-  framework: 'react',
-  async derive(_projectId, _opts) {
-    // TODO(react-resolve): enumerate src/pages|screens route components (file-based
-    // router or a <Routes>/createBrowserRouter table) → canonical screens by their
-    // route + a header/marker id; src/components/* → canonical components by import
-    // usage; scan useNavigate()/navigate('/x')/<Link to>/router.push for flow edges;
-    // detect portal/dialog modals (Radix Dialog / a barrier overlay) for modals.
-    // Mirrors the flutter strategy. For now: empty + a warning.
-    return {
-      screens: [], modals: [], templates: [], components: [],
-      entryCanonicalId: null, edges: [],
-      warnings: ['react resolve strategy not implemented (flutter ships first)'],
-      mappingRate: { mapped: 0, total: 0 },
-    };
+const webStrategy = (framework: Framework): ResolveStrategy => ({
+  framework,
+  async derive(_projectId, opts) {
+    return deriveWeb(opts.projectRoot);
   },
-};
+});
+
+async function deriveWeb(projectRoot: string): Promise<DerivedCanonical> {
+  const web = await import('./web-app');
+  const warnings: string[] = [];
+  const empty = (w: string): DerivedCanonical => ({
+    screens: [], modals: [], templates: [], components: [], entryCanonicalId: null, edges: [],
+    warnings: [...warnings, w], mappingRate: { mapped: 0, total: 0 },
+  });
+  const ix = await web.loadWebApp(projectRoot);
+  if (!ix) return empty('no react/next package.json — cannot resolve a web app');
+  const files = await web.listWebSources(ix);
+  const srcOf = new Map<string, string>();
+  for (const f of files) srcOf.set(f, await fs.readFile(f, 'utf8').catch(() => ''));
+
+  // 1) Folded-modal presenters declared anywhere in the app.
+  const modalDecl = new Map<string, { file: string; component: string | null }>();
+  for (const [f, src] of srcOf) {
+    const re = /(?:export\s+)?(?:(?:async\s+)?function\s+|(?:const|let)\s+)showModal_([0-9]+_[0-9]+)\b/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(src)) !== null) {
+      if (!modalDecl.has(m[1])) modalDecl.set(m[1], { file: f, component: web.topLevelComponent(src) });
+    }
+  }
+
+  // 2) Screens: every served route of the app, one canonical screen per entry.
+  const entries = [...new Set([...ix.byRoute.values(), ...ix.byId.values()])];
+  const screens: CanonicalScreen[] = [];
+  const idByRoute = new Map<string, string>();
+  const idByFile = new Map<string, string>();
+  const screenFiles: Array<{ id: string; file: string; placeholder: boolean }> = [];
+  const seenIds = new Set<string>();
+  // A page that only redirects (Next's root `app/page.tsx` → redirect('/10-1')) is
+  // the entry route's alias, not a screen of the design.
+  const redirectOnly = (src: string): boolean => /\bredirect\s*\(|<Navigate\b/.test(src)
+    && !/<(?!Navigate\b)[A-Za-z]/.test(src.replace(/^import\s.*$/gm, ''));
+  for (const e of entries) {
+    if (!e.canonicalId && !e.placeholder && redirectOnly(srcOf.get(e.file) ?? '')) continue;
+    const core = e.canonicalId ? web.idCore(e.canonicalId) : (e.route ? web.routeCore(e.route) : null);
+    if (core && modalDecl.has(core) && !(e.canonicalId ?? '').startsWith('c_')) {
+      // The modal's own (dead) route — the modal is canonical as a modal.
+      if (e.route) idByRoute.set(e.route, `m_${core}`);
+      continue;
+    }
+    const canonicalId = e.canonicalId ?? (core ? canonicalIdFor(core) : canonicalIdFor(e.componentName.replace(/(Screen|Page)$/, '') || 'screen'));
+    if (seenIds.has(canonicalId)) { if (e.route) idByRoute.set(e.route, canonicalId); continue; }
+    seenIds.add(canonicalId);
+    const idc = web.idCore(canonicalId);
+    const frameId = /^[0-9]+_[0-9]+$/.test(idc) ? idc.replace('_', ':') : idc;
+    const route = e.route ?? routeForCanonicalId(canonicalId);
+    screens.push({
+      canonicalId, name: webScreenName(e.componentName, route), route, role: 'screen',
+      frameIds: [frameId], states: [{ id: 'default', frameId, brief: e.placeholder ? 'unbuilt placeholder route' : `${e.componentName} (${path.relative(projectRoot, e.file)})` }],
+    });
+    if (e.route) idByRoute.set(e.route, canonicalId);
+    // Also map every route this file is served at (a stamped page's header route and
+    // its file-system route can differ after a semantic rename).
+    for (const [r, x] of ix.byRoute) if (x === e) idByRoute.set(r, canonicalId);
+    if (!e.placeholder) { idByFile.set(e.file, canonicalId); screenFiles.push({ id: canonicalId, file: e.file, placeholder: false }); }
+    else screenFiles.push({ id: canonicalId, file: e.file, placeholder: true });
+  }
+  screens.sort((a, b) => a.canonicalId.localeCompare(b.canonicalId));
+  if (!screens.length) return empty(`no screens resolved from ${path.relative(projectRoot, ix.srcDir) || '.'} (no routed screen, no canonicalId header)`);
+
+  // 3) Modals: base = the (non-placeholder) screen whose code presents it.
+  const modals: CanonicalModal[] = [];
+  const edges: CanonicalFlowEdge[] = [];
+  const seenEdge = new Set<string>();
+  const addEdge = (from: string, to: string, kind: string, label?: string) => {
+    if (from === to) return;
+    const key = `${from}|${to}|${kind}`;
+    if (seenEdge.has(key)) return;
+    seenEdge.add(key);
+    edges.push({ from, to, kind, ...(label ? { label } : {}) });
+  };
+  for (const [core, d] of [...modalDecl.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+    const canonicalId = `m_${core}`;
+    const presenter = web.modalPresenterName(canonicalId);
+    const callers = screenFiles.filter((sf) => !sf.placeholder && web.countPresenterCalls(srcOf.get(sf.file) ?? '', presenter, canonicalId) > 0)
+      .map((sf) => sf.id).sort();
+    const frameId = core.replace('_', ':');
+    const name = d.component ?? presenter;
+    if (!callers.length) {
+      warnings.push(`modal ${canonicalId} (${path.relative(projectRoot, d.file)}) is declared but no screen presents it — base left empty (REAL gap)`);
+      modals.push({ canonicalId, name, frameId, baseCanonicalId: '', trigger: { fromScreen: '', edgeType: 'modal' } });
+      continue;
+    }
+    modals.push({ canonicalId, name, frameId, baseCanonicalId: callers[0], trigger: { fromScreen: callers[0], edgeType: 'modal' } });
+    for (const c of callers) addEdge(c, canonicalId, 'overlay');
+  }
+
+  // 4) Flow edges: each built screen's navigation (+ the local components it imports).
+  for (const sf of screenFiles) {
+    if (sf.placeholder) continue;
+    const src = srcOf.get(sf.file) ?? '';
+    const targets = web.collectNavTargets(src, ix.constToRoute);
+    for (const imp of web.parseImports(src, sf.file).values()) {
+      if (idByFile.has(imp) || !srcOf.has(imp)) continue;          // another screen, or a package
+      targets.push(...web.collectNavTargets(srcOf.get(imp) ?? '', ix.constToRoute));
+    }
+    for (const t of targets) {
+      const to = t.route ? idByRoute.get(t.route) ?? null : null;
+      if (!to) continue;
+      addEdge(sf.id, to, to.startsWith('m_') ? 'overlay' : (t.replaces ? 'replace' : 'push'));
+    }
+  }
+  edges.sort((a, b) => (a.from.localeCompare(b.from)) || (a.to.localeCompare(b.to)) || a.kind.localeCompare(b.kind));
+
+  // 5) Entry route.
+  let entryRoute: string | null = null;
+  const routesSrc = ix.routesFile ? await fs.readFile(ix.routesFile, 'utf8').catch(() => '') : '';
+  const em = /ENTRY_ROUTE[^=]*=\s*(?:ROUTES\.([A-Za-z0-9_$]+)|['"](\/[^'"]*)['"])/.exec(routesSrc);
+  if (em) entryRoute = em[1] ? ix.constToRoute.get(em[1]) ?? null : em[2] ?? null;
+  if (!entryRoute && ix.routerFile) {
+    const app = srcOf.get(ix.routerFile) ?? '';
+    const rm = /<Route\s+(?:index|path=["'](?:\/|\*)["'])[^>]*element=\{\s*<Navigate\s+to=(?:\{\s*ROUTES\.([A-Za-z0-9_$]+)\s*\}|["'](\/[^"']*)["'])/.exec(app);
+    if (rm) entryRoute = rm[1] ? ix.constToRoute.get(rm[1]) ?? null : rm[2] ?? null;
+  }
+  if (!entryRoute && ix.appDir) {
+    const root = ['page.tsx', 'page.jsx', 'page.ts', 'page.js'].map((p) => path.join(ix.appDir!, p)).find((p) => srcOf.has(p));
+    const nav = root ? web.collectNavTargets(srcOf.get(root) ?? '', ix.constToRoute)[0] : undefined;
+    if (nav?.route) entryRoute = nav.route;
+  }
+  let entryCanonicalId = entryRoute ? idByRoute.get(entryRoute) ?? null : null;
+  if (!entryCanonicalId) {
+    entryCanonicalId = screens[0].canonicalId;
+    warnings.push('no entry route resolved (no ENTRY_ROUTE, root redirect or root page redirect) — defaulted entry to the first screen by id');
+  }
+
+  // 6) Components: the pipeline's components dir, used-in by importing screens.
+  const components: CanonicalComponent[] = [];
+  for (const f of files) {
+    if (!f.startsWith(ix.componentsDir + path.sep) || idByFile.has(f)) continue;
+    const src = srcOf.get(f) ?? '';
+    if (web.readHeader(src) || /showModal_[0-9]+_[0-9]+/.test(src)) continue;
+    const comp = web.topLevelComponent(src);
+    if (!comp || /^Placeholder/.test(comp)) continue;
+    const usedIn = screenFiles.filter((sf) => !sf.placeholder && web.parseImports(srcOf.get(sf.file) ?? '', sf.file).get(comp) === f).map((sf) => sf.id).sort();
+    if (!usedIn.length) continue;
+    components.push({ canonicalName: comp, kind: componentKind(comp), usedIn, count: usedIn.length });
+  }
+  components.sort((a, b) => a.canonicalName.localeCompare(b.canonicalName));
+
+  if (!edges.length) warnings.push('0 flow edges derived from code — no screen navigates to a known route or presents a modal');
+  const total = screens.length + modals.length;
+  const mapped = screens.length + modals.filter((m) => m.baseCanonicalId).length;
+  return { screens, modals, templates: [], components, entryCanonicalId, edges, warnings, mappingRate: { mapped, total } };
+}
+
+/** `LoginScreen` → `loginScreen`; a machine name keeps the route (`/10-3` → `screen10_3`). */
+function webScreenName(component: string, route: string): string {
+  const base = component.replace(/(Screen|Page)$/, '');
+  if (base && !/^(Page|Placeholder)/.test(component)) return `${base.charAt(0).toLowerCase()}${base.slice(1)}Screen`;
+  return `screen${route.replace(/[^a-zA-Z0-9]+/g, '_')}`;
+}

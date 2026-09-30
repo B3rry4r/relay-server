@@ -10,7 +10,8 @@
  *   • Navigation is `navigate(ROUTES.x)`, `<Link to={ROUTES.x}>`, `router.push('/x')`.
  *   • A nav bar builds links from a data array, so the target never appears at the
  *     call site — only the route constant does. Both are collected.
- *   • Tabs are `<Route element={<AppShell/>}>` children, not a pushed route.
+ *   • Tabs are `<Route element={<AppShell/>}>` children (react) or pages under a
+ *     `layout.tsx` whose nav links to them (next), not a pushed route.
  *   • A modal is folded into its base and presented via `showModal_<core>()`.
  */
 
@@ -236,6 +237,19 @@ export async function verifyWeb(
     }
 
     if (!toScreen) {
+      // A canonical screen FROM links to, but no page/route serves it at all (never
+      // built, or its placeholder page was stripped by 7h). Same verdict as a
+      // placeholder target: the user taps and lands nowhere. Grading it `unmapped`
+      // here but `missing` while the placeholder existed flipped the verdict between
+      // two finalize runs.
+      const canonRoute = toCanon?.route ?? null;
+      if (canonRoute && surface.routes.has(canonRoute)) {
+        findings.push({
+          ...base, status: 'missing', toRoute: canonRoute,
+          detail: `HIGH: FROM navigates to ${canonRoute}, but no built screen serves TO ${edge.to} — the screen was never built`,
+        });
+        continue;
+      }
       findings.push({ ...base, detail: `TO ${edge.to} has no built screen file — cannot verify` });
       continue;
     }
@@ -260,12 +274,26 @@ export async function verifyWeb(
     // screen. So the question is never "does Disputes navigate to Finance" — it is
     // "does the shell host Finance, and does the shell's nav link to it".
     if (edge.kind === 'tab') {
-      const hosted = shellHosts(appSrc, toScreen.componentName);
-      const shellLinks = !!toRoute && !!shellSurface
-        && (shellSurface.routes.has(toRoute)
-          || (!!toScreen.routeConst && shellSurface.consts.has(toScreen.routeConst)));
+      // react: the shell is the `<Route element={<AppShell/>}>` layout route in App.tsx.
+      // next (PG-13): the shell is a `layout.tsx` above the TO page in the App Router
+      // (the route group's layout rendering the nav); its surface — the layout plus the
+      // nav component it composes — must link to the tab.
+      let hosted: boolean;
+      let tabShell: NavSurface | null = shellSurface;
+      let shellName = 'the shell';
+      if (ix.kind === 'next') {
+        const lay = await hostingLayout(ix, toScreen.file, toRoute, toScreen.routeConst, readSrc);
+        hosted = !!lay;
+        tabShell = lay?.surface ?? null;
+        if (lay) shellName = rel(projectRoot, lay.file);
+      } else {
+        hosted = shellHosts(appSrc, toScreen.componentName);
+      }
+      const shellLinks = !!toRoute && !!tabShell
+        && (tabShell.routes.has(toRoute)
+          || (!!toScreen.routeConst && tabShell.consts.has(toScreen.routeConst)));
       if (hosted && shellLinks) {
-        findings.push({ ...base, status: 'wired', detail: `tab edge — the shell hosts <${toScreen.componentName}> and its nav links to ${toRoute}` });
+        findings.push({ ...base, status: 'wired', detail: `tab edge — ${shellName} hosts <${toScreen.componentName}> and its nav links to ${toRoute}` });
         continue;
       }
       if (!hosted && landsOnTo) {
@@ -326,6 +354,26 @@ export async function verifyWeb(
       // dressed up as an auto-fix. Hoisting a `useNavigate()` into an unknown
       // component body is not a transformation we can make blind.
       const navInScope = /\bconst\s+navigate\s*=\s*useNavigate\s*\(\s*\)/.test(fromSrc);
+      // Next (PG-14): `const router = useRouter()` from next/navigation (or the Pages
+      // Router's next/router) in scope → `router.push('<TO route>')`, the route being
+      // the URL the TO page is actually served at. Same drift guard as react.
+      const routerInScope = ix.kind === 'next'
+        && /\bconst\s+router\s*=\s*useRouter\s*\(\s*\)/.test(fromSrc)
+        && /from\s*['"]next\/(?:navigation|router)['"]/.test(fromSrc);
+      if (!opts.dryRun && !opts.noAutoFix && routerInScope && toRoute) {
+        const target = toConst && /\bimport\s*\{[^}]*\bROUTES\b[^}]*\}\s*from/.test(fromSrc) ? `ROUTES.${toConst}` : `'${toRoute.replace(/'/g, "\\'")}'`;
+        const wired = stillAt(fromSrc, named) ? `${fromSrc.slice(0, named.start)}${named.handler}={() => router.push(${target})}${fromSrc.slice(named.end)}` : null;
+        if (wired) {
+          srcCache.set(fromScreen.file, wired);
+          await fs.writeFile(fromScreen.file, wired, 'utf-8');
+          autoFixes++;
+          findings.push({
+            ...base, status: 'wired', autoFixed: true, elementHow: 'deterministic',
+            detail: `dead trigger '${edge.label}' auto-wired to router.push(${target}) (${toRoute})`,
+          });
+          continue;
+        }
+      }
       if (!opts.dryRun && !opts.noAutoFix && toConst && ix.routesFile && navInScope) {
         const wired = wireDeadHandler(fromSrc, named, toConst);
         if (wired) {
@@ -340,9 +388,11 @@ export async function verifyWeb(
           continue;
         }
       }
-      const why = !toConst ? ' — TO has no route constant to wire it to'
-        : !navInScope ? ' — not auto-wired: no `const navigate = useNavigate()` in scope'
-          : '';
+      const why = ix.kind === 'next'
+        ? (!routerInScope ? ' — not auto-wired: no `const router = useRouter()` (next/navigation) in scope' : !toRoute ? ' — TO has no served route to wire it to' : '')
+        : !toConst ? ' — TO has no route constant to wire it to'
+          : !navInScope ? ' — not auto-wired: no `const navigate = useNavigate()` in scope'
+            : '';
       findings.push({
         ...base, status: 'dead-trigger', elementHow: 'deterministic',
         detail: `element '${edge.label}' exists but its ${named.handler} handler is empty (${named.kind})${why}`,
@@ -370,6 +420,31 @@ export async function verifyWeb(
   }
 
   return { findings, autoFixes, screensMapped: mapped.size, screensReferenced: referenced.size };
+}
+
+/** Drift guard: the dead handler's exact text is still at its recorded offset. */
+const stillAt = (text: string, dead: ReturnType<typeof findDeadHandlers>[number]): boolean => text.slice(dead.start, dead.end) === dead.text;
+
+/** Next: the `layout.tsx` hosting a page — the nearest layout above the TO page (up to
+ *  the app dir) whose surface (the layout plus what it imports: the nav component)
+ *  links to the TO route. Null when no layout above the page links to it. */
+async function hostingLayout(
+  ix: WebAppIndex, pageFile: string, route: string | null, routeConst: string | null,
+  read: (f: string) => Promise<string>,
+): Promise<{ file: string; surface: NavSurface } | null> {
+  if (!ix.appDir || !route) return null;
+  let dir = path.dirname(pageFile);
+  while (dir === ix.appDir || dir.startsWith(ix.appDir + path.sep)) {
+    for (const ext of ['tsx', 'jsx', 'ts', 'js']) {
+      const lay = path.join(dir, `layout.${ext}`);
+      if (!fsSync.existsSync(lay)) continue;
+      const surface = await surfaceForScreen(lay, await read(lay), ix, read);
+      if (surface.routes.has(route) || (!!routeConst && surface.consts.has(routeConst))) return { file: lay, surface };
+    }
+    if (dir === ix.appDir) break;
+    dir = path.dirname(dir);
+  }
+  return null;
 }
 
 /** Replace `onClick={() => {}}` with a real navigate call. Drift-guarded: the exact

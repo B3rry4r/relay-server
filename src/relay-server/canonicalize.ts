@@ -34,6 +34,8 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import type { RunFlow, RunScreen } from './build-run-store';
 import { deriveSemanticIdentifiers, tokenizeName } from './semantic-names';
+import { detectFramework } from './passes/framework';
+import { loadWebApp, resolveScreen, stampHeader } from './passes/web-app';
 
 // ── canonical.json schema (RFC §4.1) ─────────────────────────────────────────
 export interface CanonicalState { id: string; frameId: string }
@@ -565,6 +567,12 @@ export async function syncLiveCanonical(projectRoot: string, runId: string, cano
 // The screen→file mapping is the SAME deterministic convention the skeleton uses
 // (`lib/screens/screen_<canonicalId-without-c_>.dart`), so this needs no on-disk
 // header to FIND the file — it can recover the header even when the agent dropped it.
+//
+// WEB (react / next, PG-03): the screen file is found through the shared resolver
+// (passes/web-app.ts — the router table / Next's file-system routes, never a guess
+// from a file name) and stamped `// canonicalId: <id> route: <route>`; on Next the
+// header goes ABOVE 'use client' (a directive may be preceded by comments). A route
+// that still mounts a placeholder is not a built screen and is not stamped.
 export interface RestampResult {
   /** files that were missing the header and got it re-stamped. */
   stamped: string[];
@@ -574,7 +582,10 @@ export interface RestampResult {
 export async function restampCanonicalHeaders(
   projectRoot: string,
   canonical: Canonical,
+  framework?: string,
 ): Promise<RestampResult> {
+  const fw = (framework || await detectFramework(projectRoot)).toLowerCase();
+  if (fw === 'react' || fw === 'next') return restampWebHeaders(projectRoot, canonical);
   const stamped: string[] = [];
   const missingFiles: string[] = [];
   // The skeleton names files SEMANTICALLY (login_screen.dart), so locate each
@@ -606,6 +617,29 @@ export async function restampCanonicalHeaders(
       '\n';
     await fs.writeFile(abs, header + src, 'utf-8');
     stamped.push(rel);
+  }
+  return { stamped, missingFiles };
+}
+
+/** Web half of restampCanonicalHeaders: resolve each canonical screen through the
+ *  shared web resolver and stamp the header on its built file. Idempotent. */
+async function restampWebHeaders(projectRoot: string, canonical: Canonical): Promise<RestampResult> {
+  const stamped: string[] = [];
+  const missingFiles: string[] = [];
+  const ix = await loadWebApp(projectRoot);
+  if (!ix) return { stamped, missingFiles: canonical.screens.map(c => c.canonicalId) };
+  for (const c of canonical.screens) {
+    const hit = resolveScreen(ix, c.canonicalId, c.frameIds)
+      ?? (c.route ? ix.byRoute.get(c.route) ?? null : null);
+    // A placeholder route (or one whose "file" is the router table itself) has no
+    // screen file to stamp.
+    if (!hit || hit.placeholder || hit.file === ix.routerFile) { missingFiles.push(c.canonicalId); continue; }
+    let src: string;
+    try { src = await fs.readFile(hit.file, 'utf-8'); } catch { missingFiles.push(c.canonicalId); continue; }
+    const next = stampHeader(src, c.canonicalId, c.route || hit.route || null);
+    if (next === src) continue;                  // already stamped → idempotent no-op
+    await fs.writeFile(hit.file, next, 'utf-8');
+    stamped.push(path.relative(projectRoot, hit.file).split(path.sep).join('/'));
   }
   return { stamped, missingFiles };
 }
@@ -666,11 +700,13 @@ export async function cleanOrphanScreens(projectRoot: string, canonical: Canonic
 // .uix/refs, .uix/asset-map.json, the .fig/inputs, and .uix/canonical.json (canon
 // rewrites it anyway).
 //
-// Non-flutter: NO-OP — the skeleton is flutter-only; we never guess another
-// framework's surface.
+// react / next (PG-34): web-skeleton.nukeWebAppSurface removes the generated
+// surface by what the pipeline itself stamped — `// canonicalId:` screen headers,
+// pipeline markers (GENERATED SKELETON, design system, asset pass, preview entries)
+// and the verify preview routes — never an unmarked (hand-authored) file.
 //
 // Idempotent + robust: a missing dir/file is fine and never throws.
-export interface NukeResult { removedDirs: string[]; removedFiles: string[]; skipped?: string }
+export interface NukeResult { removedDirs: string[]; removedFiles: string[]; skipped?: string; warnings?: string[] }
 
 /** The per-build code reports under .uix/ a restart must drop so a stale report
  *  doesn't make a gated pass (e.g. finalize) skip on the rebuild. */
@@ -683,14 +719,37 @@ const NUKE_UIX_REPORTS = [
   'last-gen.json',
 ] as const;
 
+async function removeStaleUixReports(projectRoot: string, removedFiles: string[]): Promise<void> {
+  for (const name of NUKE_UIX_REPORTS) {
+    const rel = path.join('.uix', name);
+    const abs = path.join(projectRoot, rel);
+    try {
+      const existed = await fs.stat(abs).then(() => true, () => false);
+      if (existed) { await fs.rm(abs, { force: true }); removedFiles.push(rel); }
+    } catch { /* best-effort */ }
+  }
+}
+
 export async function nukeGeneratedAppSurface(
   projectRoot: string, framework: string,
 ): Promise<NukeResult> {
   const removedDirs: string[] = [];
   const removedFiles: string[] = [];
-  if ((framework || 'flutter').toLowerCase() !== 'flutter') {
-    // Skeleton is flutter-only — don't guess any other framework's generated surface.
-    return { removedDirs, removedFiles, skipped: `non-flutter (${framework}) — skeleton is flutter-only; nothing removed` };
+  const fw = (framework || 'flutter').toLowerCase();
+  if (fw === 'react' || fw === 'next') {
+    const { nukeWebAppSurface } = await import('./web-skeleton');
+    const w = await nukeWebAppSurface(projectRoot).catch((e: Error) => ({ removed: [] as string[], prunedDirs: [] as string[], keptImporting: [] as string[], keptImports: [] as Array<{ file: string; imports: string[] }>, error: e.message }));
+    removedFiles.push(...w.removed);
+    removedDirs.push(...w.prunedDirs);
+    await removeStaleUixReports(projectRoot, removedFiles);
+    const warnings = [
+      ...('error' in w ? [`web clean slate failed part-way: ${(w as { error: string }).error}`] : []),
+      ...w.keptImports.map((k) => `${k.file} is not pipeline-generated (no header/marker) and was kept, but it imports a removed generated file (${k.imports.join(', ')}) — it will not compile until the rebuild regenerates it or a human edits it`),
+    ];
+    return { removedDirs, removedFiles, ...(warnings.length ? { warnings } : {}) };
+  }
+  if (fw !== 'flutter') {
+    return { removedDirs, removedFiles, skipped: `framework '${framework}' has no generated-surface contract — nothing removed` };
   }
   // 1. The entire generated lib/ tree.
   const libDir = path.join(projectRoot, 'lib');
@@ -702,14 +761,7 @@ export async function nukeGeneratedAppSurface(
     }
   } catch { /* best-effort: a missing/locked lib never fails the restart */ }
   // 2. Stale per-build code reports under .uix/.
-  for (const name of NUKE_UIX_REPORTS) {
-    const rel = path.join('.uix', name);
-    const abs = path.join(projectRoot, rel);
-    try {
-      const existed = await fs.stat(abs).then(() => true, () => false);
-      if (existed) { await fs.rm(abs, { force: true }); removedFiles.push(rel); }
-    } catch { /* best-effort */ }
-  }
+  await removeStaleUixReports(projectRoot, removedFiles);
   return { removedDirs, removedFiles };
 }
 
@@ -717,10 +769,9 @@ export async function nukeGeneratedAppSurface(
 // The server generates and WRITE-LOCKS: the router (every canonical route, real
 // builder or explicit stub), the theme/token file, and empty shared-component
 // stubs. Per-screen builds import these and only ADD their own screen file + fill
-// their pre-existing route slot. Today this targets Flutter (the primary
-// framework); other frameworks get the canonical.json + a manifest only.
-// TODO(P3): emit React/Next + other-framework skeletons; until then non-flutter
-// runs still get canonical screens + the manifest, just no generated router file.
+// their pre-existing route slot. Flutter is generated below; React (Vite +
+// react-router) and Next (App Router) by web-skeleton.ts → generateWebSkeleton,
+// re-exported here so every framework's skeleton is reached from one module.
 
 const pascal = (s: string): string =>
   (s.replace(/[^a-zA-Z0-9]+/g, ' ').trim().split(/\s+/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join('') || 'Screen');
@@ -843,10 +894,35 @@ function tabLabelFor(name: string): string {
  *  - lib/app_router.dart : MaterialApp with onGenerateRoute over the table
  *  - lib/theme/app_theme.dart : a theme/token stub (filled by the digest planner)
  *  - lib/screens/<slug>.dart : a write-locked stub per canonical screen
- *  - lib/components/<id>.dart : an empty shared-component stub per component
+ *  - (no component files: components are a contract, see component-contract.ts)
  * Stubs are intentionally minimal + clearly marked so per-screen builds replace
  * the screen body while keeping the route slot + imports stable.
  */
+/** flutter_svg is a GUARANTEED dependency of a pipeline Flutter app (readability F8):
+ *  the design's icons ship as SVG, and without the package an agent cannot render
+ *  them — Ping hand-drew 32 icons as CustomPainter code instead. Adds the dependency
+ *  under `dependencies:` when it is missing; never touches a pubspec that has it.
+ *  Returns true when pubspec.yaml was changed. */
+export const FLUTTER_SVG_CONSTRAINT = '^2.0.10+1';
+export async function ensureFlutterSvgDependency(projectRoot: string): Promise<boolean> {
+  const file = path.join(projectRoot, 'pubspec.yaml');
+  let src: string;
+  try { src = await fs.readFile(file, 'utf-8'); } catch { return false; }
+  if (/^\s+flutter_svg\s*:/m.test(src)) return false;
+  const depLine = /^dependencies:[ \t]*\n/m.exec(src);
+  if (!depLine) return false;
+  const after = depLine.index + depLine[0].length;
+  const sdkFlutter = /^([ \t]+)flutter:[ \t]*\n[ \t]+sdk:[ \t]*flutter[ \t]*\n/m.exec(src.slice(after));
+  // Only when that `flutter: sdk: flutter` entry is the FIRST thing in the block
+  // (not the dev_dependencies one further down).
+  const inBlock = sdkFlutter && !/^\S/m.test(src.slice(after, after + sdkFlutter.index));
+  const indent = inBlock ? sdkFlutter![1] : '  ';
+  const insertAt = inBlock ? after + sdkFlutter!.index + sdkFlutter![0].length : after;
+  const next = `${src.slice(0, insertAt)}${indent}flutter_svg: ${FLUTTER_SVG_CONSTRAINT}\n${src.slice(insertAt)}`;
+  await fs.writeFile(file, next, 'utf-8');
+  return true;
+}
+
 export async function generateFlutterSkeleton(projectRoot: string, canonical: Canonical): Promise<SkeletonResult> {
   const libDir = path.join(projectRoot, 'lib');
   const screensDir = path.join(libDir, 'screens');
@@ -857,6 +933,7 @@ export async function generateFlutterSkeleton(projectRoot: string, canonical: Ca
   await fs.mkdir(themeDir, { recursive: true });
 
   const files: string[] = [];
+  if (await ensureFlutterSvgDependency(projectRoot)) files.push('pubspec.yaml');
   const routes: SkeletonResult['routes'] = [];
   // SEMANTIC plan: file base / class / route const / route PATH for every screen,
   // derived from the human name (machine/frame-code names fall back to `screen`),
@@ -896,23 +973,12 @@ class ${className} extends StatelessWidget {
     routes.push({ canonicalId: c.canonicalId, route: c.route, className, routeConst: sem.routeConst, file: rel });
   }
 
-  // Shared-component stubs.
-  for (const cmp of canonical.components) {
-    const className = pascal(cmp.name) + 'Widget';
-    const rel = path.join('lib', 'components', `${cmp.id}.dart`);
-    const stub = `// GENERATED SKELETON — shared component stub (write-locked API surface).
-// componentId: ${cmp.id}
-import 'package:flutter/material.dart';
-
-class ${className} extends StatelessWidget {
-  const ${className}({super.key});
-  @override
-  Widget build(BuildContext context) => const SizedBox.shrink();
-}
-`;
-    try { await fs.access(path.join(projectRoot, rel)); }
-    catch { await fs.writeFile(path.join(projectRoot, rel), stub, 'utf-8'); files.push(rel); }
-  }
+  // Shared components: NO stub files (readability F1). A write-locked
+  // `SizedBox.shrink()` stub per component (cmp_<name>_<i>.dart, class <Name>Widget)
+  // gave agents nothing to reuse — every screen re-implemented the UI privately and
+  // 25 dead stubs shipped. The component contract (component-contract.ts) names the
+  // ONE path + class each component lives at; the first screen that renders one
+  // creates it there, later screens are told it exists (componentReuseBlock).
 
   // P2: APP SHELL for the tab cluster. `kind:'tab'` edges are ONE persistent
   // bottom-nav shell: the tab screens live side-by-side in an IndexedStack behind
@@ -1078,3 +1144,6 @@ export function canonicalizeRun(screens: RunScreen[], flow?: RunFlow): Canonical
   }));
   return buildCanonical(frames, flow);
 }
+
+// The web (react / next) skeleton — GEN_PHASE 3 for the web targets (PG-02).
+export { generateWebSkeleton, isWebSkeletonStub, type WebSkeletonResult } from './web-skeleton';

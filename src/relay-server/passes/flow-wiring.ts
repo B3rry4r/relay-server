@@ -52,10 +52,14 @@ import type { AIModel } from '../ai-adapters';
 import { tokenizeName } from '../semantic-names';
 import { verifyWeb, type WebFlow, type WebCanonScreen, type WebCanonModal } from './flow-wiring-web';
 import { modalPresenterName } from '../design-system';
+import { dartPresentation, dartPresenterName, stripDartPresenterDeclarations } from './dart-presenters';
+import { detectFramework, type Framework } from './framework';
 
 // ── Public contract ──────────────────────────────────────────────────────────
 
-export type Framework = 'flutter' | 'react' | 'next' | 'unknown';
+/** One shared detector (./framework) — never a local copy that can drift. */
+export { detectFramework };
+export type { Framework };
 
 export type EdgeStatus =
   | 'wired'         // a nav call from FROM lands on TO's route
@@ -168,6 +172,8 @@ export interface FlowWiringResult {
   /** Path the report was written to (null if noReport). */
   reportPath: string | null;
   dryRun: boolean;
+  /** Set when the pass had no input / no support — finalize records `skipped` with it. */
+  skippedReason?: string;
 }
 
 // ── Canonical model (subset we read) ─────────────────────────────────────────
@@ -254,24 +260,6 @@ async function readCanonical(root: string): Promise<CanonModel | null> {
   }
 }
 
-// ── Framework detection (same contract as 7a/7b/7c) ──────────────────────────
-
-export async function detectFramework(projectRoot: string): Promise<Framework> {
-  const has = async (p: string) => {
-    try { await fs.access(path.join(projectRoot, p)); return true; } catch { return false; }
-  };
-  if (await has('pubspec.yaml')) return 'flutter';
-  if (await has('package.json')) {
-    try {
-      const pkg = JSON.parse(await fs.readFile(path.join(projectRoot, 'package.json'), 'utf8'));
-      const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
-      if (deps.next) return 'next';
-      if (deps.react) return 'react';
-    } catch { /* fall through */ }
-  }
-  return 'unknown';
-}
-
 // ── Per-framework strategy seam ──────────────────────────────────────────────
 
 export interface FlowStrategy {
@@ -311,7 +299,10 @@ export async function verifyFlowWiring(projectId: string, opts: FlowWiringOption
   if (!canonical || !canonical.flow || !Array.isArray(canonical.flow.edges)) {
     const report = emptyReport([], 0, 0, 0);
     const reportPath = await maybeWriteReport(projectRoot, report, opts);
-    return { report, autoFixesApplied: 0, reportPath, dryRun: !!opts.dryRun };
+    return {
+      report, autoFixesApplied: 0, reportPath, dryRun: !!opts.dryRun,
+      skippedReason: !canonical ? 'no .uix/canonical.json — no flow to verify' : 'canonical has no flow edges to verify',
+    };
   }
 
   if (!strategy) {
@@ -323,7 +314,7 @@ export async function verifyFlowWiring(projectId: string, opts: FlowWiringOption
     }));
     const report = emptyReport(findings, 0, 0, 0);
     const reportPath = await maybeWriteReport(projectRoot, report, opts);
-    return { report, autoFixesApplied: 0, reportPath, dryRun: !!opts.dryRun };
+    return { report, autoFixesApplied: 0, reportPath, dryRun: !!opts.dryRun, skippedReason: `no flow-wiring strategy for framework '${framework}'` };
   }
 
   let flow = canonical.flow;
@@ -336,7 +327,10 @@ export async function verifyFlowWiring(projectId: string, opts: FlowWiringOption
 
   const report = emptyReport(findings, autoFixes, screensMapped, screensReferenced);
   const reportPath = await maybeWriteReport(projectRoot, report, opts);
-  return { report, autoFixesApplied: autoFixes, reportPath, dryRun: !!opts.dryRun };
+  return {
+    report, autoFixesApplied: autoFixes, reportPath, dryRun: !!opts.dryRun,
+    ...(flow.edges.length === 0 ? { skippedReason: 'canonical has no flow edges to verify' } : {}),
+  };
 }
 
 function getStrategy(fw: Framework): FlowStrategy | null {
@@ -365,7 +359,9 @@ function summarize(findings: EdgeFinding[], autoFixes: number, mapped: number, r
 }
 
 async function maybeWriteReport(projectRoot: string, report: FlowWiringReport, opts: FlowWiringOptions): Promise<string | null> {
-  if (opts.noReport) return null;
+  // A dry run describes a build that was never applied: it must not leave a
+  // report next to the real ones (PG-38).
+  if (opts.noReport || opts.dryRun) return null;
   const abs = opts.reportPath ?? path.join(projectRoot, '.uix', 'flow-wiring-report.json');
   try {
     await fs.mkdir(path.dirname(abs), { recursive: true });
@@ -388,6 +384,15 @@ interface ResolvedScreen {
   widgetClass: string;
   /** route string the screen is registered under (from its header). */
   route: string | null;
+  /** Still the skeleton's write-locked stub (`TODO(build)`): a route slot, not a
+   *  built screen (PG-12). The web resolver's `placeholder` flag, on Dart. */
+  placeholder?: boolean;
+}
+
+/** A Dart screen file the per-screen build never replaced: the skeleton writes
+ *  `// GENERATED SKELETON — write-locked route slot` and a `TODO(build)` body. */
+export function isDartSkeletonStub(src: string): boolean {
+  return /GENERATED SKELETON\s*—\s*write-locked route slot/.test(src) || /\bTODO\(build\)/.test(src);
 }
 
 const flutterStrategy: FlowStrategy = {
@@ -419,7 +424,7 @@ async function verifyFlutter(
     if (!cls) continue;
     const headerId = hm?.[1];
     const route = hm?.[2] ?? null;
-    const resolved: ResolvedScreen = { canonicalId: headerId ?? '', file: abs, widgetClass: cls, route };
+    const resolved: ResolvedScreen = { canonicalId: headerId ?? '', file: abs, widgetClass: cls, route, placeholder: isDartSkeletonStub(src) };
     if (headerId) builtById.set(idCore(headerId), resolved);
     if (route) builtByRoute.set(route, resolved);
   }
@@ -462,6 +467,9 @@ async function verifyFlutter(
   // reported `unmapped` (that mislabels correct folded-modal handling as drift).
   // Resolve a modal id → {its base's built file, the presenter} when folded.
   const foldedModalCache = new Map<string, { baseFile: string; presenter: string; presenterCount: number } | null>();
+  // A modal whose base DECLARES its presenter but never calls it (only the verify
+  // preview does) — kept so the gap is worded as what it is (PG-11).
+  const declaredOnly = new Map<string, { baseFile: string; presenter: string }>();
   const resolveFoldedModal = async (toId: string): Promise<{ baseFile: string; presenter: string; presenterCount: number } | null> => {
     if (foldedModalCache.has(toId)) return foldedModalCache.get(toId)!;
     const modal = modals.find((m) => m.canonicalId === toId);
@@ -472,13 +480,18 @@ async function verifyFlutter(
       if (baseScreen) {
         try {
           const baseSrc = await readSrc(baseScreen.file);
-          // T32: COUNT presenter call-sites — one showModal*/showDialog folds in ONE
-          // modal. A base hosting several folded modals must present each; the count
-          // gates the over-credit check below so an unpresented sibling isn't wired.
-          const calls = baseSrc.match(/\b(?:showModalBottomSheet|showDialog|showGeneralDialog)\s*[<(]/g);
-          if (calls && calls.length) {
-            const presenter = /\b(showModalBottomSheet|showDialog|showGeneralDialog)\b/.exec(calls[0])?.[1] ?? 'showModalBottomSheet';
-            result = { baseFile: baseScreen.file, presenter, presenterCount: calls.length };
+          // PG-11: a presentation is a CALL site — this modal's presenter called from
+          // the base's UI, or an inline showModalBottomSheet/showDialog outside every
+          // presenter declaration. The contract's `void showModal_<core>(ctx) {
+          // showDialog(…) }` declaration (called only by lib/_preview) is not one.
+          // T32: COUNT call-sites; the count gates the over-credit check below.
+          const own = dartPresentation(baseSrc, toId);
+          const all = dartPresentation(baseSrc);
+          if (own.presenterCalls > 0 || own.inlineCalls > 0) {
+            const presenter = own.presenterCalls > 0 ? dartPresenterName(toId) : own.inlineApi ?? 'showModalBottomSheet';
+            result = { baseFile: baseScreen.file, presenter, presenterCount: all.presenterCalls + all.inlineCalls };
+          } else if (own.declared) {
+            declaredOnly.set(toId, { baseFile: baseScreen.file, presenter: dartPresenterName(toId) });
           }
         } catch { /* unreadable base → not folded */ }
       }
@@ -678,6 +691,32 @@ async function verifyFlutter(
       }
     }
 
+    // A canonical MODAL of the FROM screen with no built file and no presentation:
+    // say what the gap is — never credit it, never call it drift (PG-11).
+    const toModal = modals.find((m) => m.canonicalId === edge.to);
+    if (fromScreen && !toScreen && toModal) {
+      const d = declaredOnly.get(edge.to);
+      base.status = 'unmapped';
+      base.detail = `REAL gap, not folded: modal ${edge.to} has no built screen, and ${path.basename(fromScreen.file)} never calls ${dartPresenterName(edge.to)}() nor presents a dialog/sheet outside a presenter declaration`
+        + `${d ? ` (it DECLARES ${d.presenter}() — only the verify preview in lib/_preview calls it)` : ''}; a modal only the preview presents is unreachable in the app`;
+      findings.push(base);
+      continue;
+    }
+
+    // A canonical screen FROM navigates to, with no built file at all: the same
+    // verdict as a stub target (web parity — the user lands nowhere).
+    const toCanonRoute = screens.find((x) => x.canonicalId === edge.to)?.route ?? null;
+    if (fromScreen && !toScreen && toCanonRoute) {
+      const reaches = collectNavTargets(await readSrc(fromScreen.file), constToRoute).some((t) => t.route === toCanonRoute);
+      if (reaches) {
+        base.status = 'missing';
+        base.toRoute = toCanonRoute;
+        base.detail = `HIGH: FROM navigates to ${toCanonRoute}, but no built screen serves TO ${edge.to} — the screen was never built`;
+        findings.push(base);
+        continue;
+      }
+    }
+
     // UNMAPPED: a screen has no built file (true design/build drift).
     if (!fromScreen || !toScreen) {
       const which = !fromScreen && !toScreen ? 'both FROM and TO have' : !fromScreen ? 'FROM has' : 'TO has';
@@ -691,6 +730,16 @@ async function verifyFlutter(
     if (toRoute) base.toRoute = toRoute;
     if (toConst) base.toRouteConst = toConst;
 
+    // PG-12: TO is still the skeleton's write-locked stub — a route slot the build
+    // never filled. Pushing its route lands on a placeholder: never `wired` (same
+    // verdict and wording as a web route mounting <PlaceholderScreen>).
+    if (toScreen.placeholder) {
+      base.status = 'missing';
+      base.detail = `HIGH: TO route ${toRoute ?? toConst ?? '?'} mounts <${toScreen.widgetClass}> — still the skeleton stub (TODO(build)); the screen was never built`;
+      findings.push(base);
+      continue;
+    }
+
     const fromSrc = await readSrc(fromScreen.file);
 
     // Collect all nav targets the FROM screen reaches (its own code + components
@@ -701,6 +750,21 @@ async function verifyFlutter(
     for (const ct of componentNavIndex.targetsForScreenSrc(fromSrc)) navTargets.push(ct);
 
     const landsOnTo = navTargets.some((t) => routeMatches(t.route, toRoute, toConst));
+
+    // A modal 7b already converted to an overlay: its route is gone and its trigger
+    // now calls `<ModalScreen>.present(context)`. That call IS the edge — grading it
+    // by the (removed) route reported every converted modal `wrong-target` on the
+    // finalize that converted it.
+    if (toModal && !landsOnTo) {
+      const toSrc = await readSrc(toScreen.file).catch(() => '');
+      const presentRe = new RegExp(`\\b${escapeRe(toScreen.widgetClass)}\\s*\\.\\s*present\\s*(?:<[^>]*>)?\\s*\\(`);
+      if (/\bstatic\s+(?:Future<[^>]*>|void)\s+present\s*(?:<[^>]*>)?\s*\(/.test(toSrc) && presentRe.test(stripDartPresenterDeclarations(fromSrc))) {
+        base.status = 'wired';
+        base.detail = `TO is a modal presented as an overlay — FROM calls ${toScreen.widgetClass}.present(context) (converted by 7b)`;
+        findings.push(base);
+        continue;
+      }
+    }
 
     // P2 TAB CONFORMANCE: a `tab` edge is a shell-hosting relationship, not a nav
     // call. Wired ONLY when the app has an AppShell hosting the destination class;
@@ -1315,3 +1379,5 @@ const webStrategy = (framework: Framework): FlowStrategy => ({
     };
   },
 });
+
+function escapeRe(s: string): string { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }

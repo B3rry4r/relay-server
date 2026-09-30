@@ -48,12 +48,17 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import type { AIModel } from '../ai-adapters';
 import { convertWebModal, type WebCanonModal, type WebCanonScreen } from './modal-overlay-web';
+import { dartPresentation, dartPresenterName } from './dart-presenters';
+import { detectFramework, type Framework } from './framework';
 
 // ── Public contract ──────────────────────────────────────────────────────────
 
-export type Framework = 'flutter' | 'react' | 'next' | 'unknown';
+/** One shared detector (./framework) — never a local copy that can drift. */
+export { detectFramework };
+export type { Framework };
 
-export type PresentationKind = 'bottomSheet' | 'dialog' | 'fullOverlay';
+/** `unknown` is web-only: the presented markup said nothing about its shape (PG-10). */
+export type PresentationKind = 'bottomSheet' | 'dialog' | 'fullOverlay' | 'unknown';
 
 export interface ModalOverlayOptions {
   /** Resolved absolute project root. */
@@ -103,6 +108,10 @@ export interface ModalTransform {
   trigger: { element?: string; wired: 'rewrote-push' | 'wired-dead' | 'none'; how: 'deterministic' | 'ai' | 'none' };
   /** Router route const that was removed (if any). */
   removedRoute?: string;
+  /** false when the modal was only CREDITED (already presented; nothing written) —
+   *  the web converter credits a presenter the build already calls and edits only
+   *  when it strips the modal's dead route. Undefined = the transform wrote source. */
+  edited?: boolean;
 }
 
 export interface ModalOverlaySkip {
@@ -118,6 +127,8 @@ export interface ModalOverlayResult {
   /** Modals left untouched (orphans / already-overlay / unmapped) with reasons. */
   skipped: ModalOverlaySkip[];
   dryRun: boolean;
+  /** Set when the pass had no input / no support — finalize records `skipped` with it. */
+  skippedReason?: string;
 }
 
 // ── Canonical model (subset we read) ─────────────────────────────────────────
@@ -166,24 +177,6 @@ async function readCanonical(projectRoot: string): Promise<CanonModel | null> {
   }
 }
 
-// ── Framework detection (same contract as 7a) ────────────────────────────────
-
-export async function detectFramework(projectRoot: string): Promise<Framework> {
-  const has = async (p: string) => {
-    try { await fs.access(path.join(projectRoot, p)); return true; } catch { return false; }
-  };
-  if (await has('pubspec.yaml')) return 'flutter';
-  if (await has('package.json')) {
-    try {
-      const pkg = JSON.parse(await fs.readFile(path.join(projectRoot, 'package.json'), 'utf8'));
-      const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
-      if (deps.next) return 'next';
-      if (deps.react) return 'react';
-    } catch { /* fall through */ }
-  }
-  return 'unknown';
-}
-
 // ── Per-framework strategy seam ──────────────────────────────────────────────
 
 export interface ModalStrategy {
@@ -223,11 +216,15 @@ export async function applyModalOverlays(projectId: string, opts: ModalOverlayOp
   // pass a silent no-op on every AI-canonical run (zero modals examined).
   const allModals = canonical ? collectModals(canonical) : [];
   if (!canonical || allModals.length === 0) {
-    return { framework, transformed: [], skipped: [], dryRun: !!opts.dryRun };
+    return {
+      framework, transformed: [], skipped: [], dryRun: !!opts.dryRun,
+      skippedReason: !canonical ? 'no .uix/canonical.json — no modals to convert' : 'canonical declares no modals',
+    };
   }
   if (!strategy) {
     return {
       framework,
+      skippedReason: `no modal-overlay strategy for framework '${framework}'`,
       transformed: [],
       skipped: allModals.map((m) => ({ canonicalId: m.canonicalId, name: m.name, reason: `no strategy for framework '${framework}'` })),
       dryRun: !!opts.dryRun,
@@ -344,19 +341,25 @@ async function resolveScreenFile(projectRoot: string, canonicalId: string, frame
 async function baseRendersFoldedOverlay(
   projectRoot: string,
   baseScreen: CanonScreen,
-): Promise<{ baseFile: string; presenter: string; presenterCount: number } | null> {
+  modalId: string,
+): Promise<{ baseFile: string; presenter: string; presenterCount: number; declaredOnly: boolean } | null> {
   const resolvedBase = await resolveScreenFile(projectRoot, baseScreen.canonicalId, baseScreen.frameIds);
   if (!resolvedBase) return null;
   let src: string;
   try { src = await fs.readFile(resolvedBase.file, 'utf8'); } catch { return null; }
-  // T32: COUNT distinct presenter CALL-SITES, not just "has one". A base that hosts
-  // several folded modals must present each — one showModal*/showDialog call can only
-  // fold ONE modal in. The count gates the per-base over-credit check in
-  // applyModalOverlays so an UNPRESENTED sibling modal isn't credited as handled.
-  const calls = src.match(/\b(?:showModalBottomSheet|showDialog|showGeneralDialog)\s*[<(]/g);
-  if (!calls || calls.length === 0) return null;
-  const presenter = /\b(showModalBottomSheet|showDialog|showGeneralDialog)\b/.exec(calls[0])?.[1] ?? 'showModalBottomSheet';
-  return { baseFile: resolvedBase.file, presenter, presenterCount: calls.length };
+  // PG-11: a presentation is a CALL — the modal's presenter called from the base's
+  // UI, or an inline showModalBottomSheet/showDialog outside any presenter
+  // declaration. The declaration `void showModal_10_8(ctx) { showDialog(…) }` the
+  // contract requires (and only the verify preview calls) is stripped first.
+  // T32: COUNT call-sites — a base hosting several folded modals must present each;
+  // the count gates the per-base over-credit check in applyModalOverlays.
+  const own = dartPresentation(src, modalId);
+  const all = dartPresentation(src);
+  if (own.presenterCalls === 0 && own.inlineCalls === 0) {
+    return own.declared ? { baseFile: resolvedBase.file, presenter: dartPresenterName(modalId), presenterCount: 0, declaredOnly: true } : null;
+  }
+  const presenter = own.presenterCalls > 0 ? dartPresenterName(modalId) : own.inlineApi ?? 'showModalBottomSheet';
+  return { baseFile: resolvedBase.file, presenter, presenterCount: all.presenterCalls + all.inlineCalls, declaredOnly: false };
 }
 
 /** The frame-id core of a canonical id: strip the `c_`/`m_` namespace prefix so a
@@ -438,7 +441,12 @@ async function convertFlutterModal(
     // the DESIRED end state (8b's whole purpose), not a failure. Detect it by
     // checking the base screen for an in-place overlay presenter and report it
     // honestly as already-overlay/not-applicable, instead of "no built screen file".
-    const folded = await baseRendersFoldedOverlay(projectRoot, baseScreen);
+    const folded = await baseRendersFoldedOverlay(projectRoot, baseScreen, modal.canonicalId);
+    if (folded?.declaredOnly) {
+      return {
+        skip: `REAL gap — base screen ${path.basename(folded.baseFile)} declares ${folded.presenter}() but no control on it calls it (a call from the verify preview in lib/_preview does not ship) — the modal is unreachable in the app`,
+      };
+    }
     if (folded) {
       // T32: report folded but CARRY the base file + presenter count so the orchestrator
       // can verify the base actually presents enough overlays for every folded modal it
@@ -1243,12 +1251,15 @@ const webStrategy = (framework: Framework): ModalStrategy => ({
         name: t.name,
         frameId: t.frameId,
         baseCanonicalId: t.baseCanonicalId,
-        presentation: 'dialog',
-        presentationSource: 'structure',
+        presentation: t.presentation,
+        presentationSource: t.presentation === 'unknown' ? 'default' : 'structure',
         modalFile: t.modalFile ?? '(folded — presenter not located)',
         baseFile: t.baseFile,
-        trigger: { wired: 'rewrote-push', how: 'deterministic' },
+        // The web converter credits a presenter the build ALREADY calls; it never
+        // rewrites a trigger, so it must not claim it did (PG-10).
+        trigger: { wired: 'none', how: 'none' },
         ...(t.removedRoute ? { removedRoute: t.removedRoute } : {}),
+        edited: !!t.removedRoute,
       },
     };
   },

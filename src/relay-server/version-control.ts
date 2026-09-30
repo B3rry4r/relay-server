@@ -223,6 +223,9 @@ const NODE_IGNORE = [
   'node_modules/',
   'dist/',
   'out/',
+  '.next/',
+  '*.tsbuildinfo',
+  'next-env.d.ts',
   '*.log',
 ];
 
