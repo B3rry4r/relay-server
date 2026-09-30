@@ -256,6 +256,33 @@ function brokenRelease(id) {
   return { id, tgz, sha256: crypto.createHash('sha256').update(fs.readFileSync(tgz)).digest('hex') };
 }
 const broken = brokenRelease('broken-1');
+// A release that boots, LISTENS in standby and then fails the host's readiness
+// probe (it reports ptyMode 'embedded', not 'remote'). A standby that published
+// itself as the shared api-url at listen time left relay-auth / mcp-server /
+// the CLAUDE.md recipe pointed at its dead port (critic P1).
+function unreadyRelease(id) {
+  const dir = path.join(REL, `${id}-stage`);
+  fs.mkdirSync(dir, { recursive: true });
+  execFileSync('tar', ['-xzf', real1.tgz, '-C', dir]);
+  const entry = path.join(dir, 'dist/src/index.js');
+  fs.writeFileSync(entry, `process.env.RELAY_PTY_MODE = 'embedded';\n${fs.readFileSync(entry, 'utf8')}`);
+  const manifest = JSON.parse(fs.readFileSync(path.join(dir, 'manifest.json'), 'utf8'));
+  fs.writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify({ ...manifest, id }, null, 2));
+  const tgz = path.join(REL, `${id}.tgz`);
+  execFileSync('tar', ['-czf', tgz, '-C', dir, '.']);
+  return { id, tgz, sha256: crypto.createHash('sha256').update(fs.readFileSync(tgz)).digest('hex') };
+}
+const unready = unreadyRelease('unready-1');
+// relay-auth exactly as a relay-pty shell runs it: no RELAY_API_URL, no PORT.
+function relayAuth(...args) {
+  const env = { PATH: process.env.PATH, HOME: WS, WORKSPACE: WS, RELAY_LOCAL_TOKEN_FILE: path.join(WS, '.relay/state/local-token') };
+  try {
+    return { code: 0, out: execFileSync(process.execPath, [path.join(WS, '.relay/bin/relay-auth'), ...args], { env, encoding: 'utf8', timeout: 15000 }) };
+  } catch (error) {
+    return { code: error.status ?? 1, out: `${error.stdout || ''}${error.stderr || ''}` };
+  }
+}
+const apiUrlFile = () => { try { return fs.readFileSync(path.join(WS, '.relay/state/api-url'), 'utf8').trim(); } catch { return ''; } };
 
 // No network downloads during the real workspace setup: mise + nvm already "installed".
 fs.mkdirSync(path.join(WS, '.relay/tools/mise/bin'), { recursive: true });
@@ -387,6 +414,20 @@ d = r.status === 202 ? await waitDeploy(r.json.deployId) : { state: `HTTP ${r.st
 await check('a release that crashes at boot → FAILED at the health step', d.state === 'FAILED' && /health/.test(d.error || ''), `${d.state} ${d.error || ''}`);
 await check('current is still real-2 and serving', (await version()) === 'real-2' && (await api('GET', '/__host/status')).json.current === 'real-2', await version());
 await check('no process of the broken release survives', pidsWithEnv('RELAY_RELEASE_ID=broken-1').length === 0, JSON.stringify(pidsWithEnv('RELAY_RELEASE_ID=broken-1')));
+r = await deploy(unready);
+d = r.status === 202 ? await waitDeploy(r.json.deployId) : { state: `HTTP ${r.status}` };
+await check('a release that boots and listens but fails readiness → FAILED', d.state === 'FAILED' && /ptyMode|remote|embedded|readiness|health/i.test(d.error || ''), `${d.state} ${d.error || ''}`);
+await check('current is still real-2', (await api('GET', '/__host/status')).json.current === 'real-2', 'ok');
+{
+  const url = apiUrlFile();
+  let h = null;
+  try { h = await (await fetch(`${url}/health`)).json(); } catch { /* dead port */ }
+  await check('the shared api-url still points at the ACTIVE release (real-2), not the rejected standby', h?.releaseId === 'real-2' && h?.mode === 'active', `${url} → ${JSON.stringify(h)}`);
+  const sessions = relayAuth('sessions', '--json');
+  let list = null;
+  try { list = JSON.parse(sessions.out).sessions; } catch { /* not JSON */ }
+  await check('`relay-auth sessions` (shell env: no RELAY_API_URL, no PORT) still works after the rejected releases', sessions.code === 0 && Array.isArray(list) && list.length > 0, `exit ${sessions.code}: ${sessions.out.slice(0, 300)}`);
+}
 {
   const t = (await (await fetch(`${BASE}/api/terminals`, { headers: { authorization: `Bearer ${SESSION}` } })).json()).terminals.find((x) => x.id === term.id);
   await check('terminal pid unchanged after the bad deploys', t && t.pid === term.pid, JSON.stringify(t));
@@ -394,6 +435,11 @@ await check('no process of the broken release survives', pidsWithEnv('RELAY_RELE
 
 // ------------------------------------------------- swap 2: real-2 → real-3
 await swap(real2, real3, 'SWAP2');
+{
+  let h = null;
+  try { h = await (await fetch(`${apiUrlFile()}/health`)).json(); } catch { /* dead port */ }
+  await check('after activating real-3 the shared api-url points at real-3', h?.releaseId === 'real-3', `${apiUrlFile()} → ${JSON.stringify(h)}`);
+}
 await check('real-3 resumed the run (lease real-3)', Boolean(await waitFor(() => agents().some((a) => a.rel === 'real-3') && readRun().lease?.releaseId === 'real-3', 60000)), JSON.stringify(readRun().lease));
 {
   const fresh = terminalClient(SESSION, { reconnection: false });
