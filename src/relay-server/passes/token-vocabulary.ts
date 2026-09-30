@@ -379,3 +379,53 @@ export function applyColorRenames(src: string, className: string, renames: Array
 }
 
 export const themeRelOf = (rel: string): string => rel.split(path.sep).join('/');
+
+// ── Text-style names (F4 fix round) ──────────────────────────────────────────
+
+/** Stems that say nothing about a text style's role — the readability metric's
+ *  generic stems (a `section16` reads like Figma's "Section 16"). */
+const GENERIC_TEXT_STEMS = new Set(['section', 'text', 'style', 'item', 'content', 'block', 'part', 'element', 'group', 'frame', 'container', 'box', 'view', 'value', 'data', 'wrapper', 'component', 'widget', 'variant', 'other']);
+
+/** One text style as the theme declares it: its name, font size and weight (100–900). */
+export interface TextStyleDecl { name: string; size?: number; weight?: number }
+
+/**
+ * `section15` / `section16` are the theme's type-scale convention (`title24`,
+ * `body14` — role + size) with a stem that names no role. Keep the convention and
+ * add the role the weight shows: ≥600 → `Heading`, else `Body` — `section16` (w600)
+ * → `sectionHeading16`. Only when the number IS the style's font size (a real
+ * counter is not renamed — its number means nothing we can keep) and the new name is
+ * free. Pure: names only, no rendered change.
+ */
+export function planTextStyleRenames(styles: TextStyleDecl[], taken: Iterable<string> = []): Array<{ from: string; to: string }> {
+  const used = new Set([...taken, ...styles.map((s) => s.name)]);
+  const out: Array<{ from: string; to: string }> = [];
+  for (const s of styles) {
+    const m = /^([a-z]+)(\d{1,3})$/.exec(s.name);
+    if (!m || !GENERIC_TEXT_STEMS.has(m[1]) || s.size == null || Number(m[2]) !== s.size) continue;
+    const role = (s.weight ?? 400) >= 600 ? 'Heading' : 'Body';
+    const to = `${m[1]}${role}${m[2]}`;
+    if (used.has(to)) continue;
+    used.add(to);
+    out.push({ from: s.name, to });
+  }
+  return out;
+}
+
+/** A Dart text-style helper's size + weight: `fontSize: 15` / `fontWeight: FontWeight.w700`,
+ *  or the positional form a `_m(15, FontWeight.w700, …)` factory uses. */
+export function dartTextStyleDecls(themeSrc: string): TextStyleDecl[] {
+  const out: TextStyleDecl[] = [];
+  for (const m of themeSrc.matchAll(/static\s+TextStyle\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*(?:=>\s*([^;]*);|\{([\s\S]*?)\})/g)) {
+    const body = m[3] ?? m[4] ?? '';
+    const size = /fontSize\s*:\s*(\d+(?:\.\d+)?)/.exec(body)?.[1] ?? /^\s*[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?\s*\(\s*(\d+(?:\.\d+)?)\s*,/.exec(body)?.[1];
+    const weight = /FontWeight\.w(\d00)/.exec(body)?.[1] ?? (/FontWeight\.bold/.test(body) ? '700' : undefined);
+    out.push({ name: m[1], ...(size ? { size: Number(size) } : {}), ...(weight ? { weight: Number(weight) } : {}) });
+  }
+  return out;
+}
+
+/** Rename a Dart text-style helper's declaration (`static TextStyle x(`). */
+export function renameDartTextStyleDecl(themeSrc: string, from: string, to: string): string {
+  return themeSrc.replace(new RegExp(`(static\\s+TextStyle\\s+)${from}(\\s*\\()`), `$1${to}$2`);
+}

@@ -216,3 +216,135 @@ describe('F2 parameter quality: a positional asset argument is `String asset`, n
     } finally { await fs.rm(root, { recursive: true, force: true }); }
   });
 });
+
+describe('numeric-suffix leftovers: asset symbols and text styles get names, not counters', () => {
+  it('assetSymbolKeys: a lone Figma counter is dropped; a shared name gets the second asset\'s kind', async () => {
+    const { assetSymbolKeys } = await import('../src/relay-server/resources-emit');
+    const I = (name: string, kind: 'icon' | 'image' = 'icon'): { name: string; kind: 'icon' | 'image'; format: 'svg' | 'png' } => ({ name, kind, format: kind === 'icon' ? 'svg' : 'png' });
+    const keys = assetSymbolKeys([
+      I('avatar_background'), I('divider'), I('divider_2'), I('ping_logo'), I('chevron_down'), I('chevron_down_2'),
+      I('avatar_background', 'image'), I('card_background', 'image'), I('card_background_2', 'image'), I('confetti_icon', 'image'), I('confetti_icon', 'image'), I('search_icon'), I('search_icon'),
+      I('divider', 'image'), I('divider_2', 'image'), I('netflix_icon_1', 'image'), I('ping_logo', 'image'), I('time_9_41_2'),
+    ]);
+    expect(keys).toEqual([
+      'avatarBackground', 'divider', 'divider2', 'pingLogo', 'chevronDown', 'chevronDown2',
+      'avatarBackgroundImage', 'cardBackground', 'cardBackground2', 'confettiIcon', 'confettiIconImage',
+      'searchIcon', 'searchIconSvg', 'dividerImage', 'divider2Image', 'netflixIcon', 'pingLogoImage', 'time9412',
+    ]);
+  });
+
+  it('flutter 7c renames old-scheme AppAssets keys (declaration + references); a second run is a no-op', async () => {
+    const { repointAssetUsage } = await import('../src/relay-server/passes/asset-usage');
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'b78fx-assets-fl-'));
+    try {
+      await fs.writeFile(path.join(root, 'pubspec.yaml'), 'name: t\ndependencies:\n  flutter:\n    sdk: flutter\n  flutter_svg: ^2.0.0\n');
+      for (const d of ['lib/resources', 'lib/screens', '.uix']) await fs.mkdir(path.join(root, d), { recursive: true });
+      const entries = [
+        ['avatar_background', 'assets/icons/avatar_background.svg', 'svg', 'icon'],
+        ['avatar_background', 'assets/images/avatar_background.png', 'png', 'image'],
+        ['netflix_icon_1', 'assets/images/netflix_icon_1.png', 'png', 'image'],
+      ];
+      await fs.writeFile(path.join(root, '.uix', 'asset-map.json'), JSON.stringify({ framework: 'flutter', resourcesPath: 'lib/resources/app_assets.dart', assets: entries.map(([name, p, format, kind], i) => ({ nodeId: `1:${i}`, name, oldPath: p, newPath: p, format, kind })) }));
+      await fs.writeFile(path.join(root, 'lib', 'resources', 'app_assets.dart'), "class AppAssets {\n  AppAssets._();\n\n  static const String avatarBackground = 'assets/icons/avatar_background.svg';\n  static const String avatarBackground_2 = 'assets/images/avatar_background.png';\n  static const String netflixIcon1 = 'assets/images/netflix_icon_1.png';\n}\n");
+      await fs.writeFile(path.join(root, 'lib', 'screens', 'home_screen.dart'), "import 'package:flutter/material.dart';\nimport '../resources/app_assets.dart';\n\nclass HomeScreen extends StatelessWidget {\n  const HomeScreen({super.key});\n  @override\n  Widget build(BuildContext context) => Column(children: [Image.asset(AppAssets.netflixIcon1), Image.asset(AppAssets.avatarBackground_2)]);\n}\n");
+      const r = await repointAssetUsage('t', { projectRoot: root, noAi: true });
+      expect(r.renamedSymbols.map((x) => `${x.from}->${x.to}:${x.refs}`).sort()).toEqual(['avatarBackground_2->avatarBackgroundImage:1', 'netflixIcon1->netflixIcon:1']);
+      const res = await fs.readFile(path.join(root, 'lib', 'resources', 'app_assets.dart'), 'utf8');
+      expect(res).toContain("static const String avatarBackgroundImage = 'assets/images/avatar_background.png';");
+      expect(res).toContain("static const String netflixIcon = 'assets/images/netflix_icon_1.png';");
+      expect(res).toContain("static const String avatarBackground = 'assets/icons/avatar_background.svg';");
+      const home = await fs.readFile(path.join(root, 'lib', 'screens', 'home_screen.dart'), 'utf8');
+      expect(home).toContain('Image.asset(AppAssets.netflixIcon), Image.asset(AppAssets.avatarBackgroundImage)');
+      const again = await repointAssetUsage('t', { projectRoot: root, noAi: true });
+      expect(again.renamedSymbols).toEqual([]);
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+
+  for (const fw of ['react', 'next'] as const) {
+    it(`${fw} 7c renames old-scheme asset keys in the resources module and every assets.x reference`, async () => {
+      const { repointAssetUsage } = await import('../src/relay-server/passes/asset-usage');
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), `b78fx-assets-${fw}-`));
+      await fs.cp(path.join(__dirname, 'fixtures', 'parity', fw), root, { recursive: true });
+      try {
+        const mapFile = path.join(root, '.uix', 'asset-map.json');
+        await fs.mkdir(path.dirname(mapFile), { recursive: true });
+        const map = await fs.readFile(mapFile, 'utf8').then((t) => JSON.parse(t)).catch(() => ({ framework: fw, assets: [] }));
+        map.assets.push(
+          { nodeId: '9:1', name: 'avatar_background', oldPath: 'public/assets/icons/avatar_background.svg', newPath: 'public/assets/icons/avatar_background.svg', format: 'svg', kind: 'icon' },
+          { nodeId: '9:2', name: 'avatar_background', oldPath: 'public/assets/images/avatar_background.png', newPath: 'public/assets/images/avatar_background.png', format: 'png', kind: 'image' },
+          { nodeId: '9:3', name: 'netflix_icon_1', oldPath: 'public/assets/images/netflix_icon_1.png', newPath: 'public/assets/images/netflix_icon_1.png', format: 'png', kind: 'image' },
+        );
+        await fs.writeFile(mapFile, JSON.stringify(map));
+        const resRel = fw === 'next' ? 'lib/resources/assets.ts' : 'src/resources/assets.ts';
+        const res0 = await fs.readFile(path.join(root, resRel), 'utf8');
+        await fs.writeFile(path.join(root, resRel), res0.replace('} as const;', "  avatarBackground: '/assets/icons/avatar_background.svg',\n  avatarBackground_2: '/assets/images/avatar_background.png',\n  netflixIcon1: '/assets/images/netflix_icon_1.png',\n} as const;"));
+        const screenRel = fw === 'next' ? 'app/10-1/page.tsx' : 'src/screens/Login/LoginScreen.tsx';
+        const s0 = await fs.readFile(path.join(root, screenRel), 'utf8');
+        const spec = fw === 'next' ? '@/lib/resources/assets' : '../../resources/assets';
+        await fs.writeFile(path.join(root, screenRel), `${s0}\nimport { assets as A9 } from '${spec}';\nexport const promo = [A9.netflixIcon1, A9.avatarBackground_2];\n`.replace(/A9/g, 'assets'));
+        const r = await repointAssetUsage('t', { projectRoot: root, noAi: true });
+        expect(r.renamedSymbols.map((x) => `${x.from}->${x.to}:${x.refs}`).sort()).toEqual(['avatarBackground_2->avatarBackgroundImage:1', 'netflixIcon1->netflixIcon:1']);
+        const res = await fs.readFile(path.join(root, resRel), 'utf8');
+        expect(res).toContain("avatarBackgroundImage: '/assets/images/avatar_background.png',");
+        expect(res).toContain("netflixIcon: '/assets/images/netflix_icon_1.png',");
+        expect(await fs.readFile(path.join(root, screenRel), 'utf8')).toContain('export const promo = [assets.netflixIcon, assets.avatarBackgroundImage];');
+        expect((await repointAssetUsage('t', { projectRoot: root, noAi: true })).renamedSymbols).toEqual([]);
+      } finally { await fs.rm(root, { recursive: true, force: true }); }
+    });
+  }
+
+  it('text styles: `section16` (size 16, w600) → `sectionHeading16`; the size convention and real counters are kept', async () => {
+    const { planTextStyleRenames, dartTextStyleDecls } = await import('../src/relay-server/passes/token-vocabulary');
+    const theme = 'class AppTheme {\n  static TextStyle _m(double size, FontWeight weight, Color color, double lh) => TextStyle(fontSize: size);\n  static TextStyle title24(Color color) => _m(24, FontWeight.w600, color, 28);\n  static TextStyle section15(Color color) => _m(15, FontWeight.w700, color, 24);\n  static TextStyle section16(Color color) => _m(16, FontWeight.w600, color, 24);\n  static TextStyle text14(Color c) => TextStyle(fontSize: 14, color: c);\n  static TextStyle section3(Color c) => TextStyle(fontSize: 12, color: c);\n}\n';
+    const decls = dartTextStyleDecls(theme);
+    expect(decls.find((d) => d.name === 'section15')).toEqual({ name: 'section15', size: 15, weight: 700 });
+    expect(planTextStyleRenames(decls)).toEqual([
+      { from: 'section15', to: 'sectionHeading15' }, { from: 'section16', to: 'sectionHeading16' }, { from: 'text14', to: 'textBody14' },
+    ]);
+  });
+
+  it('flutter 7f renames the helpers and every AppTheme.x( reference; run 2 is a no-op', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'b78fx-ts-fl-'));
+    try {
+      await fs.writeFile(path.join(root, 'pubspec.yaml'), 'name: t\ndependencies:\n  flutter:\n    sdk: flutter\n');
+      for (const d of ['lib/theme', 'lib/screens']) await fs.mkdir(path.join(root, d), { recursive: true });
+      await fs.writeFile(path.join(root, 'lib', 'theme', 'app_theme.dart'), "import 'package:flutter/material.dart';\n\nclass AppTheme {\n  AppTheme._();\n  static const Color ink = Color(0xFF000000);\n  static TextStyle _m(double size, FontWeight weight, Color color, double lh) => TextStyle(fontSize: size, fontWeight: weight, color: color, height: lh / size);\n  /// 16 / w600 — section headings.\n  static TextStyle section16(Color color) => _m(16, FontWeight.w600, color, 24);\n  static TextStyle title24(Color color) => _m(24, FontWeight.w600, color, 28);\n}\n");
+      const scr = (n: string) => `import 'package:flutter/material.dart';\nimport '../theme/app_theme.dart';\n\nclass ${n}Screen extends StatelessWidget {\n  const ${n}Screen({super.key});\n  @override\n  Widget build(BuildContext context) => Text('${n}', style: AppTheme.section16(AppTheme.ink));\n}\n`;
+      await fs.writeFile(path.join(root, 'lib', 'screens', 'a_screen.dart'), scr('A'));
+      await fs.writeFile(path.join(root, 'lib', 'screens', 'b_screen.dart'), scr('B'));
+      const r = await deepenTokensAndCleanup('t', { projectRoot: root, noAi: true, skipAnalyze: true, noReport: true });
+      expect(r.report.vocabulary?.renamed).toContainEqual({ from: 'section16', to: 'sectionHeading16' });
+      const theme = await fs.readFile(path.join(root, 'lib', 'theme', 'app_theme.dart'), 'utf8');
+      expect(theme).toContain('static TextStyle sectionHeading16(Color color) => _m(16, FontWeight.w600, color, 24);');
+      expect(theme).toContain('static TextStyle title24(');
+      for (const f of ['a_screen.dart', 'b_screen.dart']) expect(await fs.readFile(path.join(root, 'lib', 'screens', f), 'utf8')).toContain('AppTheme.sectionHeading16(AppTheme.ink)');
+      const again = await deepenTokensAndCleanup('t', { projectRoot: root, noAi: true, skipAnalyze: true, noReport: true });
+      expect(again.report.vocabulary?.renamed ?? []).toEqual([]);
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  });
+
+  for (const fw of ['react', 'next'] as const) {
+    it(`${fw} 7f renames a text group's section16 and every AppTheme.text.x reference`, async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), `b78fx-ts-${fw}-`));
+      await fs.cp(path.join(__dirname, 'fixtures', 'parity', fw), root, { recursive: true });
+      try {
+        const themeRel = fw === 'next' ? 'lib/theme.ts' : 'src/theme/theme.ts';
+        const t0 = await fs.readFile(path.join(root, themeRel), 'utf8');
+        await fs.writeFile(path.join(root, themeRel), t0.replace(/(export const AppTheme = \{\n)/, "$1  text: {\n    section16: { fontSize: 16, fontWeight: 600, lineHeight: 24 },\n    title24: { fontSize: 24, fontWeight: 600 },\n  },\n"));
+        const screenRel = fw === 'next' ? 'app/10-1/page.tsx' : 'src/screens/Login/LoginScreen.tsx';
+        const s0 = await fs.readFile(path.join(root, screenRel), 'utf8');
+        const spec = fw === 'next' ? '@/lib/theme' : '../../theme/theme';
+        const withImport = /\bAppTheme\b/.test(s0) ? s0 : `import { AppTheme } from '${spec}';\n${s0}`;
+        await fs.writeFile(path.join(root, screenRel), `${withImport}\nexport const headingStyle = AppTheme.text.section16;\n`);
+        const r = await deepenTokensAndCleanup('t', { projectRoot: root, noAi: true, skipAnalyze: true, noReport: true });
+        expect(r.report.vocabulary?.renamed).toContainEqual({ from: 'section16', to: 'sectionHeading16' });
+        const theme = await fs.readFile(path.join(root, themeRel), 'utf8');
+        expect(theme).toContain('sectionHeading16: { fontSize: 16, fontWeight: 600, lineHeight: 24 }');
+        expect(theme).toContain('title24: {');
+        expect(await fs.readFile(path.join(root, screenRel), 'utf8')).toContain('AppTheme.text.sectionHeading16');
+        const again = await deepenTokensAndCleanup('t', { projectRoot: root, noAi: true, skipAnalyze: true, noReport: true });
+        expect(again.report.vocabulary?.renamed ?? []).toEqual([]);
+      } finally { await fs.rm(root, { recursive: true, force: true }); }
+    });
+  }
+});

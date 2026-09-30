@@ -26,7 +26,7 @@ import path from 'node:path';
 import { loadWebApp, listWebSources, ensureNamedImport, importSpecFor, stillReferenced } from './web-app';
 import { DESIGN_SYSTEM_RECORD } from '../design-system';
 import { ladderNames } from '../design-vocabulary';
-import { planVocabularyAmendment } from './token-vocabulary';
+import { planVocabularyAmendment, planTextStyleRenames, type TextStyleDecl } from './token-vocabulary';
 
 export interface WebThemeModel {
   themeFile: string;
@@ -697,6 +697,37 @@ export async function deepenWebTokens(projectRoot: string, opts: WebTokenOptions
       }
     }
   }
+  // F4 (web): text styles named by a generic stem + their size (`section16`) get the
+  // role their weight shows (`sectionHeading16`) — theme key + every reference.
+  {
+    const themeSrc = fsSync.readFileSync(theme.themeFile, 'utf-8');
+    const tg = webTextGroup(themeSrc);
+    if (tg) {
+      const taken = [...theme.colors.map((c) => c.name), ...theme.spacing.map((z) => z.name), ...theme.radius.map((z) => z.name), ...(theme.sizes ?? []).map((z) => z.name)];
+      const renames = planTextStyleRenames(tg.styles, taken);
+      if (renames.length) {
+        let body = themeSrc.slice(tg.start, tg.end);
+        for (const r of renames) body = body.replace(new RegExp(`(^|[\\s,{])${r.from}(\\s*:)`), `$1${r.to}$2`);
+        const nextTheme = themeSrc.slice(0, tg.start) + body + themeSrc.slice(tg.end);
+        const writes: Array<[string, string]> = [[theme.themeFile, nextTheme]];
+        let refs = 0;
+        for (const f of targets) {
+          const src = await fs.readFile(f, 'utf-8').catch(() => '');
+          let next = src;
+          for (const r of renames) next = next.replace(new RegExp(`\\b${theme.themeSymbol}\\.${tg.key}\\.${r.from}\\b`, 'g'), () => { refs++; return `${theme.themeSymbol}.${tg.key}.${r.to}`; });
+          if (next !== src) writes.push([f, next]);
+        }
+        const reparsed = parseWebThemeSource(nextTheme, theme.themeFile);
+        if (reparsed) {
+          if (!opts.dryRun) for (const [f, src] of writes) await fs.writeFile(f, src, 'utf-8');
+          result.substitutions.renamed = (result.substitutions.renamed ?? 0) + refs;
+          result.vocabulary = { added: result.vocabulary?.added ?? [], renamed: [...(result.vocabulary?.renamed ?? []), ...renames] };
+          for (const r of renames) result.changes.push({ file: rel(projectRoot, theme.themeFile), kind: 'rename-token', from: r.from, to: r.to });
+          theme = reparsed;
+        }
+      }
+    }
+  }
   const themeM = theme;
   for (const file of targets) {
     const before = await fs.readFile(file, 'utf-8').catch(() => '');
@@ -735,6 +766,33 @@ export async function deepenWebTokens(projectRoot: string, opts: WebTokenOptions
 }
 
 const rel = (root: string, p: string): string => path.relative(root, p).split(path.sep).join('/');
+
+/** The theme's text-style group (`text` / `typography` / `type`): its key, the body's
+ *  [start, end) offsets and each style's fontSize / fontWeight. */
+function webTextGroup(src: string): { key: string; start: number; end: number; styles: TextStyleDecl[] } | null {
+  for (const key of ['text', 'typography', 'type']) {
+    const m = new RegExp(`\\b${key}\\s*:\\s*\\{`).exec(src);
+    if (!m) continue;
+    let depth = 0;
+    for (let i = m.index + m[0].length - 1; i < src.length; i++) {
+      if (src[i] === '{') depth++;
+      else if (src[i] === '}') {
+        depth--;
+        if (depth === 0) {
+          const start = m.index + m[0].length; const body = src.slice(start, i);
+          const styles: TextStyleDecl[] = [];
+          for (const e of body.matchAll(/([A-Za-z_$][\w$]*)\s*:\s*\{([^{}]*)\}/g)) {
+            const size = /fontSize\s*:\s*['"]?(\d+(?:\.\d+)?)/.exec(e[2])?.[1];
+            const w = /fontWeight\s*:\s*['"]?(\d00|bold)/.exec(e[2])?.[1];
+            styles.push({ name: e[1], ...(size ? { size: Number(size) } : {}), ...(w ? { weight: w === 'bold' ? 700 : Number(w) } : {}) });
+          }
+          return { key, start, end: i, styles };
+        }
+      }
+    }
+  }
+  return null;
+}
 
 /** Every theme numeric token (spacing, radius, size) → its value, for the box check. */
 function boxContext(theme: WebThemeModel, borderBox: boolean): WebBoxContext {

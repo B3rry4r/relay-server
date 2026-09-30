@@ -352,10 +352,10 @@ const PASSES: PassDef[] = [
         runModel: passRunModel(opts, proof, 'repointAssetUsage'),
       });
       return {
-        counts: { filesScanned: r.filesScanned, repointed: r.repointed.length, skipped: r.skipped.length },
+        counts: { filesScanned: r.filesScanned, repointed: r.repointed.length, skipped: r.skipped.length, symbolsRenamed: r.renamedSymbols.length, symbolRefsRenamed: r.renamedSymbols.reduce((n, x) => n + x.refs, 0) },
         warnings: [...r.warnings, ...r.skipped.map((s) => `${s.file}: ${s.what} — ${s.reason}`)],
         skipped: r.skippedReason,
-        changed: r.repointed.length,
+        changed: r.repointed.length + r.renamedSymbols.length,
       };
     },
   },

@@ -55,7 +55,7 @@ import { spawn } from 'child_process';
 import type { AIModel } from '../ai-adapters';
 import { detectFramework, type Framework } from './framework';
 import { promoteConst, themeConstMembers } from './dart-const';
-import { parseVocabExtras, scanVocabSites, planVocabularyAmendment, applyAmendmentToTheme, vocabIndex, substituteVocabulary, applyColorRenames, type VocabThemeModel } from './token-vocabulary';
+import { parseVocabExtras, scanVocabSites, planVocabularyAmendment, applyAmendmentToTheme, vocabIndex, substituteVocabulary, applyColorRenames, planTextStyleRenames, dartTextStyleDecls, renameDartTextStyleDecl, type VocabThemeModel } from './token-vocabulary';
 import { deepenWebTokens } from './token-cleanup-web';
 
 export { detectFramework };
@@ -428,6 +428,26 @@ async function runFlutter(projectRoot: string, opts: DeepenTokensOptions): Promi
       for (const a of added) changes.push({ file: theme.themeFileRel, kind: 'add-token', from: '', to: a });
       vocabulary = { added, renamed: plan.renames };
       themeNow = parseFlutterThemeSource(newTheme, theme.themeFileRel) ?? theme;
+    }
+    // Text styles named by a generic stem + their size (`section16`) get the role
+    // their weight shows (`sectionHeading16`), in the theme and every reference.
+    const themeSrc1 = contents.get(themeAbs)!;
+    const members = [...themeSrc1.matchAll(/static\s+(?:const\s+|final\s+)?[\w<>?]+\s+([A-Za-z_]\w*)\s*[=(;]/g)].map((m) => m[1]);
+    const tsRenames = planTextStyleRenames(dartTextStyleDecls(themeSrc1), members);
+    if (tsRenames.length) {
+      let t = themeSrc1;
+      for (const r of tsRenames) t = renameDartTextStyleDecl(t, r.from, r.to);
+      contents.set(themeAbs, t);
+      let refs = 0;
+      for (const [f, src] of contents) {
+        if (f === themeAbs) continue;
+        const r = applyColorRenames(src, theme.className, tsRenames);
+        if (r.count) { contents.set(f, r.src); refs += r.count; }
+      }
+      subs.renamed = (subs.renamed ?? 0) + refs;
+      for (const r of tsRenames) changes.push({ file: theme.themeFileRel, kind: 'rename-token', from: r.from, to: r.to });
+      vocabulary = { added: vocabulary?.added ?? [], renamed: [...(vocabulary?.renamed ?? []), ...tsRenames] };
+      themeNow = parseFlutterThemeSource(t, theme.themeFileRel) ?? themeNow;
     }
   }
 
