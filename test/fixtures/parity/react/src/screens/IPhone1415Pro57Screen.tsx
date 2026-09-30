@@ -35,8 +35,6 @@ export function IPhone1415Pro57Screen() {
       <SectionHeading>Settings</SectionHeading>
       <Badge label="beta" />
       <SearchGlyph />
-      <div style={{ height: 120, backgroundImage: `url(/${assets.mapDark})` }} />
-      <img src={'/' + assets.userAvatar} alt="" width={40} height={40} />
       <svg width="18" height="18" viewBox="0 0 18 18"><path d="M1 1h16v16H1z" fill="#1a1a1a" /></svg>
       <button onClick={() => {}}>Resolve</button>
       <button onClick={() => navigate(ROUTES.login)}>Sign out</button>

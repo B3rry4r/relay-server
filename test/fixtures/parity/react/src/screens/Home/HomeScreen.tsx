@@ -43,6 +43,8 @@ export function HomeScreen() {
       <SectionHeading>Home</SectionHeading>
       <Badge label="new" />
       <SearchGlyph />
+      <div style={{ height: 120, backgroundImage: `url(/${assets.mapDark})` }} />
+      <img src={'/' + assets.userAvatar} alt="" width={40} height={40} />
       <img src={ICONS.search} alt="search" />
       <img src={`/${assets[bannerKey]}`} alt="promo" />
       <DeliveryMapCard />

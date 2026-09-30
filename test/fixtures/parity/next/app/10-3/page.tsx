@@ -28,8 +28,6 @@ export default function IPhone1415Pro57Page() {
     <section style={{ padding: 16 }}>
       <SectionHeading>Settings</SectionHeading>
       <SearchGlyph />
-      <div style={{ height: 120, backgroundImage: `url(/${assets.mapDark})` }} />
-      <img src={'/' + assets.userAvatar} alt="" width={40} height={40} />
       <svg width="18" height="18" viewBox="0 0 18 18"><path d="M1 1h16v16H1z" fill="#1a1a1a" /></svg>
       <button onClick={() => {}}>Resolve</button>
       <button onClick={() => router.push('/10-1')}>Sign out</button>

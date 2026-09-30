@@ -36,6 +36,8 @@ export default function HomePage() {
     <main style={{ padding: 16, color: '#12ae89' }}>
       <SectionHeading>Home</SectionHeading>
       <SearchGlyph />
+      <div style={{ height: 120, backgroundImage: `url(/${assets.mapDark})` }} />
+      <img src={'/' + assets.userAvatar} alt="" width={40} height={40} />
       <img src={ICONS.search} alt="search" />
       <img src={`/${assets[bannerKey]}`} alt="promo" />
       <DeliveryMapCard />

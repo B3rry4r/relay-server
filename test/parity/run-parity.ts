@@ -408,7 +408,7 @@ const CHECKS: Record<PassName, CheckFn> = {
     // The fixture's screens were built under the pre-B56 packet (`/${assets.x}`, values
     // were paths). The resources values are served URLs now (`/assets/…`), so a prefix
     // left behind requests `//assets/…` — a protocol-relative URL to host "assets".
-    // Every spelling the old packet produced, not only the whole template: the settings
+    // Every spelling the old packet produced, not only the whole template: the home
     // screen also carries `url(/${assets.mapDark})` and `'/' + assets.userAvatar`.
     const prefixLeft = fw === 'flutter' ? [] : await grepSources(r.root, fw, /(?<!\/)\/\$\{\s*assets\b|['"`]\/['"`]\s*\+\s*assets\b/);
     return [
