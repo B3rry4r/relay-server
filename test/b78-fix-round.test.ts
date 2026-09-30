@@ -155,3 +155,21 @@ describe('F6 provenance strip: JSX-aware, no litter, no false provenance', () =>
     expect(stripProvenanceText('Chevron, 24×24px, right aligned.')).toBe('Chevron, right aligned.');
   });
 });
+
+describe('readability metric ships in dist/src (release tarballs hold dist/src only)', () => {
+  it('tsc compiles src/relay-server/readability-report.cjs next to readability.js, and the loader looks there first', async () => {
+    const ts = await import('typescript');
+    const root = path.join(__dirname, '..');
+    const cfg = ts.getParsedCommandLineOfConfigFile(path.join(root, 'tsconfig.json'), {}, { ...ts.sys, onUnRecoverableConfigFileDiagnostic: () => undefined })!;
+    expect(cfg.options.allowJs).toBe(true);
+    expect(cfg.fileNames.map((f) => path.relative(root, f))).toContain(path.join('src', 'relay-server', 'readability-report.cjs'));
+    const { loadReadabilityTool } = await import('../src/relay-server/readability');
+    const t = loadReadabilityTool();
+    expect(t.tool).not.toBeNull();
+    expect(path.relative(root, t.file!)).toBe(path.join('src', 'relay-server', 'readability-report.cjs'));
+    // the CLI wrapper is the same module
+    const { createRequire } = await import('node:module');
+    const req = createRequire(__filename);
+    expect(req('../scripts/readability-report.cjs')).toBe(req('../src/relay-server/readability-report.cjs'));
+  });
+});

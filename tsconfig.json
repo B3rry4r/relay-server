@@ -10,6 +10,8 @@
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
     "sourceMap": true,
+    "allowJs": true,
+    "checkJs": false,
     "types": [
       "node",
       "vitest/globals"
@@ -17,6 +19,7 @@
   },
   "include": [
     "src/**/*.ts",
+    "src/**/*.cjs",
     "test/**/*.ts"
   ],
   "exclude": [

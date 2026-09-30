@@ -6,7 +6,7 @@
   "main": "dist/src/index.js",
   "scripts": {
     "dev": "nodemon --watch 'src/**' --watch 'docs/**' --ext 'ts,md,json' --exec 'npm run build && node dist/src/index.js'",
-    "build": "rm -rf dist && tsc && mkdir -p dist/scripts && cp scripts/readability-report.cjs dist/scripts/",
+    "build": "rm -rf dist && tsc",
     "build:native": "mkdir -p build && gcc -O2 -Wall -Wextra -o build/pty-bridge native/pty-bridge.c -lutil",
     "start": "npm run build && node dist/src/index.js",
     "mcp": "node mcp-server.mjs",
