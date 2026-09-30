@@ -18,7 +18,10 @@ describe('F6 provenance strip — real Ping comments', () => {
     ['static display fields. The IR "Confirm" angle-left/right chevrons are omitted', 'static display fields. The angle-left/right chevrons are omitted'],
     ['Verification loading state (modal m_313_10287 / frame 81) — a non-dismissible', 'Verification loading state — a non-dismissible'],
     ['Soft-filled, read-only value field (matches the reference\'s prefilled state).', 'Soft-filled, read-only value field.'],
-    ['7×7 finder pattern squares at three corners.', 'finder pattern squares at three corners.'],
+    // A QR finder pattern IS 7×7 modules — a grid count, not a pixel size (fix round:
+    // stripping it changed the comment's meaning). A measured size still goes.
+    ['7×7 finder pattern squares at three corners.', '7×7 finder pattern squares at three corners.'],
+    ['40×40 avatar circle, brand ring.', 'avatar circle, brand ring.'],
   ];
   for (const [input, want] of cases) {
     it(JSON.stringify(input).slice(0, 70), () => { expect(stripProvenanceText(input)).toBe(want); });

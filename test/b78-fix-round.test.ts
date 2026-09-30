@@ -14,6 +14,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { scanWebSizeSites, stadiumIsExact, detectGlobalBorderBox } from '../src/relay-server/passes/token-cleanup-web';
 import { deepenTokensAndCleanup } from '../src/relay-server/passes/token-cleanup';
+import { stripProvenance, stripProvenanceText, scanComments, renderedJsxText } from '../src/relay-server/passes/source-hygiene';
 
 describe('F5 web pill: only a stadium the browser already paints', () => {
   const pills = (src: string, box = {}): number[] => scanWebSizeSites(src, undefined, box).filter((s) => s.family === 'pill').map((s) => s.value);
@@ -98,4 +99,59 @@ describe('F5 web pill: only a stadium the browser already paints', () => {
       } finally { await fs.rm(root, { recursive: true, force: true }); }
     });
   }
+});
+
+describe('F6 provenance strip: JSX-aware, no litter, no false provenance', () => {
+  it('the skeptic repro: an all-provenance {/* … */} child goes with its braces and its line', () => {
+    expect(stripProvenance('<div>\n  {/* Frame 45 hero, matches the reference */}\n  <p/>\n</div>\n', 'tsx').src).toBe('<div>\n  <p/>\n</div>\n');
+    const page = "export default function Page() {\n  return (\n    <main>\n      {/* Frame 45 hero, matches the reference */}\n      <h1>Hi</h1>\n      {/* IR \"Rectangle 24\" */}\n    </main>\n  );\n}\n";
+    expect(stripProvenance(page, 'tsx').src).toBe('export default function Page() {\n  return (\n    <main>\n      <h1>Hi</h1>\n    </main>\n  );\n}\n');
+  });
+  it('a container with a behavioural remainder keeps its comment; a mixed container keeps its code', () => {
+    expect(stripProvenance('<div>\n  {/* Hero banner (frame 45) */}\n</div>\n', 'tsx').src).toBe('<div>\n  {/* Hero banner */}\n</div>\n');
+    expect(stripProvenance('<div>\n  {x /* frame 45 */}\n</div>\n', 'tsx').src).toBe('<div>\n  {x}\n</div>\n');
+  });
+  it('removal never changes rendered text: between two text lines the empty braces stay', () => {
+    const src = '<p>\n  Hello\n  {/* Frame 45 */}\n  world\n</p>\n';
+    // React renders "Helloworld" (JSX joins lines only within one text run); dropping
+    // the braces would merge the runs into "Hello world".
+    expect(stripProvenance(src, 'tsx').src).toBe('<p>\n  Hello\n  {}\n  world\n</p>\n');
+    expect(renderedJsxText('\n  Hello\n  ') + renderedJsxText('\n  world\n')).toBe('Helloworld');
+    // same line, text on one side only: "Hi " + element — the space survives
+    expect(stripProvenance('<p>Hi {/* Frame 4 */}<b/></p>\n', 'tsx').src).toBe('<p>Hi <b/></p>\n');
+  });
+  it('`//` and `/*` inside JSX text are user-visible copy, never comments', () => {
+    const src = '<p>Go to http://ex.com/Rectangle 5 now</p>\n';
+    expect(stripProvenance(src, 'tsx').src).toBe(src);
+    const src2 = 'export const A = () => (\n  <div>\n    // Figma frame 12 is the source\n    /* Frame 9 */ text\n    <a href="http://x.io/Frame 7">x</a>\n  </div>\n);\n';
+    expect(stripProvenance(src2, 'tsx').src).toBe(src2);
+    expect(scanComments(src2, 'tsx').spans).toEqual([]);
+  });
+  it('the lexer still finds real comments around JSX: attributes, children expressions, regexes, templates', () => {
+    const src = [
+      'const re = /[/*]+/g; // Frame 12 source',
+      'const t = `${a /* frame 44 */}//not a comment`;',
+      'const el = a < b ? <X a={1 /* frame 5 */} /* IR "Icons" */ b="//x" /> : null;',
+      'const gen = <T,>(x: T) => x; // node 283:1967',
+      'const c = a / b; // Figma',
+    ].join('\n');
+    const texts = scanComments(src, 'tsx').spans.map(([a, b]) => src.slice(a, b));
+    expect(texts).toEqual(['// Frame 12 source', '/* frame 44 */', '/* frame 5 */', '/* IR "Icons" */', '// node 283:1967', '// Figma']);
+  });
+  it('CSS has no line comments: a url(http://…) is not one', () => {
+    const css = '.a { background: url(http://ex.com/Frame 12.png); } /* Frame 12 */\n';
+    expect(stripProvenance(css, 'css').src).toBe('.a { background: url(http://ex.com/Frame 12.png); }\n');
+  });
+  it('clock times and ratios are not node ids', () => {
+    expect(stripProvenanceText('Ratio 16:9 video; timeout 10:30')).toBe('Ratio 16:9 video; timeout 10:30');
+    expect(stripProvenanceText('Status bar shows 9:41 like iOS.')).toBe('Status bar shows 9:41 like iOS.');
+    expect(stripProvenanceText('Balance card (node 283:1967).')).toBe('Balance card.');
+    expect(stripProvenanceText('Balance card (I313:10287;1:2).')).toBe('Balance card.');
+  });
+  it('a size that is a sentence predicate or a small grid count stays; a measured size goes', () => {
+    expect(stripProvenanceText('Grid is 3×3 so the QR code fits')).toBe('Grid is 3×3 so the QR code fits');
+    expect(stripProvenanceText('The avatar is 40×40 so it lines up with the row')).toBe('The avatar is 40×40 so it lines up with the row');
+    expect(stripProvenanceText('Dots are 27×27 each.')).toBe('');
+    expect(stripProvenanceText('Chevron, 24×24px, right aligned.')).toBe('Chevron, right aligned.');
+  });
 });

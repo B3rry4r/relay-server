@@ -352,6 +352,11 @@ const MACHINE_TEXT_RE = new RegExp(`(?:^|[^A-Za-z])(?:${ID_LAYER_WORDS})[ _-]?\\
 const PRESET_ID_RE = /^_?(?:I[Pp]hone|Android|Desktop|Mac[Bb]ook|IPad|Ipad|Tablet|Web|Screen)(?:[A-Z]?[a-z]*)?\d{2,}\w*$/;
 const PRESET_TEXT_RE = /\b(?:iPhone|Android|Desktop|MacBook|iPad)[\w &]*?\s-\s\d+\b/g;
 // Figma node ids: 283:1967, I12:34;56:78 (colon form, ≥3 digits on one side so 10:30 times don't match)
+// A MEASURED pixel size in a comment: with a unit or "each" (`24×24px`, `27×27 each`),
+// or a bare `40×40` that is not the predicate of its sentence. `3×3` / `7×7` grid
+// counts (both < 10, no unit) and "is 40×40 so …" are not leaks. Kept in sync with
+// source-hygiene.ts SIZE_PROV (the 7h strip removes exactly what this counts).
+const SIZE_LEAK_RE = /(?<!\w|\d\.)(?!0x)(?:\d+(?:\.\d+)?\s*[×x]\s*\d+(?:\.\d+)?(?:\s*(?:px|pt)(?:\s+each)?|\s+each)|(?<!\b(?:is|are|was|were|be|been|of|a|an|the|at|to|into|by|than|as|from|becomes?)\s+)(?=\d{2}|\d+\.\d|\d+\s*[×x]\s*(?:\d{2}|\d+\.\d))\d+(?:\.\d+)?\s*×\s*\d+(?:\.\d+)?)(?!\w|\.\d)/;
 const NODE_ID_TEXT_RE = /\b(?:I?\d{1,6}[:;](?:\d{3,7})|I?\d{3,6}[:;]\d{1,7})(?:;\d+:\d+)*\b/g;
 // Node ids inside identifiers / paths / routes: screen_290_3657, showModal_313_9543, c2903657, /283-1967, c_290_4388
 const NODE_ID_IDENT_RE = /(?:^|_)(\d{2,6})_(\d{3,7})(?:_|$)|^[cm]\d{6,}$|^[cm]_\d{2,6}_\d{3,7}$/;
@@ -695,7 +700,7 @@ function analyzeFile(root, rel, framework, ctx) {
         || /^\s*<\/?[A-Za-z][\w.]*(?:\s[^<>]*)?\/?>\s*$/.test(line)) { m.comments.commentedOutCode++; noisy = true; }
       else if (
         NODE_ID_TEXT_RE.test(line) || /\b(?:frame|ref|node)\s*#?\s?\d{2,}\b/i.test(line) || /\bIR\b/.test(line)
-        || /\bFigma\b/i.test(line) || /\d+(?:\.\d+)?\s*[×x]\s*\d+(?:\.\d+)?\s*(?:px|pt)?\b/.test(line)
+        || /\bFigma\b/i.test(line) || SIZE_LEAK_RE.test(line)
         || /\badded by \//i.test(line) || /\b(?:matches?|per) the (?:reference|design|ref)\b/i.test(line)
         || new RegExp(`\\b(?:${LAYER_WORDS}) \\d+\\b`).test(line)
       ) { m.comments.figmaLeak++; noisy = true; }

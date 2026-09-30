@@ -29,19 +29,27 @@ import path from 'node:path';
 /** Figma layer-type words that, followed by a number, are a layer NAME ("Rectangle 24"). */
 const LAYER_WORDS = 'Frame|Group|Rectangle|Rect|Vector|Ellipse|Polygon|Star|Line|Union|Subtract|Intersect|Exclude|Mask|Layer|Instance|Slice';
 
+/** Pixel sizes — see PROV_SRC. Kept in sync with readability-report.cjs `SIZE_LEAK_RE`. */
+const SIZE_PROV = String.raw`(?<!\w|\d\.)(?!0x)(?:\d+(?:\.\d+)?\s*[×x]\s*\d+(?:\.\d+)?(?:\s*(?:px|pt)(?:\s+each)?|\s+each)|(?<!\b(?:is|are|was|were|be|been|of|a|an|the|at|to|into|by|than|as|from|becomes?)\s+)(?=\d{2}|\d+\.\d|\d+\s*[×x]\s*(?:\d{2}|\d+\.\d))\d+(?:\.\d+)?\s*×\s*\d+(?:\.\d+)?)(?!\w|\.\d)`;
+
 /** One provenance token. Kept in sync with scripts/readability-report.cjs `figmaLeak`
  *  so the strip and the metric agree on what provenance is. */
 const PROV_SRC = [
   String.raw`\bcanonicalId\s+[cm]_\d+_\d+\b`,
   String.raw`\b[cm]_\d+_\d+\b`,
-  String.raw`\bI?\d{1,6}[:;]\d{2,7}(?:;\d+:\d+)*\b`,
+  // a node id has 3+ digits on one side (`283:1967`, `I313:10287;1:2`); a clock time
+  // or ratio (`10:30`, `9:41`, `16:9`) does not — same rule as the metric's NODE_ID_TEXT_RE
+  String.raw`\b(?:I?\d{1,6}[:;]\d{3,7}|I?\d{3,6}[:;]\d{1,7})(?:;\d+:\d+)*\b`,
   String.raw`\b(?:frames?|ref|node)\s*#?\s?\d{2,}(?:\s*(?:[/,&–-]|and)\s*\d{2,})*(?:\s*(?:—|–|-|:)\s*"[^"]*")?`,
   String.raw`\bIR(?:\s+(?:image\s+)?(?:"[^"]*"|'[^']*'))?(?:\s*\/\s*"[^"]*")*`,
   String.raw`\bFigma\b`,
   String.raw`\badded by \/[\w/-]*`,
   String.raw`\b(?:matches?|per) the (?:reference|design|ref)(?:'s)?\b`,
   String.raw`"?\b(?:${LAYER_WORDS}) \d+(?:\s*[–-]\s*\d+)?\b"?`,
-  String.raw`\b\d+(?:\.\d+)?\s*×\s*\d+(?:\.\d+)?(?:\s*(?:px|pt))?(?:\s+each)?\b`,
+  // a MEASURED pixel size: with a unit or "each" (`24×24px`, `27×27 each`), or a bare
+  // `40×40` that is not the predicate of its sentence ("is 40×40 so …" keeps it). A
+  // small grid count (`3×3`, `7×7`: both numbers < 10, no unit) is not a pixel size.
+  SIZE_PROV,
   // a device-preset FRAME name ("iPhone 14 & 15 Pro - 85") and `frame "<name>"`
   String.raw`\bframe\s+"[^"]*"`,
   String.raw`"(?:iPhone|iPad|Android|Pixel|Galaxy|Desktop|MacBook)\b[^"]*"`,
@@ -154,30 +162,50 @@ export function stripProvenanceText(line: string): string {
   return r.length ? r[0] : '';
 }
 
-type Lang = 'dart' | 'ts';
+/** `ts` = TS/JS with no JSX (.ts/.mjs/.cjs), `tsx` = JSX-bearing (.tsx/.jsx/.js),
+ *  `css` = stylesheets (only block comments — `//` in `url(http://…)` is not one). */
+type Lang = 'dart' | 'ts' | 'tsx' | 'css';
+
+/** A JSX expression container `{ … }` among an element's children, and the JSX
+ *  text on either side of it (what React renders around it). */
+export interface JsxContainer {
+  open: number;              // offset of `{`
+  close: number;             // offset just after `}`
+  onlyComments: boolean;     // nothing but whitespace and comments inside
+  prevText: [number, number];
+  nextText: [number, number];
+}
 
 /** Every comment in `src` as [start, end) offsets, skipping string literals. */
 function commentSpans(src: string, lang: Lang): Array<[number, number]> {
+  return scanComments(src, lang).spans;
+}
+
+/**
+ * The comments of a source file. Dart and CSS: a string-aware scan. TS/TSX: a small
+ * JS lexer that also knows regex literals, template literals and — for `tsx` — JSX:
+ * element text is NOT code, so `http://ex.com` or `/* … *\/` inside `<p>…</p>` is
+ * user-visible copy, never a comment. It also returns the JSX expression containers
+ * so a stripped `{/* … *\/}` can take its braces with it.
+ */
+export function scanComments(src: string, lang: Lang): { spans: Array<[number, number]>; containers: JsxContainer[] } {
+  if (lang === 'ts' || lang === 'tsx') return scanJs(src, lang === 'tsx');
   const out: Array<[number, number]> = [];
   let i = 0;
   const n = src.length;
   while (i < n) {
     const c = src[i];
     const d = src[i + 1];
-    if (c === '/' && d === '/') { const e = src.indexOf('\n', i); const end = e === -1 ? n : e; out.push([i, end]); i = end; continue; }
+    if (lang !== 'css' && c === '/' && d === '/') { const e = src.indexOf('\n', i); const end = e === -1 ? n : e; out.push([i, end]); i = end; continue; }
     if (c === '/' && d === '*') { const e = src.indexOf('*/', i + 2); const end = e === -1 ? n : e + 2; out.push([i, end]); i = end; continue; }
-    if (c === '"' || c === "'" || (lang === 'ts' && c === '`')) {
+    if (c === '"' || c === "'") {
       const triple = lang === 'dart' && src.startsWith(c.repeat(3), i);
       const raw = lang === 'dart' && src[i - 1] === 'r';
       if (triple) { const e = src.indexOf(c.repeat(3), i + 3); i = e === -1 ? n : e + 3; continue; }
       let j = i + 1;
       while (j < n && src[j] !== c) {
         if (src[j] === '\\' && !raw) j++;
-        else if (c !== '`' && src[j] === '\n') break;
-        else if (c === '`' && src[j] === '$' && src[j + 1] === '{') {   // template expression: skip balanced braces
-          let depth = 0;
-          for (j++; j < n; j++) { if (src[j] === '{') depth++; else if (src[j] === '}') { depth--; if (depth === 0) break; } }
-        }
+        else if (src[j] === '\n') break;
         j++;
       }
       i = j + 1;
@@ -185,7 +213,161 @@ function commentSpans(src: string, lang: Lang): Array<[number, number]> {
     }
     i++;
   }
+  return { spans: out, containers: [] };
+}
+
+const REGEX_AFTER_WORD = new Set(['return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete', 'void', 'throw', 'case', 'do', 'else', 'yield', 'await']);
+const JSX_AFTER_WORD = new Set(['return', 'yield', 'default', 'case', 'else', 'await']);
+
+function scanJs(src: string, jsx: boolean): { spans: Array<[number, number]>; containers: JsxContainer[] } {
+  const spans: Array<[number, number]> = [];
+  const containers: JsxContainer[] = [];
+  const n = src.length;
+  let i = 0;
+  // the last significant token: a punctuator char, or a word (identifier / keyword / literal)
+  let prevPunct: string | null = null;
+  let prevWord: string | null = null;
+  const setWord = (w: string): void => { prevWord = w; prevPunct = null; };
+  const setPunct = (p: string): void => { prevPunct = p; prevWord = null; };
+  const exprStart = (): boolean => (prevWord == null && prevPunct == null)
+    || (prevPunct != null && '(,=:[!&|?{};+-*%<>~^'.includes(prevPunct))
+    || (prevWord != null && REGEX_AFTER_WORD.has(prevWord));
+  const jsxStart = (): boolean => {
+    if (!jsx || src[i] !== '<') return false;
+    const nx = src[i + 1];
+    if (!(nx === '>' || (nx && /[A-Za-z]/.test(nx)))) return false;
+    if (prevWord != null) return JSX_AFTER_WORD.has(prevWord);
+    if (!(prevPunct == null || '(,=:[!&|?{};>}'.includes(prevPunct))) return false;
+    // `<T,>() =>` / `<T extends X>` in a .tsx file are type parameters, not JSX
+    const m = /^<([A-Za-z_$][\w$.]*)\s*(,|extends\b)?/.exec(src.slice(i, i + 80));
+    return !(m && m[2]);
+  };
+
+  /** Skip a string starting at i (quote q); returns the index after it. */
+  const skipString = (at: number, q: string, multiline: boolean): number => {
+    let j = at + 1;
+    while (j < n && src[j] !== q) { if (!multiline && src[j] === '\\') j++; else if (!multiline && src[j] === '\n') break; j++; }
+    return j + 1;
+  };
+  const skipRegex = (at: number): number => {
+    let j = at + 1; let cls = false;
+    while (j < n && src[j] !== '\n') {
+      const c = src[j];
+      if (c === '\\') { j += 2; continue; }
+      if (c === '[') cls = true;
+      else if (c === ']') cls = false;
+      else if (c === '/' && !cls) { j++; break; }
+      j++;
+    }
+    while (j < n && /[a-z]/i.test(src[j])) j++;
+    return j;
+  };
+
+  /** Code until an unmatched `}` (stop=true) or EOF. Returns whether it saw anything but comments. */
+  const code = (stop: boolean): boolean => {
+    let depth = 0; let saw = false;
+    while (i < n) {
+      const c = src[i]; const d = src[i + 1];
+      if (c === ' ' || c === '\t' || c === '\n' || c === '\r') { i++; continue; }
+      if (c === '/' && d === '/') { const e = src.indexOf('\n', i); const end = e === -1 ? n : e; spans.push([i, end]); i = end; continue; }
+      if (c === '/' && d === '*') { const e = src.indexOf('*/', i + 2); const end = e === -1 ? n : e + 2; spans.push([i, end]); i = end; continue; }
+      if (c === '}' && stop && depth === 0) return saw;
+      saw = true;
+      if (jsxStart()) { element(); setPunct(')'); continue; }
+      if (c === '"' || c === "'") { i = skipString(i, c, false); setWord('str'); continue; }
+      if (c === '`') { template(); setWord('tpl'); continue; }
+      if (c === '/' && exprStart()) { i = skipRegex(i); setWord('re'); continue; }
+      if (/[A-Za-z_$0-9]/.test(c)) { let j = i + 1; while (j < n && /[\w$]/.test(src[j])) j++; setWord(src.slice(i, j)); i = j; continue; }
+      if (c === '{') depth++;
+      else if (c === '}') depth--;
+      if (c === '=' && d === '>') { setPunct('>'); i += 2; continue; }
+      setPunct(c); i++;
+    }
+    return saw;
+  };
+  const template = (): void => {
+    i++;
+    while (i < n && src[i] !== '`') {
+      if (src[i] === '\\') { i += 2; continue; }
+      if (src[i] === '$' && src[i + 1] === '{') { i += 2; setPunct('{'); code(true); i++; continue; }
+      i++;
+    }
+    i++;
+  };
+  /** At `<` of an element: its tag, attributes and children, up to its end. */
+  const element = (): void => {
+    i++;
+    if (src[i] === '>') { i++; }
+    else {
+      while (i < n && /[\w$.:-]/.test(src[i])) i++;
+      for (;;) {
+        if (i >= n) return;
+        const c = src[i]; const d = src[i + 1];
+        if (c === '/' && d === '>') { i += 2; return; }
+        if (c === '>') { i++; break; }
+        if (c === '/' && d === '/') { const e = src.indexOf('\n', i); const end = e === -1 ? n : e; spans.push([i, end]); i = end; continue; }
+        if (c === '/' && d === '*') { const e = src.indexOf('*/', i + 2); const end = e === -1 ? n : e + 2; spans.push([i, end]); i = end; continue; }
+        if (c === '"' || c === "'") { i = skipString(i, c, true); continue; }
+        if (c === '{') { i++; setPunct('{'); code(true); i++; continue; }
+        i++;
+      }
+    }
+    // children
+    let textStart = i;
+    let pending: JsxContainer | null = null;
+    const flush = (at: number): void => { if (pending) { pending.nextText = [textStart, at]; pending = null; } };
+    while (i < n) {
+      const c = src[i];
+      if (c === '<' && src[i + 1] === '/') {
+        flush(i);
+        const e = src.indexOf('>', i);
+        i = e === -1 ? n : e + 1;
+        return;
+      }
+      if (c === '<') { flush(i); element(); textStart = i; continue; }
+      if (c === '{') {
+        flush(i);
+        const cont: JsxContainer = { open: i, close: i, onlyComments: false, prevText: [textStart, i], nextText: [i, i] };
+        i++; setPunct('{');
+        const saw = code(true);
+        i++;
+        cont.close = i; cont.onlyComments = !saw;
+        containers.push(cont);
+        pending = cont; textStart = i;
+        continue;
+      }
+      i++;
+    }
+    flush(i);
+  };
+
+  code(false);
+  return { spans, containers };
+}
+
+/** Babel/TypeScript's JSX text rule: what a JSX text child renders as. Lines are
+ *  trimmed (not the first line's start / the last line's end), blank lines dropped,
+ *  the rest joined with one space. */
+export function renderedJsxText(t: string): string {
+  const lines = t.split(/\r\n|\n|\r/);
+  let lastNonEmpty = 0;
+  lines.forEach((l, k) => { if (/[^ \t]/.test(l)) lastNonEmpty = k; });
+  let out = '';
+  lines.forEach((l, k) => {
+    let s = l.replace(/\t/g, ' ');
+    if (k !== 0) s = s.replace(/^[ ]+/, '');
+    if (k !== lines.length - 1) s = s.replace(/[ ]+$/, '');
+    if (s) out += k === lastNonEmpty ? s : `${s} `;
+  });
   return out;
+}
+
+/** Removing src[start, end) — a container plus maybe its line — renders the same? */
+function containerRemovalNeutral(src: string, c: JsxContainer, start: number, end: number): boolean {
+  const prev = src.slice(c.prevText[0], c.prevText[1]);
+  const next = src.slice(c.nextText[0], c.nextText[1]);
+  const merged = src.slice(c.prevText[0], Math.max(c.prevText[0], Math.min(start, c.prevText[1]))) + src.slice(Math.min(c.nextText[1], Math.max(end, c.nextText[0])), c.nextText[1]);
+  return renderedJsxText(prev) + renderedJsxText(next) === renderedJsxText(merged);
 }
 
 export interface ProvenanceStripResult { src: string; stripped: number; linesRemoved: number }
@@ -196,7 +378,7 @@ export interface ProvenanceStripResult { src: string; stripped: number; linesRem
  * wrap); a trailing comment after code and each block comment are handled alone.
  */
 export function stripProvenance(src: string, lang: Lang): ProvenanceStripResult {
-  const spans = commentSpans(src, lang);
+  const { spans, containers } = scanComments(src, lang);
   // Group whole-line // comments into runs.
   type Run = { start: number; end: number; indent: string; prefix: string; lines: string[]; block: boolean };
   const runs: Run[] = [];
@@ -219,8 +401,8 @@ export function stripProvenance(src: string, lang: Lang): ProvenanceStripResult 
   }
   let stripped = 0;
   let linesRemoved = 0;
-  let out = src;
-  for (const r of runs.reverse()) {
+  const edits: Array<{ start: number; end: number; replacement: string; span: [number, number] }> = [];
+  for (const r of runs) {
     const text = r.lines.join('\n');
     if (!hasProvenance(text)) continue;
     let replacement: string;
@@ -268,15 +450,36 @@ export function stripProvenance(src: string, lang: Lang): ProvenanceStripResult 
     let start = r.start;
     let end = r.end;
     if (!replacement) {
-      if (!r.block || /^[ \t]*$/.test(out.slice(out.lastIndexOf('\n', start - 1) + 1, start))) {
-        start = out.lastIndexOf('\n', start - 1) + 1;
-        end = out[end] === '\n' ? end + 1 : end;
+      if (!r.block || /^[ \t]*$/.test(src.slice(src.lastIndexOf('\n', start - 1) + 1, start))) {
+        start = src.lastIndexOf('\n', start - 1) + 1;
+        end = src[end] === '\n' ? end + 1 : end;
       } else {
-        while (start > 0 && /[ \t]/.test(out[start - 1])) start--;
+        while (start > 0 && /[ \t]/.test(src[start - 1])) start--;
       }
     }
-    out = out.slice(0, start) + replacement + out.slice(end);
+    edits.push({ start, end, replacement, span: [r.start, r.end] });
   }
+  // A JSX expression container that held nothing but the comments we removed —
+  // `{/* Frame 45 hero, matches the reference */}` — goes with them (with its line
+  // when it had one to itself), unless dropping it would change the text React
+  // renders around it (two text runs that would merge); then the empty `{}` stays.
+  for (const c of containers) {
+    if (!c.onlyComments) continue;
+    const inside = edits.filter((e) => e.span[0] >= c.open && e.span[1] <= c.close);
+    const comments = spans.filter(([x, y]) => x > c.open && y < c.close);
+    if (!inside.length || inside.length !== comments.length || inside.some((e) => e.replacement)) continue;
+    const ls = src.lastIndexOf('\n', c.open - 1) + 1;
+    const nl = src.indexOf('\n', c.close);
+    const le = nl === -1 ? src.length : nl;
+    const ownLine = /^[ \t]*$/.test(src.slice(ls, c.open)) && /^[ \t]*$/.test(src.slice(c.close, le));
+    const options: Array<[number, number]> = ownLine ? [[ls, nl === -1 ? le : nl + 1], [c.open, c.close]] : [[c.open, c.close]];
+    const pick = options.find(([x, y]) => containerRemovalNeutral(src, c, x, y));
+    if (!pick) continue;
+    for (const e of inside) edits.splice(edits.indexOf(e), 1);
+    edits.push({ start: pick[0], end: pick[1], replacement: '', span: [c.open, c.close] });
+  }
+  let out = src;
+  for (const e of edits.sort((x, y) => y.start - x.start)) out = out.slice(0, e.start) + e.replacement + out.slice(e.end);
   return { src: out, stripped, linesRemoved };
 }
 
@@ -286,7 +489,7 @@ export interface ProvenanceSweep { filesScanned: number; filesChanged: number; c
 export async function stripProvenanceInTree(projectRoot: string, files: string[], dryRun: boolean): Promise<ProvenanceSweep> {
   const res: ProvenanceSweep = { filesScanned: 0, filesChanged: 0, commentsStripped: 0, changedFiles: [] };
   for (const f of files) {
-    const lang: Lang | null = f.endsWith('.dart') ? 'dart' : /\.(tsx?|jsx?|mjs|cjs|css)$/.test(f) ? 'ts' : null;
+    const lang: Lang | null = f.endsWith('.dart') ? 'dart' : /\.(tsx|jsx|js)$/.test(f) ? 'tsx' : /\.(ts|mts|cts|mjs|cjs)$/.test(f) ? 'ts' : /\.css$/.test(f) ? 'css' : null;
     if (!lang) continue;
     let src: string;
     try { src = await fs.readFile(f, 'utf8'); } catch { continue; }
