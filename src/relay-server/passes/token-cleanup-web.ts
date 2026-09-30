@@ -25,6 +25,11 @@ import path from 'node:path';
 
 import { loadWebApp, listWebSources, ensureNamedImport, importSpecFor, stillReferenced } from './web-app';
 import { DESIGN_SYSTEM_RECORD } from '../design-system';
+import { ladderNames } from '../design-vocabulary';
+import { planVocabularyAmendment, planTextStyleRenames, type TextStyleDecl } from './token-vocabulary';
+import { stadiumIsExact, detectGlobalBorderBox, cssMayGrowFrom, objectEntries, cssLengths, type WebBoxContext } from './web-box-model';
+
+export { stadiumIsExact, detectGlobalBorderBox, cssMayGrowFrom, type WebBoxContext } from './web-box-model';
 
 export interface WebThemeModel {
   themeFile: string;
@@ -33,21 +38,25 @@ export interface WebThemeModel {
    *  `color` vs `colors`. Emitting the name we hoped for instead of the one that
    *  exists produces `AppTheme.spacing.sm` against a theme that only has `space`:
    *  337 type errors, every one of them ours. */
-  groupKeys: { color: string | null; spacing: string | null; radius: string | null };
+  groupKeys: { color: string | null; spacing: string | null; radius: string | null; size?: string | null };
   colors: { name: string; value: string }[];
   spacing: { name: string; value: number }[];
   radius: { name: string; value: number }[];
+  /** F4/F5: role-named sizes (`size: { iconMd: 24, buttonHeight: 56 }`). */
+  sizes?: { name: string; value: number }[];
   textStyles: string[];
 }
 
-export interface WebTokenChange { file: string; kind: 'color' | 'spacing' | 'radius'; from: string; to: string }
+export interface WebTokenChange { file: string; kind: 'color' | 'spacing' | 'radius' | 'size' | 'add-token' | 'rename-token'; from: string; to: string }
 export interface WebTokenReject { file: string; kind: string; literal: string; reason: string }
 
 export interface WebTokenResult {
   themeFile: string | null;
   tokensAvailable: { colors: { name: string; argb: string }[]; spacing: { name: string; value: number }[]; radius: { name: string; value: number }[]; textStyles: string[] };
-  substitutions: { colors: number; textStyles: number; spacing: number; radius: number };
+  substitutions: { colors: number; textStyles: number; spacing: number; radius: number; sizes?: number; renamed?: number };
   removals: { imports: number; consts: number; methods: number };
+  /** F4/F5: vocabulary added to the theme module (recurring values, role-named). */
+  vocabulary?: { added: string[]; renamed: Array<{ from: string; to: string }> };
   changes: WebTokenChange[];
   rejected: WebTokenReject[];
   /** Source files read. 0 = examined nothing. */
@@ -136,6 +145,7 @@ export function parseWebThemeSource(src: string, themeFile: string): WebThemeMod
   const colors = strEntries(group('color') ?? group('colors'));
   const spacing = numEntries(group('spacing') ?? group('space'));
   const radius = numEntries(group('radius') ?? group('radii'));
+  const sizes = numEntries(group('size') ?? group('sizes'));
   return {
     themeFile,
     themeSymbol: decl[1],
@@ -143,10 +153,12 @@ export function parseWebThemeSource(src: string, themeFile: string): WebThemeMod
       color: firstKey('color', 'colors'),
       spacing: firstKey('spacing', 'space'),
       radius: firstKey('radius', 'radii'),
+      size: firstKey('size', 'sizes'),
     },
     colors,
     spacing,
     radius,
+    sizes,
     textStyles: textBody ? [...new Set([...textBody.matchAll(/([A-Za-z0-9_$]+)\s*:/g)].map((m) => m[1]))] : [],
   };
 }
@@ -196,6 +208,201 @@ function substituteNumeric(
   });
 }
 
+// ── F4/F5: sizes, pills, vocabulary amendment (web) ───────────────────────────
+
+/** Object literals `{ … }` in a source with their numeric width/height/borderRadius. */
+interface WebSizeSite { family: 'icon' | 'avatar' | 'tile' | 'button' | 'pill'; value: number; start: number; end: number; /** one element (a square's width + height are ONE use). */ el?: string }
+
+/** Square style objects (`{ width: 24, height: 24 }`), control heights next to a text
+ *  child, JSX `size={24}` on icon components, and stadium radii (≥ half the box). */
+export function scanWebSizeSites(src: string, resolve?: (expr: string) => number | null, box: WebBoxContext = {}): WebSizeSite[] {
+  const sites: WebSizeSite[] = [];
+  // `resolve` (planning only) also counts a position already holding a token
+  // (`width: AppTheme.size.iconMd`) as a use of its value, so a second run plans the
+  // same ladder as the first — 7f converges. Substitution never passes it.
+  const V = '(\\d+(?:\\.\\d+)?|[A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)+)';
+  const valueOf = (t: string): number | null => (/^\d/.test(t) ? parseFloat(t) : resolve ? resolve(t) : null);
+  const num = (body: string, key: string, base: number): { value: number; start: number; end: number } | null => {
+    const m = new RegExp(`(?<![\\w$-])${key}\\s*:\\s*${V}(?![\\w.])`).exec(body);
+    if (!m) return null;
+    const value = valueOf(m[1]);
+    return value == null ? null : { value, start: base + m.index + m[0].length - m[1].length, end: base + m.index + m[0].length };
+  };
+  // innermost `{ … }` object literals (style objects are flat)
+  for (const m of src.matchAll(/\{([^{}]*)\}/g)) {
+    const body = m[1];
+    const base = m.index! + 1;
+    if (!/\b(width|height|borderRadius)\s*:/.test(body)) continue;
+    const w = num(body, 'width', base); const h = num(body, 'height', base);
+    const br = num(body, 'borderRadius', base);
+    // A circle is judged on the box's real values: a width/height that 7f already
+    // turned into `AppTheme.size.avatar` is still 40 (else run 2 would read the
+    // circle's radius as a stadium and swap it — not idempotent).
+    const boxDim = (d: { value: number } | null, key: string): number | null => {
+      if (d) return d.value;
+      const raw = box.resolve ? objectEntries(body).get(key) : undefined;
+      const v = raw != null ? cssLengths(raw, box.resolve) : null;
+      return v && v.length === 1 ? v[0] : null;
+    };
+    const bw = boxDim(w, 'width'); const bh = boxDim(h, 'height');
+    const circle = !!br && bw != null && bh != null && bw === bh && br.value * 2 >= bw;
+    if (w && h && w.value === h.value) {
+      const fam = w.value < 28 ? 'icon' : circle ? 'avatar' : w.value <= 120 ? 'tile' : null;
+      if (fam) { sites.push({ family: fam, ...w, el: `o${base}` }); sites.push({ family: fam, ...h, el: `o${base}` }); }
+    } else if (h && !w && h.value >= 36 && h.value <= 64) {
+      sites.push({ family: 'button', ...h });
+    }
+    // A pill only when the RENDERED box is provably a stadium already (see
+    // stadiumIsExact): CSS `height` is the content box, so padding or a border
+    // makes the painted box taller and `borderRadius: 20` on `height: 40` is then a
+    // rounded rectangle — 9999 would change pixels.
+    if (br && !circle && stadiumIsExact(src, m.index!, body, br.value, box)) sites.push({ family: 'pill', ...br });
+  }
+  // <img width={18} height={18}> / <Image width={40} height={40}>: a square JSX box
+  for (const m of src.matchAll(/<([A-Za-z][\w.]*)\b([^<>]*?)\/?>/g)) {
+    const attrs = m[2];
+    const w = new RegExp(`\\bwidth=\\{${V}\\}`).exec(attrs); const h = new RegExp(`\\bheight=\\{${V}\\}`).exec(attrs);
+    if (!w || !h) continue;
+    const wv = valueOf(w[1]); const hv = valueOf(h[1]);
+    if (wv == null || hv == null || wv !== hv) continue;
+    const v = wv;
+    const fam = v < 28 ? 'icon' : /avatar/i.test(attrs) ? 'avatar' : v <= 120 ? 'tile' : null;
+    if (!fam) continue;
+    const base = m.index! + 1 + m[1].length;
+    for (const a of [w, h]) { const at = base + a.index + a[0].length - 1 - a[1].length; sites.push({ family: fam, value: v, start: at, end: at + a[1].length, el: `j${base}` }); }
+  }
+  // <SomeIcon size={24} />
+  for (const m of src.matchAll(new RegExp(`<([A-Z]\\w*)\\b[^>]*?\\bsize=\\{${V}\\}`, 'g'))) {
+    const v = valueOf(m[2]);
+    if (v == null) continue;
+    const at = m.index! + m[0].length - 1 - m[2].length;
+    if (v <= 48) sites.push({ family: 'icon', value: v, start: at, end: at + m[2].length });
+  }
+  return sites;
+}
+
+const WEB_LADDERS: Array<[WebSizeSite['family'], string[], number]> = [
+  ['icon', ['iconXs', 'iconSm', 'iconMd', 'iconLg', 'iconXl'], 2],
+  ['avatar', ['avatarSm', 'avatar', 'avatarLg'], 1],
+  ['tile', ['tileXs', 'tileSm', 'tile', 'tileLg', 'tileXl'], 2],
+  ['button', ['buttonHeightSm', 'buttonHeight', 'buttonHeightLg'], 1],
+];
+
+/** Plan the size / pill tokens to add (≥2 uses, role-named, whole pixels). */
+export function planWebVocabulary(theme: WebThemeModel, sites: WebSizeSite[]): { sizes: Array<{ name: string; value: number }>; pill: boolean } {
+  const have = theme.sizes ?? [];
+  const taken = new Set(have.map((z) => z.name));
+  const sizes: Array<{ name: string; value: number }> = [];
+  for (const [fam, ladder, md] of WEB_LADDERS) {
+    const els = new Map<number, Set<string>>();
+    const tokened = (v: number): boolean => have.some((z) => z.value === v && z.name.startsWith(fam === 'button' ? 'buttonHeight' : fam));
+    // token-held positions are counted too (see scanWebSizeSites `resolve`): the
+    // ladder stays the one the first run planned; tokened values are skipped.
+    for (const s of sites) if (s.family === fam && Number.isInteger(s.value)) els.set(s.value, (els.get(s.value) ?? new Set()).add(s.el ?? String(s.start)));
+    const counts = new Map([...els].map(([v, set]) => [v, set.size]));
+    for (const t of ladderNames(counts, ladder, md, 2)) {
+      if (tokened(t.value) || taken.has(t.name)) continue;
+      taken.add(t.name); sizes.push({ name: t.name, value: t.value });
+    }
+  }
+  const pill = new Set(sites.filter((s) => s.family === 'pill').map((s) => s.el ?? String(s.start))).size >= 2 && !theme.radius.some((r) => r.name === 'pill');
+  return { sizes, pill };
+}
+
+/** Add entries to the theme object's `size` / `radius` groups (creating `size`). */
+export function amendWebThemeSource(src: string, theme: WebThemeModel, plan: { sizes: Array<{ name: string; value: number }>; pill: boolean }): string {
+  let out = src;
+  const addToGroup = (key: string, entries: string[]): boolean => {
+    const m = new RegExp(`\\b${key}\\s*:\\s*\\{`).exec(out);
+    if (!m) return false;
+    let depth = 0;
+    for (let i = m.index + m[0].length - 1; i < out.length; i++) {
+      if (out[i] === '{') depth++;
+      else if (out[i] === '}') {
+        depth--;
+        if (depth === 0) {
+          const inner = out.slice(m.index + m[0].length, i);
+          const sep = inner.trim() ? (inner.trimEnd().endsWith(',') ? ' ' : ', ') : ' ';
+          out = `${out.slice(0, i).replace(/\s*$/, '')}${sep}${entries.join(', ')} ${out.slice(i)}`;
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+  if (plan.pill && theme.groupKeys.radius) addToGroup(theme.groupKeys.radius, ['pill: 9999']);
+  if (plan.sizes.length) {
+    const entries = plan.sizes.map((z) => `${z.name}: ${z.value}`);
+    if (!(theme.groupKeys.size && addToGroup(theme.groupKeys.size, entries))) {
+      // no size group yet: add one before the object's closing `}` (`} as const`)
+      const decl = new RegExp(`export\\s+const\\s+${theme.themeSymbol}\\s*=\\s*\\{`).exec(out);
+      if (decl) {
+        let depth = 0;
+        for (let i = decl.index + decl[0].length - 1; i < out.length; i++) {
+          if (out[i] === '{') depth++;
+          else if (out[i] === '}') { depth--; if (depth === 0) { out = `${out.slice(0, i).replace(/,?\s*$/, ',')}\n  size: { ${entries.join(', ')} },\n${out.slice(i)}`; break; } }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/** Replace sized literals with the theme's size / pill tokens. */
+function substituteWebSizes(src: string, theme: WebThemeModel, box: WebBoxContext, onChange: (kind: 'size' | 'radius', from: string, to: string) => void): string {
+  const sizes = theme.sizes ?? [];
+  const pill = theme.radius.find((r) => r.name === 'pill');
+  if (!sizes.length && !pill) return src;
+  const sizeKey = theme.groupKeys.size ?? 'size';
+  const sites = scanWebSizeSites(src, undefined, box).sort((a, b) => b.start - a.start);
+  let out = src;
+  const done = new Set<number>();
+  for (const s of sites) {
+    if (done.has(s.start)) continue;
+    let to: string | null = null;
+    if (s.family === 'pill') { if (pill && theme.groupKeys.radius) to = `${theme.themeSymbol}.${theme.groupKeys.radius}.pill`; }
+    else {
+      const prefix = s.family === 'button' ? 'buttonHeight' : s.family;
+      const tok = sizes.find((z) => z.value === s.value && z.name.startsWith(prefix));
+      if (tok) to = `${theme.themeSymbol}.${sizeKey}.${tok.name}`;
+    }
+    if (!to) continue;
+    // JSX attribute value `size={24}` keeps its braces; the number is replaced inside them.
+    const from = out.slice(s.start, s.end);
+    out = out.slice(0, s.start) + to + out.slice(s.end);
+    done.add(s.start);
+    onChange(s.family === 'pill' ? 'radius' : 'size', from, to);
+  }
+  return out;
+}
+
+/** F4 (web): counter-named colour keys (`neutral1`, `ink2`, `accent2` — what the
+ *  pre-F4 design system wrote into theme.ts) → role names, with the same planner
+ *  the Flutter side uses. Only `#rrggbb` values are classified. Pure. */
+export function planWebColorRenames(theme: WebThemeModel, refs: Map<string, number>): Array<{ from: string; to: string }> {
+  const colors = theme.colors.flatMap((c) => {
+    const h = /^#([0-9a-fA-F]{6})$/.exec(c.value.trim());
+    return h ? [{ name: c.name, argb: `ff${h[1].toLowerCase()}` }] : [];
+  });
+  return planVocabularyAmendment({
+    className: theme.themeSymbol, themeFileRel: '', colors, spacing: theme.spacing, radius: theme.radius,
+    sizes: theme.sizes ?? [], corners: [],
+  }, [], refs).renames;
+}
+
+/** Rewrite one source for the colour renames: `AppTheme.color.<from>` member
+ *  references and `var(--color-<from>)` / `--color-<from>:` CSS custom properties. */
+export function applyWebColorRenames(src: string, theme: WebThemeModel, renames: Array<{ from: string; to: string }>): { src: string; count: number } {
+  let count = 0;
+  let out = src;
+  const key = theme.groupKeys.color ?? 'color';
+  for (const r of renames) {
+    out = out.replace(new RegExp(`\\b${theme.themeSymbol}\\.${key}\\.${r.from}\\b`, 'g'), () => { count++; return `${theme.themeSymbol}.${key}.${r.to}`; });
+    out = out.replace(new RegExp(`--color-${r.from}(?![\\w-])`, 'g'), () => { count++; return `--color-${r.to}`; });
+  }
+  return { src: out, count };
+}
+
 /** Unused local `const X = …` at module scope, and imports nothing references. */
 function removeDeadImports(src: string): { src: string; removed: number } {
   let removed = 0;
@@ -222,8 +429,9 @@ export async function deepenWebTokens(projectRoot: string, opts: WebTokenOptions
 
   const ix = await loadWebApp(projectRoot);
   const themeAt = locateWebTheme(projectRoot, ix?.themeFile ?? null);
-  const theme = themeAt ? parseWebThemeSource(fsSync.readFileSync(themeAt, 'utf-8'), themeAt) : null;
-  if (!theme) return { ...empty, skippedReason: webThemeSkipReason(projectRoot, themeAt) };
+  const parsed = themeAt ? parseWebThemeSource(fsSync.readFileSync(themeAt, 'utf-8'), themeAt) : null;
+  if (!parsed) return { ...empty, skippedReason: webThemeSkipReason(projectRoot, themeAt) };
+  let theme: WebThemeModel = parsed;
 
   const result: WebTokenResult = {
     ...empty,
@@ -245,6 +453,119 @@ export async function deepenWebTokens(projectRoot: string, opts: WebTokenOptions
 
   result.filesScanned = targets.length;
   if (targets.length === 0) result.skippedReason = `no source files to scan under ${roots.map((r) => rel(projectRoot, r) || '.').join(', ')}`;
+
+  // Does the app's global CSS make every element border-box? (the pill check needs it)
+  // and could any global rule grow an element's box (a type / universal / id selector)?
+  const projectCss = await readProjectCss(projectRoot, roots);
+  const globalCss = { borderBox: detectGlobalBorderBox(projectCss), cssMayGrow: cssMayGrowFrom(projectCss) };
+
+  // F4/F5: recurring sized values with no token get ONE role-named entry in the
+  // theme object (≥2 uses); the substitution below then uses it.
+  {
+    const allSites: WebSizeSite[] = [];
+    const sizeKey = theme.groupKeys.size ?? 'size';
+    const radiusKey = theme.groupKeys.radius ?? 'radius';
+    const tokenValues = new Map<string, number>([
+      ...(theme.sizes ?? []).map((z) => [`${theme.themeSymbol}.${sizeKey}.${z.name}`, z.value] as [string, number]),
+      ...theme.radius.map((z) => [`${theme.themeSymbol}.${radiusKey}.${z.name}`, z.value] as [string, number]),
+    ]);
+    const resolve = (expr: string): number | null => tokenValues.get(expr) ?? null;
+    for (const [fi, f] of targets.entries()) { const src = await fs.readFile(f, 'utf-8').catch(() => ''); if (src) allSites.push(...scanWebSizeSites(src, resolve, boxContext(theme, globalCss)).map((x) => ({ ...x, el: `${fi}:${x.el ?? x.start}` }))); }
+    const plan = planWebVocabulary(theme, allSites);
+    if (plan.sizes.length || plan.pill) {
+      const cur = fsSync.readFileSync(theme.themeFile, 'utf-8');
+      const next = amendWebThemeSource(cur, theme, plan);
+      const reparsed = next !== cur ? parseWebThemeSource(next, theme.themeFile) : null;
+      if (reparsed) {
+        if (!opts.dryRun) await fs.writeFile(theme.themeFile, next, 'utf-8');
+        const added = [...plan.sizes.map((z) => `${z.name}=${z.value}`), ...(plan.pill ? ['pill'] : [])];
+        result.vocabulary = { added, renamed: [] };
+        for (const a of added) result.changes.push({ file: rel(projectRoot, theme.themeFile), kind: 'add-token', from: '', to: a });
+        theme = reparsed;
+        result.tokensAvailable.radius = theme.radius;
+      }
+    }
+  }
+  // F4 (web): counter-named colour keys get their role name across the theme
+  // module, its CSS custom properties and every reference.
+  {
+    const key = theme.groupKeys.color ?? 'color';
+    const refs = new Map<string, number>();
+    const srcs = new Map<string, string>();
+    for (const f of targets) {
+      const src = await fs.readFile(f, 'utf-8').catch(() => '');
+      srcs.set(f, src);
+      for (const m of src.matchAll(new RegExp(`\\b${theme.themeSymbol}\\.${key}\\.([A-Za-z_$][\\w$]*)`, 'g'))) refs.set(m[1], (refs.get(m[1]) ?? 0) + 1);
+    }
+    const renames = planWebColorRenames(theme, refs);
+    if (renames.length) {
+      const themeSrc = fsSync.readFileSync(theme.themeFile, 'utf-8');
+      let nextTheme = themeSrc;
+      for (const r of renames) nextTheme = nextTheme.replace(new RegExp(`(?<![\\w$-])${r.from}(?=\\s*:)`, 'g'), r.to);
+      nextTheme = applyWebColorRenames(nextTheme, theme, renames).src;
+      const reparsed = parseWebThemeSource(nextTheme, theme.themeFile);
+      if (reparsed && reparsed.colors.length === theme.colors.length) {
+        let refCount = 0;
+        const writes: Array<[string, string]> = [[theme.themeFile, nextTheme]];
+        // the CSS mirror (theme.css next to theme.ts, or the design-system record's cssFile)
+        const cssFiles = new Set<string>();
+        try {
+          const rec = JSON.parse(fsSync.readFileSync(path.join(projectRoot, DESIGN_SYSTEM_RECORD), 'utf-8')) as { cssFile?: unknown };
+          if (typeof rec.cssFile === 'string') cssFiles.add(path.resolve(projectRoot, rec.cssFile));
+        } catch { /* no record */ }
+        const sibling = theme.themeFile.replace(/\.[cm]?[jt]sx?$/, '.css');
+        if (sibling !== theme.themeFile) cssFiles.add(sibling);
+        for (const css of cssFiles) {
+          if (!fsSync.existsSync(css)) continue;
+          const before = fsSync.readFileSync(css, 'utf-8');
+          const r = applyWebColorRenames(before, theme, renames);
+          if (r.count) writes.push([css, r.src]);
+        }
+        for (const [f, src] of srcs) {
+          const r = applyWebColorRenames(src, theme, renames);
+          if (r.count) { writes.push([f, r.src]); refCount += r.count; }
+        }
+        if (!opts.dryRun) for (const [f, src] of writes) await fs.writeFile(f, src, 'utf-8');
+        result.substitutions.renamed = refCount;
+        result.vocabulary = { added: result.vocabulary?.added ?? [], renamed: renames };
+        for (const r of renames) result.changes.push({ file: rel(projectRoot, theme.themeFile), kind: 'rename-token', from: r.from, to: r.to });
+        theme = reparsed;
+        result.tokensAvailable.colors = theme.colors.map((c) => ({ name: c.name, argb: c.value }));
+      }
+    }
+  }
+  // F4 (web): text styles named by a generic stem + their size (`section16`) get the
+  // role their weight shows (`sectionHeading16`) — theme key + every reference.
+  {
+    const themeSrc = fsSync.readFileSync(theme.themeFile, 'utf-8');
+    const tg = webTextGroup(themeSrc);
+    if (tg) {
+      const taken = [...theme.colors.map((c) => c.name), ...theme.spacing.map((z) => z.name), ...theme.radius.map((z) => z.name), ...(theme.sizes ?? []).map((z) => z.name)];
+      const renames = planTextStyleRenames(tg.styles, taken);
+      if (renames.length) {
+        let body = themeSrc.slice(tg.start, tg.end);
+        for (const r of renames) body = body.replace(new RegExp(`(^|[\\s,{])${r.from}(\\s*:)`), `$1${r.to}$2`);
+        const nextTheme = themeSrc.slice(0, tg.start) + body + themeSrc.slice(tg.end);
+        const writes: Array<[string, string]> = [[theme.themeFile, nextTheme]];
+        let refs = 0;
+        for (const f of targets) {
+          const src = await fs.readFile(f, 'utf-8').catch(() => '');
+          let next = src;
+          for (const r of renames) next = next.replace(new RegExp(`\\b${theme.themeSymbol}\\.${tg.key}\\.${r.from}\\b`, 'g'), () => { refs++; return `${theme.themeSymbol}.${tg.key}.${r.to}`; });
+          if (next !== src) writes.push([f, next]);
+        }
+        const reparsed = parseWebThemeSource(nextTheme, theme.themeFile);
+        if (reparsed) {
+          if (!opts.dryRun) for (const [f, src] of writes) await fs.writeFile(f, src, 'utf-8');
+          result.substitutions.renamed = (result.substitutions.renamed ?? 0) + refs;
+          result.vocabulary = { added: result.vocabulary?.added ?? [], renamed: [...(result.vocabulary?.renamed ?? []), ...renames] };
+          for (const r of renames) result.changes.push({ file: rel(projectRoot, theme.themeFile), kind: 'rename-token', from: r.from, to: r.to });
+          theme = reparsed;
+        }
+      }
+    }
+  }
+  const themeM = theme;
   for (const file of targets) {
     const before = await fs.readFile(file, 'utf-8').catch(() => '');
     if (!before) continue;
@@ -255,7 +576,12 @@ export async function deepenWebTokens(projectRoot: string, opts: WebTokenOptions
       result.substitutions.colors++;
       result.changes.push({ file: relFile, kind: 'color', from, to });
     });
-    src = substituteNumeric(src, theme, RADIUS_PROPS, theme.radius, theme.groupKeys.radius, (from, to) => {
+    src = substituteWebSizes(src, themeM, boxContext(themeM, globalCss), (kind, from, to) => {
+      if (kind === 'size') result.substitutions.sizes = (result.substitutions.sizes ?? 0) + 1;
+      else result.substitutions.radius++;
+      result.changes.push({ file: relFile, kind, from, to });
+    });
+    src = substituteNumeric(src, theme, RADIUS_PROPS, theme.radius.filter((r) => r.name !== 'pill'), theme.groupKeys.radius, (from, to) => {
       result.substitutions.radius++;
       result.changes.push({ file: relFile, kind: 'radius', from, to });
     });
@@ -277,5 +603,64 @@ export async function deepenWebTokens(projectRoot: string, opts: WebTokenOptions
 }
 
 const rel = (root: string, p: string): string => path.relative(root, p).split(path.sep).join('/');
+
+/** The theme's text-style group (`text` / `typography` / `type`): its key, the body's
+ *  [start, end) offsets and each style's fontSize / fontWeight. */
+function webTextGroup(src: string): { key: string; start: number; end: number; styles: TextStyleDecl[] } | null {
+  for (const key of ['text', 'typography', 'type']) {
+    const m = new RegExp(`\\b${key}\\s*:\\s*\\{`).exec(src);
+    if (!m) continue;
+    let depth = 0;
+    for (let i = m.index + m[0].length - 1; i < src.length; i++) {
+      if (src[i] === '{') depth++;
+      else if (src[i] === '}') {
+        depth--;
+        if (depth === 0) {
+          const start = m.index + m[0].length; const body = src.slice(start, i);
+          const styles: TextStyleDecl[] = [];
+          for (const e of body.matchAll(/([A-Za-z_$][\w$]*)\s*:\s*\{([^{}]*)\}/g)) {
+            const size = /fontSize\s*:\s*['"]?(\d+(?:\.\d+)?)/.exec(e[2])?.[1];
+            const w = /fontWeight\s*:\s*['"]?(\d00|bold)/.exec(e[2])?.[1];
+            styles.push({ name: e[1], ...(size ? { size: Number(size) } : {}), ...(w ? { weight: w === 'bold' ? 700 : Number(w) } : {}) });
+          }
+          return { key, start, end: i, styles };
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/** Every theme numeric token (spacing, radius, size) → its value, for the box check. */
+function boxContext(theme: WebThemeModel, css: Pick<WebBoxContext, 'borderBox' | 'cssMayGrow'>): WebBoxContext {
+  const vals = new Map<string, number>();
+  const add = (key: string | null | undefined, list: Array<{ name: string; value: number }> | undefined): void => {
+    if (!key || !list) return;
+    for (const t of list) vals.set(`${theme.themeSymbol}.${key}.${t.name}`, t.value);
+  };
+  add(theme.groupKeys.spacing, theme.spacing);
+  add(theme.groupKeys.radius, theme.radius);
+  add(theme.groupKeys.size ?? 'size', theme.sizes);
+  return { resolve: (expr) => vals.get(expr) ?? null, ...css };
+}
+
+/** The app's stylesheets: every .css under the source roots and the usual global files. */
+async function readProjectCss(projectRoot: string, roots: string[]): Promise<string[]> {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const walk = async (dir: string, depth: number): Promise<void> => {
+    if (depth > 6) return;
+    let ents: fsSync.Dirent[];
+    try { ents = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const d of ents) {
+      if (d.name === 'node_modules' || d.name.startsWith('.')) continue;
+      const f = path.join(dir, d.name);
+      if (d.isDirectory()) await walk(f, depth + 1);
+      else if (/\.(css|scss)$/.test(d.name) && !seen.has(f)) { seen.add(f); out.push(await fs.readFile(f, 'utf-8').catch(() => '')); }
+    }
+  };
+  for (const r of [...roots, path.join(projectRoot, 'styles')]) await walk(r, 0);
+  return out;
+}
 
 export const __test = { parseWebTheme, substituteColors, substituteNumeric, normColor };

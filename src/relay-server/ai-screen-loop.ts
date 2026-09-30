@@ -546,16 +546,23 @@ function tally(re: RegExp, text: string, into: Map<string, number>, group = 0): 
   }
 }
 
-interface DesignDigest { colors: string[]; fonts: string[]; components: Array<{ name: string; screens: number }> }
+interface DesignDigest {
+  colors: string[]; fonts: string[]; components: Array<{ name: string; screens: number }>;
+  /** F4: every colour with its use count, and the IR texts (for the measured scales). */
+  colorUses: Array<[string, number]>; irTexts: string[];
+}
 function buildDesignDigest(run: import('./build-run-store').BuildRun): DesignDigest {
   const colorCounts = new Map<string, number>();
   const fontCounts = new Map<string, number>();
   // Component recurrence: count DISTINCT screens a component name shows up in (a
   // name in many screens = a real shared component, not a one-off).
   const compScreenCounts = new Map<string, number>();
+  const irTexts: string[] = [];
+  const irColorCounts = new Map<string, number>();
   for (const s of run.screens) {
     const text = `${s.spec?.tree ?? ''}\n${s.spec?.packet ?? ''}`;
     if (!text.trim()) continue;
+    if (s.spec?.tree) { irTexts.push(s.spec.tree); tally(HEX, s.spec.tree, irColorCounts); }
     tally(HEX, text, colorCounts);
     tally(FONT_HINT, text, fontCounts, 1);
     const seenHere = new Set<string>();
@@ -568,7 +575,9 @@ function buildDesignDigest(run: import('./build-run-store').BuildRun): DesignDig
     .filter(([, n]) => n >= 2)                  // shared = recurs across ≥2 screens
     .sort((a, b) => b[1] - a[1]).slice(0, 12)
     .map(([name, screens]) => ({ name, screens }));
-  return { colors: topN(colorCounts, 8), fonts: topN(fontCounts, 4), components };
+  // F4: colour uses are counted over the IR trees only (the packet repeats the tree).
+  const colorUses = [...(irColorCounts.size ? irColorCounts : colorCounts).entries()].map(([h, n]) => [h.toLowerCase(), n] as [string, number]);
+  return { colors: topN(colorCounts, 8), fonts: topN(fontCounts, 4), components, colorUses, irTexts };
 }
 
 /**
@@ -2491,10 +2500,10 @@ async function runAppLoopBody(projectId: string, runId: string): Promise<void> {
     setGenPhase(projectId, runId, 'Pre-flight', 'design system + token extract');
     try {
       const digest = buildDesignDigest(run);
-      const ds = await generateDesignSystem(projectRoot, run.framework || 'flutter', { colors: digest.colors, fonts: digest.fonts });
+      const ds = await generateDesignSystem(projectRoot, run.framework || 'flutter', { colors: digest.colors, fonts: digest.fonts, colorUses: digest.colorUses, irTexts: digest.irTexts });
       themeTokens = ds.tokens;
       if (ds.wrote) await seedContextWithThemeApi(projectRoot, ds.api);
-      await appendRunLog(projectId, runId, `[design-system] ${ds.wrote ? 'generated' : 'reused'} ${ds.themeFile} with ${ds.tokenCount} color token(s)${digest.fonts[0] ? ` + ${digest.fonts[0]}` : ''} — screens import AppTheme.* (no per-screen hardcoding)`);
+      await appendRunLog(projectId, runId, `[design-system] ${ds.wrote ? 'generated' : 'reused'} ${ds.themeFile} with ${ds.tokenCount} color token(s)${ds.tokens.mergedColors.length ? ` (${ds.tokens.mergedColors.length} near-duplicate(s) merged)` : ''}, ${ds.tokens.scales.spacing.length} spacing / ${ds.tokens.scales.radius.length + (ds.tokens.scales.pill ? 1 : 0)} radius / ${ds.tokens.scales.sizes.length} size token(s)${digest.fonts[0] ? ` + ${digest.fonts[0]}` : ''} — screens import AppTheme.* (no per-screen hardcoding)`);
     } catch (e: any) {
       await appendRunLog(projectId, runId, `[design-system] generation skipped (non-fatal): ${e?.message || 'unknown'}`);
     }

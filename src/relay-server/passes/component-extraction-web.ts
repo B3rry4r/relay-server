@@ -360,13 +360,21 @@ export async function extractWebGroup(
       await fs.mkdir(componentsDir, { recursive: true });
       const header = `${useClient ? "'use client';\n" : ''}${EXTRACTED_COMPONENT_MARKER} — shared by ${distinctFiles.length} screens\n`;
       const imports = renderImports(carried);
-      await fs.writeFile(componentPath, `${header}${imports ? `${imports}\n` : ''}\nexport ${declNamed}\n`, 'utf-8');
+      const src0 = await fs.readFile(group[0].file, 'utf-8');
+      const at0 = src0.indexOf(group[0].source);
+      const doc = at0 >= 0 ? leadingLineComments(src0, at0) : '';
+      await fs.writeFile(componentPath, `${header}${imports ? `${imports}\n` : ''}\n${doc}export ${declNamed}\n`, 'utf-8');
     }
     for (const file of distinctFiles) {
       let src = await fs.readFile(file, 'utf-8');
       const hoistedFromHere = group.filter((x) => x.file === file);
       for (const u of hoistedFromHere) {
-        src = src.replace(u.source, '');
+        // the declaration's own leading `//` comment lines go with it (else they are
+        // left describing whatever declaration follows)
+        const at = src.indexOf(u.source);
+        const lead = at >= 0 ? leadingLineComments(src, at) : '';
+        const cut = lead ? src.lastIndexOf('\n', at - 1) + 1 - lead.length : at;
+        src = at >= 0 ? src.slice(0, cut) + src.slice(at + u.source.length) : src;
         if (u.localName !== name) src = src.replace(new RegExp(`\\b${escapeRe(u.localName)}\\b`, 'g'), name);
       }
       // Imports only the hoisted body used, now unreferenced in this screen.
@@ -390,6 +398,23 @@ export async function extractWebGroup(
     componentPath: rel(projectRoot, componentPath),
     occurrences: group.length,
   };
+}
+
+/** The `//` comment lines directly above offset `at` (no blank line between), as
+ *  one string ending in a newline — '' when there are none. A pipeline marker
+ *  (`// canonicalId:` header) is never taken. */
+export function leadingLineComments(src: string, at: number): string {
+  const lineStart = src.lastIndexOf('\n', at - 1) + 1;
+  // only when the declaration starts its line
+  if (src.slice(lineStart, at).trim()) return '';
+  let start = lineStart;
+  while (start > 0) {
+    const prevStart = src.lastIndexOf('\n', start - 2) + 1;
+    const line = src.slice(prevStart, start - 1);
+    if (!/^\s*\/\//.test(line) || /^\s*\/\/\s*(canonicalId:|states:|GENERATED|extracted by relay-server)/.test(line)) break;
+    start = prevStart;
+  }
+  return src.slice(start, lineStart);
 }
 
 /** Rewrite `import { Old } from '<screen>'` in every other source to the shared file. */

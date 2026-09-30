@@ -36,8 +36,9 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import type { AIModel } from '../ai-adapters';
 import { repointWeb, findWebResourcesFile, parseDeclaredWebSymbols, WEB_RESOURCES_SYMBOL } from './asset-usage-web';
-import { loadWebApp } from './web-app';
-import { detectFramework, type Framework } from './framework';
+import { loadWebApp, listWebSources } from './web-app';
+import { detectFramework, webAssetKey, type Framework } from './framework';
+import { assetSymbolKeys } from '../resources-emit';
 
 // ── Public contract ──────────────────────────────────────────────────────────
 
@@ -109,6 +110,9 @@ export interface RepointResult {
   filesScanned: number;
   /** Set when the pass had no input / no support — finalize records `skipped` with it. */
   skippedReason?: string;
+  /** Resources symbols renamed to the readable scheme (assetSymbolKeys), with every
+   *  reference: `netflixIcon1` → `netflixIcon`, `avatarBackground_2` → `avatarBackgroundImage`. */
+  renamedSymbols: Array<{ from: string; to: string; refs: number }>;
 }
 
 // ── asset-map model ──────────────────────────────────────────────────────────
@@ -163,7 +167,7 @@ export async function repointAssetUsage(projectId: string, opts: RepointOptions)
 
   if (!map || !Array.isArray(map.assets) || map.assets.length === 0) {
     return {
-      framework, repointed: [], skipped: [],
+      framework, repointed: [], skipped: [], renamedSymbols: [],
       warnings: ['no .uix/asset-map.json (or empty) — nothing to re-point. Run the Phase-2 asset pass (runAssetPass) first.'],
       resourcesPath: map?.resourcesPath ?? null, dryRun: !!opts.dryRun,
       filesScanned: 0, skippedReason: 'no .uix/asset-map.json (or it is empty) — nothing to re-point',
@@ -171,7 +175,7 @@ export async function repointAssetUsage(projectId: string, opts: RepointOptions)
   }
   if (!strategy) {
     return {
-      framework, repointed: [], skipped: [],
+      framework, repointed: [], skipped: [], renamedSymbols: [],
       warnings: [`no strategy for framework '${framework}'`],
       resourcesPath: map.resourcesPath ?? null, dryRun: !!opts.dryRun,
       filesScanned: 0, skippedReason: `no asset re-point strategy for framework '${framework}'`,
@@ -179,6 +183,11 @@ export async function repointAssetUsage(projectId: string, opts: RepointOptions)
   }
 
   const index = buildAssetIndex(map);
+  // A resources file emitted before the readable-key scheme still declares
+  // `netflixIcon1` / `avatarBackground_2`: rename those to the index's keys first
+  // (declaration + every reference), so the repoint below and every later reader
+  // agree on one name per asset. Symbol names only — no path, no pixel changes.
+  const renamedSymbols = await reconcileAssetSymbols(projectRoot, framework, index, !!opts.dryRun);
   const out = await strategy.repoint(projectRoot, index, opts);
   return {
     framework,
@@ -188,8 +197,77 @@ export async function repointAssetUsage(projectId: string, opts: RepointOptions)
     resourcesPath: map.resourcesPath ?? null,
     dryRun: !!opts.dryRun,
     filesScanned: out.filesScanned,
-    ...(out.skippedReason ? { skippedReason: out.skippedReason } : {}),
+    renamedSymbols,
+    ...(out.skippedReason && !renamedSymbols.length ? { skippedReason: out.skippedReason } : {}),
   };
+}
+
+/**
+ * Rename resources symbols whose asset the index names differently (the pre-F4
+ * `_2` / trailing-counter keys) — the declaration and every `AppAssets.x` /
+ * `assets.x` reference. A symbol is renamed only when its PATH is the index asset's
+ * path and the new key is free; anything else is left alone. Idempotent.
+ */
+export async function reconcileAssetSymbols(projectRoot: string, framework: Framework, index: AssetIndex, dryRun: boolean): Promise<Array<{ from: string; to: string; refs: number }>> {
+  const web = framework === 'react' || framework === 'next';
+  if (framework !== 'flutter' && !web) return [];
+  let resourcesFile: string | null;
+  let sources: string[];
+  if (web) {
+    const ix = await loadWebApp(projectRoot);
+    resourcesFile = ix?.resourcesFile && parseDeclaredWebSymbols((await readFileOrNull(ix.resourcesFile)) ?? '').size ? ix.resourcesFile : findWebResourcesFile(projectRoot);
+    sources = ix ? await listWebSources(ix) : [];
+  } else {
+    resourcesFile = path.join(projectRoot, FLUTTER_RESOURCES_REL);
+    sources = await collectDartFiles(projectRoot);
+  }
+  if (!resourcesFile) return [];
+  const resSrc = await readFileOrNull(resourcesFile);
+  if (!resSrc) return [];
+  // declared symbol → normalized path
+  const declared = new Map<string, string>();
+  if (web) for (const [k, v] of parseDeclaredWebSymbols(resSrc)) declared.set(k, webAssetKey(v));
+  else for (const m of resSrc.matchAll(/static\s+const\s+String\s+([A-Za-z_]\w*)\s*=\s*['"]([^'"]+)['"]/g)) declared.set(m[1], normPath(m[2]));
+  const bySymbolPath = new Map<string, string>();
+  for (const [k, p] of declared) if (!bySymbolPath.has(p)) bySymbolPath.set(p, k);
+  const renames: Array<{ from: string; to: string }> = [];
+  const taken = new Set(declared.keys());
+  for (const a of index.assets) {
+    const p = web ? webAssetKey(a.newPath) : normPath(a.newPath);
+    const cur = bySymbolPath.get(p);
+    if (!cur || cur === a.symbolKey || taken.has(a.symbolKey)) continue;
+    // only a name the OLD scheme produced for this asset is ours to change
+    const oldKey = toLowerCamel(a.name);
+    if (!(cur === oldKey || new RegExp(`^${oldKey}_\\d+$`).test(cur))) continue;
+    renames.push({ from: cur, to: a.symbolKey });
+    taken.delete(cur); taken.add(a.symbolKey);
+  }
+  if (!renames.length) return [];
+  const cls = web ? WEB_RESOURCES_SYMBOL : FLUTTER_RESOURCES_CLASS;
+  const out: Array<{ from: string; to: string; refs: number }> = renames.map((r) => ({ ...r, refs: 0 }));
+  const writes = new Map<string, string>();
+  // the declaration
+  let res = resSrc;
+  for (const r of renames) {
+    res = web
+      ? res.replace(new RegExp(`(^|[\\s,{])${r.from}(\\s*:)`, 'm'), `$1${r.to}$2`)
+      : res.replace(new RegExp(`(static\\s+const\\s+String\\s+)${r.from}(\\s*=)`), `$1${r.to}$2`);
+  }
+  writes.set(resourcesFile, res);
+  // every reference
+  for (const f of sources) {
+    if (path.resolve(f) === path.resolve(resourcesFile)) continue;
+    const src = await readFileOrNull(f);
+    if (!src) continue;
+    let next = src;
+    for (const [i, r] of renames.entries()) {
+      next = next.replace(new RegExp(`\\b${cls}\\.${r.from}\\b`, 'g'), () => { out[i].refs++; return `${cls}.${r.to}`; });
+      if (web) next = next.replace(new RegExp(`\\b${cls}\\[(['"])${r.from}\\1\\]`, 'g'), () => { out[i].refs++; return `${cls}.${r.to}`; });
+    }
+    if (next !== src) writes.set(f, next);
+  }
+  if (!dryRun) for (const [f, src] of writes) await fs.writeFile(f, src, 'utf8');
+  return out;
 }
 
 function getStrategy(fw: Framework): AssetUsageStrategy | null {
@@ -262,14 +340,11 @@ export function buildAssetIndex(map: AssetMap): AssetIndex {
   //    what app_assets.dart declares.
   const reps = [...repByNewPath.values()].sort((a, b) =>
     a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === 'icon' ? -1 : 1);
-  const used = new Map<string, number>();
+  const keys = assetSymbolKeys(reps);
   const assets: IndexedAsset[] = [];
   const repSymbolByNewPath = new Map<string, IndexedAsset>();
-  for (const e of reps) {
-    let key = toLowerCamel(e.name);
-    const n = used.get(key) ?? 0;
-    used.set(key, n + 1);
-    if (n > 0) key = `${key}_${n + 1}`;
+  for (const [ri, e] of reps.entries()) {
+    const key = keys[ri];
     const ia: IndexedAsset = {
       name: e.name, oldPath: e.oldPath, newPath: e.newPath,
       format: e.format, kind: e.kind, nodeId: e.nodeId, symbolKey: key,

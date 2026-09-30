@@ -125,9 +125,44 @@ function dartCtor(src: string, cls: string): string {
   let depth = 0;
   for (let i = start; i < src.length; i++) {
     if (src[i] === '(') depth++;
-    else if (src[i] === ')') { depth--; if (depth === 0) return oneLine(`${cls}${src.slice(start, i + 1)}`).replace(/\bsuper\.key,?\s*/, '').replace(/\{\s*\}/, '').replace(/\(\s*,\s*/, '('); }
+    else if (src[i] === ')') {
+      depth--;
+      if (depth === 0) {
+        // `this.label` → `String label`: an agent reading the packet needs the TYPE.
+        const body = classBody(src, cls);
+        const typed = src.slice(start, i + 1).replace(/\bthis\.([A-Za-z_]\w*)/g, (m, f: string) => {
+          const t = new RegExp(`\\bfinal\\s+([A-Za-z_][\\w<>?, .]*?)\\s+${f}\\s*;`).exec(body)?.[1];
+          return t ? `${t.replace(/\s+/g, ' ').trim()} ${f}` : m;
+        });
+        return tidySignature(`${cls}${typed}`.replace(/\bsuper\.key\s*,?/, ''));
+      }
+    }
   }
   return `${cls}()`;
+}
+
+/** The `{ … }` body of `class Cls`. */
+function classBody(src: string, cls: string): string {
+  const at = src.search(new RegExp(`class\\s+${cls}\\b`));
+  const open = at < 0 ? -1 : src.indexOf('{', at);
+  if (open < 0) return '';
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}') { depth--; if (depth === 0) return src.slice(open, i + 1); }
+  }
+  return src.slice(open);
+}
+
+/** One readable line, no stray separators: `Disc(this.color, {})` → `Disc(Color color)`,
+ *  `Foo({ required …, })` → `Foo({required …})`. */
+function tidySignature(s: string): string {
+  return oneLine(s)
+    .replace(/,?\s*\{\s*,?\s*\}/g, '')      // an emptied `{}` (only super.key was in it)
+    .replace(/\{\s+/g, '{').replace(/\s+\}/g, '}')
+    .replace(/\[\s+/g, '[').replace(/\s+\]/g, ']')
+    .replace(/,\s*([)}\]])/g, '$1')
+    .replace(/\(\s*,\s*/g, '(').replace(/\{\s*,\s*/g, '{');
 }
 
 /** Web: `export function Foo(props: {...})` / `export const Foo = ({...}: P) =>`. */

@@ -78,5 +78,11 @@
   "readability hygiene: stub components + provenance comments (F1/F6) | next": "IMPLEMENTED",
   "finalize readability delta + honest no-op (F7/F9) | flutter": "IMPLEMENTED",
   "finalize readability delta + honest no-op (F7/F9) | react": "IMPLEMENTED",
-  "finalize readability delta + honest no-op (F7/F9) | next": "IMPLEMENTED"
+  "finalize readability delta + honest no-op (F7/F9) | next": "IMPLEMENTED",
+  "readability vocabulary: sizes, pills, colour role names (F4/F5) | flutter": "IMPLEMENTED",
+  "readability vocabulary: sizes, pills, colour role names (F4/F5) | react": "IMPLEMENTED",
+  "readability vocabulary: sizes, pills, colour role names (F4/F5) | next": "IMPLEMENTED",
+  "readability extraction correctness (F2) | flutter": "IMPLEMENTED",
+  "readability extraction correctness (F2) | react": "IMPLEMENTED",
+  "readability extraction correctness (F2) | next": "IMPLEMENTED"
 }

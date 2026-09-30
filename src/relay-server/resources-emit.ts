@@ -63,16 +63,46 @@ const toLowerCamel = (s: string): string => {
   return /^[0-9]/.test(camel) ? `a${camel}` : (camel || 'asset');
 };
 
-/** Dedupe identifiers (two assets can normalize to the same key) by suffixing. */
-function dedupeKeys<T>(items: T[], keyOf: (t: T) => string): Array<{ key: string; item: T }> {
-  const used = new Map<string, number>();
-  return items.map((item) => {
-    let key = keyOf(item);
-    const n = used.get(key) ?? 0;
-    used.set(key, n + 1);
-    if (n > 0) key = `${key}_${n + 1}`;
-    return { key, item };
+/**
+ * The resources symbol for each asset, in order (readability F4/F5 fix round). Two
+ * rules replace the old blind `_2` counter, so a key says WHICH asset it is:
+ *  - a Figma counter on a name nothing else shares (`Netflix Icon 1`) is dropped:
+ *    `netflixIcon`, not `netflixIcon1`;
+ *  - a name two assets share gets the second one's kind: the icon keeps
+ *    `avatarBackground`, the bitmap is `avatarBackgroundImage` (a name that already
+ *    ends in its kind uses the format: `confettiIconPng`). Only a third collision
+ *    falls back to a counter.
+ * Asset-usage (7c) computes the SAME keys (buildAssetIndex) and renames a resources
+ * file emitted with the old scheme to them.
+ */
+export function assetSymbolKeys(items: Array<{ name: string; kind: 'icon' | 'image'; format: 'svg' | 'png' }>): string[] {
+  const bases = items.map((a) => toLowerCamel(a.name));
+  const baseSet = new Set(bases);
+  const stemOf = (name: string): string | null => {
+    const m = /^(.*[a-z])_(\d{1,3})$/.exec(toSnake(name));
+    return m ? toLowerCamel(m[1]) : null;
+  };
+  const stemCount = new Map<string, number>();
+  for (const a of items) { const st = stemOf(a.name); if (st) stemCount.set(st, (stemCount.get(st) ?? 0) + 1); }
+  const used = new Set<string>();
+  return items.map((a, i) => {
+    let key = bases[i];
+    const st = stemOf(a.name);
+    if (st && !baseSet.has(st) && stemCount.get(st) === 1 && !used.has(st)) key = st;
+    if (!used.has(key)) { used.add(key); return key; }
+    const kindNoun = a.kind === 'image' ? 'Image' : 'Icon';
+    const noun = key.toLowerCase().endsWith(kindNoun.toLowerCase()) ? (a.format === 'svg' ? 'Svg' : 'Png') : kindNoun;
+    let k = `${key}${noun}`;
+    for (let n = 2; used.has(k) || baseSet.has(k); n++) k = `${key}_${n}`;
+    used.add(k);
+    return k;
   });
+}
+
+/** Keys for a list (see assetSymbolKeys). */
+function dedupeKeys<T extends { name: string; kind: 'icon' | 'image'; format: 'svg' | 'png' }>(items: T[]): Array<{ key: string; item: T }> {
+  const keys = assetSymbolKeys(items);
+  return items.map((item, i) => ({ key: keys[i], item }));
 }
 
 // ── per-framework emitters ────────────────────────────────────────────────────
@@ -80,7 +110,7 @@ function dedupeKeys<T>(items: T[], keyOf: (t: T) => string): Array<{ key: string
 const flutterEmitter: Emitter = {
   filePath: 'lib/resources/app_assets.dart',
   emit(assets) {
-    const entries = dedupeKeys(assets, (a) => toLowerCamel(a.name));
+    const entries = dedupeKeys(assets);
     const lines = entries.map(({ key, item }) =>
       `  static const String ${key} = '${item.relPath}';`);
     return [
@@ -103,7 +133,7 @@ const flutterEmitter: Emitter = {
 const tsEmitter = (filePath: string): Emitter => ({
   filePath,
   emit(assets) {
-    const entries = dedupeKeys(assets, (a) => toLowerCamel(a.name));
+    const entries = dedupeKeys(assets);
     const body = entries.map(({ key, item }) =>
       `  ${key}: '${webServedUrl(item.relPath)}',`);
     return [

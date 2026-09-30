@@ -18,7 +18,6 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-// @ts-expect-error — plain ESM script without types
 import { packRelease, RUNTIME_FILES, ENTRY } from '../scripts/pack-release.mjs';
 
 const ROOT = path.resolve(__dirname, '..');
@@ -68,6 +67,14 @@ describe('pack:release', () => {
     expect(fs.statSync(path.join(app, 'scripts', 'relay-auth')).mode & 0o111).not.toBe(0);
     const bad = result.files.filter((f: string) => f.startsWith('node_modules/') || f.startsWith('test/') || f.startsWith('src/') || f.startsWith('dist/test/') || f.endsWith('.ts') || f.endsWith('.map'));
     expect(bad).toEqual([]);
+  });
+
+  it('the finalize readability metric loads from the unpacked release (dist/src only)', () => {
+    const tool = path.join(app, 'dist', 'src', 'relay-server', 'readability-report.cjs');
+    expect(fs.existsSync(tool)).toBe(true);
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const loaded = require(tool);
+    expect(typeof loaded.main).toBe('function');
   });
 
   it('every cwd-relative path the compiled server reads is shipped (or a documented optional binary)', () => {

@@ -2,7 +2,8 @@
 // File: src/relay-server/readability.ts
 //
 // Readability MEASUREMENT for the pipeline (lane B78, F7 + F9). The metrics live in
-// ONE place — scripts/readability-report.cjs (zero-dep, flutter + react + next) —
+// ONE place — src/relay-server/readability-report.cjs (zero-dep, flutter + react +
+// next; CLI: scripts/readability-report.cjs) —
 // and this module is the runtime's door to it:
 //
 //  - F9: `measureReadability` + `readabilityDelta` give finalize a before/after
@@ -31,13 +32,14 @@ interface ReadabilityTool {
 
 let cached: { tool: ReadabilityTool | null; reason?: string; file?: string } | null = null;
 
-/** Locate + load scripts/readability-report.cjs (dev: repo scripts/; built: dist/scripts/). */
+/** Locate + load the readability metric. It sits next to this module in src/ and —
+ *  tsc allowJs — in dist/src, so a release that ships dist/src only still has it.
+ *  The repo CLI wrapper is the fallback for an unusual layout. */
 export function loadReadabilityTool(): { tool: ReadabilityTool | null; reason?: string; file?: string } {
   if (cached) return cached;
   const candidates = [
-    path.resolve(__dirname, '..', '..', 'scripts', 'readability-report.cjs'),        // src/relay-server → repo/scripts, dist/src/relay-server → dist/scripts
-    path.resolve(__dirname, '..', '..', '..', 'scripts', 'readability-report.cjs'),  // dist/src/relay-server → repo/scripts
-    path.resolve(process.cwd(), 'scripts', 'readability-report.cjs'),
+    path.resolve(__dirname, 'readability-report.cjs'),
+    path.resolve(__dirname, '..', '..', 'scripts', 'readability-report.cjs'),
   ];
   const file = candidates.find((c) => fs.existsSync(c));
   if (!file) {

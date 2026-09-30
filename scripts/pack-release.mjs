@@ -40,9 +40,9 @@ export const RUNTIME_FILES = [
   'setup-workspace.sh',
   'scripts/relay-auth',
   'scripts/relay-agent-install.mjs',
-  // Read at runtime by src/relay-server/readability.ts (finalize F7/F9 metric);
-  // resolved from a release as <release>/scripts/readability-report.cjs.
-  'scripts/readability-report.cjs',
+  // (The finalize F7/F9 readability metric is src/relay-server/readability-report.cjs,
+  // emitted into dist/src by tsc allowJs, so it ships with dist/src; the
+  // scripts/readability-report.cjs CLI wrapper requires ../src and is repo-only.)
   'mcp-server.mjs',
   'native/pty-bridge.c',
 ];
