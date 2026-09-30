@@ -154,7 +154,10 @@ export function scanVocabSites(src: string): VocabSite[] {
       // a small square slot (an icon's box: SizedBox(20×20, child: icon/painter))
       sites.push({ family: 'icon', ...w, el: open }); sites.push({ family: 'icon', ...h, el: open });
     } else if (w && h && w.value === h.value && w.value >= 28 && w.value <= 120) {
-      const circle = /BoxShape\.circle/.test(args.get('decoration')?.text ?? '') || /^(?:const\s+)?(?:ClipOval|CircleAvatar)\b/.test(args.get('child')?.text ?? '');
+      // a circle: BoxShape.circle, a clipped oval child, or a corner radius ≥ half the side
+      const decText = args.get('decoration')?.text ?? '';
+      const rr = /BorderRadius\.circular\(\s*(\d+(?:\.\d+)?)\s*\)/.exec(decText);
+      const circle = /BoxShape\.circle/.test(decText) || (!!rr && Number(rr[1]) * 2 >= w.value) || /^(?:const\s+)?(?:ClipOval|CircleAvatar)\b/.test(args.get('child')?.text ?? '');
       const fam = circle ? 'avatar' : 'tile';
       sites.push({ family: fam, ...w, el: open }); sites.push({ family: fam, ...h, el: open });
     } else if (h && (!w || args.get('width')?.text === 'double.infinity') && h.value >= 36 && h.value <= 64 && hasChild && /\b(Text|TextField|TextFormField|ElevatedButton|TextButton|OutlinedButton)\s*\(/.test(argText)) {

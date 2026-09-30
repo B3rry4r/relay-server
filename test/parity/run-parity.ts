@@ -1407,6 +1407,175 @@ async function phaseReadabilityReport(): Promise<Cell[]> {
   return cells;
 }
 
+/** Theme module per framework in the parity fixtures. */
+const THEME_FILE: Record<Fw, string> = { flutter: 'lib/theme/app_theme.dart', react: 'src/theme/theme.ts', next: 'lib/theme.ts' };
+
+/** Insert a line after the last import of a source (after 'use client' + header otherwise). */
+function afterImports(src: string, line: string): string {
+  const lines = src.split('\n');
+  const last = lines.reduce((acc, l, i) => (/^import\s/.test(l) ? i : acc), -1);
+  lines.splice(last + 1, 0, line);
+  return lines.join('\n');
+}
+
+/** F4/F5 (7f): recurring sizes / pills get ONE role-named token each (≥2 uses),
+ *  counter-named colours get role names, and every literal in those positions is
+ *  swapped for the token of the same value — theme, references and a second run. */
+async function phaseReadabilityVocabulary(): Promise<Cell[]> {
+  const { finalizeApp } = await import('../../src/relay-server/passes/finalize');
+  const cells: Cell[] = [];
+  for (const fw of FRAMEWORKS) {
+    const { projectId, root } = await copyFixture(fw, 'readability-vocab');
+    const s = SCREEN[fw];
+    const themeRel = THEME_FILE[fw];
+    const theme0 = read(root, themeRel);
+    if (fw === 'flutter') {
+      await fs.writeFile(path.join(root, themeRel), theme0.replace(/(static const Color surface = [^\n]*\n)/, '$1  static const Color neutral1 = Color(0xff6c7278); // #6c7278 (neutral)\n  static const Color accent2 = Color(0xffbecaea); // #becaea\n'));
+      for (const [rel, n] of [[s.home, 'Home'], [s.login, 'Login']] as const) {
+        let src = read(root, rel);
+        src = afterImports(src, "import '../theme/app_theme.dart';");
+        src = src.replace(/children: \[\n/, `children: [\n            const _VocabRow${n}(),\n`);
+        src += `\nclass _VocabRow${n} extends StatelessWidget {\n  const _VocabRow${n}();\n  @override\n  Widget build(BuildContext context) {\n    return Row(children: [\n      Icon(Icons.person, size: 22, color: AppTheme.neutral1),\n      Container(width: 40, height: 40, decoration: BoxDecoration(color: AppTheme.accent2, borderRadius: BorderRadius.circular(20))),\n      Container(height: 48, decoration: BoxDecoration(color: AppTheme.neutral1, borderRadius: BorderRadius.circular(24)), child: const Text('Go ${n}')),\n    ]);\n  }\n}\n`;
+        await fs.writeFile(path.join(root, rel), src);
+      }
+    } else {
+      await fs.writeFile(path.join(root, themeRel), theme0.replace(/(surface: '#ffffff',)/, "$1\n    neutral1: '#6c7278',\n    accent2: '#becaea',"));
+      for (const [rel, n] of [[s.home, 'Home'], [s.login, 'Login']] as const) {
+        let src = read(root, rel);
+        const spec = fw === 'react' ? '../../theme/theme' : '@/lib/theme';
+        if (!/\bAppTheme\b/.test(src)) src = afterImports(src, `import { AppTheme } from '${spec}';`);
+        src += `\nfunction VocabRow${n}() {\n  return (\n    <div>\n      <img src="" alt="" width={22} height={22} />\n      <div style={{ width: 40, height: 40, borderRadius: 20, background: AppTheme.color.accent2 }} />\n      <button style={{ height: 48, borderRadius: 24, color: AppTheme.color.neutral1 }}>Go ${n}</button>\n    </div>\n  );\n}\nvoid VocabRow${n};\n`;
+        await fs.writeFile(path.join(root, rel), src);
+      }
+    }
+    const before = await snapshot(root);
+    const r1 = await finalizeApp(projectId, { projectRoot: root, onlyPasses: ['deepenTokensAndCleanup'], skipBuildCheck: true, noReport: true });
+    const mid = await snapshot(root);
+    const r2 = await finalizeApp(projectId, { projectRoot: root, onlyPasses: ['deepenTokensAndCleanup'], skipBuildCheck: true, noReport: true });
+    const after = await snapshot(root);
+    const files = diffSnaps(before, mid);
+    const p = r1.passes.find((x) => x.name === 'deepenTokensAndCleanup');
+    const theme = read(root, themeRel);
+    const home = read(root, s.home);
+    const login = read(root, s.login);
+    // token name → value, read back from the rewritten theme
+    const tokenValue = (name: string): number | null => {
+      const m = fw === 'flutter'
+        ? new RegExp(`\\b${name}\\s*=\\s*(\\d+(?:\\.\\d+)?)`).exec(theme)
+        : new RegExp(`\\b${name}\\s*:\\s*(\\d+(?:\\.\\d+)?)`).exec(theme);
+      return m ? Number(m[1]) : null;
+    };
+    const used = (src: string, re: RegExp): string[] => [...src.matchAll(re)].map((m) => m[1]);
+    const iconRe = fw === 'flutter' ? /size: AppTheme\.(icon\w+)/g : /width=\{AppTheme\.size\.(icon\w+)\}/g;
+    const avatarRe = fw === 'flutter' ? /width: AppTheme\.(avatar\w*)/g : /width: AppTheme\.size\.(avatar\w*)/g;
+    const btnRe = fw === 'flutter' ? /height: AppTheme\.(buttonHeight\w*)/g : /height: AppTheme\.size\.(buttonHeight\w*)/g;
+    const pillRe = fw === 'flutter' ? /borderRadius: AppTheme\.radiusPill/ : /borderRadius: AppTheme\.radius\.pill/;
+    // only the planted rows: the fixture's own 18px icon is not part of this check
+    const row = (src: string): string => { const i = src.search(fw === 'flutter' ? /class _VocabRow/ : /function VocabRow/); return i < 0 ? '' : src.slice(i); };
+    const icons = [...used(row(home), iconRe), ...used(row(login), iconRe)];
+    const avatars = [...used(row(home), avatarRe), ...used(row(login), avatarRe)];
+    const btns = [...used(row(home), btnRe), ...used(row(login), btnRe)];
+    const valuesOk = icons.every((n) => tokenValue(n) === 22) && avatars.every((n) => tokenValue(n) === 40) && btns.every((n) => tokenValue(n) === 48);
+    const counterLeft = (await appSources(root, fw)).filter((f) => /\bneutral1\b|\baccent2\b/.test(read(root, f)));
+    const renamed = (p?.counts?.tokensRenamed as number | undefined) ?? 0;
+    const syn = fw === 'flutter' ? [] : syntaxErrorsIn(root, files);
+    const d2 = diffSnaps(mid, after, /^\.uix\//);
+    const checks = [
+      chk('rv.sizes', icons.length >= 2 && avatars.length >= 2 && btns.length >= 2, 'stub', 'recurring icon (22) / avatar (40) / button-height (48) literals in two screens become role-named size tokens', `icon=${icons.join(',') || 'none'} avatar=${avatars.join(',') || 'none'} button=${btns.join(',') || 'none'}`),
+      chk('rv.values', valuesOk && (icons.length + avatars.length + btns.length) > 0, 'lie', 'each token used holds exactly the literal it replaced (no pixel changes)', `${icons.concat(avatars, btns).map((n) => `${n}=${tokenValue(n)}`).join(' ')}`),
+      chk('rv.pill', pillRe.test(row(home)) && pillRe.test(row(login)), 'stub', 'a stadium radius (24 on a 48-high box) becomes the pill token', `${pillRe.test(row(home))}/${pillRe.test(row(login))}`),
+      chk('rv.renamed', counterLeft.length === 0 && renamed >= 2, 'stub', 'counter-named colours (neutral1, accent2) get role names in the theme and every reference', `renamed=${renamed}; counters left in: ${counterLeft.join(', ') || 'none'}`),
+      chk('rv.counts', (p?.counts?.sizes as number ?? 0) > 0 && (p?.counts?.tokensAdded as number ?? 0) > 0 && p?.status === 'applied', 'lie', 'the pass reports the added vocabulary and the size swaps it made', JSON.stringify(p?.counts ?? {})),
+      chk('rv.syntax', syn.length === 0, 'lie', 'every file the pass wrote parses', syn.join(' | ') || 'ok'),
+      chk('rv.idempotent', d2.length === 0, 'lie', 'a second run changes nothing', d2.map((d) => `${d.change}:${d.file}`).join(', ') || 'no changes'),
+    ];
+    cells.push({
+      pass: 'readability vocabulary: sizes, pills, colour role names (F4/F5)', framework: fw,
+      reported: p ? { status: p.status, ...(p.reason ? { reason: p.reason } : {}), counts: p.counts, warnings: p.warnings } : null,
+      files, checks, cell_status: classify(p ? { status: p.status, reason: p.reason, counts: p.counts, warnings: p.warnings } : null, checks),
+      notes: [`run 2: ${r2.passes.find((x) => x.name === 'deepenTokensAndCleanup')?.status}`],
+    });
+  }
+  return cells;
+}
+
+/** F2 (7a): the extraction reads the persisted canonical schema without matching an
+ *  empty name, never shadows an SDK name, never overwrites an existing component,
+ *  lifts only per-screen copies (flutter: private; a public class is the screen's
+ *  own), and (flutter) lifts identical StatefulWidget + State pairs. */
+async function phaseReadabilityExtraction(): Promise<Cell[]> {
+  const { finalizeApp } = await import('../../src/relay-server/passes/finalize');
+  const cells: Cell[] = [];
+  for (const fw of FRAMEWORKS) {
+    const { projectId, root } = await copyFixture(fw, 'readability-extract');
+    const s = SCREEN[fw];
+    const dir = COMPONENTS_DIR[fw];
+    // the persisted BUILD shape {id, frameId, name}, with an empty-named entry first
+    const canon = JSON.parse(read(root, '.uix/canonical.json'));
+    canon.components = [{ id: 'cmp_x', frameId: '1:1', name: '' }, { id: 'cmp_section_heading', frameId: '10:2', name: 'sectionHeading' }];
+    await fs.writeFile(path.join(root, '.uix/canonical.json'), JSON.stringify(canon, null, 2));
+    let existingRel: string; let existingBody: string; let sdkFile: string; let sdkRe: RegExp;
+    if (fw === 'flutter') {
+      existingRel = `${dir}/promo_tile.dart`;
+      existingBody = "import 'package:flutter/material.dart';\n\nclass PromoTile extends StatelessWidget {\n  const PromoTile({super.key});\n  @override\n  Widget build(BuildContext context) => const Text('agent-built promo');\n}\n";
+      sdkFile = `${dir}/app_back_button.dart`; sdkRe = /class AppBackButton extends StatelessWidget/;
+      const add = `\nclass _BackButton extends StatelessWidget {\n  const _BackButton();\n  @override\n  Widget build(BuildContext context) {\n    return IconButton(onPressed: () => Navigator.pop(context), icon: const Icon(Icons.arrow_back));\n  }\n}\n\nclass _PromoTile extends StatelessWidget {\n  const _PromoTile();\n  @override\n  Widget build(BuildContext context) {\n    return const Text('Promo');\n  }\n}\n\nclass _Blink extends StatefulWidget {\n  const _Blink();\n  @override\n  State<_Blink> createState() => _BlinkState();\n}\n\nclass _BlinkState extends State<_Blink> {\n  bool on = false;\n  @override\n  Widget build(BuildContext context) {\n    return GestureDetector(onTap: () => setState(() => on = !on), child: Text(on ? 'on' : 'off'));\n  }\n}\n\nclass WelcomeBanner extends StatelessWidget {\n  const WelcomeBanner({super.key});\n  @override\n  Widget build(BuildContext context) {\n    return const Text('Welcome');\n  }\n}\n`;
+      for (const rel of [s.home, s.login]) {
+        const src = read(root, rel).replace(/children: \[\n/, 'children: [\n            const _BackButton(),\n            const _PromoTile(),\n            const _Blink(),\n            const WelcomeBanner(),\n');
+        await fs.writeFile(path.join(root, rel), src + add);
+      }
+    } else {
+      existingRel = `${dir}/PromoTile.tsx`;
+      existingBody = "export function PromoTile() {\n  return <span>agent-built promo</span>;\n}\n";
+      sdkFile = `${dir}/AppLink.tsx`; sdkRe = /export function AppLink\b/;
+      const add = `\nfunction Link({ to }: { to: string }) {\n  return <a href={to}>{to}</a>;\n}\n\nfunction PromoTile() {\n  return <span>Promo</span>;\n}\nvoid Link;\nvoid PromoTile;\n`;
+      for (const rel of [s.home, s.login]) await fs.appendFile(path.join(root, rel), add);
+    }
+    await fs.mkdir(path.join(root, dir), { recursive: true });
+    await fs.writeFile(path.join(root, existingRel), existingBody);
+    const before = await snapshot(root);
+    const r1 = await finalizeApp(projectId, { projectRoot: root, onlyPasses: ['extractComponents'], skipBuildCheck: true, noReport: true });
+    const mid = await snapshot(root);
+    const r2 = await finalizeApp(projectId, { projectRoot: root, onlyPasses: ['extractComponents'], skipBuildCheck: true, noReport: true });
+    const after = await snapshot(root);
+    const files = diffSnaps(before, mid);
+    const p = r1.passes.find((x) => x.name === 'extractComponents');
+    const home = read(root, s.home);
+    const login = read(root, s.login);
+    const added = files.filter((f) => f.change === 'added').map((f) => f.file);
+    const shadowFile = fw === 'flutter' ? `${dir}/back_button.dart` : `${dir}/Link.tsx`;
+    const localSdkRe = fw === 'flutter' ? /class _BackButton\b/ : /^function Link\b/m;
+    const useSdkRe = fw === 'flutter' ? /\bAppBackButton\b/ : /\bAppLink\b/;
+    const localPromoRe = fw === 'flutter' ? /class _PromoTile\b/ : /^function PromoTile\b/m;
+    const sectionFile = added.find((f) => /section_?heading/i.test(f));
+    const sectionSrc = sectionFile ? read(root, sectionFile) : '';
+    const unrelated = /IconButton|arrow_back|<a href|GestureDetector|Promo'|>Promo</.test(sectionSrc);
+    const names = added.filter((f) => f.startsWith(dir)).map((f) => path.basename(f));
+    const syn = fw === 'flutter' ? [] : syntaxErrorsIn(root, files);
+    const d2 = diffSnaps(mid, after, /^\.uix\//);
+    const checks = [
+      chk('rx.sdk-safe', exists(root, sdkFile) && sdkRe.test(read(root, sdkFile)) && !exists(root, shadowFile) && ![home, login].some((x) => localSdkRe.test(x)) && [home, login].every((x) => useSdkRe.test(x)), 'stub',
+        `a copy named like a framework widget (${fw === 'flutter' ? 'BackButton' : 'Link'}) is lifted under the App prefix and both screens use it`, `added: ${names.join(', ') || 'none'}`),
+      chk('rx.no-overwrite', read(root, existingRel) === existingBody && [home, login].every((x) => localPromoRe.test(x)), 'lie', `an existing ${existingRel} is never overwritten; the colliding group stays local and is reported`, read(root, existingRel) === existingBody ? 'untouched' : 'OVERWRITTEN'),
+      chk('rx.canonical-schema', !!sectionFile && !unrelated, 'lie', 'the {id,name} canonical schema is read and an empty name never pulls unrelated groups onto a canonical name', sectionFile ? `${sectionFile}${unrelated ? ' contains an unrelated body' : ''}` : 'no SectionHeading lifted'),
+      ...(fw === 'flutter' ? [
+        chk('rx.public-kept', [home, login].every((x) => /class WelcomeBanner extends/.test(x)) && !names.some((n) => /welcome/i.test(n)), 'lie', 'a public class in a screen file is never lifted as a component', names.join(', ') || 'none'),
+        chk('rx.stateful', exists(root, `${dir}/blink.dart`) && /class Blink extends StatefulWidget/.test(read(root, `${dir}/blink.dart`)) && /extends State<Blink>/.test(read(root, `${dir}/blink.dart`)) && ![home, login].some((x) => /class _Blink\b|_BlinkState/.test(x)), 'stub', 'an identical StatefulWidget + State pair is lifted whole', exists(root, `${dir}/blink.dart`) ? 'lib/components/blink.dart' : 'not lifted'),
+        chk('rx.param-names', !added.filter((f) => f.endsWith('.dart')).some((f) => /\bthis\.p\d+\b/.test(read(root, f))), 'lie', 'no pN parameters', 'ok'),
+      ] : []),
+      chk('rx.syntax', syn.length === 0, 'lie', 'every file the pass wrote parses', syn.join(' | ') || 'ok'),
+      chk('rx.idempotent', d2.length === 0, 'lie', 'a second run changes nothing', d2.map((d) => `${d.change}:${d.file}`).join(', ') || 'no changes'),
+    ];
+    cells.push({
+      pass: 'readability extraction correctness (F2)', framework: fw,
+      reported: p ? { status: p.status, ...(p.reason ? { reason: p.reason } : {}), counts: p.counts, warnings: p.warnings } : null,
+      files, checks, cell_status: classify(p ? { status: p.status, reason: p.reason, counts: p.counts, warnings: p.warnings } : null, checks),
+      notes: [`run 2: ${r2.passes.find((x) => x.name === 'extractComponents')?.status}`],
+    });
+  }
+  return cells;
+}
+
 // ── toolchain probe (what the passes / gates would spawn) ──────────────────
 
 function probeTools(): Record<string, string> {
@@ -1488,6 +1657,8 @@ export async function runParity(opts: { log?: (m: string) => void; /** debug: ru
     ['finalize-dryrun', phaseFinalizeDryRun],
     ['readability-hygiene', phaseReadabilityHygiene],
     ['readability-report', phaseReadabilityReport],
+    ['readability-vocabulary', phaseReadabilityVocabulary],
+    ['readability-extraction', phaseReadabilityExtraction],
   ];
   for (const [name, fn] of phases) {
     if (opts.only && !name.includes(opts.only)) continue;
