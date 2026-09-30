@@ -12,7 +12,7 @@ import { describe, it, expect } from 'vitest';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { scanWebSizeSites, stadiumIsExact, detectGlobalBorderBox } from '../src/relay-server/passes/token-cleanup-web';
+import { scanWebSizeSites, stadiumIsExact, detectGlobalBorderBox, cssMayGrowFrom } from '../src/relay-server/passes/token-cleanup-web';
 import { deepenTokensAndCleanup } from '../src/relay-server/passes/token-cleanup';
 import { stripProvenance, stripProvenanceText, scanComments, renderedJsxText } from '../src/relay-server/passes/source-hygiene';
 
@@ -40,10 +40,13 @@ describe('F5 web pill: only a stadium the browser already paints', () => {
     expect(pills("<div style={{ height: 40, borderRadius: 21, border: '1px solid #eee' }} />")).toEqual([21]);
     expect(pills("<div style={{ height: 40, borderRadius: 20, borderStyle: 'solid' }} />")).toEqual([]);
   });
-  it('a className on a content-box element may add padding we cannot see', () => {
+  it('a className may add padding or min-height we cannot see — content-box OR border-box', () => {
     expect(pills('<div className="chip" style={{ height: 40, borderRadius: 20 }} />')).toEqual([]);
     expect(pills('<div style={{ height: 40, borderRadius: 20 }} className="chip" />')).toEqual([]);
-    expect(pills('<div className="chip" style={{ height: 40, borderRadius: 20 }} />', { borderBox: true })).toEqual([20]);
+    // recheck repro: `.tall { padding: 30px 0 }` makes a border-box <button> 64 high
+    expect(pills('<div className="chip" style={{ height: 40, borderRadius: 20 }} />', { borderBox: true })).toEqual([]);
+    expect(pills('<button className="tall" style={{ height: 40, borderRadius: 20, width: 200 }}>x</button>')).toEqual([]);
+    expect(pills('<button {...rest} style={{ height: 40, borderRadius: 20, width: 200 }}>x</button>')).toEqual([]);
   });
   it('an inline <span> ignores width/height; a component may pad; min-height and flex growth can grow the box', () => {
     expect(pills('<span style={{ height: 40, borderRadius: 20 }}>x</span>')).toEqual([]);
@@ -54,10 +57,55 @@ describe('F5 web pill: only a stadium the browser already paints', () => {
     expect(pills('<div style={{ height: 40, width: 100, borderRadius: 50, flex: 1 }} />')).toEqual([50]);
     expect(pills("<div style={{ height: 40, width: 100, borderRadius: 20, flex: '0 0 auto' }} />")).toEqual([20]);
   });
-  it('a style object outside JSX (element unknown) is a pill only under a border-box reset', () => {
+  it('a style object outside JSX is judged on every element that uses it', () => {
     expect(pills('const chip = { height: 40, borderRadius: 20 };')).toEqual([]);
-    expect(pills('const chip = { height: 40, borderRadius: 20 };', { borderBox: true })).toEqual([20]);
+    expect(pills('const chip = { height: 40, borderRadius: 20 };', { borderBox: true })).toEqual([]);   // no use: element unknown
+    expect(pills('const chip = { height: 40, borderRadius: 20 };\nconst A = () => <div style={chip} />;')).toEqual([20]);
+    expect(pills('const chip = { height: 40, borderRadius: 20 };\nconst A = () => <><div style={chip} /><div className="x" style={chip} /></>;')).toEqual([]);
+    expect(pills('const chip = { height: 40, borderRadius: 20 };\nconst A = () => <input style={chip} />;')).toEqual([]);
+    expect(pills('const chip = { height: 40, borderRadius: 20 };\nconst A = () => <div style={{ ...chip, padding: 9 }} />;')).toEqual([]);
+    expect(pills('export const chip = { height: 40, borderRadius: 20 };\nconst A = () => <div style={chip} />;')).toEqual([]);
+    expect(pills('const s = { chip: { height: 40, borderRadius: 20 }, row: { width: 3 } };\nconst A = () => <div style={s.chip}><p style={s.row} /></div>;')).toEqual([20]);
+    expect(pills('const s = { chip: { height: 40, borderRadius: 20 } };\nconst A = () => <textarea style={s.chip} />;')).toEqual([]);
+    expect(pills('const s = { chip: { height: 40, borderRadius: 20 } };\nconst A = () => <Card styles={s} />;')).toEqual([]);
     expect(pills('<div style={{ ...base, height: 40, borderRadius: 20 }} />')).toEqual([]);
+  });
+  it('<input>/<textarea> are content-box with UA padding + border (Chromium: 208x46, 213x44, 206x46) — not a stadium', () => {
+    expect(pills('<input style={{ height: 40, borderRadius: 20, width: 200 }} />')).toEqual([]);
+    expect(pills("<input style={{ height: 40, borderRadius: 20, padding: '0 16px' }} />")).toEqual([]);
+    expect(pills('<textarea style={{ height: 40, borderRadius: 20, width: 200 }} />')).toEqual([]);
+    // the style overrides every UA side → the box is exactly 40 high
+    expect(pills("<input style={{ height: 40, borderRadius: 20, padding: 0, border: 'none' }} />")).toEqual([20]);
+    // border-box (explicit or a global reset) keeps the UA extras inside the 40
+    expect(pills("<input style={{ boxSizing: 'border-box', height: 40, borderRadius: 20 }} />")).toEqual([20]);
+    expect(pills('<textarea style={{ height: 40, borderRadius: 20 }} />', { borderBox: true })).toEqual([20]);
+    // …unless the UA extras could exceed the box (upper bound 11px a side)
+    expect(pills('<input style={{ height: 16, borderRadius: 8 }} />', { borderBox: true })).toEqual([]);
+    // elements whose UA box we do not model are refused
+    expect(pills('<ul style={{ height: 40, borderRadius: 20 }} />')).toEqual([]);
+    expect(pills('<fieldset style={{ height: 40, borderRadius: 20 }} />')).toEqual([]);
+    expect(pills('<Chip style={{ height: 40, borderRadius: 20 }} />', { borderBox: true })).toEqual([]);
+  });
+  it('global stylesheets: a rule that can reach the element and grow it blocks the pill', () => {
+    const grow = (css: string) => ({ cssMayGrow: cssMayGrowFrom([css]) });
+    const btn = '<button style={{ height: 40, borderRadius: 20, width: 200 }}>x</button>';
+    const div = '<div style={{ height: 40, borderRadius: 20, width: 200 }}>x</div>';
+    expect(pills(btn, grow('button { min-height: 64px }'))).toEqual([]);
+    expect(pills(btn, grow('.card button:hover { padding: 30px 0 }'))).toEqual([]);
+    expect(pills(btn, grow('@media (max-width: 600px) { button { border: 4px solid red } }'))).toEqual([]);
+    expect(pills(btn, grow('nav { a { padding: 4px } & button { min-height: 50px } }'))).toEqual([]);
+    expect(pills(div, grow('* { box-sizing: content-box; padding: 2px }'))).toEqual([]);
+    expect(pills(div, grow('[role] { padding: 2px }'))).toEqual([]);
+    expect(pills(div, grow('div { display: inline }'))).toEqual([]);
+    // rules that cannot reach it, or cannot grow it, do not
+    expect(pills(btn, grow('.tall { padding: 30px 0 } #root { min-height: 100vh } a { padding: 9px } button::after { padding: 9px }'))).toEqual([20]);
+    expect(pills(div, grow('*, *::before, *::after { box-sizing: border-box; padding: 0; margin: 0 } html, body { max-width: 100vw } p { margin: 0 }'))).toEqual([20]);
+    expect(pills(div, grow('@keyframes k { from { padding: 9px } } @font-face { font-family: x; src: url("a;b{c}.woff") }'))).toEqual([20]);
+    expect(pills(div, grow('div { border-radius: 3px; color: red; margin: 8px; max-height: 10px }'))).toEqual([20]);
+    // an id selector reaches only the element with that id
+    expect(pills('<div id="hero" style={{ height: 40, borderRadius: 20 }} />', grow('#root { padding: 9px }'))).toEqual([20]);
+    expect(pills('<div id="hero" style={{ height: 40, borderRadius: 20 }} />', grow('#hero { padding: 9px }'))).toEqual([]);
+    expect(pills('<div id={x} style={{ height: 40, borderRadius: 20 }} />', grow('#root { padding: 9px }'))).toEqual([]);
   });
   it('token padding is resolved (run 2 sees AppTheme.spacing.s10 where run 1 saw 10)', () => {
     const resolve = (e: string): number | null => (e === 'AppTheme.spacing.s10' ? 10 : null);
