@@ -25,6 +25,7 @@ import path from 'node:path';
 
 import { loadWebApp, listWebSources, ensureNamedImport, importSpecFor, stillReferenced } from './web-app';
 import { DESIGN_SYSTEM_RECORD } from '../design-system';
+import { ladderNames } from '../design-vocabulary';
 
 export interface WebThemeModel {
   themeFile: string;
@@ -33,21 +34,25 @@ export interface WebThemeModel {
    *  `color` vs `colors`. Emitting the name we hoped for instead of the one that
    *  exists produces `AppTheme.spacing.sm` against a theme that only has `space`:
    *  337 type errors, every one of them ours. */
-  groupKeys: { color: string | null; spacing: string | null; radius: string | null };
+  groupKeys: { color: string | null; spacing: string | null; radius: string | null; size?: string | null };
   colors: { name: string; value: string }[];
   spacing: { name: string; value: number }[];
   radius: { name: string; value: number }[];
+  /** F4/F5: role-named sizes (`size: { iconMd: 24, buttonHeight: 56 }`). */
+  sizes?: { name: string; value: number }[];
   textStyles: string[];
 }
 
-export interface WebTokenChange { file: string; kind: 'color' | 'spacing' | 'radius'; from: string; to: string }
+export interface WebTokenChange { file: string; kind: 'color' | 'spacing' | 'radius' | 'size' | 'add-token'; from: string; to: string }
 export interface WebTokenReject { file: string; kind: string; literal: string; reason: string }
 
 export interface WebTokenResult {
   themeFile: string | null;
   tokensAvailable: { colors: { name: string; argb: string }[]; spacing: { name: string; value: number }[]; radius: { name: string; value: number }[]; textStyles: string[] };
-  substitutions: { colors: number; textStyles: number; spacing: number; radius: number };
+  substitutions: { colors: number; textStyles: number; spacing: number; radius: number; sizes?: number };
   removals: { imports: number; consts: number; methods: number };
+  /** F4/F5: vocabulary added to the theme module (recurring values, role-named). */
+  vocabulary?: { added: string[]; renamed: Array<{ from: string; to: string }> };
   changes: WebTokenChange[];
   rejected: WebTokenReject[];
   /** Source files read. 0 = examined nothing. */
@@ -136,6 +141,7 @@ export function parseWebThemeSource(src: string, themeFile: string): WebThemeMod
   const colors = strEntries(group('color') ?? group('colors'));
   const spacing = numEntries(group('spacing') ?? group('space'));
   const radius = numEntries(group('radius') ?? group('radii'));
+  const sizes = numEntries(group('size') ?? group('sizes'));
   return {
     themeFile,
     themeSymbol: decl[1],
@@ -143,10 +149,12 @@ export function parseWebThemeSource(src: string, themeFile: string): WebThemeMod
       color: firstKey('color', 'colors'),
       spacing: firstKey('spacing', 'space'),
       radius: firstKey('radius', 'radii'),
+      size: firstKey('size', 'sizes'),
     },
     colors,
     spacing,
     radius,
+    sizes,
     textStyles: textBody ? [...new Set([...textBody.matchAll(/([A-Za-z0-9_$]+)\s*:/g)].map((m) => m[1]))] : [],
   };
 }
@@ -196,6 +204,147 @@ function substituteNumeric(
   });
 }
 
+// ── F4/F5: sizes, pills, vocabulary amendment (web) ───────────────────────────
+
+/** Object literals `{ … }` in a source with their numeric width/height/borderRadius. */
+interface WebSizeSite { family: 'icon' | 'avatar' | 'tile' | 'button' | 'pill'; value: number; start: number; end: number; /** one element (a square's width + height are ONE use). */ el?: string }
+
+/** Square style objects (`{ width: 24, height: 24 }`), control heights next to a text
+ *  child, JSX `size={24}` on icon components, and stadium radii (≥ half the box). */
+export function scanWebSizeSites(src: string): WebSizeSite[] {
+  const sites: WebSizeSite[] = [];
+  const num = (body: string, key: string, base: number): { value: number; start: number; end: number } | null => {
+    const m = new RegExp(`(?<![\\w$-])${key}\\s*:\\s*(\\d+(?:\\.\\d+)?)(?![\\w.])`).exec(body);
+    return m ? { value: parseFloat(m[1]), start: base + m.index + m[0].length - m[1].length, end: base + m.index + m[0].length } : null;
+  };
+  // innermost `{ … }` object literals (style objects are flat)
+  for (const m of src.matchAll(/\{([^{}]*)\}/g)) {
+    const body = m[1];
+    const base = m.index! + 1;
+    if (!/\b(width|height|borderRadius)\s*:/.test(body)) continue;
+    const w = num(body, 'width', base); const h = num(body, 'height', base);
+    const br = num(body, 'borderRadius', base);
+    const circle = !!br && !!w && !!h && w.value === h.value && br.value * 2 >= w.value;
+    if (w && h && w.value === h.value) {
+      const fam = w.value < 28 ? 'icon' : circle ? 'avatar' : w.value <= 120 ? 'tile' : null;
+      if (fam) { sites.push({ family: fam, ...w, el: `o${base}` }); sites.push({ family: fam, ...h, el: `o${base}` }); }
+    } else if (h && !w && h.value >= 36 && h.value <= 64) {
+      sites.push({ family: 'button', ...h });
+    }
+    const dims = [w?.value, h?.value].filter((v): v is number => typeof v === 'number');
+    if (br && dims.length && !circle && br.value * 2 >= Math.min(...dims)) sites.push({ family: 'pill', ...br });
+  }
+  // <img width={18} height={18}> / <Image width={40} height={40}>: a square JSX box
+  for (const m of src.matchAll(/<([A-Za-z][\w.]*)\b([^<>]*?)\/?>/g)) {
+    const attrs = m[2];
+    const w = /\bwidth=\{(\d+(?:\.\d+)?)\}/.exec(attrs); const h = /\bheight=\{(\d+(?:\.\d+)?)\}/.exec(attrs);
+    if (!w || !h || w[1] !== h[1]) continue;
+    const v = parseFloat(w[1]);
+    const fam = v < 28 ? 'icon' : /avatar/i.test(attrs) ? 'avatar' : v <= 120 ? 'tile' : null;
+    if (!fam) continue;
+    const base = m.index! + 1 + m[1].length;
+    for (const a of [w, h]) { const at = base + a.index + a[0].length - 1 - a[1].length; sites.push({ family: fam, value: v, start: at, end: at + a[1].length, el: `j${base}` }); }
+  }
+  // <SomeIcon size={24} />
+  for (const m of src.matchAll(/<([A-Z]\w*)\b[^>]*?\bsize=\{(\d+(?:\.\d+)?)\}/g)) {
+    const at = m.index! + m[0].length - 1 - m[2].length;
+    if (parseFloat(m[2]) <= 48) sites.push({ family: 'icon', value: parseFloat(m[2]), start: at, end: at + m[2].length });
+  }
+  return sites;
+}
+
+const WEB_LADDERS: Array<[WebSizeSite['family'], string[], number]> = [
+  ['icon', ['iconXs', 'iconSm', 'iconMd', 'iconLg', 'iconXl'], 2],
+  ['avatar', ['avatarSm', 'avatar', 'avatarLg'], 1],
+  ['tile', ['tileXs', 'tileSm', 'tile', 'tileLg', 'tileXl'], 2],
+  ['button', ['buttonHeightSm', 'buttonHeight', 'buttonHeightLg'], 1],
+];
+
+/** Plan the size / pill tokens to add (≥2 uses, role-named, whole pixels). */
+export function planWebVocabulary(theme: WebThemeModel, sites: WebSizeSite[]): { sizes: Array<{ name: string; value: number }>; pill: boolean } {
+  const have = theme.sizes ?? [];
+  const taken = new Set(have.map((z) => z.name));
+  const sizes: Array<{ name: string; value: number }> = [];
+  for (const [fam, ladder, md] of WEB_LADDERS) {
+    const els = new Map<number, Set<string>>();
+    for (const s of sites) if (s.family === fam && Number.isInteger(s.value) && !have.some((z) => z.value === s.value && z.name.startsWith(fam === 'button' ? 'buttonHeight' : fam))) els.set(s.value, (els.get(s.value) ?? new Set()).add(s.el ?? String(s.start)));
+    const counts = new Map([...els].map(([v, set]) => [v, set.size]));
+    for (const t of ladderNames(counts, ladder, md, 2)) {
+      if (taken.has(t.name)) continue;
+      taken.add(t.name); sizes.push({ name: t.name, value: t.value });
+    }
+  }
+  const pill = new Set(sites.filter((s) => s.family === 'pill').map((s) => s.el ?? String(s.start))).size >= 2 && !theme.radius.some((r) => r.name === 'pill');
+  return { sizes, pill };
+}
+
+/** Add entries to the theme object's `size` / `radius` groups (creating `size`). */
+export function amendWebThemeSource(src: string, theme: WebThemeModel, plan: { sizes: Array<{ name: string; value: number }>; pill: boolean }): string {
+  let out = src;
+  const addToGroup = (key: string, entries: string[]): boolean => {
+    const m = new RegExp(`\\b${key}\\s*:\\s*\\{`).exec(out);
+    if (!m) return false;
+    let depth = 0;
+    for (let i = m.index + m[0].length - 1; i < out.length; i++) {
+      if (out[i] === '{') depth++;
+      else if (out[i] === '}') {
+        depth--;
+        if (depth === 0) {
+          const inner = out.slice(m.index + m[0].length, i);
+          const sep = inner.trim() ? (inner.trimEnd().endsWith(',') ? ' ' : ', ') : ' ';
+          out = `${out.slice(0, i).replace(/\s*$/, '')}${sep}${entries.join(', ')} ${out.slice(i)}`;
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+  if (plan.pill && theme.groupKeys.radius) addToGroup(theme.groupKeys.radius, ['pill: 9999']);
+  if (plan.sizes.length) {
+    const entries = plan.sizes.map((z) => `${z.name}: ${z.value}`);
+    if (!(theme.groupKeys.size && addToGroup(theme.groupKeys.size, entries))) {
+      // no size group yet: add one before the object's closing `}` (`} as const`)
+      const decl = new RegExp(`export\\s+const\\s+${theme.themeSymbol}\\s*=\\s*\\{`).exec(out);
+      if (decl) {
+        let depth = 0;
+        for (let i = decl.index + decl[0].length - 1; i < out.length; i++) {
+          if (out[i] === '{') depth++;
+          else if (out[i] === '}') { depth--; if (depth === 0) { out = `${out.slice(0, i).replace(/,?\s*$/, ',')}\n  size: { ${entries.join(', ')} },\n${out.slice(i)}`; break; } }
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/** Replace sized literals with the theme's size / pill tokens. */
+function substituteWebSizes(src: string, theme: WebThemeModel, onChange: (kind: 'size' | 'radius', from: string, to: string) => void): string {
+  const sizes = theme.sizes ?? [];
+  const pill = theme.radius.find((r) => r.name === 'pill');
+  if (!sizes.length && !pill) return src;
+  const sizeKey = theme.groupKeys.size ?? 'size';
+  const sites = scanWebSizeSites(src).sort((a, b) => b.start - a.start);
+  let out = src;
+  const done = new Set<number>();
+  for (const s of sites) {
+    if (done.has(s.start)) continue;
+    let to: string | null = null;
+    if (s.family === 'pill') { if (pill && theme.groupKeys.radius) to = `${theme.themeSymbol}.${theme.groupKeys.radius}.pill`; }
+    else {
+      const prefix = s.family === 'button' ? 'buttonHeight' : s.family;
+      const tok = sizes.find((z) => z.value === s.value && z.name.startsWith(prefix));
+      if (tok) to = `${theme.themeSymbol}.${sizeKey}.${tok.name}`;
+    }
+    if (!to) continue;
+    // JSX attribute value `size={24}` keeps its braces; the number is replaced inside them.
+    const from = out.slice(s.start, s.end);
+    out = out.slice(0, s.start) + to + out.slice(s.end);
+    done.add(s.start);
+    onChange(s.family === 'pill' ? 'radius' : 'size', from, to);
+  }
+  return out;
+}
+
 /** Unused local `const X = …` at module scope, and imports nothing references. */
 function removeDeadImports(src: string): { src: string; removed: number } {
   let removed = 0;
@@ -222,8 +371,9 @@ export async function deepenWebTokens(projectRoot: string, opts: WebTokenOptions
 
   const ix = await loadWebApp(projectRoot);
   const themeAt = locateWebTheme(projectRoot, ix?.themeFile ?? null);
-  const theme = themeAt ? parseWebThemeSource(fsSync.readFileSync(themeAt, 'utf-8'), themeAt) : null;
-  if (!theme) return { ...empty, skippedReason: webThemeSkipReason(projectRoot, themeAt) };
+  const parsed = themeAt ? parseWebThemeSource(fsSync.readFileSync(themeAt, 'utf-8'), themeAt) : null;
+  if (!parsed) return { ...empty, skippedReason: webThemeSkipReason(projectRoot, themeAt) };
+  let theme: WebThemeModel = parsed;
 
   const result: WebTokenResult = {
     ...empty,
@@ -245,6 +395,28 @@ export async function deepenWebTokens(projectRoot: string, opts: WebTokenOptions
 
   result.filesScanned = targets.length;
   if (targets.length === 0) result.skippedReason = `no source files to scan under ${roots.map((r) => rel(projectRoot, r) || '.').join(', ')}`;
+
+  // F4/F5: recurring sized values with no token get ONE role-named entry in the
+  // theme object (≥2 uses); the substitution below then uses it.
+  {
+    const allSites: WebSizeSite[] = [];
+    for (const [fi, f] of targets.entries()) { const src = await fs.readFile(f, 'utf-8').catch(() => ''); if (src) allSites.push(...scanWebSizeSites(src).map((x) => ({ ...x, el: `${fi}:${x.el ?? x.start}` }))); }
+    const plan = planWebVocabulary(theme, allSites);
+    if (plan.sizes.length || plan.pill) {
+      const cur = fsSync.readFileSync(theme.themeFile, 'utf-8');
+      const next = amendWebThemeSource(cur, theme, plan);
+      const reparsed = next !== cur ? parseWebThemeSource(next, theme.themeFile) : null;
+      if (reparsed) {
+        if (!opts.dryRun) await fs.writeFile(theme.themeFile, next, 'utf-8');
+        const added = [...plan.sizes.map((z) => `${z.name}=${z.value}`), ...(plan.pill ? ['pill'] : [])];
+        result.vocabulary = { added, renamed: [] };
+        for (const a of added) result.changes.push({ file: rel(projectRoot, theme.themeFile), kind: 'add-token', from: '', to: a });
+        theme = reparsed;
+        result.tokensAvailable.radius = theme.radius;
+      }
+    }
+  }
+  const themeM = theme;
   for (const file of targets) {
     const before = await fs.readFile(file, 'utf-8').catch(() => '');
     if (!before) continue;
@@ -255,7 +427,12 @@ export async function deepenWebTokens(projectRoot: string, opts: WebTokenOptions
       result.substitutions.colors++;
       result.changes.push({ file: relFile, kind: 'color', from, to });
     });
-    src = substituteNumeric(src, theme, RADIUS_PROPS, theme.radius, theme.groupKeys.radius, (from, to) => {
+    src = substituteWebSizes(src, themeM, (kind, from, to) => {
+      if (kind === 'size') result.substitutions.sizes = (result.substitutions.sizes ?? 0) + 1;
+      else result.substitutions.radius++;
+      result.changes.push({ file: relFile, kind, from, to });
+    });
+    src = substituteNumeric(src, theme, RADIUS_PROPS, theme.radius.filter((r) => r.name !== 'pill'), theme.groupKeys.radius, (from, to) => {
       result.substitutions.radius++;
       result.changes.push({ file: relFile, kind: 'radius', from, to });
     });

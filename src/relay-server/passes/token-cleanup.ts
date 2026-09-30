@@ -54,6 +54,8 @@ import * as path from 'path';
 import { spawn } from 'child_process';
 import type { AIModel } from '../ai-adapters';
 import { detectFramework, type Framework } from './framework';
+import { promoteConst, themeConstMembers } from './dart-const';
+import { parseVocabExtras, scanVocabSites, planVocabularyAmendment, applyAmendmentToTheme, vocabIndex, substituteVocabulary, applyColorRenames, type VocabThemeModel } from './token-vocabulary';
 import { deepenWebTokens } from './token-cleanup-web';
 
 export { detectFramework };
@@ -101,6 +103,17 @@ export interface SubstitutionCounts {
   textStyles: number;
   spacing: number;
   radius: number;
+  /** F5: width/height/size literals replaced by a role-named size token. */
+  sizes?: number;
+  /** F4: references moved from a counter-named colour token to its role name. */
+  renamed?: number;
+}
+
+/** F4/F5: vocabulary the pass ADDED to the theme (recurring values, role-named) and
+ *  the counter-named colour tokens it renamed. */
+export interface VocabularyAmendment {
+  added: string[];
+  renamed: Array<{ from: string; to: string }>;
 }
 export interface RemovalCounts {
   imports: number;
@@ -123,6 +136,8 @@ export interface TokenCleanupReport {
   };
   substitutions: SubstitutionCounts;
   removals: RemovalCounts;
+  /** F4/F5: theme vocabulary added / renamed by this run (absent when none). */
+  vocabulary?: VocabularyAmendment;
   /** Per-file detail of what changed (for review/audit). */
   changes: Array<{ file: string; kind: string; from: string; to: string }>;
   /** Substitutions considered but REJECTED (and why) — the adversarial trail. */
@@ -375,8 +390,50 @@ async function runFlutter(projectRoot: string, opts: DeepenTokensOptions): Promi
   const contents = new Map<string, string>();
   for (const f of dartFiles) contents.set(f, await fs.readFile(f, 'utf8'));
 
+  // ── 0) VOCABULARY AMENDMENT (F4/F5) ─────────────────────────────────────────
+  // Recurring values in a recognisable role that have no token get ONE role-named
+  // token (≥2 uses); counter-named colour tokens get their role name. Pure
+  // additions/renames — no rendered value changes.
+  let vocabulary: VocabularyAmendment | undefined;
+  let themeNow = theme;
+  const themeAbs = theme ? path.join(projectRoot, theme.themeFileRel) : null;
+  if (theme && themeAbs && contents.has(themeAbs)) {
+    const isTarget = (f: string): boolean => f !== themeAbs && !/[\\/]_preview[\\/]/.test(f);
+    const extras = parseVocabExtras(contents.get(themeAbs)!);
+    const vt: VocabThemeModel = { className: theme.className, themeFileRel: theme.themeFileRel, colors: theme.colors, spacing: theme.spacing, radius: theme.radius, sizes: extras.sizes, corners: extras.corners };
+    const sites = [...contents].filter(([f]) => isTarget(f)).map(([, src]) => scanVocabSites(src));
+    const colorRefs = new Map<string, number>();
+    for (const [f, src] of contents) if (isTarget(f)) for (const m of src.matchAll(new RegExp(`\\b${theme.className}\\.([A-Za-z_]\\w*)`, 'g'))) colorRefs.set(m[1], (colorRefs.get(m[1]) ?? 0) + 1);
+    const plan = planVocabularyAmendment(vt, sites, colorRefs);
+    const added = [
+      ...plan.add.spacing.map((n) => `s${n}`), ...plan.add.radius.map((n) => `r${n}`), ...(plan.add.pill ? ['radiusPill'] : []),
+      ...plan.add.corners.map((n) => `corner${n}`), ...plan.add.sizes.map((z) => `${z.name}=${z.value}`),
+    ];
+    if (added.length || plan.renames.length) {
+      const newTheme = applyAmendmentToTheme(contents.get(themeAbs)!, theme.className, plan);
+      contents.set(themeAbs, newTheme);
+      let renamedRefs = 0;
+      if (plan.renames.length) {
+        for (const [f, src] of contents) {
+          if (f === themeAbs) continue;
+          const r = applyColorRenames(src, theme.className, plan.renames);
+          if (r.count) { contents.set(f, r.src); renamedRefs += r.count; }
+        }
+      }
+      subs.renamed = renamedRefs;
+      for (const r of plan.renames) changes.push({ file: theme.themeFileRel, kind: 'rename-token', from: r.from, to: r.to });
+      for (const a of added) changes.push({ file: theme.themeFileRel, kind: 'add-token', from: '', to: a });
+      vocabulary = { added, renamed: plan.renames };
+      themeNow = parseFlutterThemeSource(newTheme, theme.themeFileRel) ?? theme;
+    }
+  }
+
   // ── 1) TOKEN DEEPENING (deterministic transforms) ──────────────────────────
-  if (theme) {
+  if (themeNow) {
+    const theme = themeNow;
+    const extras = themeAbs && contents.has(themeAbs) ? parseVocabExtras(contents.get(themeAbs)!) : { sizes: [], corners: [] };
+    const vix = vocabIndex({ className: theme.className, themeFileRel: theme.themeFileRel, colors: theme.colors, spacing: theme.spacing, radius: theme.radius, sizes: extras.sizes, corners: extras.corners });
+    const constCtx = { themeClass: theme.className, themeConsts: themeConstMembers(themeAbs && contents.has(themeAbs) ? contents.get(themeAbs)! : '') };
     for (const [file, src0] of contents) {
       const rel = path.relative(projectRoot, file);
       let src = src0;
@@ -389,8 +446,18 @@ async function runFlutter(projectRoot: string, opts: DeepenTokensOptions): Promi
       // c) radius
       const rRes = substituteRadius(src, theme, rel);
       src = rRes.src; subs.radius += rRes.count; changes.push(...rRes.changes);
+      // d) F5: sizes, single corners, stadium radii, EdgeInsets.only/fromLTRB, spacing:
+      if (file !== themeAbs && !/[\\/]_preview[\\/]/.test(file)) {
+        const vRes = substituteVocabulary(src, rel, vix);
+        src = vRes.src;
+        subs.spacing += vRes.count.spacing; subs.radius += vRes.count.radius; subs.sizes = (subs.sizes ?? 0) + vRes.count.sizes;
+        changes.push(...vRes.changes);
+      }
 
       if (src !== src0) {
+        // A constant token where a non-constant expression stood can make the
+        // enclosing constructor const-able — write the `const` the analyzer would ask for.
+        src = promoteConst(src, constCtx).src;
         // Any substitution may need the theme import (token is AppTheme.x).
         src = ensureThemeImport(src, file, projectRoot, theme);
       }
@@ -487,6 +554,7 @@ async function runFlutter(projectRoot: string, opts: DeepenTokensOptions): Promi
       tokensAvailable,
       substitutions: subs,
       removals,
+      ...(vocabulary ? { vocabulary } : {}),
       changes,
       rejected,
       analyze: { before: analyzeBefore, after: analyzeAfter, skipped: !!opts.skipAnalyze },
@@ -1114,6 +1182,7 @@ const webStrategy = (framework: Framework): DeepenStrategy => ({
         tokensAvailable: r.tokensAvailable,
         substitutions: r.substitutions,
         removals: r.removals,
+        ...(r.vocabulary ? { vocabulary: r.vocabulary } : {}),
         changes: r.changes,
         rejected: r.rejected,
         // The finalize orchestrator owns the typecheck gate for web; this pass does

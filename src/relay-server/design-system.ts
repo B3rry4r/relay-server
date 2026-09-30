@@ -21,16 +21,27 @@ import * as fsSync from 'fs';
 import * as path from 'path';
 import { webPreviewRoute } from './agent-packet';
 import { webThemePaths } from './web-skeleton';
+import { measureDesign, planColorVocabulary, planDesignScales, defaultDesignScales, PILL_RADIUS, type DesignScales, type MergedColor } from './design-vocabulary';
 
 export interface DesignDigestInput {
   colors: string[];   // dominant hex colors, most-used first (e.g. "#12ae89")
   fonts: string[];    // dominant font families, most-used first
+  /** F4: EVERY design colour with its use count (hex → uses). When present the
+   *  palette is planned from it: near-duplicates merged, one-off colours dropped,
+   *  role names without counters. Absent → `colors` (usage-ordered) is the palette. */
+  colorUses?: Array<[string, number]>;
+  /** F4: the per-screen IR texts, measured for the spacing / radius / size scales. */
+  irTexts?: string[];
 }
 
 export interface ColorToken { name: string; hex: string; comment: string }
 export interface ThemeTokens {
   colors: ColorToken[];
   fontFamily?: string;
+  /** F4: design-derived spacing / radius / size vocabulary. */
+  scales: DesignScales;
+  /** F4: colours folded into a near-identical token (tell the agent which to use). */
+  mergedColors: MergedColor[];
   /** marker so generate is idempotent + the prompt can name the file. */
   themeFile: string;          // project-relative, e.g. lib/theme/app_theme.dart
   className: string;          // e.g. "AppTheme"
@@ -60,37 +71,25 @@ function lightness(r: number, g: number, b: number): number {
   return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;   // 0..1
 }
 
-/** Turn the digest into named, role-classified tokens (pure, testable). */
+/** Turn the digest into named, role-classified tokens (pure, testable).
+ *  Readability F4: role names WITHOUT counters (textPrimary, textMuted, border,
+ *  brandSoft, success …), near-duplicate colours merged, and — when the digest
+ *  carries IR — spacing / radius / size scales measured from the design. */
 export function planThemeTokens(digest: DesignDigestInput, opts?: { className?: string; themeFile?: string }): ThemeTokens {
   const className = opts?.className ?? 'AppTheme';
   const themeFile = opts?.themeFile ?? path.join('lib', 'theme', 'app_theme.dart');
-  const used = new Set<string>();
-  const uniq = (base: string): string => {
-    let n = base, i = 2;
-    while (used.has(n)) n = `${base}${i++}`;
-    used.add(n);
-    return n;
-  };
-  const colors: ColorToken[] = [];
-  let accentIdx = 0, neutralIdx = 0;
-  for (const raw of digest.colors) {
-    const c = parseHex(raw);
-    if (!c) continue;
-    const hex = `#${raw.replace('#', '').toLowerCase()}`;
-    let name: string;
-    if (isGrayscale(c.r, c.g, c.b)) {
-      const L = lightness(c.r, c.g, c.b);
-      if (L >= 0.93) name = uniq('surface');         // near-white backgrounds
-      else if (L <= 0.10) name = uniq('ink');        // near-black text
-      else name = uniq(`neutral${++neutralIdx}`);
-    } else {
-      name = accentIdx === 0 ? uniq('brand') : uniq(`accent${accentIdx + 1}`);
-      accentIdx++;
-    }
-    colors.push({ name, hex, comment: `${hex}${isGrayscale(c.r, c.g, c.b) ? ' (neutral)' : ''}` });
-  }
+  const counted = digest.colorUses && digest.colorUses.length > 0;
+  // Without counts the digest order IS the usage order: synthesize descending counts.
+  const uses: Array<[string, number]> = counted
+    ? digest.colorUses!
+    : digest.colors.map((c, i) => [`#${c.replace('#', '')}`, digest.colors.length - i] as [string, number]);
+  // With real counts a colour must recur (≥2 uses) to earn a token — a one-off stays
+  // a local value in its one file; the legacy top-N list is taken whole.
+  const plan = planColorVocabulary(uses, { minUses: counted ? 2 : 1, max: counted ? 20 : Math.max(digest.colors.length, 1) });
+  const colors: ColorToken[] = plan.colors.map((c) => ({ name: c.name, hex: c.hex, comment: c.comment }));
   const fontFamily = digest.fonts[0];
-  return { colors, fontFamily, themeFile, className };
+  const scales = digest.irTexts && digest.irTexts.some((t) => t && t.trim()) ? planDesignScales(measureDesign(digest.irTexts)) : defaultDesignScales();
+  return { colors, fontFamily, themeFile, className, scales, mergedColors: plan.merged };
 }
 
 const argb = (hex: string): string => `0xFF${hex.replace('#', '').toLowerCase()}`;
@@ -104,7 +103,12 @@ export function themeApiDescription(tokens: ThemeTokens): string {
   ];
   for (const c of tokens.colors) out.push(`- ${tokens.className}.${c.name}  = ${c.hex}`);
   if (tokens.fontFamily) out.push(`Typeface: ${tokens.fontFamily} — use ${tokens.className}.textTheme / the family constant, do not re-declare per screen.`);
-  out.push(`Spacing: ${tokens.className}.s4/s8/s12/s16/s20/s24 (EdgeInsets/SizedBox). Radius: ${tokens.className}.r8/r12/r16/r24 (BorderRadius).`);
+  const t = tokens.className;
+  const sc = tokens.scales;
+  out.push(`Spacing (EdgeInsets / SizedBox gaps / Row-Column spacing): ${sc.spacing.map((n) => `${t}.s${n}`).join(', ')}.`);
+  out.push(`Radius (BorderRadius): ${sc.radius.map((n) => `${t}.r${n}`).join(', ')}${sc.pill ? `, ${t}.radiusPill (stadium buttons/chips; or StadiumBorder())` : ''}; single corners (BorderRadius.only / .vertical): ${sc.radius.map((n) => `${t}.corner${n}`).join(', ')}.`);
+  if (sc.sizes.length) out.push(`Sizes (width/height/size): ${sc.sizes.map((z) => `${t}.${z.name} = ${z.value}`).join(', ')}.`);
+  for (const m of tokens.mergedColors.slice(0, 12)) out.push(`- ${m.hex} → use ${t}.${m.into} (near-identical; do not add a token for it)`);
   return out.join('\n');
 }
 
@@ -115,8 +119,9 @@ export function themeApiDescription(tokens: ThemeTokens): string {
 // app entry (react: src/main.tsx; next: app/layout.tsx — both written by the web
 // skeleton). The agent gets a web-worded contract, never the Dart API (PG-31).
 
-const WEB_SPACING = [4, 8, 12, 16, 20, 24, 32];
-const WEB_RADIUS = [8, 12, 16, 24];
+const webSpacing = (tokens: ThemeTokens): number[] => tokens.scales?.spacing ?? defaultDesignScales().spacing;
+const webRadius = (tokens: ThemeTokens): number[] => tokens.scales?.radius ?? defaultDesignScales().radius;
+const WEB_PILL = 9999;
 
 /** The web design-system contract injected into the React/Next agent's prompt. */
 export function webThemeApiDescription(tokens: ThemeTokens): string {
@@ -127,8 +132,10 @@ export function webThemeApiDescription(tokens: ThemeTokens): string {
   ];
   for (const c of tokens.colors) out.push(`- ${t}.color.${c.name} = ${c.hex}  (var(--color-${c.name}))`);
   if (tokens.fontFamily) out.push(`Typeface: ${tokens.fontFamily} — \`${t}.font.family\` / var(--font-family), already set on <body>; do not re-declare it per screen.`);
-  out.push(`Spacing (px numbers for style props — padding, margin, gap): ${WEB_SPACING.map(n => `${t}.spacing.s${n}`).join(', ')} (var(--space-<n>) in CSS).`);
-  out.push(`Radius (borderRadius): ${WEB_RADIUS.map(n => `${t}.radius.r${n}`).join(', ')} (var(--radius-<n>) in CSS).`);
+  out.push(`Spacing (px numbers for style props — padding, margin, gap): ${webSpacing(tokens).map(n => `${t}.spacing.s${n}`).join(', ')} (var(--space-<n>) in CSS).`);
+  out.push(`Radius (borderRadius): ${webRadius(tokens).map(n => `${t}.radius.r${n}`).join(', ')}${tokens.scales?.pill ? `, ${t}.radius.pill (stadium buttons/chips)` : ''} (var(--radius-<n>)${tokens.scales?.pill ? ' / var(--radius-pill)' : ''} in CSS).`);
+  if (tokens.scales?.sizes.length) out.push(`Sizes (width/height of icons, avatars, buttons): ${tokens.scales.sizes.map((z) => `${t}.size.${z.name} = ${z.value}`).join(', ')} (var(--size-<name>) in CSS).`);
+  for (const m of (tokens.mergedColors ?? []).slice(0, 12)) out.push(`- ${m.hex} → use ${t}.color.${m.into} (near-identical; do not add a token for it)`);
   return out.join('\n');
 }
 
@@ -148,8 +155,8 @@ ${colorLines || '    // (no dominant colors detected)'}
   font: {
     family: ${JSON.stringify(family)},
   },
-  spacing: { ${WEB_SPACING.map(n => `s${n}: ${n}`).join(', ')} },
-  radius: { ${WEB_RADIUS.map(n => `r${n}: ${n}`).join(', ')} },
+  spacing: { ${webSpacing(tokens).map(n => `s${n}: ${n}`).join(', ')} },
+  radius: { ${[...webRadius(tokens).map(n => `r${n}: ${n}`), ...(tokens.scales?.pill ? [`pill: ${WEB_PILL}`] : [])].join(', ')} },${tokens.scales?.sizes.length ? `\n  size: { ${tokens.scales.sizes.map((z) => `${z.name}: ${z.value}`).join(', ')} },` : ''}
 } as const;
 
 export type ${tokens.className}Color = keyof typeof ${tokens.className}.color;
@@ -158,14 +165,14 @@ export type ${tokens.className}Color = keyof typeof ${tokens.className}.color;
 
 function renderWebThemeCss(tokens: ThemeTokens): string {
   const family = tokens.fontFamily ? `'${cssString(tokens.fontFamily)}', system-ui, sans-serif` : 'system-ui, sans-serif';
-  const surface = tokens.colors.find(c => c.name.startsWith('surface'))?.name;
-  const ink = tokens.colors.find(c => c.name.startsWith('ink'))?.name;
+  const surface = tokens.colors.find(c => c.name === 'surface')?.name ?? tokens.colors.find(c => c.name.startsWith('surface'))?.name;
+  const ink = tokens.colors.find(c => c.name === 'textPrimary')?.name ?? tokens.colors.find(c => c.name.startsWith('ink'))?.name;
   return `/* GENERATED (extract-first design system) — CSS custom properties mirroring
    ${tokens.className} in ${path.posix.basename(tokens.themeFile)}. Imported once by the app entry. */
 :root {
 ${tokens.colors.map(c => `  --color-${c.name}: ${c.hex};`).join('\n')}${tokens.colors.length ? '\n' : ''}  --font-family: ${family};
-${WEB_SPACING.map(n => `  --space-${n}: ${n}px;`).join('\n')}
-${WEB_RADIUS.map(n => `  --radius-${n}: ${n}px;`).join('\n')}
+${webSpacing(tokens).map(n => `  --space-${n}: ${n}px;`).join('\n')}
+${webRadius(tokens).map(n => `  --radius-${n}: ${n}px;`).join('\n')}${tokens.scales?.pill ? `\n  --radius-pill: ${WEB_PILL}px;` : ''}${(tokens.scales?.sizes ?? []).map((z) => `\n  --size-${z.name}: ${z.value}px;`).join('')}
 }
 
 *, *::before, *::after { box-sizing: border-box; }
@@ -181,8 +188,9 @@ body {
 function renderFlutterTheme(tokens: ThemeTokens): string {
   const colorLines = tokens.colors.map(c => `  static const Color ${c.name} = Color(${argb(c.hex)}); // ${c.comment}`).join('\n');
   const fam = tokens.fontFamily ? `\n  static const String fontFamily = '${tokens.fontFamily.replace(/'/g, '')}';` : '';
-  const surface = tokens.colors.find(c => c.name.startsWith('surface'))?.name ?? null;
+  const surface = tokens.colors.find(c => c.name === 'surface')?.name ?? tokens.colors.find(c => c.name.startsWith('surface'))?.name ?? null;
   const brand = tokens.colors.find(c => c.name === 'brand')?.name ?? null;
+  const sc = tokens.scales ?? defaultDesignScales();
   return `// GENERATED (extract-first design system). Single source of truth for the
 // palette + type scale + spacing/radius. Screens MUST import these tokens instead
 // of hardcoding raw literals. Safe to extend; do not duplicate tokens per screen.
@@ -194,18 +202,17 @@ class ${tokens.className} {
   // ── Colors (role-classified, usage-ordered) ──
 ${colorLines || '  // (no dominant colors detected)'}${fam}
 
-  // ── Spacing scale ──
-  static const double s4 = 4, s8 = 8, s12 = 12, s16 = 16, s20 = 20, s24 = 24, s32 = 32;
+  // ── Spacing scale (design-derived) ──
+  static const double ${sc.spacing.map((n) => `s${n} = ${n}`).join(', ')};
   static EdgeInsets pad(double v) => EdgeInsets.all(v);
   static EdgeInsets padX(double v) => EdgeInsets.symmetric(horizontal: v);
   static EdgeInsets padY(double v) => EdgeInsets.symmetric(vertical: v);
 
-  // ── Radius scale ──
-  static const BorderRadius r8 = BorderRadius.all(Radius.circular(8));
-  static const BorderRadius r12 = BorderRadius.all(Radius.circular(12));
-  static const BorderRadius r16 = BorderRadius.all(Radius.circular(16));
-  static const BorderRadius r24 = BorderRadius.all(Radius.circular(24));
-
+  // ── Radius scale (design-derived) ──
+${sc.radius.map((n) => `  static const BorderRadius r${n} = BorderRadius.all(Radius.circular(${n}));`).join('\n')}${sc.pill ? `\n  static const BorderRadius radiusPill = BorderRadius.all(Radius.circular(${PILL_RADIUS}));` : ''}
+  // single corners, for BorderRadius.only(...) / BorderRadius.vertical(...)
+${sc.radius.map((n) => `  static const Radius corner${n} = Radius.circular(${n});`).join('\n')}
+${sc.sizes.length ? `\n  // ── Sizes (design-derived roles) ──\n  static const double ${sc.sizes.map((z) => `${z.name} = ${z.value}`).join(', ')};\n` : ''}
   static ThemeData themeData() => ThemeData(
         useMaterial3: true,${fam ? `\n        fontFamily: fontFamily,` : ''}${brand ? `\n        colorSchemeSeed: ${brand},` : ''}${surface ? `\n        scaffoldBackgroundColor: ${surface},` : ''}
       );
@@ -286,6 +293,7 @@ async function generateWebDesignSystem(
       framework, themeFile: where.themeFile, cssFile: where.cssFile, importSpecifier: where.importSpecifier, importFrom: where.importFrom,
       symbol: tokens.className, groups: { color: 'color', spacing: 'spacing', radius: 'radius', font: 'font' },
       colors: tokens.colors.map(c => ({ name: c.name, hex: c.hex })), fontFamily: tokens.fontFamily ?? null,
+      scales: tokens.scales, mergedColors: tokens.mergedColors,
     };
     const recAbs = path.join(projectRoot, DESIGN_SYSTEM_RECORD);
     const body = `${JSON.stringify(rec, null, 2)}\n`;
