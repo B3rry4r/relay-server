@@ -19,6 +19,7 @@ import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { io as createClient, type Socket } from 'socket.io-client';
 import { createRelayServer, defaultPtyFactory, type RelayServer } from '../../src/relay-server';
+import { reapTerminalSessions } from './reap';
 
 const ROOT = path.resolve(__dirname, '../..');
 const FAKE_AGENT = path.join(ROOT, 'test/fixtures/agent/fake-agent.mjs');
@@ -63,6 +64,7 @@ describe.skipIf(SKIP !== null)('Agent view E2E: remote PTY (relay-pty on loopbac
   let ptyUrl = '';
   const servers: RelayServer[] = [];
   const clients: Socket[] = [];
+  const shellPids: number[] = [];
 
   beforeEach(async () => {
     workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-agent-remote-'));
@@ -104,14 +106,18 @@ describe.skipIf(SKIP !== null)('Agent view E2E: remote PTY (relay-pty on loopbac
     for (const c of clients.splice(0)) c.disconnect();
     for (const s of servers.splice(0)) await s.stop();
     for (const key of ['PORT', 'AUTH_TOKEN', 'WORKSPACE', 'SHELL', 'RELAY_PTY_MODE', 'RELAY_PTY_URL', 'RELAY_PTY_TOKEN']) delete process.env[key];
-    if (pty && pty.exitCode === null) {
+    if (pty && pty.exitCode === null && pty.signalCode === null) {
+      const exited = new Promise((r) => pty!.once('exit', r));
       pty.kill('SIGTERM');
-      await new Promise((r) => { const t = setTimeout(r, 3000); pty!.once('exit', () => { clearTimeout(t); r(undefined); }); });
-      if (pty.exitCode === null) pty.kill('SIGKILL');
+      const t = setTimeout(() => pty?.kill('SIGKILL'), 3000);
+      await exited;   // relay-pty writes its session file on the way out: wait for the exit itself
+      clearTimeout(t);
     }
     pty = null;
-    // the killed shell may still be writing (.bash_history on SIGHUP): retry ENOTEMPTY
-    fs.rmSync(workspace, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    // the hung-up shells (and the agents they ran) may still be writing into the
+    // workspace (.bash_history on SIGHUP, key logs): wait until they are gone
+    await reapTerminalSessions(shellPids.splice(0));
+    fs.rmSync(workspace, { recursive: true, force: true });
   });
 
   async function relay() {
@@ -154,6 +160,7 @@ describe.skipIf(SKIP !== null)('Agent view E2E: remote PTY (relay-pty on loopbac
     const app = await open(url, { token: 'test-token' });
     clients.push(app.client);
     const created = await app.waitFor('terminal:created');
+    shellPids.push(created.pid);
     let env: string[] = [];
     for (let i = 0; i < 50 && !env.some((kv) => kv.startsWith('RELAY_TERMINAL_ID=')); i += 1) {
       env = fs.readFileSync(`/proc/${created.pid}/environ`, 'utf8').split('\0');
@@ -171,6 +178,7 @@ describe.skipIf(SKIP !== null)('Agent view E2E: remote PTY (relay-pty on loopbac
     const term = await open(ptyUrl, { token: PTY_TOKEN });
     clients.push(term.client);
     const created = await term.waitFor('terminal:created');
+    shellPids.push(created.pid);
     const app = await open(url, { token: 'test-token', noTerminals: true });
     clients.push(app.client);
     // the Option-B app socket gets agent events but no terminal plumbing

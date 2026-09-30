@@ -19,6 +19,7 @@ import { spawnSync } from 'node:child_process';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { io as createClient, type Socket } from 'socket.io-client';
 import { createRelayServer, defaultPtyFactory, type RelayServer } from '../../src/relay-server';
+import { reapTerminalSessions } from './reap';
 
 const ROOT = path.resolve(__dirname, '../..');
 const FAKE_AGENT = path.join(ROOT, 'test/fixtures/agent/fake-agent.mjs');
@@ -72,6 +73,7 @@ describe.skipIf(PTY_UNAVAILABLE !== null)('Agent view E2E: fake agent in a real 
   let workspace = '';
   const servers: RelayServer[] = [];
   const clients: Socket[] = [];
+  const shellPids: number[] = [];
 
   beforeEach(() => {
     workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-agent-e2e-'));
@@ -93,8 +95,10 @@ describe.skipIf(PTY_UNAVAILABLE !== null)('Agent view E2E: fake agent in a real 
     for (const c of clients.splice(0)) c.disconnect();
     for (const s of servers.splice(0)) await s.stop();
     for (const key of ['PORT', 'AUTH_TOKEN', 'WORKSPACE', 'SHELL']) delete process.env[key];
-    // the killed shell may still be writing (.bash_history on SIGHUP): retry ENOTEMPTY
-    fs.rmSync(workspace, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    // the hung-up shell (and the agent it ran) may still be writing into the
+    // workspace (.bash_history on SIGHUP, the key log): wait until they are gone
+    await reapTerminalSessions(shellPids.splice(0));
+    fs.rmSync(workspace, { recursive: true, force: true });
   });
 
   async function start() {
@@ -105,6 +109,7 @@ describe.skipIf(PTY_UNAVAILABLE !== null)('Agent view E2E: fake agent in a real 
     clients.push(rec.client);
     const created = await rec.waitFor('terminal:created');
     const terminalId: string = created.id;
+    shellPids.push(created.pid);
     // the shell env carries the terminal id (spec §5.1) — read it back from the kernel
     // (right after fork, before exec, environ can read empty under load: poll)
     let env: string[] = [];

@@ -22,8 +22,8 @@ import { promises as fs } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { runAnalyzeGate, analyzeGateEnabled } from '../src/relay-server/passes/finalize';
-import { registerScreenLoopRoutes } from '../src/relay-server/ai-screen-loop';
-import { readRunLog, getRun, type BuildRun } from '../src/relay-server/build-run-store';
+import { registerScreenLoopRoutes, runLoopSettled } from '../src/relay-server/ai-screen-loop';
+import { readRunLog, getRun, drainRunWrites, type BuildRun } from '../src/relay-server/build-run-store';
 
 // ── unit: runAnalyzeGate ──────────────────────────────────────────────────────
 
@@ -182,25 +182,15 @@ async function writeFinalizeReport(finalErrors: number): Promise<void> {
   }, null, 2), 'utf-8');
 }
 
-async function waitForLog(runId: string, needle: string, timeoutMs = 20000): Promise<string> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const log = await readRunLog(PROJECT_ID, runId);
-    if (log.includes(needle)) return log;
-    if (Date.now() > deadline) return log;
-    await new Promise(r => setTimeout(r, 100));
-  }
-}
-
-/** The log line is appended BEFORE the status write (several awaits apart), so under
- *  load reading the run right after the line races the write. Poll the status. */
-async function waitForStatus(runId: string, status: string, timeoutMs = 10000): Promise<BuildRun | null> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const run = await getRun(PROJECT_ID, runId);
-    if (run?.status === status || Date.now() > deadline) return run;
-    await new Promise(r => setTimeout(r, 50));
-  }
+/** POST /start launches the orchestration fire-and-forget; the loop appends the
+ *  verdict line several awaits BEFORE its status write, so polling the log and then
+ *  the status races those writes under load. Await the loop itself (and every run
+ *  file write it queued), then read log + run once — no deadline, no polling. */
+async function startAndSettle(runId: string): Promise<{ log: string; run: BuildRun | null }> {
+  await request(app).post(`/api/ai/runs/${runId}/start`).send({ projectId: PROJECT_ID }).expect(200);
+  await runLoopSettled(runId);
+  await drainRunWrites();
+  return { log: await readRunLog(PROJECT_ID, runId), run: await getRun(PROJECT_ID, runId) };
 }
 
 beforeEach(async () => {
@@ -224,12 +214,10 @@ describe('P3 analyze gate through the run', () => {
     await writeRun(makeRun(runId));
     await writeFinalizeReport(17);
 
-    await request(app).post(`/api/ai/runs/${runId}/start`).send({ projectId: PROJECT_ID }).expect(200);
-    const log = await waitForLog(runId, 'run NOT complete');
+    const { log, run } = await startAndSettle(runId);
 
     expect(log).toContain('[finalize] 17 analyzer error(s) remain — run NOT complete');
     expect(log).not.toContain('[run] complete');
-    const run = await waitForStatus(runId, 'needs-review');
     expect(run?.status).toBe('needs-review');
     expect(run?.finalized ?? false).toBe(false);   // NOT finalize-complete
   }, 30000);
@@ -239,12 +227,10 @@ describe('P3 analyze gate through the run', () => {
     await writeRun(makeRun(runId));
     await writeFinalizeReport(0);
 
-    await request(app).post(`/api/ai/runs/${runId}/start`).send({ projectId: PROJECT_ID }).expect(200);
-    const log = await waitForLog(runId, '[run] complete');
+    const { log, run } = await startAndSettle(runId);
 
     expect(log).toContain('[run] complete');
     expect(log).not.toContain('run NOT complete');
-    const run = await waitForStatus(runId, 'done');
     expect(run?.status).toBe('done');
     expect(run?.finalized).toBe(true);
   }, 30000);
@@ -255,12 +241,10 @@ describe('P3 analyze gate through the run', () => {
     await writeRun(makeRun(runId));
     await writeFinalizeReport(17);
 
-    await request(app).post(`/api/ai/runs/${runId}/start`).send({ projectId: PROJECT_ID }).expect(200);
-    const log = await waitForLog(runId, '[run] complete');
+    const { log, run } = await startAndSettle(runId);
 
     expect(log).toContain('[finalize] analyze gate OFF');
     expect(log).toContain('[run] complete');
-    const run = await waitForStatus(runId, 'done');
     expect(run?.status).toBe('done');
     expect(run?.finalized).toBe(true);
   }, 30000);

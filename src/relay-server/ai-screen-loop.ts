@@ -2216,7 +2216,32 @@ async function gate(run: BuildRun, gateName: CheckpointGate, message: string): P
   return true;
 }
 
-async function runAppLoop(projectId: string, runId: string): Promise<void> {
+// The in-flight orchestration per run (this process). The loop is always launched
+// fire-and-forget (/start, resume, prep hand-off, the rate-limit sweep), so a caller
+// that must act on its OUTCOME — the run's final status, the log's last line — has
+// nothing to await but a status poll racing the loop's last writes (it appends
+// "run NOT complete" several awaits BEFORE it writes status 'needs-review').
+// runLoopSettled(runId) resolves once the loop has returned, i.e. after its final
+// status write, its last awaited log line and its lease release.
+const runLoops = new Map<string, Promise<void>>();
+
+function runAppLoop(projectId: string, runId: string): Promise<void> {
+  // A second launch while one orchestrates is a no-op (runAppLoopBody returns at
+  // once): hand back the loop that is actually running, never a settled no-op.
+  if (isRunActive(runId)) return runLoops.get(runId) ?? Promise.resolve();
+  const loop: Promise<void> = runAppLoopBody(projectId, runId).finally(() => {
+    if (runLoops.get(runId) === loop) runLoops.delete(runId);
+  });
+  runLoops.set(runId, loop);
+  return loop;
+}
+
+/** Resolves once the run's in-flight orchestration (if any) has returned. Never rejects. */
+export function runLoopSettled(runId: string): Promise<void> {
+  return (runLoops.get(runId) ?? Promise.resolve()).catch(() => undefined);
+}
+
+async function runAppLoopBody(projectId: string, runId: string): Promise<void> {
   if (isRunActive(runId)) return;          // already orchestrating in this process
   markRunActive(runId);
   clearRunCancelled(runId);
