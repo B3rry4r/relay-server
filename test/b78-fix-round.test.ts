@@ -66,6 +66,11 @@ describe('F5 web pill: only a stadium the browser already paints', () => {
     expect(pills('<div style={{ height: 40, borderRadius: 20, padding: AppTheme.spacing.sX }} />', { resolve })).toEqual([]);
     expect(stadiumIsExact(src, src.indexOf('{ h'), src.slice(src.indexOf('{ h') + 1, src.indexOf(' }') + 1), 30, { resolve })).toBe(true);
   });
+  it('a circle whose side 7f already tokenised is still a circle on run 2, never a pill', () => {
+    const resolve = (e: string): number | null => (e === 'AppTheme.size.avatar' ? 40 : null);
+    expect(pills('<div style={{ width: AppTheme.size.avatar, height: AppTheme.size.avatar, borderRadius: 20 }} />', { resolve })).toEqual([]);
+    expect(pills('<div style={{ width: 40, height: 40, borderRadius: 20 }} />', { resolve })).toEqual([]);
+  });
   it('detects Tailwind preflight and universal border-box resets', () => {
     expect(detectGlobalBorderBox(['@tailwind base;\n@tailwind components;'])).toBe(true);
     expect(detectGlobalBorderBox(['@import "tailwindcss";'])).toBe(true);
@@ -151,9 +156,9 @@ describe('F6 provenance strip: JSX-aware, no litter, no false provenance', () =>
   it('a size that is a sentence predicate or a small grid count stays; a measured size goes', () => {
     expect(stripProvenanceText('Grid is 3×3 so the QR code fits')).toBe('Grid is 3×3 so the QR code fits');
     expect(stripProvenanceText('The avatar is 40×40 so it lines up with the row')).toBe('The avatar is 40×40 so it lines up with the row');
-    expect(stripProvenanceText('Dots are 27×27 each.')).toBe('Dots are 27×27 each.');   // a predicate: the size IS the statement
+    expect(stripProvenanceText('Dots are 27×27 each.')).toBe('');   // a measured size as the complement: the sentence only described the design
     expect(stripProvenanceText('Back chevron in a 24×24 tap target.')).toBe('Back chevron in a tap target.');
-    expect(stripProvenanceText('The icon is 24×24px so it aligns')).toBe('The icon is 24×24px so it aligns');
+    expect(stripProvenanceText('The icon is 24×24px so it aligns. Tap opens search.')).toBe('Tap opens search.');
     expect(stripProvenanceText('Chevron, 24×24px, right aligned.')).toBe('Chevron, right aligned.');
   });
 });

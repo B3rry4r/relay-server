@@ -232,7 +232,17 @@ export function scanWebSizeSites(src: string, resolve?: (expr: string) => number
     if (!/\b(width|height|borderRadius)\s*:/.test(body)) continue;
     const w = num(body, 'width', base); const h = num(body, 'height', base);
     const br = num(body, 'borderRadius', base);
-    const circle = !!br && !!w && !!h && w.value === h.value && br.value * 2 >= w.value;
+    // A circle is judged on the box's real values: a width/height that 7f already
+    // turned into `AppTheme.size.avatar` is still 40 (else run 2 would read the
+    // circle's radius as a stadium and swap it — not idempotent).
+    const boxDim = (d: { value: number } | null, key: string): number | null => {
+      if (d) return d.value;
+      const raw = box.resolve ? objectEntries(body).get(key) : undefined;
+      const v = raw != null ? cssLengths(raw, box.resolve) : null;
+      return v && v.length === 1 ? v[0] : null;
+    };
+    const bw = boxDim(w, 'width'); const bh = boxDim(h, 'height');
+    const circle = !!br && bw != null && bh != null && bw === bh && br.value * 2 >= bw;
     if (w && h && w.value === h.value) {
       const fam = w.value < 28 ? 'icon' : circle ? 'avatar' : w.value <= 120 ? 'tile' : null;
       if (fam) { sites.push({ family: fam, ...w, el: `o${base}` }); sites.push({ family: fam, ...h, el: `o${base}` }); }

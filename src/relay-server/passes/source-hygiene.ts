@@ -30,7 +30,7 @@ import path from 'node:path';
 const LAYER_WORDS = 'Frame|Group|Rectangle|Rect|Vector|Ellipse|Polygon|Star|Line|Union|Subtract|Intersect|Exclude|Mask|Layer|Instance|Slice';
 
 /** Pixel sizes — see PROV_SRC. Kept in sync with readability-report.cjs `SIZE_LEAK_RE`. */
-const SIZE_PROV = String.raw`(?<!\w|\d\.)(?!0x)(?:(?<!\b(?:is|are|was|were|be|been|becomes?|of|than|as|at|to|into|by|from|a|an|the)\s+)(?:\d+(?:\.\d+)?\s*[×x]\s*\d+(?:\.\d+)?(?:\s*(?:px|pt|dp|pixels?|points?)(?:\s+each)?|\s+each)|(?=\d{2}|\d+\.\d|\d+\s*[×x]\s*(?:\d{2}|\d+\.\d))\d+(?:\.\d+)?\s*×\s*\d+(?:\.\d+)?)|(?<=\b(?:a|an|the)\s+)(?:\d+(?:\.\d+)?\s*[×x]\s*\d+(?:\.\d+)?(?:\s*(?:px|pt|dp|pixels?|points?)(?:\s+each)?|\s+each)|(?=\d{2}|\d+\.\d|\d+\s*[×x]\s*(?:\d{2}|\d+\.\d))\d+(?:\.\d+)?\s*×\s*\d+(?:\.\d+)?)(?=\s+(?!(?:so|and|or|but|because|which|that|when|while|if|then|with|for|to|in|on|at|by|of|from|as)\b)[A-Za-z]))(?!\w|\.\d)`;
+const SIZE_PROV = String.raw`(?<!\w|\d\.)(?!0x)(?:\d+(?:\.\d+)?\s*[×x]\s*\d+(?:\.\d+)?(?:\s*(?:px|pt|dp|pixels?|points?)(?:\s+each)?|\s+each)|(?<!\b(?:is|are|was|were|be|been|becomes?|of|than|as|at|to|into|by|from|a|an|the)\s+)(?=\d{2}|\d+\.\d|\d+\s*[×x]\s*(?:\d{2}|\d+\.\d))\d+(?:\.\d+)?\s*×\s*\d+(?:\.\d+)?|(?<=\b(?:a|an|the)\s+)(?=\d{2}|\d+\.\d|\d+\s*[×x]\s*(?:\d{2}|\d+\.\d))\d+(?:\.\d+)?\s*×\s*\d+(?:\.\d+)?(?=\s+(?!(?:so|and|or|but|because|which|that|when|while|if|then|with|for|to|in|on|at|by|of|from|as)\b)[A-Za-z]))(?!\w|\.\d)`;
 
 /** One provenance token. Kept in sync with scripts/readability-report.cjs `figmaLeak`
  *  so the strip and the metric agree on what provenance is. */
@@ -92,8 +92,17 @@ function cleanLine(line: string): string {
   // a function word ("Dots are 27×27 each." → "Dots are.") goes whole.
   const TOKEN_RE = new RegExp(String.raw`(?:\s*[,;:]|\s+(?:—|–|-|\/)|\s+(?:in|at|on|from|of|see|via|for|by))?\s*(?:${PROV_SRC.join('|')})`, 'g');
   s = s.split(/(?<=[.;!?])\s+/).map((sent) => {
-    const cut = sent.replace(TOKEN_RE, '');
+    // A token that was the COMPLEMENT of its sentence ("Dots are 27×27 each", "The
+    // icon is 24×24px so it aligns") leaves "are." / "is so": the sentence only
+    // described the design file, so it goes whole.
+    let complement = false;
+    const cut = sent.replace(TOKEN_RE, (m: string, ...args: unknown[]) => {
+      const off = args[args.length - 2] as number;
+      if (/\b(?:is|are|was|were|be|been|becomes?)\s*$/i.test(sent.slice(0, off))) complement = true;
+      return '';
+    });
     if (cut === sent) return sent;
+    if (complement) return '';
     const body = cut.replace(/[\s.;!?,:]+$/, '');
     return DANGLING.test(body) || !/[A-Za-z]{2,}/.test(body) ? '' : cut;
   }).filter((x) => x.trim()).join(' ');
