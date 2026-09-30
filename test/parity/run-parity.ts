@@ -408,7 +408,9 @@ const CHECKS: Record<PassName, CheckFn> = {
     // The fixture's screens were built under the pre-B56 packet (`/${assets.x}`, values
     // were paths). The resources values are served URLs now (`/assets/…`), so a prefix
     // left behind requests `//assets/…` — a protocol-relative URL to host "assets".
-    const prefixLeft = fw === 'flutter' ? [] : await grepSources(r.root, fw, /`\/\$\{\s*assets\b/);
+    // Every spelling the old packet produced, not only the whole template: the settings
+    // screen also carries `url(/${assets.mapDark})` and `'/' + assets.userAvatar`.
+    const prefixLeft = fw === 'flutter' ? [] : await grepSources(r.root, fw, /(?<!\/)\/\$\{\s*assets\b|['"`]\/['"`]\s*\+\s*assets\b/);
     return [
       chk('a.old-path', oldPathGone && oldToSym, 'stub', "the IR's OPAQUE pre-rename path 'assets/icons/vector_10_20.svg' (asset-map oldPath) is re-pointed to the searchIcon symbol",
         oldPathGone ? `home now: ${home.split('\n').find((l) => /searchIcon/.test(l))?.trim() ?? '?'}` : `still a raw literal in ${s.home}: ${home.split('\n').find((l) => /vector_10_20/.test(l))?.trim()}`),
@@ -418,7 +420,7 @@ const CHECKS: Record<PassName, CheckFn> = {
       chk('a.import', importOk, 'lie', 'a file that now uses the symbol imports the resources module', importOk ? 'import present' : `${s.login} uses ${sym}.userAvatar with no import`),
       chk('a.art-reported', artReported, 'stub', 'the art-sized hand-drawn <svg> (DeliveryMapCard) is reported against the real image assets', artReported ? 'reported' : `no inline-svg finding in warnings (${(r.reported?.warnings ?? []).length} warning(s))`),
       chk('a.syntax', syn.length === 0, 'lie', 'every file the pass wrote parses', syn.join(' | ') || 'ok'),
-      ...(fw === 'flutter' ? [] : [chk('a.served-url', prefixLeft.length === 0, 'lie', 'no `/${assets.x}` prefix is left now that every symbol value is a served URL (it would request //assets/…)', prefixLeft.slice(0, 4).join(' | ') || 'none left')]),
+      ...(fw === 'flutter' ? [] : [chk('a.served-url', prefixLeft.length === 0, 'lie', 'no `/`-prefixed served URL is left (`/${assets.x}`, `url(/${assets.x})`, `\'/\' + assets.x`) now that every symbol value is a served URL (it would request //assets/…)', prefixLeft.slice(0, 4).join(' | ') || 'none left')]),
     ];
   },
 

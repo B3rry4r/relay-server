@@ -109,6 +109,50 @@ describe('7c web re-point (PG-15 / PG-16 / PG-17)', () => {
     expect(again.repointed).toEqual([]);
   });
 
+  it('every `/`-prefixed composition of a served URL loses the prefix (B56 fix round: `url(/${…})`, `\'/\' + assets.x`)', async () => {
+    // The pre-B56 packet taught "prefix the value with /". Only the exact template
+    // `/${assets.x}` was migrated; `url(/${assets.mapDark})` and `'/' + assets.userAvatar`
+    // stayed and requested //assets/… — a HOST named "assets" (ERR_NAME_NOT_RESOLVED in
+    // Chromium) while tsc and the bundler stayed green.
+    const rw = (src: string) => webAssets.rewriteServedPrefixes(src).src;
+    expect(rw('const s = { backgroundImage: `url(/${assets.mapDark})` };')).toBe('const s = { backgroundImage: `url(${assets.mapDark})` };');
+    expect(rw("<img src={'/' + assets.userAvatar} />")).toBe('<img src={assets.userAvatar} />');
+    expect(rw('const u = "/" + assets[key];')).toBe('const u = assets[key];');
+    expect(rw('const u = `/` +assets.a;')).toBe('const u = assets.a;');
+    expect(rw("const u = 'https://cdn.example/' + assets.a;")).toBe("const u = 'https://cdn.example' + assets.a;");
+    expect(rw('const u = `${origin}/${assets.a}?v=2`;')).toBe('const u = `${origin}${assets.a}?v=2`;');
+    expect(rw('<img src={`/${assets.a}`} />')).toBe('<img src={assets.a} />');
+    // Left alone: a comment / deliberate double slash, JSX text, a path segment.
+    for (const keep of ['// see //${assets.a}', 'const u = `//${assets.a}`;', '<p>/${assets.a}</p>',
+      "const u = '//' + assets.a;", 'const u = assets.a + \'/\';', 'const u = `${assets.a}`;']) {
+      expect(rw(keep)).toBe(keep);
+    }
+    // Every rewrite is idempotent.
+    const once = rw("a = `url(/${assets.m})`; b = '/' + assets.u;");
+    expect(rw(once)).toBe(once);
+  });
+
+  it('repointWeb migrates the `url(/${…})` and `\'/\' + …` forms in a real file and reports them', async () => {
+    await write('package.json', JSON.stringify({ dependencies: { react: '19' } }));
+    await write('src/resources/assets.ts', "export const assets = {\n  mapDark: '/assets/images/map_dark.png',\n  userAvatar: '/assets/images/user_avatar.png',\n} as const;\n");
+    await write('src/screens/Home.tsx', [
+      "import { assets } from '../resources/assets';",
+      'export function Home() {',
+      '  return (<div style={{ backgroundImage: `url(/${assets.mapDark})` }}>',
+      "    <img src={'/' + assets.userAvatar} alt=\"\" />",
+      '  </div>);',
+      '}',
+      '',
+    ].join('\n'));
+    const r = await repointWeb(root, [], {});
+    const home = await read('src/screens/Home.tsx');
+    expect(home).toContain('backgroundImage: `url(${assets.mapDark})`');
+    expect(home).toContain('<img src={assets.userAvatar} alt="" />');
+    expect(home).not.toMatch(/\/\$\{\s*assets|['"`]\/['"`]\s*\+\s*assets/);
+    expect(r.repointed.filter((x) => x.from === 'served-url-prefix').map((x) => x.symbol).sort()).toEqual(['mapDark', 'userAvatar']);
+    expect((await repointWeb(root, [], {})).repointed).toEqual([]);
+  });
+
   it('an unknown path is reported, never guessed; a module with no symbols is a skip with its reason', async () => {
     await write('package.json', JSON.stringify({ dependencies: { react: '19' } }));
     await write('src/resources/assets.ts', "export const assets = { a: '/assets/icons/a.svg' } as const;\n");

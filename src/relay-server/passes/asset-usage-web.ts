@@ -12,8 +12,9 @@
  *     pre-rename `'assets/icons/vector_10_20.svg'` (asset-map oldPath, PG-15), the
  *     renamed path, the served `/assets/…` URL, `public/assets/…` — becomes
  *     `assets.<symbol>` + import; in a JSX attribute it becomes `src={assets.x}`
- *     (PG-16: a bare `src=assets.x` is a syntax error); the pre-B56 served-URL
- *     shape `` `/${assets.x}` `` becomes `assets.x` now that the values ARE URLs;
+ *     (PG-16: a bare `src=assets.x` is a syntax error); every pre-B56 `/`-prefixed
+ *     composition (`` `/${assets.x}` ``, `` `url(/${assets.x})` ``, `'/' + assets.x`)
+ *     loses the prefix now that the values ARE URLs (rewriteServedPrefixes);
  *   • AI-gated: an inline `<svg>` whose enclosing component clearly stands in for a
  *     real exported IMAGE asset is reported (never rewritten blind — replacing a
  *     drawing with an <img> changes layout, and a wrong match is worse than none).
@@ -102,6 +103,65 @@ function findServedPrefixTemplates(src: string): { start: number; end: number; e
   let m: RegExpExecArray | null;
   while ((m = re.exec(src)) !== null) out.push({ start: m.index, end: m.index + m[0].length, expr: m[1].replace(/\s+/g, '') });
   return out;
+}
+
+/** An `assets` member expression: `assets.x`, `assets[key]`. */
+const ASSET_EXPR = String.raw`assets\s*(?:\.\s*[A-Za-z0-9_$]+|\[[^\]\`\n]+\])`;
+
+/** True when offset `at` is inside a template literal's text (an odd number of
+ *  unescaped backticks before it). Cheap and conservative: nested templates inside
+ *  an interpolation break the parity, and then nothing is rewritten there. */
+function inTemplateText(src: string, at: number): boolean {
+  let n = 0;
+  for (let i = 0; i < at; i++) if (src[i] === '`' && src[i - 1] !== '\\') n++;
+  return n % 2 === 1;
+}
+
+export interface ServedPrefixHit { original: string; expr: string }
+
+/**
+ * Every composition that PREFIXES a served asset URL with `/` — each one yields the
+ * protocol-relative `//assets/…` now that the resources values are served URLs
+ * (`/assets/x.png`), which a browser requests from a host named "assets"
+ * (net::ERR_NAME_NOT_RESOLVED) while tsc and the bundler stay green. The pre-B56
+ * packet taught "prefix the value with /", so every spelling of that is migrated:
+ *   • the whole template        `` `/${assets.x}` ``             → `assets.x`
+ *   • inside a larger template  `` `url(/${assets.mapDark})` `` → `` `url(${assets.mapDark})` ``
+ *                               `` `${origin}/${assets.x}` ``  → `` `${origin}${assets.x}` ``
+ *   • string concatenation      `'/' + assets.userAvatar`       → `assets.userAvatar`
+ *                               `'https://cdn/' + assets.x`     → `'https://cdn' + assets.x`
+ * `//${assets.x}` (a comment, or an intentional double slash) is left alone.
+ */
+export function rewriteServedPrefixes(src: string): { src: string; hits: ServedPrefixHit[] } {
+  const hits: ServedPrefixHit[] = [];
+  const norm = (e: string): string => e.replace(/\s+/g, '');
+  // 1. the whole template is the prefixed interpolation.
+  let out = src;
+  for (const t of findServedPrefixTemplates(out).reverse()) {
+    hits.push({ original: out.slice(t.start, t.end), expr: t.expr });
+    out = out.slice(0, t.start) + t.expr + out.slice(t.end);
+  }
+  // 2. a `/` right before an interpolation inside a larger template.
+  const inner = new RegExp(String.raw`\/(\$\{\s*(${ASSET_EXPR})\s*\})`, 'g');
+  const edits: Array<{ at: number; len: number; text: string; hit: ServedPrefixHit }> = [];
+  let m: RegExpExecArray | null;
+  while ((m = inner.exec(out)) !== null) {
+    if (out[m.index - 1] === '/') continue;            // `//${…}` — a comment or deliberate
+    if (!inTemplateText(out, m.index)) continue;       // JSX text / a plain string: not interpolated
+    edits.push({ at: m.index, len: m[0].length, text: m[1], hit: { original: m[0], expr: norm(m[2]) } });
+  }
+  // 3. `'…/' + assets.x` — a string literal ending in `/` concatenated with the URL.
+  const concat = new RegExp(String.raw`(['"\`])([^'"\`\n$\\]*)\/\1(\s*\+\s*)(${ASSET_EXPR})`, 'g');
+  while ((m = concat.exec(out)) !== null) {
+    const [whole, q, head, , expr] = m;
+    if (head.endsWith('/')) continue;                  // `'//' + …` — deliberate
+    edits.push({ at: m.index, len: whole.length, text: head ? `${q}${head}${q} + ${expr}` : expr, hit: { original: whole, expr: norm(expr) } });
+  }
+  for (const e of edits.sort((a, b) => b.at - a.at)) {
+    out = out.slice(0, e.at) + e.text + out.slice(e.at + e.len);
+    hits.push(e.hit);
+  }
+  return { src: out, hits };
 }
 
 export type SvgScale = 'icon' | 'art';
@@ -213,11 +273,12 @@ export async function repointWeb(
     const before = src;
     const fileRel = rel(projectRoot, file);
 
-    // ── (a) `/${assets.x}` → assets.x (values are served URLs now) ────────────
+    // ── (a) every `/`-prefixed composition → the URL itself (values are served URLs) ──
     if (valuesAreUrls) {
-      for (const t of findServedPrefixTemplates(src).reverse()) {
-        src = src.slice(0, t.start) + t.expr + src.slice(t.end);
-        repointed.push({ file: fileRel, from: 'served-url-prefix', original: `\`/\${${t.expr}}\``, symbol: t.expr.replace(/^assets\.?/, ''), how: 'deterministic' });
+      const r = rewriteServedPrefixes(src);
+      src = r.src;
+      for (const h of r.hits) {
+        repointed.push({ file: fileRel, from: 'served-url-prefix', original: h.original, symbol: h.expr.replace(/^assets\.?/, ''), how: 'deterministic' });
       }
     }
 
@@ -300,4 +361,4 @@ export async function repointWeb(
 
 const rel = (root: string, p: string): string => path.relative(root, p).split(path.sep).join('/');
 
-export const __test = { parseDeclaredWebSymbols, findPathLiterals, findInlineSvgs, findServedPrefixTemplates, tokensOf, escapeRe };
+export const __test = { parseDeclaredWebSymbols, findPathLiterals, findInlineSvgs, findServedPrefixTemplates, rewriteServedPrefixes, tokensOf, escapeRe };
