@@ -26,6 +26,7 @@ import path from 'node:path';
 import { loadWebApp, listWebSources, ensureNamedImport, importSpecFor, stillReferenced } from './web-app';
 import { DESIGN_SYSTEM_RECORD } from '../design-system';
 import { ladderNames } from '../design-vocabulary';
+import { planVocabularyAmendment } from './token-vocabulary';
 
 export interface WebThemeModel {
   themeFile: string;
@@ -43,13 +44,13 @@ export interface WebThemeModel {
   textStyles: string[];
 }
 
-export interface WebTokenChange { file: string; kind: 'color' | 'spacing' | 'radius' | 'size' | 'add-token'; from: string; to: string }
+export interface WebTokenChange { file: string; kind: 'color' | 'spacing' | 'radius' | 'size' | 'add-token' | 'rename-token'; from: string; to: string }
 export interface WebTokenReject { file: string; kind: string; literal: string; reason: string }
 
 export interface WebTokenResult {
   themeFile: string | null;
   tokensAvailable: { colors: { name: string; argb: string }[]; spacing: { name: string; value: number }[]; radius: { name: string; value: number }[]; textStyles: string[] };
-  substitutions: { colors: number; textStyles: number; spacing: number; radius: number; sizes?: number };
+  substitutions: { colors: number; textStyles: number; spacing: number; radius: number; sizes?: number; renamed?: number };
   removals: { imports: number; consts: number; methods: number };
   /** F4/F5: vocabulary added to the theme module (recurring values, role-named). */
   vocabulary?: { added: string[]; renamed: Array<{ from: string; to: string }> };
@@ -345,6 +346,33 @@ function substituteWebSizes(src: string, theme: WebThemeModel, onChange: (kind: 
   return out;
 }
 
+/** F4 (web): counter-named colour keys (`neutral1`, `ink2`, `accent2` — what the
+ *  pre-F4 design system wrote into theme.ts) → role names, with the same planner
+ *  the Flutter side uses. Only `#rrggbb` values are classified. Pure. */
+export function planWebColorRenames(theme: WebThemeModel, refs: Map<string, number>): Array<{ from: string; to: string }> {
+  const colors = theme.colors.flatMap((c) => {
+    const h = /^#([0-9a-fA-F]{6})$/.exec(c.value.trim());
+    return h ? [{ name: c.name, argb: `ff${h[1].toLowerCase()}` }] : [];
+  });
+  return planVocabularyAmendment({
+    className: theme.themeSymbol, themeFileRel: '', colors, spacing: theme.spacing, radius: theme.radius,
+    sizes: theme.sizes ?? [], corners: [],
+  }, [], refs).renames;
+}
+
+/** Rewrite one source for the colour renames: `AppTheme.color.<from>` member
+ *  references and `var(--color-<from>)` / `--color-<from>:` CSS custom properties. */
+export function applyWebColorRenames(src: string, theme: WebThemeModel, renames: Array<{ from: string; to: string }>): { src: string; count: number } {
+  let count = 0;
+  let out = src;
+  const key = theme.groupKeys.color ?? 'color';
+  for (const r of renames) {
+    out = out.replace(new RegExp(`\\b${theme.themeSymbol}\\.${key}\\.${r.from}\\b`, 'g'), () => { count++; return `${theme.themeSymbol}.${key}.${r.to}`; });
+    out = out.replace(new RegExp(`--color-${r.from}(?![\\w-])`, 'g'), () => { count++; return `--color-${r.to}`; });
+  }
+  return { src: out, count };
+}
+
 /** Unused local `const X = …` at module scope, and imports nothing references. */
 function removeDeadImports(src: string): { src: string; removed: number } {
   let removed = 0;
@@ -413,6 +441,54 @@ export async function deepenWebTokens(projectRoot: string, opts: WebTokenOptions
         for (const a of added) result.changes.push({ file: rel(projectRoot, theme.themeFile), kind: 'add-token', from: '', to: a });
         theme = reparsed;
         result.tokensAvailable.radius = theme.radius;
+      }
+    }
+  }
+  // F4 (web): counter-named colour keys get their role name across the theme
+  // module, its CSS custom properties and every reference.
+  {
+    const key = theme.groupKeys.color ?? 'color';
+    const refs = new Map<string, number>();
+    const srcs = new Map<string, string>();
+    for (const f of targets) {
+      const src = await fs.readFile(f, 'utf-8').catch(() => '');
+      srcs.set(f, src);
+      for (const m of src.matchAll(new RegExp(`\\b${theme.themeSymbol}\\.${key}\\.([A-Za-z_$][\\w$]*)`, 'g'))) refs.set(m[1], (refs.get(m[1]) ?? 0) + 1);
+    }
+    const renames = planWebColorRenames(theme, refs);
+    if (renames.length) {
+      const themeSrc = fsSync.readFileSync(theme.themeFile, 'utf-8');
+      let nextTheme = themeSrc;
+      for (const r of renames) nextTheme = nextTheme.replace(new RegExp(`(?<![\\w$-])${r.from}(?=\\s*:)`, 'g'), r.to);
+      nextTheme = applyWebColorRenames(nextTheme, theme, renames).src;
+      const reparsed = parseWebThemeSource(nextTheme, theme.themeFile);
+      if (reparsed && reparsed.colors.length === theme.colors.length) {
+        let refCount = 0;
+        const writes: Array<[string, string]> = [[theme.themeFile, nextTheme]];
+        // the CSS mirror (theme.css next to theme.ts, or the design-system record's cssFile)
+        const cssFiles = new Set<string>();
+        try {
+          const rec = JSON.parse(fsSync.readFileSync(path.join(projectRoot, DESIGN_SYSTEM_RECORD), 'utf-8')) as { cssFile?: unknown };
+          if (typeof rec.cssFile === 'string') cssFiles.add(path.resolve(projectRoot, rec.cssFile));
+        } catch { /* no record */ }
+        const sibling = theme.themeFile.replace(/\.[cm]?[jt]sx?$/, '.css');
+        if (sibling !== theme.themeFile) cssFiles.add(sibling);
+        for (const css of cssFiles) {
+          if (!fsSync.existsSync(css)) continue;
+          const before = fsSync.readFileSync(css, 'utf-8');
+          const r = applyWebColorRenames(before, theme, renames);
+          if (r.count) writes.push([css, r.src]);
+        }
+        for (const [f, src] of srcs) {
+          const r = applyWebColorRenames(src, theme, renames);
+          if (r.count) { writes.push([f, r.src]); refCount += r.count; }
+        }
+        if (!opts.dryRun) for (const [f, src] of writes) await fs.writeFile(f, src, 'utf-8');
+        result.substitutions.renamed = refCount;
+        result.vocabulary = { added: result.vocabulary?.added ?? [], renamed: renames };
+        for (const r of renames) result.changes.push({ file: rel(projectRoot, theme.themeFile), kind: 'rename-token', from: r.from, to: r.to });
+        theme = reparsed;
+        result.tokensAvailable.colors = theme.colors.map((c) => ({ name: c.name, argb: c.value }));
       }
     }
   }

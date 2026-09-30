@@ -236,6 +236,46 @@ describe('F5 token cleanup (react + next): size tokens and pills', () => {
   }
 });
 
+describe('F4 web: counter-named colour keys get role names (react + next)', () => {
+  for (const fw of ['react', 'next'] as const) {
+    it(`${fw}: theme key, CSS custom property and every reference move together; a second run is a no-op`, async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), `b78-webren-${fw}-`));
+      await fs.cp(path.join(__dirname, 'fixtures', 'parity', fw), root, { recursive: true });
+      try {
+        const first = await deepenTokensAndCleanup('t', { projectRoot: root, noAi: true, skipAnalyze: true, noReport: true, dryRun: true });
+        const themeRel = first.report.themeFile!;
+        const themeAbs = path.join(root, themeRel);
+        // the pre-F4 design system's names: a counter-named grey + a counter-named accent
+        const theme0 = await fs.readFile(themeAbs, 'utf8');
+        await fs.writeFile(themeAbs, theme0.replace(/(surface: '#ffffff',)/, "$1\n    neutral1: '#6c7278',\n    accent2: '#becaea',"));
+        await fs.writeFile(themeAbs.replace(/\.ts$/, '.css'), ':root {\n  --color-neutral1: #6c7278;\n  --color-accent2: #becaea;\n}\n.muted { color: var(--color-neutral1); }\n');
+        const screen = path.join(root, first.report.changes.find(() => true)?.file ?? '');
+        const target = fsSync.existsSync(screen) && /\.tsx$/.test(screen) ? screen : (await fs.readdir(path.join(root, fw === 'react' ? 'src/screens' : 'app'), { recursive: true }))
+          .map((f) => path.join(root, fw === 'react' ? 'src/screens' : 'app', String(f))).find((f) => f.endsWith('.tsx'))!;
+        const src0 = await fs.readFile(target, 'utf8');
+        const spec = path.relative(path.dirname(target), themeAbs).replace(/\.ts$/, '').split(path.sep).join('/');
+        await fs.writeFile(target, `import { AppTheme as T0 } from '${spec.startsWith('.') ? spec : `./${spec}`}';\nexport const muted = [T0.color.neutral1, T0.color.neutral1, T0.color.accent2];\n${src0}`.replace(/T0/g, 'AppTheme'));
+        const r = await deepenTokensAndCleanup('t', { projectRoot: root, noAi: true, skipAnalyze: true, noReport: true });
+        const renamed = r.report.vocabulary?.renamed ?? [];
+        expect(renamed.map((x) => x.from).sort()).toEqual(['accent2', 'neutral1']);
+        expect(renamed.every((x) => !COUNTER.test(x.to) && !/\d/.test(x.to))).toBe(true);
+        const to = Object.fromEntries(renamed.map((x) => [x.from, x.to]));
+        const theme1 = await fs.readFile(themeAbs, 'utf8');
+        expect(theme1).toContain(`${to.neutral1}: '#6c7278'`);
+        expect(theme1).not.toMatch(/neutral1|accent2/);
+        const css1 = await fs.readFile(themeAbs.replace(/\.ts$/, '.css'), 'utf8');
+        expect(css1).toContain(`--color-${to.neutral1}: #6c7278`);
+        expect(css1).toContain(`var(--color-${to.neutral1})`);
+        const src1 = await fs.readFile(target, 'utf8');
+        expect(src1).toContain(`AppTheme.color.${to.neutral1}, AppTheme.color.${to.neutral1}, AppTheme.color.${to.accent2}`);
+        expect(r.report.substitutions.renamed).toBe(3);
+        const again = await deepenTokensAndCleanup('t', { projectRoot: root, noAi: true, skipAnalyze: true, noReport: true });
+        expect(again.report.vocabulary?.renamed ?? []).toEqual([]);
+      } finally { await fs.rm(root, { recursive: true, force: true }); }
+    });
+  }
+});
+
 it('fixtures are untouched by these tests', () => {
   expect(fsSync.readFileSync(path.join(__dirname, 'fixtures', 'parity', 'react', 'src', 'theme', 'theme.ts'), 'utf8')).not.toMatch(/size:/);
 });
