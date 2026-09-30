@@ -738,13 +738,13 @@ export async function nukeGeneratedAppSurface(
   const fw = (framework || 'flutter').toLowerCase();
   if (fw === 'react' || fw === 'next') {
     const { nukeWebAppSurface } = await import('./web-skeleton');
-    const w = await nukeWebAppSurface(projectRoot).catch((e: Error) => ({ removed: [] as string[], prunedDirs: [] as string[], keptImporting: [] as string[], error: e.message }));
+    const w = await nukeWebAppSurface(projectRoot).catch((e: Error) => ({ removed: [] as string[], prunedDirs: [] as string[], keptImporting: [] as string[], keptImports: [] as Array<{ file: string; imports: string[] }>, error: e.message }));
     removedFiles.push(...w.removed);
     removedDirs.push(...w.prunedDirs);
     await removeStaleUixReports(projectRoot, removedFiles);
     const warnings = [
       ...('error' in w ? [`web clean slate failed part-way: ${(w as { error: string }).error}`] : []),
-      ...w.keptImporting.map((f) => `${f} is not pipeline-generated (no header/marker) and was kept, but it imports a removed generated file`),
+      ...w.keptImports.map((k) => `${k.file} is not pipeline-generated (no header/marker) and was kept, but it imports a removed generated file (${k.imports.join(', ')}) — it will not compile until the rebuild regenerates it or a human edits it`),
     ];
     return { removedDirs, removedFiles, ...(warnings.length ? { warnings } : {}) };
   }

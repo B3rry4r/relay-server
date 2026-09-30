@@ -769,6 +769,34 @@ async function phaseSkeletonAndRestart(): Promise<Cell[]> {
       rstChecks.push(chk('rst.hand-kept', exists(root, hand), 'lie', 'an unmarked (hand-authored) module is never deleted', exists(root, hand) ? `${hand} kept` : `${hand} DELETED`));
       if (fw === 'next') rstChecks.push(chk('rst.previews', !exists(root, 'app/_preview') && !exists(root, 'app/%5Fpreview'), 'stub', 'verify preview routes are removed', exists(root, 'app/_preview') ? 'app/_preview left' : 'removed'));
     }
+    // A restart after a FINALIZED build: the shared components 7a itself wrote carry
+    // no canonical header, but they are pipeline output and import generated modules
+    // the nuke removes (B56 fix round: components/SearchGlyph.tsx survived, importing
+    // the removed '@/…/assets', and tsc broke with no warning). Real 7a output, then
+    // a hand-written importer of it (Next through the `@/` alias), then the nuke.
+    {
+      const x = await runOnePass(fw, 'extractComponents');
+      const extracted = x.files.filter((d) => d.change === 'added' && /\.(tsx?|dart)$/.test(d.file)).map((d) => d.file);
+      const comp = extracted.find((f) => fw === 'flutter' || /^(src\/)?components\//.test(f));
+      let importer: string | null = null;
+      if (comp && fw !== 'flutter') {
+        const name = path.basename(comp).replace(/\.tsx?$/, '');
+        const exported = /export\s+(?:function|const)\s+([A-Za-z0-9_]+)/.exec(read(x.root, comp))?.[1] ?? name;
+        importer = fw === 'next' ? 'components/HandToolbar.tsx' : 'src/extra/HandToolbar.tsx';
+        const spec = fw === 'next' ? `@/${comp.replace(/\.tsx?$/, '')}` : path.posix.relative('src/extra', comp.replace(/\.tsx?$/, ''));
+        await fs.mkdir(path.dirname(path.join(x.root, importer)), { recursive: true });
+        await fs.writeFile(path.join(x.root, importer), `import { ${exported} } from '${spec}';\nexport const HandToolbar = ${exported};\n`);
+      }
+      const n = await nukeGeneratedAppSurface(x.root, fw);
+      const survivors = extracted.filter((f) => exists(x.root, f));
+      rstChecks.push(chk('rst.extracted-removed', !!comp && survivors.length === 0, 'stub', "a restart after finalize removes the shared components 7a wrote (pipeline output with no canonical header)",
+        !comp ? `7a extracted nothing on the fixture (added: ${extracted.join(', ') || 'none'}) — nothing to grade` : survivors.length ? `kept: ${survivors.join(', ')}` : `removed ${extracted.join(', ')}`));
+      if (importer) {
+        const warned = (n.warnings ?? []).some((w) => w.startsWith(importer!) && w.includes(comp!));
+        rstChecks.push(chk('rst.kept-importer-warned', exists(x.root, importer) && warned, 'lie', 'a hand-written file importing a removed module (through the `@/` alias on Next) is kept AND named in the restart warnings',
+          `${importer} ${exists(x.root, importer) ? 'kept' : 'DELETED'}; warnings: ${(n.warnings ?? []).join(' | ').slice(0, 300) || 'none'}`));
+      }
+    }
     cells.push({
       pass: 'restart clean-slate (nukeGeneratedAppSurface)', framework: fw, reported: null, files: diff.slice(0, 40),
       checks: rstChecks, cell_status: classify(null, rstChecks), notes: [],

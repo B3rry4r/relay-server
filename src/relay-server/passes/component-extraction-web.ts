@@ -22,6 +22,7 @@ import path from 'node:path';
 
 import {
   loadWebApp, listSourceFiles, listWebSources, resolveSpecifier, ensureNamedImport, importPathBetween, importSpecFor, escapeRe, stillReferenced,
+  EXTRACTED_COMPONENT_MARKER,
 } from './web-app';
 
 export interface WebWidgetUnit {
@@ -357,7 +358,7 @@ export async function extractWebGroup(
   if (!dryRun) {
     if (!reuse) {
       await fs.mkdir(componentsDir, { recursive: true });
-      const header = `${useClient ? "'use client';\n" : ''}// extracted by relay-server phase 7a — shared by ${distinctFiles.length} screens\n`;
+      const header = `${useClient ? "'use client';\n" : ''}${EXTRACTED_COMPONENT_MARKER} — shared by ${distinctFiles.length} screens\n`;
       const imports = renderImports(carried);
       await fs.writeFile(componentPath, `${header}${imports ? `${imports}\n` : ''}\nexport ${declNamed}\n`, 'utf-8');
     }

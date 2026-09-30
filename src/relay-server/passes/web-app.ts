@@ -102,6 +102,11 @@ export const frameCore = (frameId: string): string => String(frameId).replace(/[
 /** The route the skeleton mints for a frame: `88:4361` → `/88-4361`. */
 export const frameRoute = (frameId: string): string => `/${String(frameId).replace(/[^a-zA-Z0-9]+/g, '-')}`;
 
+/** First comment line of every shared component 7a (component-extraction-web)
+ *  writes. It is how a restart's clean slate (web-skeleton.nukeWebAppSurface)
+ *  recognises a pipeline-written component that has no canonical header. */
+export const EXTRACTED_COMPONENT_MARKER = '// extracted by relay-server phase 7a';
+
 /** The presenter a folded modal exposes: `m_88_6412` → `showModal_88_6412`. Must
  *  match design-system.ts, which is what the build agent was told to emit. */
 export const modalPresenterName = (modalId: string): string => `showModal_${idCore(modalId)}`;
