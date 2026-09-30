@@ -117,10 +117,10 @@ class OtherWidget extends StatelessWidget {
 }
 `);
     const built = scanBuiltComponents(root, 'flutter');
-    expect(built).toEqual([{ className: 'AppBackButton', file: 'lib/components/app_back_button.dart', signature: 'AppBackButton({required this.onTap})' }]);
+    expect(built).toEqual([{ className: 'AppBackButton', file: 'lib/components/app_back_button.dart', signature: 'AppBackButton({required VoidCallback onTap})' }]);
     const block = componentReuseBlock(root, 'flutter', canonical());
     expect(block).toContain('ALREADY BUILT');
-    expect(block).toContain('AppBackButton({required this.onTap})  — lib/components/app_back_button.dart');
+    expect(block).toContain('AppBackButton({required VoidCallback onTap})  — lib/components/app_back_button.dart');
     expect(block).toContain('PrimaryButton → lib/components/primary_button.dart');
     expect(block).not.toContain('AppBackButton → ');        // built → not "still to build"
     expect(block).not.toContain('OtherWidget');

@@ -173,7 +173,7 @@ function webSignature(src: string, cls: string): string {
   let depth = 0;
   for (let i = open; i < src.length; i++) {
     if (src[i] === '(') depth++;
-    else if (src[i] === ')') { depth--; if (depth === 0) return tidySignature(`${cls}${src.slice(open, i + 1)}`); }
+    else if (src[i] === ')') { depth--; if (depth === 0) return oneLine(`${cls}${src.slice(open, i + 1)}`); }
   }
   return `<${cls} />`;
 }
