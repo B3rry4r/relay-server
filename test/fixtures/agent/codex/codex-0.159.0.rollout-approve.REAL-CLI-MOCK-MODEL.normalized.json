@@ -1,0 +1,80 @@
+[
+ {
+  "kind": "session.start",
+  "at": "2026-09-29T12:09:07.616Z",
+  "sessionId": "01a0ed11-74f7-73b2-80de-5b575e0fe92f",
+  "cwd": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/codex/proj",
+  "source": "cli",
+  "cliVersion": "0.159.0"
+ },
+ {
+  "kind": "status",
+  "at": "2026-09-29T12:09:07.617Z",
+  "state": "working",
+  "turnId": "01a0ed11-9518-7f83-b10b-d718d046b5e0"
+ },
+ {
+  "kind": "user.message",
+  "at": "2026-09-29T12:09:07.718Z",
+  "text": "create the demo file"
+ },
+ {
+  "kind": "assistant.thinking",
+  "at": "2026-09-29T12:09:07.768Z",
+  "text": "**Planning file creation**\n\nI will create the demo file."
+ },
+ {
+  "kind": "assistant.text",
+  "at": "2026-09-29T12:09:07.773Z",
+  "text": "I'll create the file.",
+  "blocks": []
+ },
+ {
+  "kind": "tool.call",
+  "at": "2026-09-29T12:09:07.776Z",
+  "toolUseId": "call_mock_1",
+  "tool": "exec_command",
+  "toolKind": "shell",
+  "title": "touch relay-demo.txt",
+  "input": {
+   "cmd": "touch relay-demo.txt",
+   "sandbox_permissions": "require_escalated",
+   "justification": "Create the demo file?"
+  }
+ },
+ {
+  "kind": "tool.result",
+  "at": "2026-09-29T12:09:09.717Z",
+  "toolUseId": "call_mock_1",
+  "ok": true,
+  "exitCode": 0,
+  "summary": "Output:",
+  "output": "Chunk ID: d79625\nWall time: 0.0000 seconds\nProcess exited with code 0\nOriginal token count: 0\nOutput:\n"
+ },
+ {
+  "kind": "assistant.text",
+  "at": "2026-09-29T12:09:09.754Z",
+  "text": "Created the file.\n\n```relay-summary\ntitle: Created demo file\n- ran `touch relay-demo.txt`\n```",
+  "blocks": [
+   {
+    "kind": "summary",
+    "fields": {
+     "title": "Created demo file"
+    },
+    "items": [
+     {
+      "text": "ran `touch relay-demo.txt`"
+     }
+    ],
+    "raw": "title: Created demo file\n- ran `touch relay-demo.txt`"
+   }
+  ]
+ },
+ {
+  "kind": "turn.end",
+  "at": "2026-09-29T12:09:09.820Z",
+  "reason": "done",
+  "durationMs": 2208,
+  "turnId": "01a0ed11-9518-7f83-b10b-d718d046b5e0"
+ }
+]

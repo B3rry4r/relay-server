@@ -1,0 +1,134 @@
+[
+ {
+  "kind": "user.message",
+  "at": "2026-09-29T12:00:35.526Z",
+  "text": "list the files"
+ },
+ {
+  "kind": "assistant.thinking",
+  "at": "2026-09-29T12:00:35.687Z",
+  "text": "The user wants the files listed. I will run ls."
+ },
+ {
+  "kind": "assistant.text",
+  "at": "2026-09-29T12:00:35.691Z",
+  "text": "I'll list the files first.",
+  "blocks": [],
+  "final": false
+ },
+ {
+  "kind": "tool.call",
+  "at": "2026-09-29T12:00:35.728Z",
+  "toolUseId": "toolu_mock_0001",
+  "tool": "Bash",
+  "toolKind": "shell",
+  "title": "Create a demo file",
+  "input": {
+   "command": "touch relay-demo.txt",
+   "description": "Create a demo file"
+  }
+ },
+ {
+  "kind": "tool.result",
+  "at": "2026-09-29T12:00:37.225Z",
+  "toolUseId": "toolu_mock_0001",
+  "ok": true,
+  "summary": "(Bash completed with no output)",
+  "output": "(Bash completed with no output)"
+ },
+ {
+  "kind": "assistant.text",
+  "at": "2026-09-29T12:00:37.280Z",
+  "text": "Found the files.\n\n```relay-summary\ntitle: Listed workspace\n- ran `ls -la`\n- 3 entries\n```\n\n```relay-choices\nquestion: What next?\n1. Run tests\n2. Open README\n```",
+  "blocks": [
+   {
+    "kind": "summary",
+    "fields": {
+     "title": "Listed workspace"
+    },
+    "items": [
+     {
+      "text": "ran `ls -la`"
+     },
+     {
+      "text": "3 entries"
+     }
+    ],
+    "raw": "title: Listed workspace\n- ran `ls -la`\n- 3 entries"
+   },
+   {
+    "kind": "choices",
+    "fields": {
+     "question": "What next?"
+    },
+    "items": [
+     {
+      "n": 1,
+      "text": "Run tests"
+     },
+     {
+      "n": 2,
+      "text": "Open README"
+     }
+    ],
+    "raw": "question: What next?\n1. Run tests\n2. Open README"
+   }
+  ],
+  "final": true
+ },
+ {
+  "kind": "turn.end",
+  "at": "2026-09-29T12:00:37.343Z",
+  "reason": "done",
+  "durationMs": 804
+ },
+ {
+  "kind": "user.message",
+  "at": "2026-09-29T12:00:39.821Z",
+  "text": "list again"
+ },
+ {
+  "kind": "assistant.thinking",
+  "at": "2026-09-29T12:00:39.910Z",
+  "text": "The user wants the files listed. I will run ls."
+ },
+ {
+  "kind": "assistant.text",
+  "at": "2026-09-29T12:00:39.913Z",
+  "text": "I'll list the files first.",
+  "blocks": [],
+  "final": false
+ },
+ {
+  "kind": "tool.call",
+  "at": "2026-09-29T12:00:39.915Z",
+  "toolUseId": "toolu_mock_0001",
+  "tool": "Bash",
+  "toolKind": "shell",
+  "title": "Create a demo file",
+  "input": {
+   "command": "touch relay-demo.txt",
+   "description": "Create a demo file"
+  }
+ },
+ {
+  "kind": "tool.result",
+  "at": "2026-09-29T12:00:40.896Z",
+  "toolUseId": "toolu_mock_0001",
+  "ok": false,
+  "denied": true,
+  "summary": "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP wha…",
+  "output": "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed."
+ },
+ {
+  "kind": "turn.end",
+  "at": "2026-09-29T12:00:40.898Z",
+  "reason": "interrupted"
+ },
+ {
+  "kind": "turn.end",
+  "at": "2026-09-29T12:00:40.904Z",
+  "reason": "done",
+  "durationMs": 168
+ }
+]

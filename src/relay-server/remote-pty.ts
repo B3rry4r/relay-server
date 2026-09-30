@@ -22,6 +22,7 @@
 import type { Socket as ServerSocket } from 'socket.io';
 import { io as ioClient } from 'socket.io-client';
 import { getSecret } from './auth/secrets';
+import { ptyHub, registerBridgeWriter } from './agent/pty-hub';
 
 export function isRemotePtyEnabled(): boolean {
   return (process.env.RELAY_PTY_MODE || 'embedded').trim().toLowerCase() === 'remote';
@@ -98,7 +99,7 @@ type UpstreamSocket = ReturnType<typeof ioClient> & { sendBuffer?: unknown[] };
  * - A PTY-service drop is told to the browser, and input typed during an outage
  *   longer than staleInputMs() is dropped rather than replayed late (a.2 #4).
  */
-export function attachRemoteTerminalProxy(socket: ServerSocket): { dispose(): void } {
+export function attachRemoteTerminalProxy(socket: ServerSocket): { dispose(): void; writeInput?(terminalId: string, data: string): Promise<boolean> } {
   const url = getRemotePtyUrl();
   if (!url) {
     console.error('[relay] RELAY_PTY_MODE=remote but RELAY_PTY_URL is not set — terminals are unavailable.');
@@ -213,9 +214,13 @@ export function attachRemoteTerminalProxy(socket: ServerSocket): { dispose(): vo
       if (typeof id === 'string' && id) activeTerminalId = id;
     }
     if (event === 'resize') {
-      const payload = args[0] as { id?: unknown } | undefined;
+      const payload = args[0] as { id?: unknown; cols?: unknown; rows?: unknown } | undefined;
       const key = typeof payload?.id === 'string' ? payload.id : '';
       lastResize.set(key, args.filter((a) => typeof a !== 'function'));
+      const cols = Number(payload?.cols);
+      const rows = Number(payload?.rows);
+      const id = key || activeTerminalId;
+      if (id && Number.isInteger(cols) && Number.isInteger(rows) && cols > 0 && rows > 0) ptyHub.resized(id, cols, rows);
     }
     if (discardInput && !upstream.connected) {
       discardedWhileDown += 1;
@@ -229,9 +234,23 @@ export function attachRemoteTerminalProxy(socket: ServerSocket): { dispose(): vo
     upstream.emit(event, ...args);
   });
 
+  // Agent view (agent-display-spec §6.2): the tracker answers a permission prompt
+  // through the bridge of the socket that asked (acked terminal:input).
+  const writeInput = (terminalId: string, data: string): Promise<boolean> => new Promise((resolve) => {
+    if (disposed || !upstream.connected) { resolve(false); return; }
+    const timer = setTimeout(() => resolve(false), 3000);
+    upstream.emit('terminal:input', { id: terminalId, data }, (ack: { ok?: boolean } | undefined) => {
+      clearTimeout(timer);
+      resolve(Boolean(ack?.ok));
+    });
+  });
+  const unregisterWriter = registerBridgeWriter(socket.id, writeInput);
+
   return {
+    writeInput,
     dispose: () => {
       disposed = true;
+      unregisterWriter();
       if (outageTimer) clearTimeout(outageTimer);
       try { upstream.close(); } catch { /* already closed */ }
     },

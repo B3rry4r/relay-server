@@ -1,0 +1,315 @@
+[
+ {
+  "kind": "user.message.meta",
+  "at": "2026-09-29T12:16:44.849Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "messageId": "msg_0ed188f27001FKo3Qz6nKq4feD",
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "status",
+  "at": "2026-09-29T12:16:44.870Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "state": "working",
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "user.message.meta",
+  "at": "2026-09-29T12:16:44.944Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "messageId": "msg_0ed188f27001FKo3Qz6nKq4feD",
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "status",
+  "at": "2026-09-29T12:16:46.713Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "state": "working",
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "assistant.thinking",
+  "at": "2026-09-29T12:16:46.780Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "text": "I will create the demo file.",
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "tool.call",
+  "at": "2026-09-29T12:16:46.809Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "toolUseId": "call_mock_2",
+  "tool": "bash",
+  "toolKind": "shell",
+  "title": "touch relay-demo.txt",
+  "input": {
+   "command": "touch relay-demo.txt"
+  },
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "assistant.text",
+  "at": "2026-09-29T12:16:46.821Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "partId": "prt_0ed1896bc001Gm6PgX5meRghY9",
+  "text": "I'll create the file.",
+  "blocks": [],
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "permission.request",
+  "at": "2026-09-29T12:16:46.910Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "requestId": "per_0ed18973d001d6tuhI3U8jxfsq",
+  "toolUseId": "call_mock_2",
+  "tool": "bash",
+  "title": "touch relay-demo.txt",
+  "input": {
+   "command": "touch relay-demo.txt"
+  },
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "permission.resolved",
+  "at": "2026-09-29T12:16:48.515Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "requestId": "per_0ed18973d001d6tuhI3U8jxfsq",
+  "outcome": "allowed",
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "tool.call",
+  "at": "2026-09-29T12:16:48.524Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "toolUseId": "call_mock_2",
+  "tool": "bash",
+  "toolKind": "shell",
+  "title": "touch relay-demo.txt",
+  "input": {
+   "command": "touch relay-demo.txt"
+  },
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "tool.result",
+  "at": "2026-09-29T12:16:48.554Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "toolUseId": "call_mock_2",
+  "ok": true,
+  "summary": "touch relay-demo.txt",
+  "output": "(no output)",
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "status",
+  "at": "2026-09-29T12:16:48.592Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "state": "working",
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "user.message.meta",
+  "at": "2026-09-29T12:16:48.609Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "messageId": "msg_0ed188f27001FKo3Qz6nKq4feD",
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "status",
+  "at": "2026-09-29T12:16:48.659Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "state": "working",
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "assistant.text",
+  "at": "2026-09-29T12:16:48.700Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "partId": "prt_0ed189e360014kpVQOmg5EWrIA",
+  "text": "Created the file.\n\n```relay-summary\ntitle: Created demo file\n- ran `touch relay-demo.txt`\n```",
+  "blocks": [
+   {
+    "kind": "summary",
+    "fields": {
+     "title": "Created demo file"
+    },
+    "items": [
+     {
+      "text": "ran `touch relay-demo.txt`"
+     }
+    ],
+    "raw": "title: Created demo file\n- ran `touch relay-demo.txt`"
+   }
+  ],
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "status",
+  "at": "2026-09-29T12:16:48.711Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "state": "working",
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "status",
+  "at": "2026-09-29T12:16:48.717Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "state": "idle",
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "turn.end",
+  "at": "2026-09-29T12:16:48.717Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "reason": "done",
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "user.message.meta",
+  "at": "2026-09-29T12:16:48.737Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "messageId": "msg_0ed188f27001FKo3Qz6nKq4feD",
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "user.message.meta",
+  "at": "2026-09-29T12:16:51.734Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "messageId": "msg_0ed18aa12001hJezK859DE0wvb",
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "status",
+  "at": "2026-09-29T12:16:51.744Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "state": "working",
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "user.message.meta",
+  "at": "2026-09-29T12:16:51.774Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "messageId": "msg_0ed18aa12001hJezK859DE0wvb",
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "status",
+  "at": "2026-09-29T12:16:51.840Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "state": "working",
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "assistant.thinking",
+  "at": "2026-09-29T12:16:51.900Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "text": "I will create the demo file.",
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "permission.request",
+  "at": "2026-09-29T12:16:51.917Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "requestId": "per_0ed18aacc001bq98SDnaxmyuWl",
+  "toolUseId": "call_mock_4",
+  "tool": "bash",
+  "title": "touch relay-demo.txt",
+  "input": {
+   "command": "touch relay-demo.txt"
+  },
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "tool.call",
+  "at": "2026-09-29T12:16:51.924Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "toolUseId": "call_mock_4",
+  "tool": "bash",
+  "toolKind": "shell",
+  "title": "touch relay-demo.txt",
+  "input": {
+   "command": "touch relay-demo.txt"
+  },
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "assistant.text",
+  "at": "2026-09-29T12:16:51.930Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "partId": "prt_0ed18aabd0019yYzXYZ50nIq3g",
+  "text": "I'll create the file.",
+  "blocks": [],
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "permission.resolved",
+  "at": "2026-09-29T12:16:53.669Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "requestId": "per_0ed18aacc001bq98SDnaxmyuWl",
+  "outcome": "denied",
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "tool.result",
+  "at": "2026-09-29T12:16:53.677Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "toolUseId": "call_mock_4",
+  "ok": false,
+  "summary": "The user rejected permission to use this specific tool call.",
+  "output": "The user rejected permission to use this specific tool call.",
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "status",
+  "at": "2026-09-29T12:16:53.694Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "state": "idle",
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "turn.end",
+  "at": "2026-09-29T12:16:53.695Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "reason": "done",
+  "source": "hook",
+  "cli": "opencode"
+ },
+ {
+  "kind": "user.message.meta",
+  "at": "2026-09-29T12:16:53.705Z",
+  "sessionId": "ses_f12e770f8ffens4ExwL6Q9mH4F",
+  "messageId": "msg_0ed18aa12001hJezK859DE0wvb",
+  "source": "hook",
+  "cli": "opencode"
+ }
+]

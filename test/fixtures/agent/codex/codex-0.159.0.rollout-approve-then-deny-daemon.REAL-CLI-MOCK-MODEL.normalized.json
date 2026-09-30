@@ -1,0 +1,129 @@
+[
+ {
+  "kind": "session.start",
+  "at": "2026-09-29T12:04:55.615Z",
+  "sessionId": "01a0ed0d-9dc7-7b73-a5cf-dc331fbceb17",
+  "cwd": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/codex/proj",
+  "source": "vscode",
+  "cliVersion": "0.159.0"
+ },
+ {
+  "kind": "status",
+  "at": "2026-09-29T12:04:55.615Z",
+  "state": "working",
+  "turnId": "01a0ed0d-bcbb-7e63-b939-02b298b7eaa4"
+ },
+ {
+  "kind": "user.message",
+  "at": "2026-09-29T12:04:55.717Z",
+  "text": "create the demo file"
+ },
+ {
+  "kind": "assistant.thinking",
+  "at": "2026-09-29T12:04:55.754Z",
+  "text": "**Planning file creation**\n\nI will create the demo file."
+ },
+ {
+  "kind": "assistant.text",
+  "at": "2026-09-29T12:04:55.758Z",
+  "text": "I'll create the file.",
+  "blocks": []
+ },
+ {
+  "kind": "tool.call",
+  "at": "2026-09-29T12:04:55.760Z",
+  "toolUseId": "call_mock_1",
+  "tool": "exec_command",
+  "toolKind": "shell",
+  "title": "touch relay-demo.txt",
+  "input": {
+   "cmd": "touch relay-demo.txt",
+   "sandbox_permissions": "require_escalated",
+   "justification": "Create the demo file?"
+  }
+ },
+ {
+  "kind": "tool.result",
+  "at": "2026-09-29T12:04:57.405Z",
+  "toolUseId": "call_mock_1",
+  "ok": true,
+  "exitCode": 0,
+  "summary": "Output:",
+  "output": "Chunk ID: 7949a6\nWall time: 0.0000 seconds\nProcess exited with code 0\nOriginal token count: 0\nOutput:\n"
+ },
+ {
+  "kind": "assistant.text",
+  "at": "2026-09-29T12:04:57.428Z",
+  "text": "Created the file.\n\n```relay-summary\ntitle: Created demo file\n- ran `touch relay-demo.txt`\n```",
+  "blocks": [
+   {
+    "kind": "summary",
+    "fields": {
+     "title": "Created demo file"
+    },
+    "items": [
+     {
+      "text": "ran `touch relay-demo.txt`"
+     }
+    ],
+    "raw": "title: Created demo file\n- ran `touch relay-demo.txt`"
+   }
+  ]
+ },
+ {
+  "kind": "turn.end",
+  "at": "2026-09-29T12:04:57.473Z",
+  "reason": "done",
+  "durationMs": 1859,
+  "turnId": "01a0ed0d-bcbb-7e63-b939-02b298b7eaa4"
+ },
+ {
+  "kind": "status",
+  "at": "2026-09-29T12:04:59.831Z",
+  "state": "working",
+  "turnId": "01a0ed0d-cd2f-7211-baf6-81b2935b28e5"
+ },
+ {
+  "kind": "user.message",
+  "at": "2026-09-29T12:04:59.898Z",
+  "text": "do it again"
+ },
+ {
+  "kind": "assistant.thinking",
+  "at": "2026-09-29T12:04:59.928Z",
+  "text": "**Planning file creation**\n\nI will create the demo file."
+ },
+ {
+  "kind": "assistant.text",
+  "at": "2026-09-29T12:04:59.932Z",
+  "text": "I'll create the file.",
+  "blocks": []
+ },
+ {
+  "kind": "tool.call",
+  "at": "2026-09-29T12:04:59.934Z",
+  "toolUseId": "call_mock_4",
+  "tool": "exec_command",
+  "toolKind": "shell",
+  "title": "touch relay-demo.txt",
+  "input": {
+   "cmd": "touch relay-demo.txt",
+   "sandbox_permissions": "require_escalated",
+   "justification": "Create the demo file?"
+  }
+ },
+ {
+  "kind": "tool.result",
+  "at": "2026-09-29T12:05:01.525Z",
+  "toolUseId": "call_mock_4",
+  "ok": false,
+  "summary": "Wall time: 1.6 seconds",
+  "output": "Wall time: 1.6 seconds\naborted by user"
+ },
+ {
+  "kind": "turn.end",
+  "at": "2026-09-29T12:05:01.574Z",
+  "reason": "interrupted",
+  "turnId": "01a0ed0d-cd2f-7211-baf6-81b2935b28e5"
+ }
+]

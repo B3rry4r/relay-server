@@ -18,7 +18,8 @@
 //   scripts/relay-auth     installed into $RELAY_HOME/bin by setup-workspace.sh
 //   mcp-server.mjs         `npm run mcp` / agent MCP config
 //   native/pty-bridge.c    pty-bridge-factory.ts (optional native bridge build)
-//   agent/**               agent display guide + hooks, when present
+//   agent/**               agent display guide, relay-agent-hook, opencode plugin
+//   scripts/relay-agent-install.mjs  run by setup-workspace.sh (agent hooks/guide)
 //
 // By default the server is compiled FRESH into a temp dir (never a stale dist/).
 
@@ -38,11 +39,14 @@ export const RUNTIME_FILES = [
   'package-lock.json',
   'setup-workspace.sh',
   'scripts/relay-auth',
+  'scripts/relay-agent-install.mjs',
   'mcp-server.mjs',
   'native/pty-bridge.c',
 ];
 /** Optional runtime directories: included when they exist. */
-export const OPTIONAL_RUNTIME_DIRS = ['agent'];
+export const OPTIONAL_RUNTIME_DIRS = [];
+/** Required runtime directories. */
+export const RUNTIME_DIRS = ['agent'];
 export const ENTRY = 'dist/src/index.js';
 
 function parseArgs(argv) {
@@ -111,11 +115,16 @@ export function packRelease(options = {}) {
       if (!fs.existsSync(src)) throw new Error(`runtime file ${rel} is missing`);
       copy(src, path.join(stage, rel));
     }
+    for (const rel of RUNTIME_DIRS) {
+      const src = path.join(ROOT, rel);
+      if (!fs.existsSync(src)) throw new Error(`runtime directory ${rel} is missing`);
+      copy(src, path.join(stage, rel));
+    }
     for (const rel of OPTIONAL_RUNTIME_DIRS) {
       const src = path.join(ROOT, rel);
       if (fs.existsSync(src)) copy(src, path.join(stage, rel));
     }
-    for (const exe of ['setup-workspace.sh', 'scripts/relay-auth']) fs.chmodSync(path.join(stage, exe), 0o755);
+    for (const exe of ['setup-workspace.sh', 'scripts/relay-auth', 'scripts/relay-agent-install.mjs', 'agent/relay-agent-hook']) fs.chmodSync(path.join(stage, exe), 0o755);
 
     const files = listFiles(stage);
     const manifest = {

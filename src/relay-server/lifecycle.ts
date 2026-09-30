@@ -43,6 +43,7 @@ let activation: Promise<void> | null = null;
 let activations = 0;
 let ipcInstalled = false;
 let shutdownPromise: Promise<void> | null = null;
+const activeCallbacks = new Set<() => void>();
 
 /** RELAY_RELEASE_ID (the host's process tag), or 'dev' outside the host. */
 export function getReleaseId(): string {
@@ -143,8 +144,26 @@ export function lifecycleGuard(
   next();
 }
 
+/**
+ * Run `fn` once this release is ACTIVE (now, if it already is). A standby
+ * release must not start background work that competes with the active one
+ * (e.g. the agent tracker rotating the shared spool). Returns a canceller.
+ */
+export function whenActive(fn: () => void): () => void {
+  if (activation && mode === 'active') {
+    fn();
+    return () => undefined;
+  }
+  activeCallbacks.add(fn);
+  return () => { activeCallbacks.delete(fn); };
+}
+
 /** The work that only the ACTIVE release does. */
 function runActivationWork(): void {
+  for (const fn of [...activeCallbacks]) {
+    activeCallbacks.delete(fn);
+    try { fn(); } catch (error) { console.error('[lifecycle] activation callback failed:', error); }
+  }
   // Resume any full-app build run that was interrupted by the last restart (a
   // redeploy / release swap) so it keeps building server-side. Best-effort.
   void resumeInterruptedRuns();
@@ -326,4 +345,5 @@ export function resetLifecycleForTests(): void {
   activations = 0;
   ipcInstalled = false;
   shutdownPromise = null;
+  activeCallbacks.clear();
 }

@@ -1,0 +1,34 @@
+  
+  Thought for 1s 
+
+● I'll list the files first.
+
+  Ran 1 shell command 
+  ⎿  Interrupted · What should Claude do instead?
+ 
+● Found the files.
+
+  relay-summary
+  title: Listed workspace
+  - ran `ls -la`
+  - 3 entries
+
+  relay-choices
+  question: What next?
+  1. Run tests
+  2. Open README
+
+✻ Cogitated for 0s · done 12:00 PM
+ 
+❯ list again                                                                                        
+   
+  Thought for 1s 
+
+● I'll list the files first.
+ 
+✻ Cooked for 0s · done 12:00 PM
+                                                                                ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯  
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts · ← for agents

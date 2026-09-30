@@ -1,0 +1,16 @@
+[
+  {
+    "pid": 6034,
+    "cmd": "bash --noprofile --norc",
+    "cwd": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/claude/proj",
+    "RELAY_TERMINAL_ID": "term-research-1",
+    "files": []
+  },
+  {
+    "pid": 6040,
+    "cmd": "claude --permission-mode default",
+    "cwd": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/claude/proj",
+    "RELAY_TERMINAL_ID": "term-research-1",
+    "files": []
+  }
+]

@@ -1,0 +1,92 @@
+#!/usr/bin/env node
+// Relay agent hook (agent-display-spec §5.2). Installed into $RELAY_HOME/bin and
+// registered as a command hook for claude / codex / gemini by
+// scripts/relay-agent-install.mjs:  relay-agent-hook <cli>
+//
+// Reads the hook payload on stdin (codex `notify` passes it as the last argv)
+// and appends ONE JSON line to $RELAY_AGENT_SPOOL/<terminalId>.jsonl:
+//   {v:1, cli, terminalId, pid, ppid, lineage:[{pid,cmd}…], at, payload}
+//
+// Rules: never print to stdout (Claude and Codex read hook stdout as a
+// decision), always exit 0, never block the CLI for long. Strings over 16 KB are
+// truncated so a Write tool's content cannot bloat the spool. The process
+// lineage is captured HERE, at write time: Claude runs hooks through a transient
+// `sh -c` that is gone by the time the tracker reads the record.
+//
+// Written without require/import so it runs as CommonJS or as ESM (a
+// "type":"module" package.json above $RELAY_HOME/bin must not break it).
+'use strict';
+const fs = process.getBuiltinModule('fs');
+const path = process.getBuiltinModule('path');
+
+const MAX_STRING = 16 * 1024;
+const LINEAGE_DEPTH = 6;
+const cli = String(process.argv[2] || 'unknown').replace(/[^a-z0-9-]/gi, '').slice(0, 32) || 'unknown';
+
+function truncate(value, depth) {
+  if (depth > 32) return '[depth]';
+  if (typeof value === 'string') return value.length > MAX_STRING ? `${value.slice(0, MAX_STRING)}…[+${value.length - MAX_STRING} chars]` : value;
+  if (Array.isArray(value)) return value.map((v) => truncate(v, depth + 1));
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) out[k] = truncate(v, depth + 1);
+    return out;
+  }
+  return value;
+}
+
+function lineage() {
+  const out = [];
+  let cur = process.ppid;
+  for (let i = 0; i < LINEAGE_DEPTH && cur > 1; i += 1) {
+    let cmd = '';
+    try { cmd = fs.readFileSync(`/proc/${cur}/cmdline`, 'utf8').split('\0').filter(Boolean).join(' ').slice(0, 120); } catch { /* gone */ }
+    out.push({ pid: cur, cmd });
+    try {
+      const st = fs.readFileSync(`/proc/${cur}/stat`, 'utf8');
+      cur = Number(st.slice(st.lastIndexOf(')') + 2).split(' ')[1]);
+    } catch { break; }
+  }
+  return out;
+}
+
+let written = false;
+function write(raw) {
+  if (written) return;
+  written = true;
+  try {
+    let payload = raw;
+    try { payload = raw ? JSON.parse(raw) : null; } catch { /* keep raw text */ }
+    const last = process.argv[process.argv.length - 1];
+    if ((payload === null || payload === '') && process.argv.length > 3 && last) {
+      try { payload = JSON.parse(last); } catch { payload = last; }
+    }
+    const env = process.env;
+    const spool = env.RELAY_AGENT_SPOOL
+      || path.join(env.RELAY_HOME || path.join(env.HOME || '/tmp', '.relay'), 'state', 'agent-events');
+    const tid = env.RELAY_TERMINAL_ID || '';
+    const file = tid ? `${tid.replace(/[^A-Za-z0-9_.-]/g, '_')}.jsonl` : '_unattributed.jsonl';
+    const record = {
+      v: 1, cli, terminalId: tid || '_unattributed', pid: process.pid, ppid: process.ppid,
+      lineage: lineage(), at: new Date().toISOString(), payload: truncate(payload, 0),
+    };
+    fs.mkdirSync(spool, { recursive: true, mode: 0o700 });
+    fs.appendFileSync(path.join(spool, file), `${JSON.stringify(record)}\n`, { mode: 0o600 });
+  } catch { /* a hook must never fail the CLI */ }
+  process.exit(0);
+}
+
+try {
+  let raw = '';
+  if (process.stdin.isTTY) write('');
+  else {
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (c) => { raw += c; if (raw.length > 8 * 1024 * 1024) write(raw); });
+    process.stdin.on('end', () => write(raw));
+    process.stdin.on('error', () => write(raw));
+    // a CLI that never closes our stdin must not hang the hook
+    setTimeout(() => write(raw), 3000).unref();
+  }
+} catch {
+  process.exit(0);
+}

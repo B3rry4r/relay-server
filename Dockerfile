@@ -107,6 +107,10 @@ COPY setup-workspace.sh .
 # MCP server both read the box-local token; ship them in the runtime image.
 COPY scripts/relay-auth ./scripts/relay-auth
 COPY mcp-server.mjs .
+# Agent view (agent-display-spec §10.1): guide, hook, opencode plugin + the
+# installer setup-workspace.sh runs on every boot.
+COPY agent ./agent
+COPY scripts/relay-agent-install.mjs ./scripts/relay-agent-install.mjs
 
 # Non-root user. Claude Code and Flutter refuse to run as root, and the root
 # check is only skipped when Claude itself runs as a non-root user. Setting

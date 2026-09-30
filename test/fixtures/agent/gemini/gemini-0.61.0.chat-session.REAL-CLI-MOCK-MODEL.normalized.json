@@ -1,0 +1,97 @@
+[
+ {
+  "kind": "user.message",
+  "at": "2026-09-29T12:14:03.144Z",
+  "text": "create the demo file"
+ },
+ {
+  "kind": "assistant.thinking",
+  "at": "2026-09-29T12:14:03.254Z",
+  "text": "I will create the demo file."
+ },
+ {
+  "kind": "assistant.text",
+  "at": "2026-09-29T12:14:03.255Z",
+  "text": "I'll create the file.",
+  "blocks": []
+ },
+ {
+  "kind": "tool.call",
+  "at": "2026-09-29T12:14:03.255Z",
+  "toolUseId": "run_shell_command__run_shell_command_1790684043162_0",
+  "tool": "run_shell_command",
+  "toolKind": "shell",
+  "title": "Create a demo file",
+  "input": {
+   "command": "touch relay-demo.txt",
+   "description": "Create a demo file"
+  }
+ },
+ {
+  "kind": "tool.result",
+  "at": "2026-09-29T12:14:04.725Z",
+  "toolUseId": "run_shell_command__run_shell_command_1790684043162_0",
+  "ok": true,
+  "summary": "success"
+ },
+ {
+  "kind": "assistant.text",
+  "at": "2026-09-29T12:14:04.806Z",
+  "text": "Created the file.\n\n```relay-summary\ntitle: Created demo file\n- ran `touch relay-demo.txt`\n```",
+  "blocks": [
+   {
+    "kind": "summary",
+    "fields": {
+     "title": "Created demo file"
+    },
+    "items": [
+     {
+      "text": "ran `touch relay-demo.txt`"
+     }
+    ],
+    "raw": "title: Created demo file\n- ran `touch relay-demo.txt`"
+   }
+  ]
+ },
+ {
+  "kind": "user.message",
+  "at": "2026-09-29T12:14:08.077Z",
+  "text": "do it again"
+ },
+ {
+  "kind": "assistant.thinking",
+  "at": "2026-09-29T12:14:08.092Z",
+  "text": "I will create the demo file."
+ },
+ {
+  "kind": "assistant.text",
+  "at": "2026-09-29T12:14:08.092Z",
+  "text": "I'll create the file.",
+  "blocks": []
+ },
+ {
+  "kind": "tool.call",
+  "at": "2026-09-29T12:14:08.092Z",
+  "toolUseId": "run_shell_command__run_shell_command_1790684048089_0",
+  "tool": "run_shell_command",
+  "toolKind": "shell",
+  "title": "Create a demo file",
+  "input": {
+   "command": "touch relay-demo.txt",
+   "description": "Create a demo file"
+  }
+ },
+ {
+  "kind": "tool.result",
+  "at": "2026-09-29T12:14:09.239Z",
+  "toolUseId": "run_shell_command__run_shell_command_1790684048089_0",
+  "ok": false,
+  "denied": true,
+  "summary": "cancelled"
+ },
+ {
+  "kind": "turn.end",
+  "at": "2026-09-29T12:14:09.239Z",
+  "reason": "interrupted"
+ }
+]

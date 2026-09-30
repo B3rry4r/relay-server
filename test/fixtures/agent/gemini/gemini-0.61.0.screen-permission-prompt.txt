@@ -1,0 +1,33 @@
+gemini
+bash-5.2# gemini
+
+ ▝▜▄     Gemini CLI v0.61.0
+   ▝▜▄
+  ▗▟▀    Authenticated with gemini-api-key /auth
+ ▝▀    
+
+
+Tips for getting started:
+1. /help for more information
+2. Ask coding questions, edit code or run commands
+3. Be specific for the best results
+▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+ > create the demo file                                                                             
+▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+✦ I'll create the file.
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ ? Shell  touch relay-demo.txt                                                                    │
+│ ╭──────────────────────────────────────────────────────────────────────────────────────────────╮ │
+│ │ touch relay-demo.txt                                                                         │ │
+│ ╰──────────────────────────────────────────────────────────────────────────────────────────────╯ │
+│ Allow execution of [Shell]?                                                                      │
+│                                                                                                  │
+│ ● 1. Allow once                                                                                  │
+│   2. Allow for this session                                                                      │
+│   3. No, suggest changes (esc)                                                                   │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+
+

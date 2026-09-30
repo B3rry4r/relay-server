@@ -10,7 +10,8 @@ import { registerFlutterRoutes } from './relay-server/flutter-routes';
 import { registerGitRoutes } from './relay-server/git-routes';
 import { registerVisualRoutes } from './relay-server/visual-routes';
 import { registerScreenLoopRoutes, stopAutoResumeSweep } from './relay-server/ai-screen-loop';
-import { busySnapshot, isUnderHost, lifecycleGuard, startLifecycle } from './relay-server/lifecycle';
+import { createAgentRuntime } from './relay-server/agent';
+import { busySnapshot, isUnderHost, lifecycleGuard, startLifecycle, whenActive } from './relay-server/lifecycle';
 import { registerProjectRoutes } from './relay-server/project-routes';
 import {
   closeAllTerminalSessions,
@@ -196,6 +197,10 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
   registerScreenLoopRoutes(app);
   auth.installSocketAuth(io);
   registerSocketHandlers(io, ptyFactory);
+  // Agent view (agent-display-spec): agent:* events on this io for every
+  // authenticated socket, including Option-B (noTerminals) sockets.
+  const agents = createAgentRuntime(io);
+  let cancelAgentStart: (() => void) | null = null;
 
   let listeningPort = 0;
 
@@ -255,6 +260,13 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
         writeFileAtomic(authStatePaths().apiUrl, `http://127.0.0.1:${listeningPort}\n`, 0o644);
       } catch { /* the relay-auth CLI falls back to RELAY_API_URL / PORT */ }
 
+      // Agent view tracker: only the ACTIVE release runs it (a standby release
+      // must not rotate the shared spool). It is an overlay — a failure is
+      // logged, never fatal for the server.
+      cancelAgentStart = whenActive(() => {
+        agents.start().catch((error) => console.error('[agent] tracker failed to start:', error));
+      });
+
       // Activate now, or (RELAY_START_MODE=standby, under the host) wait for the
       // host's IPC {type:'activate'}. Activation resumes interrupted runs and
       // starts the rate-limit auto-resume sweep — work only the ACTIVE release may
@@ -264,6 +276,9 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
       return listeningPort;
     },
     async stop() {
+      cancelAgentStart?.();
+      cancelAgentStart = null;
+      agents.stop();
       auth.dispose();
       stopAutoResumeSweep();
       if (listeningPort) unregisterProtectedPort(listeningPort);

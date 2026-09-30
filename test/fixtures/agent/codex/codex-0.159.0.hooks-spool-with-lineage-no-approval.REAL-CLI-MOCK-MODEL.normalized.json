@@ -1,0 +1,50 @@
+[
+ {
+  "kind": "session.start",
+  "at": "2026-09-29T12:35:48.242Z",
+  "sessionId": "01a0ed29-e19b-7711-b62a-115608295c7c",
+  "transcriptPath": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/codex/home/.codex/sessions/2026/09/29/rollout-2026-09-29T12-35-40-01a0ed29-e19b-7711-b62a-115608295c7c.jsonl",
+  "cwd": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/codex/proj",
+  "model": "mock-model",
+  "source": "hook",
+  "cli": "codex"
+ },
+ {
+  "kind": "status",
+  "at": "2026-09-29T12:35:48.278Z",
+  "sessionId": "01a0ed29-e19b-7711-b62a-115608295c7c",
+  "transcriptPath": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/codex/home/.codex/sessions/2026/09/29/rollout-2026-09-29T12-35-40-01a0ed29-e19b-7711-b62a-115608295c7c.jsonl",
+  "state": "working",
+  "source": "hook",
+  "cli": "codex"
+ },
+ {
+  "kind": "permission.resolved",
+  "at": "2026-09-29T12:35:48.485Z",
+  "sessionId": "01a0ed29-e19b-7711-b62a-115608295c7c",
+  "transcriptPath": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/codex/home/.codex/sessions/2026/09/29/rollout-2026-09-29T12-35-40-01a0ed29-e19b-7711-b62a-115608295c7c.jsonl",
+  "outcome": "allowed-or-not-needed",
+  "toolUseId": "call_mock_1",
+  "source": "hook",
+  "cli": "codex"
+ },
+ {
+  "kind": "turn.end",
+  "at": "2026-09-29T12:35:48.577Z",
+  "sessionId": "01a0ed29-e19b-7711-b62a-115608295c7c",
+  "transcriptPath": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/codex/home/.codex/sessions/2026/09/29/rollout-2026-09-29T12-35-40-01a0ed29-e19b-7711-b62a-115608295c7c.jsonl",
+  "reason": "done",
+  "lastText": "Created the file.\n\n```relay-summary\ntitle: Created demo file\n- ran `touch relay-demo.txt`\n```",
+  "source": "hook",
+  "cli": "codex"
+ },
+ {
+  "kind": "session.end",
+  "at": "2026-09-29T12:36:21.143Z",
+  "sessionId": "01a0ed29-e19b-7711-b62a-115608295c7c",
+  "transcriptPath": "/tmp/claude-0/-home-user/48ce78b7-4980-5add-a5f1-fc3a87f883f5/scratchpad/cli-research/runs/codex/home/.codex/sessions/2026/09/29/rollout-2026-09-29T12-35-40-01a0ed29-e19b-7711-b62a-115608295c7c.jsonl",
+  "reason": "other",
+  "source": "hook",
+  "cli": "codex"
+ }
+]

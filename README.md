@@ -89,6 +89,32 @@ never passed to terminals, agents or any other child process (`PORT`, `FLY_*` an
 the release variables are stripped too). UIX is called with `UIX_SERVICE_TOKEN`;
 the browser reaches UIX only through `ALL /api/uix/*`.
 
+## Agent view
+
+The Agent view renders a CLI agent (Claude Code, Codex, Gemini CLI, opencode)
+that runs **interactively in a terminal** as phone-sized cards. The agent keeps
+running in the PTY; nothing about the terminal changes.
+
+- **Install (every boot)**: `setup-workspace.sh` copies `agent/relay-agent-hook`
+  into `$RELAY_HOME/bin` and runs `scripts/relay-agent-install.mjs`, which adds a
+  marked guide block (`agent/RELAY-AGENT-GUIDE.md`) to each CLI's global
+  instructions and Relay's hook entries to its global settings (user content is
+  never touched; invalid JSON is skipped). Codex gets `[features] hooks = true`
+  and `daemon_auto_start = false`, and asks once in its TUI to trust the hooks.
+- **Tracker** (`src/relay-server/agent/`): reads the hook spool
+  (`$RELAY_HOME/state/agent-events/<terminalId>.jsonl`) and the CLI transcripts,
+  validates each hook record by its process lineage against the terminal's
+  `/proc` tree, and emits `agent:*` socket events. Answers to permission prompts
+  (`agent:respond`) are written as keystrokes **only** when the prompt is on that
+  terminal's screen (headless xterm ScreenGuard).
+- **Protocol**: server → client `agent:sessions`, `agent:snapshot`,
+  `agent:event`, `agent:events`; client → server `agent:subscribe`,
+  `agent:unsubscribe`, `agent:history`, `agent:respond`, `agent:send`,
+  `agent:choose`, `agent:interrupt`, `agent:bind`. Types:
+  `src/relay-server/agent/types.ts`.
+- **Switches**: `RELAY_AGENT_VIEW=off` disables the tracker;
+  `RELAY_AGENT_GUIDE=off` removes the guide blocks at the next boot (hooks stay).
+
 ## MCP bridge
 
 Relay also ships a standalone MCP server for local clients and agents.
