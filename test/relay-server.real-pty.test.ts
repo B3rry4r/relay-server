@@ -183,6 +183,34 @@ describe.skipIf(PTY_UNAVAILABLE !== null)('Relay terminals on a REAL PTY (node-p
     await second.waitForOutput(created.id, (t) => t.includes('GOT_alive_42'));
   }, TIMEOUT_MS);
 
+  // Critic P0: the scrollback ring used to be appended inside the per-socket
+  // bind, so N attached sockets (phone + desktop, two tabs) put every chunk in
+  // it N times and a reload replayed the output N times. Appended once now.
+  it('with 3 sockets attached, a fresh socket replays one command\'s output exactly once', async () => {
+    const { port } = await startRelay();
+    const a = await connect(port);
+    clients.push(a.client);
+    const created = await a.waitFor<{ id: string; pid: number }>('terminal:created');
+    pids.push(created.pid);
+    const b = await connect(port);
+    const c = await connect(port);
+    clients.push(b.client, c.client);
+    await b.waitFor('terminals:ready');
+    await c.waitFor('terminals:ready');
+
+    // The echoed command line holds `ARK_ONCE`; only the OUTPUT says MARK_ONCE.
+    const typed = `printf 'M%s\\n' ARK_ONCE`;
+    a.client.emit('terminal:input', { id: created.id, data: `${typed}\n` });
+    for (const r of [a, b, c]) await r.waitForOutput(created.id, (t) => t.includes('MARK_ONCE'));
+    for (const r of [a, b, c]) expect(r.output(created.id).split('MARK_ONCE').length - 1).toBe(1);
+
+    const fresh = await connect(port);
+    clients.push(fresh.client);
+    const replay = await fresh.waitFor<{ id: string; data: string }>('terminal:replay', (p) => p.id === created.id);
+    expect(replay.data.split('MARK_ONCE').length - 1).toBe(1);
+    expect(replay.data.split(typed).length - 1).toBe(1);
+  }, TIMEOUT_MS);
+
   it('restores a terminal (same id + scrollback, fresh live shell) after a relay restart', async () => {
     const one = await startRelay();
     const rec1 = await connect(one.port);

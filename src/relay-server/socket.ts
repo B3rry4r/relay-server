@@ -224,7 +224,29 @@ export function createTerminalSession(
   activeShells.set(terminalId, shell);
   terminalSessions.set(terminalId, session);
   scrollbackBuffers.set(terminalId, new ScrollbackBuffer(MAX_SCROLLBACK_BYTES));
-  const tap = shell.onData((data: string) => ptyHub.output(terminalId, data));
+  // ONE module-level tap per shell: the scrollback ring is appended here exactly
+  // once per chunk, and the agent tracker sees the same output. It used to be
+  // appended inside the per-socket bind, so with N sockets attached (phone +
+  // desktop, two tabs) a replay repeated the output N times. Sockets only fan
+  // the output out. Persist at most every ~8 KB of new output, not per chunk:
+  // hundreds of debounced writeFile calls per second during AI streaming
+  // compete with the PTY.
+  let bytesSinceLastPersist = 0;
+  const PERSIST_AFTER_BYTES = 8192;
+  const tap = shell.onData((data: string) => {
+    const buffer = scrollbackBuffers.get(terminalId);
+    if (buffer) {
+      // O(chunk.length) ring-buffer append (an O(n²) string concat here was the
+      // main cause of GC-induced terminal freezes during AI streaming).
+      buffer.append(data);
+      bytesSinceLastPersist += data.length;
+      if (bytesSinceLastPersist >= PERSIST_AFTER_BYTES) {
+        bytesSinceLastPersist = 0;
+        schedulePersistTerminalState();
+      }
+    }
+    ptyHub.output(terminalId, data);
+  });
   if (tap) agentOutputTaps.set(terminalId, tap);
   schedulePersistTerminalState();
   ptyHub.changed();
@@ -417,13 +439,6 @@ export function registerSocketHandlers(
       const MAX_PENDING_BYTES = 64 * 1024;
       let flushTimer: ReturnType<typeof setTimeout> | null = null;
       let pendingChunk = '';
-      // Track bytes accumulated since last disk persist to avoid hammering the
-      // filesystem on every chunk during heavy AI streaming (opencode, claude,
-      // gemini, etc.).  Scheduling a persist on every chunk means hundreds of
-      // 250ms-debounced writeFile calls per second, which competes with the PTY
-      // and is the primary cause of the "stuck / can't type" freeze.
-      let bytesSinceLastPersist = 0;
-      const PERSIST_AFTER_BYTES = 8192; // ~8 KB of new output between persists
 
       const flushPending = (): void => {
         flushTimer = null;
@@ -440,21 +455,9 @@ export function registerSocketHandlers(
         }
       };
 
+      // Fan-out only: the scrollback is appended once per chunk by the tap
+      // registered in createTerminalSession, never here (per socket).
       const dataDisposable = shell.onData((data: string) => {
-        const buffer = scrollbackBuffers.get(terminalId);
-        if (buffer) {
-          // O(chunk.length) ring-buffer append — replaces the previous
-          // `session.scrollback = ${session.scrollback}${data}.slice(-N)`
-          // pattern which allocated and copied the full buffer on every
-          // chunk and was the main cause of GC-induced terminal freezes
-          // during AI tool streaming.
-          buffer.append(data);
-          bytesSinceLastPersist += data.length;
-          if (bytesSinceLastPersist >= PERSIST_AFTER_BYTES) {
-            bytesSinceLastPersist = 0;
-            schedulePersistTerminalState();
-          }
-        }
         // Batch + emit for EVERY terminal (multiplex), not just the focused one.
         pendingChunk += data;
         if (pendingChunk.length >= MAX_PENDING_BYTES) {
@@ -472,10 +475,7 @@ export function registerSocketHandlers(
         dispose: () => {
           if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
           flushPending();
-          if (bytesSinceLastPersist > 0) {
-            bytesSinceLastPersist = 0;
-            schedulePersistTerminalState();
-          }
+          schedulePersistTerminalState();
         },
       };
       disposables.push(flushDisposable);
