@@ -30,7 +30,13 @@ export function spoolRecord(r: SpoolRecord): RawAgentEvent[] {
     case 'UserPromptSubmit': case 'BeforeAgent': out.push({ kind: 'status', ...base, state: 'working' }); break;
     case 'PermissionRequest': out.push({ kind: 'permission.request', ...base, tool: p.tool_name, title: toolTitle(p.tool_input), input: p.tool_input }); break;
     case 'Notification':
-      if (p.notification_type === 'permission_prompt' || p.notification_type === 'ToolPermission') out.push({ kind: 'permission.request', ...base, tool: p.details?.rootCommand || '', title: clip(p.message, 160), input: p.details });
+      if (p.notification_type === 'permission_prompt' || p.notification_type === 'ToolPermission') {
+        // Gemini's ToolPermission carries its confirmation details: {type:'exec', rootCommand,…}
+        // or {type:'edit', fileName, filePath, fileDiff,…} (gemini 0.61.0, verified by a real run).
+        const d = p.details;
+        if (d?.type === 'edit') out.push({ kind: 'permission.request', ...base, tool: 'Edit', title: clip(`Edit ${d.fileName || d.filePath || ''}`.trim(), 160), input: { file_path: d.filePath, diff: typeof d.fileDiff === 'string' ? clip(d.fileDiff, 4000) : undefined } });
+        else out.push({ kind: 'permission.request', ...base, tool: d?.rootCommand || '', title: clip(p.message, 160), input: d });
+      }
       else if (p.notification_type === 'idle_prompt') out.push({ kind: 'status', ...base, state: 'idle' });
       break;
     case 'PostToolUse': case 'AfterTool': case 'PostToolUseFailure': out.push({ kind: 'permission.resolved', ...base, outcome: 'allowed-or-not-needed', toolUseId: p.tool_use_id }); break;

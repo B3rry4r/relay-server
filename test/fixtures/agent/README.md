@@ -45,3 +45,8 @@ in-flight tool rather than only redrawing. That was not done in this round. Unti
 `agent:interrupt` reports `verified:false`, and relay-web offers Stop only while the CLI
 itself prints its hint (`esc to interrupt` / `esc to cancel`). This is the same key the
 user would press in the terminal.
+
+`test/agent/e2e.real-cli-edit.test.ts` runs the same three binaries inside a relay terminal
+(real installer hooks, the mocks above) and answers the edit prompt with `agent:respond
+allow_once`; the file on disk must change. It needs `RELAY_AGENT_CLI_BIN` (a directory with
+`claude`, `codex`, `gemini`) and is skipped as NEEDS_EXTERNAL without it.
