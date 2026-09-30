@@ -256,14 +256,22 @@ export function createRelayServer(ptyFactory: PtyFactory = defaultPtyFactory): R
       listeningPort = address && typeof address === 'object' ? address.port : port;
       registerProtectedPort(listeningPort, "relay's own API port");
       setRelayApiUrl(`http://127.0.0.1:${listeningPort}`);
-      try {
-        writeFileAtomic(authStatePaths().apiUrl, `http://127.0.0.1:${listeningPort}\n`, 0o644);
-      } catch { /* the relay-auth CLI falls back to RELAY_API_URL / PORT */ }
+      const ownApiUrl = `http://127.0.0.1:${listeningPort}`;
 
-      // Agent view tracker: only the ACTIVE release runs it (a standby release
-      // must not rotate the shared spool). It is an overlay — a failure is
-      // logged, never fatal for the server.
+      // Only the ACTIVE release may do this work:
+      //  - the shared `$WORKSPACE/.relay/state/api-url` (read by the relay-auth
+      //    CLI, mcp-server.mjs and the CLAUDE.md curl recipe, since relay-pty
+      //    shells get no RELAY_API_URL). A standby release that wrote it at
+      //    listen time pointed every tool at a 503-ing standby while the good
+      //    release drained, and at a dead port when the standby then failed
+      //    health/activation and was killed. It runs before the host is sent
+      //    {type:'activated'} (activate() runs the callbacks first).
+      //  - the Agent view tracker (a standby must not rotate the shared spool).
+      //    It is an overlay — a failure is logged, never fatal for the server.
       cancelAgentStart = whenActive(() => {
+        try {
+          writeFileAtomic(authStatePaths().apiUrl, `${ownApiUrl}\n`, 0o644);
+        } catch { /* the relay-auth CLI falls back to RELAY_API_URL / PORT */ }
         agents.start().catch((error) => console.error('[agent] tracker failed to start:', error));
       });
 

@@ -189,6 +189,7 @@ describe('lifecycle — the real entrypoint under a host-style parent', () => {
   const readLog = () => { try { return fs.readFileSync(logPath(), 'utf8'); } catch { return ''; } };
   const agentPids = () => { try { return fs.readFileSync(path.join(ws, 'agent-pids'), 'utf8').trim().split('\n').filter(Boolean).map(Number); } catch { return []; } };
   const localToken = () => fs.readFileSync(path.join(ws, '.relay', 'state', 'local-token'), 'utf8').trim();
+  const apiUrl = () => { try { return fs.readFileSync(path.join(ws, '.relay', 'state', 'api-url'), 'utf8').trim(); } catch { return null; } };
 
   function startRelease(id: string, extra: Record<string, string> = {}): Promise<Release> {
     const env: NodeJS.ProcessEnv = { ...process.env };
@@ -288,6 +289,9 @@ describe('lifecycle — the real entrypoint under a host-style parent', () => {
     expect(health.body).toMatchObject({ ok: true, releaseId: 'rel-A', mode: 'standby', ptyMode: 'embedded', draining: false });
     expect(typeof health.body.uptimeMs).toBe('number');
     expect((await get(a, '/api/version')).body).toMatchObject({ releaseId: 'rel-A' });
+    // A standby never publishes itself as THE api-url (critic P1: a standby that
+    // failed activation left api-url pointing at a dead port).
+    expect(apiUrl()).toBeNull();
 
     await sleep(1500);
     expect(readLog()).not.toContain('resuming interrupted run');
@@ -311,6 +315,8 @@ describe('lifecycle — the real entrypoint under a host-style parent', () => {
     // ── A: activate (twice) → resumes the run exactly once ───────────────────
     await activate(a);
     expect((await get(a, '/health')).body.mode).toBe('active');
+    // Written before the {type:'activated'} ack.
+    expect(apiUrl()).toBe(`http://127.0.0.1:${a.port}`);
     await waitFor(() => agentPids().length >= 2, 30_000, `the resumed run to reach its agent call\n${a.out()}\n${readLog()}`);
     const [agentPid, agentChildPid] = agentPids();
     expect(aliveNotZombie(agentPid) && aliveNotZombie(agentChildPid)).toBe(true);
@@ -322,7 +328,10 @@ describe('lifecycle — the real entrypoint under a host-style parent', () => {
 
     // ── B: activated while A still holds a fresh lease → does NOT resume ─────
     const b = await startRelease('rel-B');
+    await sleep(500);
+    expect(apiUrl()).toBe(`http://127.0.0.1:${a.port}`); // B on standby: unchanged
     await activate(b);
+    expect(apiUrl()).toBe(`http://127.0.0.1:${b.port}`);
     await waitFor(() => b.out().includes('not resuming — leased by live pid'), 10_000, `B to skip the leased run\n${b.out()}`);
     expect(b.out()).toContain(`leased by live pid ${a.child.pid} (release rel-A)`);
     await sleep(1000);
