@@ -223,10 +223,10 @@ export interface PassOutcome {
  *  nothing it looked at did not "apply" anything — recording it `applied` is exactly
  *  how six stubs finalized green (PG-01). When the net (not the pass) produced the
  *  skip, `guarded` says so: the pass itself would have claimed `applied`. */
-export function settlePassOutcome(out: PassOutcome): { skipReason: string | undefined; guarded: boolean; noop: boolean } {
-  if (out.skipped) return { skipReason: out.skipped, guarded: false, noop: false };
+export function settlePassOutcome(out: PassOutcome): { skipReason: string | undefined; guarded: boolean; noop?: true } {
+  if (out.skipped) return { skipReason: out.skipped, guarded: false };
   if (Object.values(out.counts).every((v) => !v)) {
-    return { skipReason: 'examined no input — every count is zero (the pass reported nothing it looked at)', guarded: true, noop: false };
+    return { skipReason: 'examined no input — every count is zero (the pass reported nothing it looked at)', guarded: true };
   }
   // F9: a mutating pass that looked at real input and changed NOTHING did not
   // "apply" — the Ping finalize reported renameSemantic/deepenTokens `applied` with
@@ -235,7 +235,7 @@ export function settlePassOutcome(out: PassOutcome): { skipReason: string | unde
     const examined = Object.entries(out.counts).filter(([, v]) => v).map(([k, v]) => `${k}=${v}`).join(', ');
     return { skipReason: `no-op: nothing to change (already clean) — examined ${examined}`, guarded: false, noop: true };
   }
-  return { skipReason: undefined, guarded: false, noop: false };
+  return { skipReason: undefined, guarded: false };
 }
 
 /** Orchestrator-provided capabilities a pass may use during a real run. */
@@ -677,7 +677,9 @@ export async function finalizeApp(projectId: string, opts: FinalizeOptions): Pro
       const out = await def.run(projectId, opts, proof, ctx);
       counts = out.counts;
       warnings = out.warnings;
-      ({ skipReason, guarded, noop } = settlePassOutcome(def.mutates ? out : { ...out, changed: undefined }));
+      const settled = settlePassOutcome(def.mutates ? out : { ...out, changed: undefined });
+      ({ skipReason, guarded } = settled);
+      noop = !!settled.noop;
     } catch (e) {
       threw = e as Error;
     }
