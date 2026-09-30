@@ -21,6 +21,7 @@ import { promisify } from 'node:util';
 import { createServer } from 'node:http';
 import { resolveWorkspace, getFlutterRoot, getRelayCacheRoot, createTerminalEnv } from './runtime';
 import { mainDartFor, pubspecFor, ScaffoldError } from './visual-flutter-scaffold';
+import { resolveRouteDocument } from './static-route-doc';
 
 const execFile = promisify(execFileCb);
 
@@ -453,17 +454,17 @@ export async function serveDir(dir: string): Promise<{ url: string; close: () =>
       };
       const isClientRoute = rel !== '/' && rel !== '/index.html' && !path.extname(rel);
       if (isClientRoute && !isFile(diskFile)) {
-        const bare = diskFile.replace(/\/+$/, '');
-        const doc = [`${bare}.html`, path.join(bare, 'index.html')].find(isFile);
-        if (doc) {
-          servedDocs.set(rel, path.relative(dir, doc).split(path.sep).join('/'));
-          await sendHtml(doc);
+        // Shared with the live preview server (static-route-doc.ts): a regular FILE
+        // `<path>.html` / `<path>/index.html` wins over a directory at the path.
+        const route = resolveRouteDocument(dir, rel, isNextExport);
+        if (route.kind === 'doc') {
+          servedDocs.set(rel, route.rel);
+          await sendHtml(route.file);
           return;
         }
-        if (isNextExport) {
+        if (route.kind === 'not-found') {
           servedDocs.set(rel, '404');
-          const nf = path.join(dir, '404.html');
-          if (isFile(nf)) { await sendHtml(nf, 404); return; }
+          if (route.file) { await sendHtml(route.file, 404); return; }
           res.statusCode = 404; res.end(); return;
         }
       }

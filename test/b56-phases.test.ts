@@ -217,6 +217,71 @@ describe('live web preview server on a Next static export (PG-33, same defect)',
   });
 });
 
+describe('a Next route that also has nested routes (B56 fix round, PG-33)', () => {
+  // `next build` (output: export) of app/10-3/page.tsx + app/10-3/about/page.tsx writes
+  // out/10-3.html AND a directory out/10-3/ (holding about.html). The live preview
+  // server answered /10-3 with 403 "Directory listing disabled" because its lookup
+  // asked "does the path exist" before trying `<path>.html`.
+  async function nestedExport(): Promise<string> {
+    const out = path.join(root, 'out-nested');
+    await fs.mkdir(path.join(out, '_next'), { recursive: true });
+    await fs.mkdir(path.join(out, '10-3'), { recursive: true });
+    await fs.writeFile(path.join(out, 'index.html'), '<html><head></head><body>ROOT</body></html>');
+    await fs.writeFile(path.join(out, '404.html'), '<html><head></head><body>NF</body></html>');
+    await fs.writeFile(path.join(out, '10-3.html'), '<html><head></head><body>S103</body></html>');
+    await fs.writeFile(path.join(out, '10-3', 'about.html'), '<html><head></head><body>ABOUT</body></html>');
+    return out;
+  }
+
+  it('live preview server: /10-3 and /10-3/ serve 10-3.html (not 403), /10-3/about serves its own document', async () => {
+    const { startStaticPreviewServer, stopFlutterPreviewServer } = await import('../src/relay-server/flutter-preview-server');
+    const out = await nestedExport();
+    const port = await startStaticPreviewServer('b56-nested', out);
+    try {
+      for (const p of ['/10-3', '/10-3/']) {
+        const r = await fetch(`http://127.0.0.1:${port}${p}`);
+        expect(r.status, p).toBe(200);
+        expect(await r.text()).toMatch(/S103/);
+      }
+      const a = await fetch(`http://127.0.0.1:${port}/10-3/about`);
+      expect(a.status).toBe(200);
+      expect(await a.text()).toMatch(/ABOUT/);
+      const n = await fetch(`http://127.0.0.1:${port}/10-3/nope`);
+      expect(n.status).toBe(404);
+      expect(await n.text()).toMatch(/NF/);
+    } finally { await stopFlutterPreviewServer('b56-nested'); }
+  });
+
+  it('verify server: the same export gives the same answers and records the document served', async () => {
+    const out = await nestedExport();
+    const srv = await serveDir(out);
+    const base = srv.url.replace(/\/index\.html$/, '');
+    try {
+      for (const p of ['/10-3', '/10-3/']) {
+        const r = await fetch(`${base}${p}`);
+        expect(r.status, p).toBe(200);
+        expect(await r.text()).toMatch(/S103/);
+        expect(srv.servedDocument(p)).toBe('10-3.html');
+      }
+      expect(await (await fetch(`${base}/10-3/about`)).text()).toMatch(/ABOUT/);
+      expect(srv.servedDocument('/10-3/about')).toBe('10-3/about.html');
+    } finally { srv.close(); }
+  });
+
+  it('resolveRouteDocument: a regular file wins, a directory never does; a SPA falls through', async () => {
+    const { resolveRouteDocument } = await import('../src/relay-server/static-route-doc');
+    const out = await nestedExport();
+    expect(resolveRouteDocument(out, '/10-3')).toMatchObject({ kind: 'doc', rel: '10-3.html' });
+    expect(resolveRouteDocument(out, '/10-3/about')).toMatchObject({ kind: 'doc', rel: '10-3/about.html' });
+    expect(resolveRouteDocument(out, '/missing')).toMatchObject({ kind: 'not-found' });
+    expect(resolveRouteDocument(out, '/10-3.html')).toEqual({ kind: 'none' });
+    expect(resolveRouteDocument(out, '/')).toEqual({ kind: 'none' });
+    expect(resolveRouteDocument(out, '/../etc/passwd')).toEqual({ kind: 'none' });
+    await fs.rm(path.join(out, '_next'), { recursive: true });
+    expect(resolveRouteDocument(out, '/missing')).toEqual({ kind: 'none' });
+  });
+});
+
 describe('POST /api/ai/resolve-app on web (PG-27, through the route)', () => {
   it('next: resolves from code, records framework next on its run; an app with no screens is `skipped` and canonical.json survives', async () => {
     const express = (await import('express')).default;
